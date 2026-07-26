@@ -226,8 +226,9 @@ own. `wait_for_shutdown` is fully tested.
 
 ## `proxy` feature — reverse-proxy primitives
 
-Ported from limen (a production reverse proxy) with no behavior change: the
-parts of it that aren't about limen.
+Ported from limen (a reverse proxy for service migrations) with no behavior
+change — specifically the parts that are generic HTTP-proxy plumbing rather
+than limen's own shadow-traffic and comparison machinery, which stays there.
 
 ```rust
 use stridelabs_http::proxy::{

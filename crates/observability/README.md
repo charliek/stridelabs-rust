@@ -102,7 +102,9 @@ an upstream in a proxy).
 ```rust
 use stridelabs_observability::{install, status_class, DURATION_BUCKETS};
 
-let handle = install(); // idempotent; call again anywhere to get the same handle
+// Idempotent; call again anywhere to get the same handle. Errs only if
+// something outside this crate already installed a global recorder.
+let handle = install()?;
 // axum: .route("/metrics", get(move || async move { handle.render() }))
 
 let class = status_class(response_status.as_u16()); // "2xx", "4xx", ...
@@ -112,7 +114,10 @@ let class = status_class(response_status.as_u16()); // "2xx", "4xx", ...
   and applies `DURATION_BUCKETS` to every metric whose name ends in
   `duration_seconds` (the house naming convention for a duration histogram,
   e.g. `http_request_duration_seconds`). Safe to call from multiple places;
-  every call returns a clone of the same handle.
+  every call returns a clone of the same handle. It returns
+  `Result<_, PrometheusInstallError>` rather than panicking: `OnceLock` only
+  serializes this crate's own callers, so a host that installed its own
+  recorder first is a real condition a library should report, not abort on.
 - `status_class(u16) -> &'static str` buckets a numeric status code into
   `"1xx"`..`"5xx"` (or `"other"` outside that range) — keeps label
   cardinality low (a handful of values, not hundreds of codes) when used as

@@ -14,7 +14,7 @@ default = []
 # Off by default: most consumers don't render `/metrics`, and pulling in the
 # Prometheus exporter + `metrics` facade unconditionally would be dead weight
 # for the ones that don't.
-prometheus = ["dep:metrics", "dep:metrics-exporter-prometheus"]
+prometheus = ["dep:metrics", "dep:metrics-exporter-prometheus", "dep:thiserror"]
 
 [lints]
 workspace = true
@@ -27,6 +27,8 @@ http = { workspace = true }
 rand = { workspace = true }
 metrics = { workspace = true, optional = true }
 metrics-exporter-prometheus = { workspace = true, optional = true }
+# Only the prometheus feature has a fallible surface (recorder installation).
+thiserror = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

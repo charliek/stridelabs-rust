@@ -27,7 +27,7 @@ static INIT: Once = Once::new();
 ///
 /// The level filter is read from the standard `RUST_LOG` env var if set,
 /// else falls back to `default_filter` (callers pass their own
-/// service-specific fallback, e.g. `"info"` or `"info,sqlx=warn""` — this
+/// service-specific fallback, e.g. `"info"` or `"info,sqlx=warn"` — this
 /// crate doesn't hard-code a house filter string).
 ///
 /// Idempotent: safe to call more than once (e.g. once per test in a suite
@@ -37,15 +37,21 @@ static INIT: Once = Once::new();
 /// once per process, so there is nothing more this could do (and no way to
 /// signal "you asked for something different" back to a caller that isn't
 /// checking a return value).
+///
+/// The same reasoning applies when *something else* already installed a
+/// global subscriber (a test harness, or a host that configures its own
+/// before calling this): `try_init` is used rather than `init` so that case
+/// is the same silent no-op instead of a panic. A library helper has no
+/// business aborting a process over whose logging is already set up.
 pub fn init_logging(format: LogFormat, default_filter: &str) {
     INIT.call_once(|| {
         let filter =
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter));
         let registry = tracing_subscriber::registry().with(filter);
-        match format {
-            LogFormat::Json => registry.with(fmt::layer().json()).init(),
-            LogFormat::Text => registry.with(fmt::layer()).init(),
-        }
+        let _ = match format {
+            LogFormat::Json => registry.with(fmt::layer().json()).try_init(),
+            LogFormat::Text => registry.with(fmt::layer()).try_init(),
+        };
     });
 }
 

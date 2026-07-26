@@ -28,25 +28,39 @@ pub const DURATION_BUCKETS: &[f64] = &[
 
 static HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
 
+/// [`install`] could not set the global recorder — in practice, because
+/// something outside this crate already installed one.
+#[derive(Debug, thiserror::Error)]
+#[error("could not install the Prometheus recorder: {0}")]
+pub struct PrometheusInstallError(String);
+
 /// Install the global Prometheus recorder (idempotent) and return a handle
 /// for rendering `/metrics`.
 ///
 /// Safe to call more than once — `metrics`'s global recorder can only be set
 /// once per process, so only the first call actually installs one; every
 /// call, first or later, returns a clone of that same handle.
-pub fn install() -> PrometheusHandle {
-    HANDLE
-        .get_or_init(|| {
-            PrometheusBuilder::new()
-                .set_buckets_for_metric(
-                    Matcher::Suffix("duration_seconds".to_string()),
-                    DURATION_BUCKETS,
-                )
-                .expect("duration buckets are non-empty")
-                .install_recorder()
-                .expect("install Prometheus recorder")
-        })
-        .clone()
+/// Returns an error rather than panicking when the recorder cannot be
+/// installed: `OnceLock` only serializes *this* crate's callers, so a host
+/// that installed its own global recorder first is a real, recoverable
+/// condition — and a library has no business aborting the process over it.
+pub fn install() -> Result<PrometheusHandle, PrometheusInstallError> {
+    if let Some(handle) = HANDLE.get() {
+        return Ok(handle.clone());
+    }
+
+    let handle = PrometheusBuilder::new()
+        .set_buckets_for_metric(
+            Matcher::Suffix("duration_seconds".to_string()),
+            DURATION_BUCKETS,
+        )
+        .map_err(|err| PrometheusInstallError(err.to_string()))?
+        .install_recorder()
+        .map_err(|err| PrometheusInstallError(err.to_string()))?;
+
+    // A racing caller may have won `set`; either way the stored handle is
+    // the live one, so hand back whatever is in the cell.
+    Ok(HANDLE.get_or_init(|| handle).clone())
 }
 
 /// The status *class* label for a numeric HTTP status code: `"1xx"` through
@@ -69,8 +83,8 @@ mod tests {
 
     #[test]
     fn install_is_idempotent_and_returns_a_handle_both_times() {
-        let a = install();
-        let b = install();
+        let a = install().expect("first install succeeds in a fresh process");
+        let b = install().expect("second install returns the memoized handle");
         // Both calls hand back a handle over the same underlying registry,
         // so they must render identical output.
         assert_eq!(a.render(), b.render());
