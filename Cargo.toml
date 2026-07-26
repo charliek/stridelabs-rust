@@ -58,7 +58,7 @@ metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.17", default-features = false }
 
 # Database
-sqlx = { version = "0.8", default-features = false, features = [
+sqlx = { version = "0.9", default-features = false, features = [
     "runtime-tokio",
     "tls-rustls-ring",
     "postgres",
