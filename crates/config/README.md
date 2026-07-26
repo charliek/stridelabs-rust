@@ -33,9 +33,11 @@ let cors_origins: Vec<String> = parse_string_array("CORS_ORIGINS")?;
 # Ok::<(), EnvError>(())
 ```
 
-- `env_or(key, default)` — missing **or non-Unicode** falls back to `default`
-  (never errors; there's no sensible way to report "not Unicode" more
-  usefully than "not set").
+- `env_or(key, default)` — missing, **empty**, or non-Unicode falls back to
+  `default` (never errors; there's no sensible way to report "not Unicode"
+  more usefully than "not set"). Empty counts as unset because that's how a
+  variable arrives when a compose file writes `FOO:` or a k8s manifest writes
+  `value: ""` — someone left it unfilled.
 - `env_parse::<T>(key, default)` — missing or empty falls back to `default`;
   present-but-unparsable is `Err(EnvError)` naming the variable.
 - `parse_string_array(key)` — parses a JSON array of strings

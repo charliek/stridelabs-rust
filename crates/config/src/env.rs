@@ -25,15 +25,26 @@ pub struct EnvError {
     pub message: String,
 }
 
-/// Read `key` from the environment; return `default` if it is unset **or**
-/// not valid Unicode (`std::env::var`'s only other failure mode) — both
+/// Read `key` from the environment; return `default` if it is unset, **empty**,
+/// or not valid Unicode (`std::env::var`'s only other failure mode) — all
 /// collapse to the same "nothing usable was set" outcome.
+///
+/// Empty counts as unset because that is how an env var arrives when a
+/// compose file writes `FOO:`, a k8s manifest writes `value: ""`, or a
+/// `.env` line is left blank — a variable someone left unfilled, not a
+/// deliberate empty value. Taking `""` literally turns those into
+/// boot failures far from their cause (an empty `BIND_ADDR` that fails to
+/// parse, an empty issuer that 401s every token). This also matches
+/// [`env_parse`] and [`parse_string_array`], which both treat empty as
+/// absent.
 pub fn env_or(key: &str, default: &str) -> String {
     env_or_from(key, default, |k| std::env::var(k).ok())
 }
 
 fn env_or_from(key: &str, default: &str, get: impl Fn(&str) -> Option<String>) -> String {
-    get(key).unwrap_or_else(|| default.to_string())
+    get(key)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| default.to_string())
 }
 
 /// Read `key` from the environment and parse it as `T`. Missing or empty
@@ -124,6 +135,18 @@ mod tests {
         assert_eq!(
             env_or_from("FOO", "fallback", lookup(&[("FOO", "set")])),
             "set"
+        );
+    }
+
+    #[test]
+    fn env_or_empty_falls_back_to_default() {
+        // An unfilled variable (compose `FOO:`, k8s `value: ""`, blank .env
+        // line) must not win over the default — taking it literally turns a
+        // missing value into a boot failure far from its cause. Matches
+        // env_parse/parse_string_array, which already treat empty as absent.
+        assert_eq!(
+            env_or_from("FOO", "fallback", lookup(&[("FOO", "")])),
+            "fallback"
         );
     }
 
