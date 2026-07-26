@@ -1,0 +1,48 @@
+[package]
+name = "stridelabs-http"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "axum error convention, security-header and CORS layers, and graceful-shutdown helpers for StrideLabs services"
+publish = false
+
+[features]
+default = []
+# Off by default: plenty of services are same-origin (or sit behind a gateway
+# that owns CORS), and they shouldn't pay for tower-http's `cors` module in
+# their dependency graph just to get `AppError` and the security headers.
+cors = ["tower-http/cors"]
+# `proxy` (reverse-proxy primitives: hop-by-hop filtering, body buffering,
+# `UpstreamClient`) is not implemented yet — it lands in its own commit and
+# will add `reqwest`/`url`/`bytes`/`futures` as optional dependencies here.
+
+[lints]
+workspace = true
+
+[dependencies]
+axum = { workspace = true }
+# The same `http` crate axum re-exports; used directly so the layers here stay
+# axum-compatible without every module reaching through `axum::http`.
+http = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true, features = ["set-header"] }
+# Non-optional: `shutdown` is signal/watch machinery, and a service that
+# doesn't already depend on tokio has nothing to gracefully shut down. Gating
+# it would buy no consumer a leaner graph.
+tokio = { workspace = true, features = ["macros", "signal", "sync"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+# `test-util` (not part of tokio's `full`) gives `start_paused`, so the
+# shutdown tests assert "does not resolve yet" without a real sleep.
+tokio = { workspace = true, features = [
+    "macros",
+    "rt-multi-thread",
+    "test-util",
+] }
