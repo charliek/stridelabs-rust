@@ -72,7 +72,7 @@ sqlx = { version = "0.8", default-features = false, features = [
 # `use_pem` (pem + simple_asn1 + ~11 transitive crates) from production graphs:
 # verification decodes keys from the JWKS, never PEM. Only offline test-token
 # minting needs PEM, and stridelabs-auth's `test-support` feature re-enables it.
-jsonwebtoken = { version = "9", default-features = false }
+jsonwebtoken = { version = "11", default-features = false }
 sha2 = "0.10"
 
 # Misc
