@@ -57,16 +57,17 @@ mise exec -- cargo test --workspace
 
 ## Crate map
 
-`stridelabs-config`, `stridelabs-observability` and `stridelabs-http` exist as
-real code today; the other two are the planned rest of the workspace (see the
-work breakdown for sequencing) — don't assume their APIs exist yet.
+`stridelabs-config`, `stridelabs-observability`, `stridelabs-http` and
+`stridelabs-auth` exist as real code today; `stridelabs-testing` is the planned
+rest of the workspace (see the work breakdown for sequencing) — don't assume
+its API exists yet.
 
 | Crate | Status | Contents |
 |---|---|---|
 | `stridelabs-config` | Implemented | Env-var helpers (`env_or`/`env_parse`/`parse_string_array`), layered YAML/JSON file loading with field-pathed errors, a validation-error accumulator + socket/fraction checks |
 | `stridelabs-observability` | Implemented | tracing init (json/pretty), a `RequestIdLayer` tower middleware, optional Prometheus wiring |
 | `stridelabs-http` | Implemented | `AppError`→`IntoResponse` convention, security-headers layer, CORS layer (feature `cors`), graceful-shutdown helpers, reverse-proxy primitives (feature `proxy`) |
-| `stridelabs-auth` | Planned | slauth resource-server client: JWKS cache, RS256 verification, PAT hashing, offline test-key minting |
+| `stridelabs-auth` | Implemented | slauth resource-server client: rate-limited JWKS cache, RS256 verification, bearer extraction (feature `axum`), PAT hashing, offline test-key minting (feature `test-support`) |
 | `stridelabs-testing` | Planned | Fail-loud real-Postgres harness, oneshot router-test helpers, wiremock conveniences |
 
 Each crate documents its own **feature topology** in its README — most are

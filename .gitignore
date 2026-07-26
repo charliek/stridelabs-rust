@@ -3,6 +3,12 @@ target/
 *.pdb
 .DS_Store
 
+# Key material never belongs in this repo — with one exception. The throwaway
+# RSA keypairs under crates/auth/testdata are committed on purpose (the crate
+# embeds them via include_str!, so CI needs them); see that directory's README.
+*.pem
+!crates/auth/testdata/*.pem
+
 # The marker below is used by envsecrets to track secret files for this project.
 # Do not remove or modify the "# envsecrets" line.
 # envsecrets
