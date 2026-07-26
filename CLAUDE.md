@@ -65,7 +65,7 @@ work breakdown for sequencing) — don't assume their APIs exist yet.
 |---|---|---|
 | `stridelabs-config` | Implemented | Env-var helpers (`env_or`/`env_parse`/`parse_string_array`), layered YAML/JSON file loading with field-pathed errors, a validation-error accumulator + socket/fraction checks |
 | `stridelabs-observability` | Implemented | tracing init (json/pretty), a `RequestIdLayer` tower middleware, optional Prometheus wiring |
-| `stridelabs-http` | Implemented (core) | `AppError`→`IntoResponse` convention, security-headers layer, CORS layer (feature `cors`), graceful-shutdown helpers. The `proxy` feature (reverse-proxy primitives) is not implemented yet |
+| `stridelabs-http` | Implemented | `AppError`→`IntoResponse` convention, security-headers layer, CORS layer (feature `cors`), graceful-shutdown helpers, reverse-proxy primitives (feature `proxy`) |
 | `stridelabs-auth` | Planned | slauth resource-server client: JWKS cache, RS256 verification, PAT hashing, offline test-key minting |
 | `stridelabs-testing` | Planned | Fail-loud real-Postgres harness, oneshot router-test helpers, wiremock conveniences |
 

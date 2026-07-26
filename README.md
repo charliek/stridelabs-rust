@@ -6,10 +6,10 @@ patterns and practices live here once, so services stay consistent.
 
 **Status: bootstrapped.** The workspace scaffold (Cargo workspace, CI, toolchain
 pins) and the first three crates — `stridelabs-config`,
-`stridelabs-observability` and `stridelabs-http` (core; its `proxy` feature is
-still to come) — are implemented. The remaining two crates below are still
-planned. See `slauth/plans/rust-migration.md` for scope and sequencing, and
-each crate's own README once it lands.
+`stridelabs-observability` and `stridelabs-http` — are implemented. The
+remaining two crates below are still planned. See
+`slauth/plans/rust-migration.md` for scope and sequencing, and each crate's
+own README once it lands.
 
 ## Crates
 
@@ -17,7 +17,7 @@ each crate's own README once it lands.
 |---|---|---|---|
 | `stridelabs-config` | Implemented | Env-var config helpers + layered file loading with field-pathed errors | spendwise-rs `config.rs`, limen `config/load.rs` |
 | `stridelabs-observability` | Implemented | tracing init (json/pretty), request-ID tower layer, Prometheus wiring | limen `observability/` |
-| `stridelabs-http` | Implemented (core) | `AppError`→`IntoResponse` convention, security-headers + CORS layers, graceful shutdown (proxy primitives still to come) | spendwise-rs `error.rs`, limen `http/` |
+| `stridelabs-http` | Implemented | `AppError`→`IntoResponse` convention, security-headers + CORS layers, graceful shutdown, reverse-proxy primitives (feature `proxy`) | spendwise-rs `error.rs`, limen `http/` |
 | `stridelabs-auth` | Planned | slauth resource-server client: JWKS cache, RS256 verification, PAT hashing, offline test-key minting | spendwise-rs `auth/` |
 | `stridelabs-testing` | Planned | `oneshot` router-test helpers, fail-loud real-Postgres harness, wiremock conveniences | spendwise-rs test idioms, hardened |
 

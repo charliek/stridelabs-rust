@@ -15,9 +15,10 @@ default = []
 # that owns CORS), and they shouldn't pay for tower-http's `cors` module in
 # their dependency graph just to get `AppError` and the security headers.
 cors = ["tower-http/cors"]
-# `proxy` (reverse-proxy primitives: hop-by-hop filtering, body buffering,
-# `UpstreamClient`) is not implemented yet — it lands in its own commit and
-# will add `reqwest`/`url`/`bytes`/`futures` as optional dependencies here.
+# Off by default for the same reason, only more so: the reverse-proxy
+# primitives drag in an HTTP *client* and a TLS stack, which is a large thing
+# to hand a service that only ever answers requests.
+proxy = ["dep:reqwest", "dep:url", "dep:bytes", "dep:futures"]
 
 [lints]
 workspace = true
@@ -38,6 +39,16 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 
+# --- `proxy` only ---------------------------------------------------------
+# `stream` is not in reqwest's default set, and everything in `proxy` is built
+# on it: `Response::bytes_stream` is what lets a body be relayed without ever
+# being held in memory, and what lets `buffer_or_stream` bail out to streaming
+# mid-body once it crosses the cap.
+reqwest = { workspace = true, features = ["stream"], optional = true }
+url = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+
 [dev-dependencies]
 # `test-util` (not part of tokio's `full`) gives `start_paused`, so the
 # shutdown tests assert "does not resolve yet" without a real sleep.
@@ -46,3 +57,7 @@ tokio = { workspace = true, features = [
     "rt-multi-thread",
     "test-util",
 ] }
+# Used only by the `proxy` tests (which are themselves feature-gated), but
+# dev-dependencies cannot be feature-gated. It costs consumers nothing — dev
+# deps never enter a downstream graph.
+wiremock = { workspace = true }

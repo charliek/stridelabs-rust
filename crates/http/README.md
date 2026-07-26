@@ -1,9 +1,9 @@
 # stridelabs-http
 
 The house `AppError` → HTTP convention, a security-headers layer, an
-explicit-origin CORS builder, and graceful-shutdown primitives, for
-StrideLabs axum services. Extracted from spendwise-rs's `error.rs` and
-limen's `http::server`.
+explicit-origin CORS builder, graceful-shutdown primitives, and the
+mechanical layer of a reverse proxy, for StrideLabs axum services. Extracted
+from spendwise-rs's `error.rs` and limen's `http/`.
 
 ## Feature topology
 
@@ -13,13 +13,12 @@ axum service wants all three, so gating them would only add friction.
 | Feature | Default | Adds |
 |---|---|---|
 | `cors` | off | `cors_layer`, via `tower-http/cors` |
+| `proxy` | off | the `proxy` module, via `reqwest`/`url`/`bytes`/`futures` |
 
-A `proxy` feature — reverse-proxy primitives (hop-by-hop header filtering,
-body buffering, `UpstreamClient`) — is **reserved but not yet declared**; see
-the comment in `Cargo.toml`. It lands in a follow-up commit and will pull in
-`reqwest`/`url`/`bytes`/`futures`. It is kept out of the table above rather
-than listed as "off" because `features = ["proxy"]` is a hard resolver error
-today, not a no-op.
+`proxy` is the gate that matters: it pulls in an HTTP *client* and a TLS
+stack. A service that only answers requests should never compile that, which
+is why the proxy primitives live behind a feature instead of in a crate
+everyone already depends on.
 
 `tokio` is a **non-optional** dependency (`signal`, `sync`, `macros`) because
 `shutdown` is signal/watch machinery. A service with no tokio in its graph
@@ -34,6 +33,9 @@ stridelabs-http = { git = "ssh://git@github.com/charliek/stridelabs-rust.git", t
 
 # with the CORS layer builder:
 stridelabs-http = { git = "ssh://git@github.com/charliek/stridelabs-rust.git", tag = "v0.1.0", features = ["cors"] }
+
+# for a service that proxies to an upstream:
+stridelabs-http = { git = "ssh://git@github.com/charliek/stridelabs-rust.git", tag = "v0.1.0", features = ["proxy"] }
 ```
 
 (During development against an unreleased commit, pin `rev = "<sha>"`
@@ -221,3 +223,80 @@ app-side.
 signal to the test process, which races every other test in the binary. Its
 body is a `select!` over two `tokio::signal` futures with no logic of its
 own. `wait_for_shutdown` is fully tested.
+
+## `proxy` feature — reverse-proxy primitives
+
+Ported from limen (a production reverse proxy) with no behavior change: the
+parts of it that aren't about limen.
+
+```rust
+use stridelabs_http::proxy::{
+    build_upstream_url, filter_headers, relay_response, Direction, UpstreamClient,
+};
+use url::Url;
+
+async fn proxy(
+    path: &str,
+    query: Option<&str>,
+    headers: &http::HeaderMap,
+) -> Result<axum::response::Response, Box<dyn std::error::Error>> {
+    let client = UpstreamClient::build(true, None)?;
+    let base = Url::parse("https://upstream.internal")?;
+    let url = build_upstream_url(&base, path, query).ok_or("path would be rewritten")?;
+
+    let upstream = client
+        .inner()
+        .get(url)
+        .headers(filter_headers(headers, Direction::Request))
+        .send()
+        .await?;
+
+    Ok(relay_response(upstream))
+}
+```
+
+| Item | What it does |
+|---|---|
+| `HOP_BY_HOP` | The RFC 7230 §6.1 header list, as `&[&str]` (lowercased) |
+| `filter_headers(&HeaderMap, Direction)` | The copy that may cross a hop |
+| `connection_tokens(&HeaderMap)` | Header names banned by a `Connection` list |
+| `request_has_body(&HeaderMap)` | Body presence from framing headers alone |
+| `build_upstream_url(&Url, path, query)` | Origin + path/query, or `None` |
+| `Buffered` / `buffer_or_stream(resp, limit)` | Bounded buffering that still serves the body |
+| `relay_response` / `response_from_parts` | `reqwest` → axum translation |
+| `UpstreamClient::build(verify, ca_pem)` | The pooled client |
+
+Four behaviors are worth knowing about, because each is a bug someone
+re-introduces every time this layer gets rewritten:
+
+- **Repeated headers stay repeated.** The header copy appends. An
+  `insert`-based copy silently collapses `set-cookie` to its last value,
+  which surfaces months later as "users occasionally get logged out". Tested
+  on both `filter_headers` and the full relay.
+- **A path that would be rewritten is refused.** `build_upstream_url`
+  returns `None` when normalization changes the path (`/public/../admin`
+  collapses to `/admin`). If the edge authorizes the raw path and the
+  upstream gets the collapsed one, every prefix-based rule in front of the
+  proxy has been bypassed. Refusing is the only answer that can't be wrong —
+  the two parties already disagree about what was requested.
+- **Redirects are relayed, never followed** (`redirect::Policy::none()`). A
+  3xx is the client's to act on; chasing it returns the client a response
+  from a URL it never asked for, fetched from the proxy's network position
+  rather than the client's.
+- **Bounding a body doesn't cost the client the body.** `buffer_or_stream`
+  reads up to `limit` and, the moment it would be exceeded, returns
+  `TooLarge` carrying a `Body` of the already-read prefix chained to the rest
+  of the upstream stream. The client is served every byte; only whatever
+  wanted to *inspect* the bytes gives up. Exactly `limit` buffers,
+  `limit + 1` streams.
+
+`UpstreamClient::build` takes `(verify_certificates: bool, ca_bundle_pem:
+Option<&[u8]>)` rather than limen's config struct, so adopting these
+primitives doesn't mean adopting limen's configuration model. Reading the
+bundle is the caller's job — hence bytes, and hence no `CaRead` variant in
+`ClientBuildError`. Per-request timeouts are also left to call sites: they
+are per-route policy and don't belong on a client shared by every route.
+
+**Not included: a proxy handler.** Routing, retries, timeouts, circuit
+breaking, shadowing, metrics — that's policy, it differs per service, and it
+stays in the service. This is the mechanical layer underneath it.

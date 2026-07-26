@@ -1,10 +1,12 @@
 //! Shared HTTP plumbing for StrideLabs axum services: the house error type
 //! and its wire representation, ready-made security-header and CORS layers,
-//! and graceful-shutdown primitives.
+//! graceful-shutdown primitives, and (behind a feature) the mechanical layer
+//! of a reverse proxy.
 //!
 //! Extracted from spendwise-rs's `error.rs` (the [`error::AppError`] enum and
 //! its redacting [`axum::response::IntoResponse`] impl) and limen's
-//! `http::server` (the shutdown pair). The pieces that were only ever
+//! `http::{server,proxy,body,client}` (the shutdown pair and the whole of
+//! [`proxy`]). The pieces that were only ever
 //! *implicit* in those services — a security-headers layer, an
 //! explicit-origin CORS builder — are written here as first-class API so
 //! every service gets them by adding a layer rather than by remembering to.
@@ -18,12 +20,14 @@
 //! | Feature | Default | Adds |
 //! |---|---|---|
 //! | `cors` | off | [`cors::cors_layer`], via `tower-http/cors` |
+//! | `proxy` | off | [`proxy`] — reverse-proxy primitives, via `reqwest`/`url`/`bytes`/`futures` |
 //!
-//! A `proxy` feature (reverse-proxy primitives: hop-by-hop header filtering,
-//! body buffering, `UpstreamClient`) is *reserved but not yet declared* — see
-//! the comment in `Cargo.toml`. It is deliberately absent from the table
-//! above rather than listed as "off", since `features = ["proxy"]` is a hard
-//! resolver error today, not a no-op.
+//! `proxy` is the one that really earns its gate: it pulls in an HTTP
+//! *client* and a TLS stack, which no service that merely answers requests
+//! should be compiling. Its items stay namespaced under [`proxy`] rather than
+//! being re-exported at the crate root — `filter_headers` and `relay_response`
+//! only mean anything in that context, and a dozen more names at the root
+//! would bury the four that every service uses.
 //!
 //! # A deliberate exception to the workspace's "typed errors only" rule
 //!
@@ -44,6 +48,9 @@ pub mod shutdown;
 
 #[cfg(feature = "cors")]
 pub mod cors;
+
+#[cfg(feature = "proxy")]
+pub mod proxy;
 
 pub use error::{AppError, AppResult};
 pub use headers::{security_headers, SecurityHeadersLayer};
