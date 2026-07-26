@@ -1,0 +1,88 @@
+# Virtual workspace. Each shared crate lives under `crates/*` with its own
+# Cargo.toml; there is no root package. One `target/` and one `Cargo.lock` for
+# the whole repo.
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+[workspace.package]
+# Lockstep versioning: every crate in this workspace ships at the same
+# version, bumped together at release time regardless of which crate(s)
+# changed. Consumers pin a single git rev/tag for the whole set.
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.96"
+license = "MIT"
+authors = ["Charlie Knudsen"]
+repository = "https://github.com/charliek/stridelabs-rust"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP server / middleware
+axum = "0.8"
+tower = { version = "0.5", features = ["util"] }
+tower-http = "0.6"
+
+# HTTP client (proxy primitives, JWKS fetch). rustls-tls only — no
+# native-roots/openssl feature — so consumers get one predictable, pure-Rust
+# TLS stack.
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+] }
+
+# Serialization / config parsing
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+serde_path_to_error = "0.1"
+
+# Errors
+thiserror = "2"
+anyhow = "1"
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.17", default-features = false }
+
+# Database
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio",
+    "tls-rustls-ring",
+    "postgres",
+    "uuid",
+    "time",
+    "migrate",
+    "macros",
+] }
+
+# Auth (slauth JWT verification + PAT hashing)
+jsonwebtoken = "9"
+sha2 = "0.10"
+
+# Misc
+rand = "0.9"
+uuid = { version = "1", features = ["v4", "serde"] }
+time = { version = "0.3", features = ["serde"] }
+bytes = "1"
+futures = "0.3"
+url = "2"
+
+# Test-only
+wiremock = "0.6"
+
+[workspace.lints.rust]
+# Shared library crates: no unsafe code has ever been needed, so forbid it
+# outright rather than relying on reviewers to catch a stray `unsafe` block.
+unsafe_code = "forbid"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
+
+[profile.dev]
+debug = "limited"

@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+
+    # Postgres for stridelabs-testing's fail-loud integration tests. Mapped to
+    # 5438 to match docker-compose.yml / the local dev port.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: localdev
+          POSTGRES_DB: stridelabs_test
+        ports:
+          - 5438:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_URL: postgres://postgres:localdev@localhost:5438/stridelabs_test
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (all targets, all features)
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+      - name: Test (default features)
+        run: cargo test --workspace --locked
+
+      - name: Test (all features)
+        run: cargo test --workspace --all-features --locked
+
+      - name: Build (no default features)
+        run: cargo build --workspace --no-default-features --locked
+
+      - name: Doc
+        run: cargo doc --workspace --all-features --no-deps --locked
+
+  # Single required status check the branch ruleset gates on. Keeping it a
+  # separate aggregator job means the required check name stays stable even as
+  # the matrix of jobs grows.
+  ci-success:
+    needs: [build-test]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require all jobs to have passed
+        run: |
+          if [ "${{ needs.build-test.result }}" != "success" ]; then
+            echo "::error::build-test='${{ needs.build-test.result }}'"
+            exit 1
+          fi

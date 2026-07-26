@@ -4,26 +4,41 @@ Shared Rust crates for StrideLabs services — the Rust twin of
 [stridelabs-python](https://github.com/charliek/stridelabs-python). Common
 patterns and practices live here once, so services stay consistent.
 
-**Status: pre-bootstrap.** The workspace is scaffolded by slice 02 of the slauth
-Rust migration roadmap (`slauth/plans/rust-migration.md`), which is the source of
-truth for scope and sequencing until this repo is established.
+**Status: bootstrapped.** The workspace scaffold (Cargo workspace, CI, toolchain
+pins) and the first crate, `stridelabs-config`, are implemented. The remaining
+four crates below are still planned. See `slauth/plans/rust-migration.md` for
+scope and sequencing, and each crate's own README once it lands.
 
-## Planned crates
+## Crates
 
-| Crate | Contents | Seeded from |
-|---|---|---|
-| `stridelabs-config` | Env-var config helpers + layered file loading with field-pathed errors | spendwise-rs `config.rs`, limen `config/load.rs` |
-| `stridelabs-observability` | tracing init (json/pretty), request-ID tower layer, Prometheus wiring | limen `observability/` |
-| `stridelabs-http` | `AppError`→`IntoResponse` convention, security-headers + CORS layers, proxy primitives, graceful shutdown | spendwise-rs `error.rs`, limen `http/` |
-| `stridelabs-auth` | slauth resource-server client: JWKS cache, RS256 verification, PAT hashing, offline test-key minting | spendwise-rs `auth/` |
-| `stridelabs-testing` | `oneshot` router-test helpers, fail-loud real-Postgres harness, wiremock conveniences | spendwise-rs test idioms, hardened |
+| Crate | Status | Contents | Seeded from |
+|---|---|---|---|
+| `stridelabs-config` | Implemented | Env-var config helpers + layered file loading with field-pathed errors | spendwise-rs `config.rs`, limen `config/load.rs` |
+| `stridelabs-observability` | Planned | tracing init (json/pretty), request-ID tower layer, Prometheus wiring | limen `observability/` |
+| `stridelabs-http` | Planned | `AppError`→`IntoResponse` convention, security-headers + CORS layers, proxy primitives, graceful shutdown | spendwise-rs `error.rs`, limen `http/` |
+| `stridelabs-auth` | Planned | slauth resource-server client: JWKS cache, RS256 verification, PAT hashing, offline test-key minting | spendwise-rs `auth/` |
+| `stridelabs-testing` | Planned | `oneshot` router-test helpers, fail-loud real-Postgres harness, wiremock conveniences | spendwise-rs test idioms, hardened |
 
-## Conventions (to be codified during bootstrap)
+## Conventions
 
 - Cargo virtual workspace; lockstep versions via `[workspace.package]`; shared
   `[workspace.lints]` and `[workspace.dependencies]`.
-- Consumed as a **git dependency** pinned to a tag, with `[patch]` for local
-  co-development.
+- Consumed as a **git dependency** pinned to a tag (release-accepted) or a
+  commit rev (PR-accepted, pending release):
+
+  ```toml
+  [dependencies]
+  stridelabs-config = { git = "ssh://git@github.com/charliek/stridelabs-rust.git", tag = "v0.1.0" }
+  ```
+
+  For local co-development against an unpublished change, override it with
+  `[patch]` in the consumer's root `Cargo.toml`:
+
+  ```toml
+  [patch."ssh://git@github.com/charliek/stridelabs-rust.git"]
+  stridelabs-config = { path = "../stridelabs-rust/crates/config" }
+  ```
+
 - Integration tests **fail loudly** when a required dependency (e.g. Postgres)
   is unreachable — never skip.
 - OpenAPI default for services: utoipa 5 + utoipa-axum, Swagger UI dev-gated,

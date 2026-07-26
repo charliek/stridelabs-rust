@@ -1,0 +1,20 @@
+# Dependabot keeps dependencies current and surfaces security advisories as PRs.
+# Updates are weekly; each ecosystem gets its own PR stream.
+version: 2
+updates:
+  # CI workflow actions (actions/checkout, setup-rust-toolchain, …). Bumps the
+  # pinned ref whether it's a version tag or a commit SHA.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+
+  # The Cargo workspace at the repo root.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      cargo-minor-patch:
+        update-types: ["minor", "patch"]

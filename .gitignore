@@ -2,5 +2,9 @@ target/
 **/*.rs.bk
 *.pdb
 .DS_Store
+
+# The marker below is used by envsecrets to track secret files for this project.
+# Do not remove or modify the "# envsecrets" line.
+# envsecrets
 .env
 .env.local
