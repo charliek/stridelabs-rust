@@ -55,12 +55,22 @@ mise exec -- cargo test --workspace
 `--all-features`, a `--no-default-features` build, and `cargo doc`, all
 `--locked`, against a live Postgres service.
 
+**DB-touching tests need `docker compose up -d` (or `make up`) running
+first.** `cargo test --workspace` (default features) never needs it —
+`stridelabs-testing`'s `postgres` feature is off by default, so those tests
+don't even compile into that run. They *do* compile and run under
+`mise exec -- make test-all-features` (`cargo test --workspace
+--all-features`), which is why that's the lane to run before trusting a
+change touches Postgres correctly — and why CI runs it against a live
+Postgres service rather than only the default-features lane. If Postgres
+isn't up, `require_postgres`'s own test panics loudly (that's the point);
+it will not silently skip.
+
 ## Crate map
 
-`stridelabs-config`, `stridelabs-observability`, `stridelabs-http` and
-`stridelabs-auth` exist as real code today; `stridelabs-testing` is the planned
-rest of the workspace (see the work breakdown for sequencing) — don't assume
-its API exists yet.
+All five crates are implemented: `stridelabs-config`, `stridelabs-observability`,
+`stridelabs-http`, `stridelabs-auth` and `stridelabs-testing`. Next up (see
+the work breakdown) is adopting them into spendwise-rs.
 
 | Crate | Status | Contents |
 |---|---|---|
@@ -68,7 +78,7 @@ its API exists yet.
 | `stridelabs-observability` | Implemented | tracing init (json/pretty), a `RequestIdLayer` tower middleware, optional Prometheus wiring |
 | `stridelabs-http` | Implemented | `AppError`→`IntoResponse` convention, security-headers layer, CORS layer (feature `cors`), graceful-shutdown helpers, reverse-proxy primitives (feature `proxy`) |
 | `stridelabs-auth` | Implemented | slauth resource-server client: rate-limited JWKS cache, RS256 verification, bearer extraction (feature `axum`), PAT hashing, offline test-key minting (feature `test-support`) |
-| `stridelabs-testing` | Planned | Fail-loud real-Postgres harness, oneshot router-test helpers, wiremock conveniences |
+| `stridelabs-testing` | Implemented | Fail-loud real-Postgres pool (feature `postgres`), `oneshot` axum router-test helpers, a one-line wiremock JSON stub |
 
 Each crate documents its own **feature topology** in its README — most are
 `default = []` so a consumer's dependency graph stays as lean as it wants.
