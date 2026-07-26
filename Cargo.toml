@@ -24,6 +24,9 @@ tokio = { version = "1", features = ["full"] }
 axum = "0.8"
 tower = { version = "0.5", features = ["util"] }
 tower-http = "0.6"
+# Request/response types for tower layers that stay axum-compatible without
+# depending on axum itself (axum re-exports this same `http` crate).
+http = "1"
 
 # HTTP client (proxy primitives, JWKS fetch). rustls-tls only — no
 # native-roots/openssl feature — so consumers get one predictable, pure-Rust

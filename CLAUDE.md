@@ -57,14 +57,14 @@ mise exec -- cargo test --workspace
 
 ## Crate map
 
-Only `stridelabs-config` exists as real code today; the other four are the
-planned rest of the workspace (see the work breakdown for sequencing) —
-don't assume their APIs exist yet.
+`stridelabs-config` and `stridelabs-observability` exist as real code today;
+the other three are the planned rest of the workspace (see the work
+breakdown for sequencing) — don't assume their APIs exist yet.
 
 | Crate | Status | Contents |
 |---|---|---|
 | `stridelabs-config` | Implemented | Env-var helpers (`env_or`/`env_parse`/`parse_string_array`), layered YAML/JSON file loading with field-pathed errors, a validation-error accumulator + socket/fraction checks |
-| `stridelabs-observability` | Planned | tracing init (json/pretty), a `RequestIdLayer` tower middleware, optional Prometheus wiring |
+| `stridelabs-observability` | Implemented | tracing init (json/pretty), a `RequestIdLayer` tower middleware, optional Prometheus wiring |
 | `stridelabs-http` | Planned | `AppError`→`IntoResponse` convention, security-headers + CORS layers, reverse-proxy primitives (feature-gated), graceful-shutdown helpers |
 | `stridelabs-auth` | Planned | slauth resource-server client: JWKS cache, RS256 verification, PAT hashing, offline test-key minting |
 | `stridelabs-testing` | Planned | Fail-loud real-Postgres harness, oneshot router-test helpers, wiremock conveniences |
