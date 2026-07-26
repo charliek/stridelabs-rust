@@ -1,0 +1,12 @@
+{
+  "keys": [
+    {
+      "kty": "RSA",
+      "use": "sig",
+      "alg": "RS256",
+      "kid": "stridelabs-test-key-2",
+      "n": "2CGQ_j5gpi0IYLvqad11u8A0N7IZ0JvhgYoaI4Qs1n2CLfT0MASPrS8ppkXHe1qSyRtlxH7hUmdEylI93_-fpewfVVyEW0itihFdUeVwe_FYzS70xnfW4mOoQNcNApMrohB2ugUr0Vxv1Z5CV3hVyAKd2z2ouf01pwq__au_TFVn_tLsZ0OuvPiZo078RWXi-8b0q967ohtiw9Oi9WAXyp0l5SZajEzv1688Y1RnlgvzRaY1avvAOxpZ8-GYkn-m8Y9Up0kh11tfqxXFEkX-VWWLGZLvqCbMQ4L6iy8v98FH0wHiddvc2-3tMcPMkAO4kpAAEsxkXYGiyfv9CFOQPQ",
+      "e": "AQAB"
+    }
+  ]
+}

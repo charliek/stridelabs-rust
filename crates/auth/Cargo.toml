@@ -1,0 +1,65 @@
+[package]
+name = "stridelabs-auth"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "slauth resource-server client for StrideLabs services: JWKS cache, RS256 access-token verification, and personal-access-token hashing"
+publish = false
+
+[features]
+default = []
+# Bearer-header extraction for axum/tower services. Named for the consumer,
+# not the dependency: what it actually pulls in is the `http` types crate
+# (which axum re-exports), because `http::request::Parts` is all the helper
+# needs and depending on axum itself would be heavier than the feature is.
+axum = ["dep:http"]
+# Integration with the *stridelabs-http* crate: `From<AuthError> for AppError`.
+# Note the name refers to that crate, NOT the `http` types crate above.
+http = ["dep:stridelabs-http", "dep:anyhow"]
+# Offline JWT minting against two committed throwaway keypairs, for consumers'
+# tests. Enables jsonwebtoken's PEM machinery (`use_pem` → pem + simple_asn1 +
+# ~11 transitive crates), which ONLY minting needs — verification decodes keys
+# from the JWKS, never from PEM — so production graphs stay 13 crates lighter.
+# Consumers put `stridelabs-auth = { features = ["test-support"] }` in
+# dev-dependencies, keeping those crates out of release builds entirely.
+test-support = ["jsonwebtoken/use_pem"]
+
+[lints]
+workspace = true
+
+[dependencies]
+jsonwebtoken = { workspace = true }
+# `json` so a JWKS response deserializes straight into `JwkSet`; the rest of
+# reqwest's default feature set stays off (see the workspace manifest).
+reqwest = { workspace = true, features = ["json"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+rand = { workspace = true }
+thiserror = { workspace = true }
+# Non-optional: the JWKS cache is an async `RwLock` around shared state, so a
+# consumer of this crate is running on tokio by construction.
+tokio = { workspace = true, features = ["sync"] }
+tracing = { workspace = true }
+
+# --- feature-gated ---------------------------------------------------------
+http = { workspace = true, optional = true }
+stridelabs-http = { workspace = true, optional = true }
+anyhow = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+wiremock = { workspace = true }
+# The `http` feature's tests assert on `StatusCode`, but that feature enables
+# `stridelabs-http`, not the `http` types crate — and dev-dependencies cannot
+# be feature-gated. Without this line `--features http` fails to compile (CI
+# only runs the default and `--all-features` lanes, so nothing catches it).
+# Same rationale as the ungated `wiremock` dev-dep in `crates/http`.
+http = { workspace = true }
+# The crate's own tests mint tokens (the cfg(all(test, not(feature))) path),
+# which needs PEM decoding regardless of whether test-support is enabled.
+# Dev-only: consumers' production graphs are unaffected.
+jsonwebtoken = { workspace = true, features = ["use_pem"] }

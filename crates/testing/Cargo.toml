@@ -1,0 +1,47 @@
+[package]
+name = "stridelabs-testing"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Test-only helpers for StrideLabs services: a fail-loud Postgres pool, axum oneshot request helpers, and a one-line wiremock JSON stub"
+publish = false
+
+[features]
+default = []
+# Off by default: `sqlx` pulls in a real Postgres driver and TLS stack, which
+# only consumers whose *own* tests touch a database need. `oneshot` and
+# `wiremock` have nothing to do with Postgres and are always available.
+postgres = ["dep:sqlx", "dep:url"]
+
+[lints]
+workspace = true
+
+[dependencies]
+# `oneshot` — driving an axum Router without binding a socket.
+axum = { workspace = true }
+http = { workspace = true }
+tower = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# `wiremock` — a regular (non-dev) dependency on purpose: this crate is
+# consumed from consumers' [dev-dependencies], so wiremock never reaches a
+# production build regardless of which side of *this* manifest it's listed
+# on. Declaring it here, rather than duplicating the version pin in every
+# consumer, is the entire reason `stridelabs-testing` owns a `wiremock` module.
+wiremock = { workspace = true }
+
+# --- `postgres` only -------------------------------------------------------
+sqlx = { workspace = true, optional = true }
+# Only used to redact the password out of a connection string before it can
+# reach a panic message.
+url = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# Drives requests against the mock server started by `wiremock::serve_json`
+# in that module's own tests.
+reqwest = { workspace = true, features = ["json"] }
