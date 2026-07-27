@@ -11,7 +11,7 @@ resolver = "2"
 # changed. Consumers pin a single git rev/tag for the whole set.
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.96"
+rust-version = "1.97"
 license = "MIT"
 authors = ["Charlie Knudsen"]
 repository = "https://github.com/charliek/stridelabs-rust"
