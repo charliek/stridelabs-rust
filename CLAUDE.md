@@ -34,7 +34,7 @@ against.
 
 ## Toolchain
 
-- Rust is pinned to **1.96.0** via both `.mise.toml` and `rust-toolchain.toml`.
+- Rust is pinned to **1.97.1** via both `.mise.toml` and `rust-toolchain.toml`.
   Reach Cargo through mise: `mise exec -- cargo …` (or `mise exec -- make …`).
 - `.cargo/config.toml` sets `resolver.incompatible-rust-versions = "fallback"`
   so the dependency graph resolves against the pinned compiler instead of
