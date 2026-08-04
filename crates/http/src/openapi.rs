@@ -19,8 +19,15 @@
 //! have to guess at that shape and would be wrong for at least one consumer,
 //! so the shape stays in the service and only the mechanics live here.
 //!
-//! Two conventions are worth carrying across services even though they are
-//! not code and cannot be enforced from here:
+//! # Two conventions worth carrying across services
+//!
+//! Neither is code and neither can be enforced from here. **This is the
+//! single authoritative statement of both** — the crate README summarizes
+//! them in two clauses and links here rather than restating them, because
+//! they were previously written out at length in three places and a wrong
+//! version of the `nest`/`merge` claim propagated into two repositories
+//! before review caught it. Correct them here; nowhere else carries a copy to
+//! keep in sync.
 //!
 //! - **Prefer structural exclusion to a maintained list — but know where the
 //!   hole is.** A route reaches the document by being registered on an
@@ -175,8 +182,7 @@ fn method_name(method: &HttpMethod) -> &'static str {
 /// should have stayed excluded, changes this set.
 ///
 /// ```
-/// use std::collections::BTreeSet;
-/// use stridelabs_http::openapi::documented_pairs;
+/// use stridelabs_http::openapi::{documented_pairs, expected_pairs};
 /// use utoipa::OpenApi;
 ///
 /// #[utoipa::path(get, path = "/widgets", responses((status = 200, description = "ok")))]
@@ -186,9 +192,10 @@ fn method_name(method: &HttpMethod) -> &'static str {
 /// #[openapi(paths(list_widgets))]
 /// struct ApiDoc;
 ///
-/// let expected: BTreeSet<(String, String)> =
-///     [("GET", "/widgets")].into_iter().map(|(m, p)| (m.to_string(), p.to_string())).collect();
-/// assert_eq!(documented_pairs(&ApiDoc::openapi()), expected);
+/// assert_eq!(
+///     documented_pairs(&ApiDoc::openapi()),
+///     expected_pairs(&[("GET", "/widgets")]),
+/// );
 /// ```
 pub fn documented_pairs(spec: &OpenApi) -> BTreeSet<(String, String)> {
     let mut pairs = BTreeSet::new();
@@ -202,6 +209,78 @@ pub fn documented_pairs(spec: &OpenApi) -> BTreeSet<(String, String)> {
     pairs
 }
 
+/// The expected side of a [`documented_pairs`] assertion, written the way a
+/// test table wants to write it: `&[("GET", "/widgets"), …]`.
+///
+/// [`documented_pairs`] returns owned `String`s — it has to, since the paths
+/// are cloned out of the document — so every consumer that compares against a
+/// hand-written list needs the same `.map(|(m, p)| (m.to_string(),
+/// p.to_string())).collect()`. Three independent copies of that closure
+/// existed before this function did: slauth's, this README's, and this
+/// module's own tests'. It lives here so the conversion tracks
+/// [`documented_pairs`]' return type by construction; the tests below use it
+/// for exactly that reason, so a change to one side cannot compile against a
+/// stale copy of the other.
+///
+/// No validation is performed — the argument is an *expectation*, and a
+/// misspelled method or path is supposed to fail the `assert_eq!` loudly
+/// rather than be rejected here with a worse message.
+///
+/// ```
+/// use stridelabs_http::openapi::expected_pairs;
+///
+/// let expected = expected_pairs(&[("GET", "/widgets"), ("POST", "/widgets")]);
+/// assert!(expected.contains(&("GET".to_string(), "/widgets".to_string())));
+/// ```
+pub fn expected_pairs(pairs: &[(&str, &str)]) -> BTreeSet<(String, String)> {
+    pairs
+        .iter()
+        .map(|(method, path)| ((*method).to_string(), (*path).to_string()))
+        .collect()
+}
+
+/// Why [`find_operation`] could not return an [`Operation`] — the three
+/// distinguishable ways a `(method, path)` lookup misses.
+///
+/// The distinction is the point. A single "not found" makes a route-renamed
+/// document and a route-that-lost-its-`POST` document fail identically, which
+/// is strictly less than the two hand-written panics a consumer would have
+/// written without this helper at all.
+///
+/// [`std::fmt::Display`] renders a complete, self-contained sentence for each
+/// case, so a caller that only wants to fail can forward it verbatim (that is
+/// what [`expect_operation`] does); a caller that wants to render its own
+/// message, group misses, or count them has the path, the method, and — for
+/// the near-miss case — the methods the path *does* document.
+#[derive(Debug, thiserror::Error)]
+pub enum OperationNotFound {
+    /// The document has no such path key at all.
+    #[error("the OpenAPI document has no path `{path}` (looking up `{method} {path}`)")]
+    Path { method: String, path: String },
+    /// The path is documented, but carries no operation under `method`.
+    #[error(
+        "the OpenAPI document has path `{path}` but no `{method}` operation on it \
+         (it documents: {})",
+        .documented.join(", ")
+    )]
+    Method {
+        method: String,
+        path: String,
+        /// The methods this path *does* document, in
+        /// [`documented_pairs`] order. Never empty: a [`PathItem`] with no
+        /// operations at all has no way into a `utoipa` document.
+        documented: Vec<&'static str>,
+    },
+    /// `method` is not one of the eight uppercase wire spellings, so the
+    /// lookup never got as far as the document. Almost always a typo in the
+    /// calling table (`"get"` for `"GET"`).
+    #[error(
+        "`{method}` is not an HTTP method spelling this lookup recognizes (looking up `{path}`); \
+         they are uppercase: GET, PUT, POST, DELETE, OPTIONS, HEAD, PATCH, TRACE"
+    )]
+    UnknownMethod { method: String, path: String },
+}
+
 /// The [`Operation`] documented at `method` + `path`, addressed the way a
 /// test table spells it (`("GET", "/api/v1/session")`) rather than through an
 /// [`HttpMethod`] value.
@@ -210,16 +289,105 @@ pub fn documented_pairs(spec: &OpenApi) -> BTreeSet<(String, String)> {
 /// requirements, response schemas) doesn't have to re-derive the
 /// string-to-[`HttpMethod`] lookup, which is the same mapping
 /// [`documented_pairs`] emits on its way out.
-/// Returns `None` for both "no such path" and "no such method on that path" —
-/// a caller wanting to tell those apart should reach into `spec.paths.paths`
-/// itself.
 ///
 /// `method` is matched case-sensitively against the uppercase wire spellings
-/// (`"GET"`, `"DELETE"`, …); an unrecognized spelling is `None`, not a panic.
-pub fn find_operation<'a>(spec: &'a OpenApi, method: &str, path: &str) -> Option<&'a Operation> {
-    let item = spec.paths.paths.get(path)?;
-    let method = ALL_HTTP_METHODS.iter().find(|m| method_name(m) == method)?;
-    operation_for(item, method)
+/// (`"GET"`, `"DELETE"`, …); an unrecognized spelling is
+/// [`OperationNotFound::UnknownMethod`], not a panic.
+///
+/// # Why `Result` here and a panicking [`expect_operation`] alongside
+///
+/// This pair mirrors [`check_committed_spec`] / [`assert_committed_spec_is_fresh`]
+/// deliberately, and for the same reason: the typed error is the primitive,
+/// the panicking form is the one a test actually writes.
+///
+/// A test table is realistically the only caller, and for that caller
+/// [`expect_operation`] is the whole answer — one expression, and the message
+/// is already the two-case one. But the primitive stays a `Result` rather
+/// than *only* a panic, because the error carries structure a panic throws
+/// away: an `xtask` diffing two specs, or a lint that reports every missing
+/// route in one pass instead of dying on the first, needs to inspect the miss
+/// rather than abort on it. Building the panic on the `Result` costs one
+/// `match`, and it guarantees the two forms can never describe the same miss
+/// differently.
+///
+/// There is deliberately **no** `Option`-returning form. That was the
+/// previous shape, and it is what this replaces: it collapsed all three cases
+/// into one `None` and pushed callers back to `spec.paths.paths` to tell them
+/// apart. A caller who genuinely wants "present or not, don't care why"
+/// writes `.ok()` — one call, at the one call site that wants it, instead of
+/// a second name in the crate's surface that everyone has to choose between.
+///
+/// One wrinkle worth knowing before it surprises you: `unwrap_err` and
+/// `expect_err` do **not** compile on this `Result`. Both require the *ok*
+/// type to be `Debug`, and `utoipa` implements `Debug` for [`Operation`] only
+/// under its `debug` feature, which this crate does not enable. `unwrap`,
+/// `expect` and `?` on the success side are all fine ([`OperationNotFound`]
+/// is `Debug`); a test that wants to assert on a miss should `match` or use
+/// `let Err(e) = … else`.
+pub fn find_operation<'a>(
+    spec: &'a OpenApi,
+    method: &str,
+    path: &str,
+) -> Result<&'a Operation, OperationNotFound> {
+    let item = spec
+        .paths
+        .paths
+        .get(path)
+        .ok_or_else(|| OperationNotFound::Path {
+            method: method.to_string(),
+            path: path.to_string(),
+        })?;
+
+    let http_method = ALL_HTTP_METHODS
+        .iter()
+        .find(|m| method_name(m) == method)
+        .ok_or_else(|| OperationNotFound::UnknownMethod {
+            method: method.to_string(),
+            path: path.to_string(),
+        })?;
+
+    operation_for(item, http_method).ok_or_else(|| OperationNotFound::Method {
+        method: method.to_string(),
+        path: path.to_string(),
+        documented: ALL_HTTP_METHODS
+            .iter()
+            .filter(|m| operation_for(item, m).is_some())
+            .map(method_name)
+            .collect(),
+    })
+}
+
+/// [`find_operation`], panicking with the rendered [`OperationNotFound`].
+///
+/// The form a per-route test table wants: the lookup is one expression, and a
+/// miss already says which of the three things went wrong — the path is
+/// absent, the path is there but not under this method (with the methods it
+/// does document), or the method spelling is a typo. `#[track_caller]` puts
+/// the panic's location on the calling test line rather than inside this
+/// crate.
+///
+/// ```
+/// use stridelabs_http::openapi::expect_operation;
+/// use utoipa::OpenApi;
+///
+/// #[utoipa::path(post, path = "/widgets", responses((status = 201, description = "created")))]
+/// fn create_widget() {}
+///
+/// #[derive(OpenApi)]
+/// #[openapi(paths(create_widget))]
+/// struct ApiDoc;
+///
+/// let spec = ApiDoc::openapi();
+/// let op = expect_operation(&spec, "POST", "/widgets");
+/// let codes: Vec<&str> = op.responses.responses.keys().map(String::as_str).collect();
+/// assert_eq!(codes, ["201"]);
+/// ```
+#[track_caller]
+pub fn expect_operation<'a>(spec: &'a OpenApi, method: &str, path: &str) -> &'a Operation {
+    match find_operation(spec, method, path) {
+        Ok(operation) => operation,
+        Err(e) => panic!("{e}"),
+    }
 }
 
 /// Render an [`OpenApi`] document as pretty JSON with a CANONICAL
@@ -291,7 +459,14 @@ fn canonicalize(value: serde_json::Value) -> serde_json::Value {
 /// **LF, not CRLF** — see [`check_committed_spec`] for why that is a
 /// requirement stated out loud rather than something normalized away, and for
 /// the one `.gitattributes` line that makes it true on every checkout.
-pub fn committed_file_contents(spec: &OpenApi) -> String {
+///
+/// Named for what it returns — the contents a committed file is *expected* to
+/// have — rather than `committed_file_contents`, which read like an accessor
+/// for a file that exists when in fact nothing here touches the filesystem.
+/// It pairs with [`expected_pairs`]: both name the right-hand side of a
+/// comparison, derived from the document, that a repository is checked
+/// against.
+pub fn expected_file_contents(spec: &OpenApi) -> String {
     format!("{}\n", to_pretty_json(spec))
 }
 
@@ -339,7 +514,7 @@ pub enum SpecFreshnessError {
 /// error. Pass the real, copy-pasteable command:
 /// `cargo run --bin svc -- openapi > openapi.json`.
 ///
-/// The comparison is against [`committed_file_contents`] and is exact: pretty
+/// The comparison is against [`expected_file_contents`] and is exact: pretty
 /// JSON, LF line endings, one trailing newline.
 ///
 /// # LF is required, not normalized
@@ -392,7 +567,7 @@ pub fn check_committed_spec(
         source,
     })?;
 
-    let fresh = committed_file_contents(spec);
+    let fresh = expected_file_contents(spec);
     if committed == fresh {
         return Ok(());
     }
@@ -606,11 +781,19 @@ mod tests {
     #[openapi()]
     struct EmptyDoc;
 
-    fn pairs(pairs: &[(&str, &str)]) -> BTreeSet<(String, String)> {
-        pairs
-            .iter()
-            .map(|(m, p)| (m.to_string(), p.to_string()))
-            .collect()
+    /// The error side of a [`find_operation`] miss.
+    ///
+    /// `Result::expect_err`/`unwrap_err` are unavailable: both require the
+    /// *ok* type to be `Debug`, and `utoipa`'s [`Operation`] implements
+    /// `Debug` only under its `debug` feature, which this crate does not
+    /// enable. Worth knowing before a consumer writes `.unwrap_err()` and is
+    /// confused by the bound — see [`find_operation`]'s docs, which name it.
+    #[track_caller]
+    fn miss(result: Result<&Operation, OperationNotFound>) -> OperationNotFound {
+        match result {
+            Ok(_) => panic!("expected the lookup to miss, but it found an operation"),
+            Err(e) => e,
+        }
     }
 
     /// A file that would be committed for `spec`, written under a temp dir.
@@ -728,18 +911,21 @@ mod tests {
 
     #[test]
     fn to_pretty_json_emits_no_trailing_newline() {
-        // The exporter's `println!` supplies it; `committed_file_contents` is
+        // The exporter's `println!` supplies it; `expected_file_contents` is
         // the one place the convention lives.
         let rendered = to_pretty_json(&ApiDoc::openapi());
         assert!(!rendered.ends_with('\n'), "{rendered:?}");
-        assert_eq!(committed_file_contents(&ApiDoc::openapi()), rendered + "\n");
+        assert_eq!(expected_file_contents(&ApiDoc::openapi()), rendered + "\n");
     }
 
     #[test]
     fn documented_pairs_covers_every_http_method() {
+        // `expected_pairs`, not a local closure: it is the public conversion
+        // consumers use, so exercising it here is what keeps it in step with
+        // `documented_pairs`' return type rather than merely resembling it.
         assert_eq!(
             documented_pairs(&ApiDoc::openapi()),
-            pairs(&[
+            expected_pairs(&[
                 ("GET", "/widgets"),
                 ("POST", "/widgets"),
                 ("PUT", "/widgets/{id}"),
@@ -772,6 +958,25 @@ mod tests {
     }
 
     #[test]
+    fn expected_pairs_matches_documented_pairs_for_a_single_route() {
+        // The narrow claim `expected_pairs` exists to make: its output type
+        // and element shape are `documented_pairs`', not merely similar.
+        #[derive(utoipa::OpenApi)]
+        #[openapi(paths(handlers::list_widgets))]
+        struct OneRoute;
+
+        assert_eq!(
+            documented_pairs(&OneRoute::openapi()),
+            expected_pairs(&[("GET", "/widgets")])
+        );
+    }
+
+    #[test]
+    fn expected_pairs_is_empty_for_an_empty_slice() {
+        assert!(expected_pairs(&[]).is_empty());
+    }
+
+    #[test]
     fn find_operation_addresses_a_route_by_its_table_spelling() {
         let spec = ApiDoc::openapi();
 
@@ -780,23 +985,83 @@ mod tests {
         assert_eq!(codes, ["201"]);
     }
 
+    /// The regression this API shape exists to prevent: "the path is gone"
+    /// and "the path lost this method" must not report identically, which is
+    /// what a single `None` did.
     #[test]
-    fn find_operation_is_none_for_an_undocumented_method_path_or_spelling() {
+    fn find_operation_tells_a_missing_path_apart_from_a_missing_method() {
         let spec = ApiDoc::openapi();
 
-        assert!(find_operation(&spec, "DELETE", "/widgets").is_none());
-        assert!(find_operation(&spec, "GET", "/nope").is_none());
+        let missing_path = miss(find_operation(&spec, "GET", "/nope"));
         assert!(
-            find_operation(&spec, "get", "/widgets").is_none(),
-            "the table spelling is uppercase; a lowercase one is a typo, not a lookup"
+            matches!(missing_path, OperationNotFound::Path { .. }),
+            "{missing_path:?}"
         );
+        let msg = missing_path.to_string();
+        assert!(msg.contains("no path `/nope`"), "{msg}");
+
+        let missing_method = miss(find_operation(&spec, "DELETE", "/widgets"));
+        assert!(
+            matches!(missing_method, OperationNotFound::Method { .. }),
+            "{missing_method:?}"
+        );
+        let msg = missing_method.to_string();
+        assert!(msg.contains("has path `/widgets`"), "{msg}");
+        assert!(msg.contains("no `DELETE` operation"), "{msg}");
+        assert!(
+            msg.contains("GET, POST"),
+            "the near-miss case should name the methods the path does document: {msg}"
+        );
+    }
+
+    #[test]
+    fn find_operation_names_an_unrecognized_method_spelling_as_such() {
+        let spec = ApiDoc::openapi();
+
+        // The table spelling is uppercase; a lowercase one is a typo.
+        let err = miss(find_operation(&spec, "get", "/widgets"));
+
+        assert!(
+            matches!(err, OperationNotFound::UnknownMethod { .. }),
+            "{err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("`get` is not an HTTP method spelling"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("/widgets"),
+            "a typo'd lookup should still say what was being looked up: {msg}"
+        );
+    }
+
+    #[test]
+    fn expect_operation_returns_the_operation_when_it_is_documented() {
+        let spec = ApiDoc::openapi();
+
+        let op = expect_operation(&spec, "POST", "/widgets");
+        let codes: Vec<&str> = op.responses.responses.keys().map(String::as_str).collect();
+        assert_eq!(codes, ["201"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "has no path `/nope`")]
+    fn expect_operation_panics_naming_a_missing_path() {
+        expect_operation(&ApiDoc::openapi(), "GET", "/nope");
+    }
+
+    #[test]
+    #[should_panic(expected = "no `DELETE` operation")]
+    fn expect_operation_panics_naming_a_missing_method_distinctly() {
+        expect_operation(&ApiDoc::openapi(), "DELETE", "/widgets");
     }
 
     #[test]
     fn check_committed_spec_accepts_a_file_written_the_documented_way() {
         let dir = tempfile::tempdir().unwrap();
         let spec = ApiDoc::openapi();
-        let path = write_spec_file(dir.path(), &committed_file_contents(&spec));
+        let path = write_spec_file(dir.path(), &expected_file_contents(&spec));
 
         check_committed_spec(&path, &spec, REGEN).expect("a freshly written file is fresh");
     }
@@ -819,7 +1084,7 @@ mod tests {
     fn check_committed_spec_names_the_first_differing_line() {
         let dir = tempfile::tempdir().unwrap();
         let spec = ApiDoc::openapi();
-        let stale = committed_file_contents(&spec).replace("/widgets", "/gadgets");
+        let stale = expected_file_contents(&spec).replace("/widgets", "/gadgets");
         let path = write_spec_file(dir.path(), &stale);
 
         let err = check_committed_spec(&path, &spec, REGEN).expect_err("the paths were renamed");
@@ -852,7 +1117,7 @@ mod tests {
     fn a_crlf_checkout_is_named_as_such_and_told_how_to_fix_it() {
         let dir = tempfile::tempdir().unwrap();
         let spec = ApiDoc::openapi();
-        let crlf = committed_file_contents(&spec).replace('\n', "\r\n");
+        let crlf = expected_file_contents(&spec).replace('\n', "\r\n");
         let path = write_spec_file(dir.path(), &crlf);
 
         let err = check_committed_spec(&path, &spec, REGEN)
@@ -878,7 +1143,7 @@ mod tests {
     fn a_crlf_file_that_also_drifted_says_there_is_more_than_line_endings() {
         let dir = tempfile::tempdir().unwrap();
         let spec = ApiDoc::openapi();
-        let crlf = committed_file_contents(&spec)
+        let crlf = expected_file_contents(&spec)
             .replace("/widgets", "/gadgets")
             .replace('\n', "\r\n");
         let path = write_spec_file(dir.path(), &crlf);
@@ -894,7 +1159,7 @@ mod tests {
     fn a_truncated_committed_file_says_where_it_stops() {
         let dir = tempfile::tempdir().unwrap();
         let spec = ApiDoc::openapi();
-        let full = committed_file_contents(&spec);
+        let full = expected_file_contents(&spec);
         let head: String = full.lines().take(3).map(|l| format!("{l}\n")).collect();
         let path = write_spec_file(dir.path(), &head);
 
@@ -918,7 +1183,7 @@ mod tests {
     fn assert_committed_spec_is_fresh_passes_on_a_fresh_file() {
         let dir = tempfile::tempdir().unwrap();
         let spec = ApiDoc::openapi();
-        let path = write_spec_file(dir.path(), &committed_file_contents(&spec));
+        let path = write_spec_file(dir.path(), &expected_file_contents(&spec));
 
         assert_committed_spec_is_fresh(&path, &spec, REGEN);
     }

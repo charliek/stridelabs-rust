@@ -22,10 +22,10 @@ unless asked for.
 
 ```toml
 [dependencies]
-stridelabs-observability = { git = "ssh://git@github.com/charliek/stridelabs-rust.git", tag = "v0.1.0" }
+stridelabs-observability = { git = "ssh://git@github.com/charliek/stridelabs-rust.git", tag = "v0.3.0" }
 
 # with Prometheus wiring:
-stridelabs-observability = { git = "ssh://git@github.com/charliek/stridelabs-rust.git", tag = "v0.1.0", features = ["prometheus"] }
+stridelabs-observability = { git = "ssh://git@github.com/charliek/stridelabs-rust.git", tag = "v0.3.0", features = ["prometheus"] }
 ```
 
 (During development against an unreleased commit, pin `rev = "<sha>"`
