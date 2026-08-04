@@ -25,7 +25,7 @@ just to get the `oneshot` helpers.
 
 ```toml
 [dev-dependencies]
-stridelabs-testing = { git = "ssh://git@github.com/charliek/stridelabs-rust.git", tag = "v0.1.0", features = ["postgres"] }
+stridelabs-testing = { git = "ssh://git@github.com/charliek/stridelabs-rust.git", tag = "v0.3.0", features = ["postgres"] }
 ```
 
 (During development against an unreleased commit, pin `rev = "<sha>"` instead

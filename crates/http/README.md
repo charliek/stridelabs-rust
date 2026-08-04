@@ -1,9 +1,10 @@
 # stridelabs-http
 
 The house `AppError` → HTTP convention, a security-headers layer, an
-explicit-origin CORS builder, graceful-shutdown primitives, and the
-mechanical layer of a reverse proxy, for StrideLabs axum services. Extracted
-from spendwise-rs's `error.rs` and limen's `http/`.
+explicit-origin CORS builder, graceful-shutdown primitives, the mechanical
+layer of a reverse proxy, and the mechanics of publishing an OpenAPI document,
+for StrideLabs axum services. Extracted from spendwise-rs's `error.rs`,
+limen's `http/`, and slauth's `http/openapi.rs`.
 
 ## Feature topology
 
@@ -13,7 +14,7 @@ axum service wants all three, so gating them would only add friction.
 | Feature | Default | Adds |
 |---|---|---|
 | `cors` | off | `cors_layer`, via `tower-http/cors` |
-| `openapi` | off | the `openapi` module, via `utoipa` |
+| `openapi` | off | the `openapi` module — spec canonicalization, `(method, path)` enumeration, committed-spec freshness check — via `utoipa` |
 | `proxy` | off | the `proxy` module, via `reqwest`/`url`/`bytes`/`futures` |
 
 `proxy` is the gate that matters: it pulls in an HTTP *client* and a TLS
@@ -30,17 +31,16 @@ build.
 
 ```toml
 [dependencies]
-stridelabs-http = { git = "ssh://git@github.com/charliek/stridelabs-rust.git", tag = "v0.1.0" }
+stridelabs-http = { git = "ssh://git@github.com/charliek/stridelabs-rust.git", tag = "v0.3.0" }
 
 # with the CORS layer builder:
-stridelabs-http = { git = "ssh://git@github.com/charliek/stridelabs-rust.git", tag = "v0.1.0", features = ["cors"] }
+stridelabs-http = { git = "ssh://git@github.com/charliek/stridelabs-rust.git", tag = "v0.3.0", features = ["cors"] }
 
 # for a service that proxies to an upstream:
-stridelabs-http = { git = "ssh://git@github.com/charliek/stridelabs-rust.git", tag = "v0.1.0", features = ["proxy"] }
+stridelabs-http = { git = "ssh://git@github.com/charliek/stridelabs-rust.git", tag = "v0.3.0", features = ["proxy"] }
 
-# for a service that publishes an OpenAPI document
-# (`openapi` landed after v0.1.0 — pin the first tag that carries it):
-stridelabs-http = { git = "ssh://git@github.com/charliek/stridelabs-rust.git", tag = "v0.2.0", features = ["openapi"] }
+# for a service that publishes an OpenAPI document:
+stridelabs-http = { git = "ssh://git@github.com/charliek/stridelabs-rust.git", tag = "v0.3.0", features = ["openapi"] }
 ```
 
 (During development against an unreleased commit, pin `rev = "<sha>"`
@@ -240,19 +240,20 @@ in it.
 | Item | What it does |
 |---|---|
 | `to_pretty_json(&OpenApi)` | Pretty JSON with alphabetical keys at every nesting level |
-| `committed_file_contents(&OpenApi)` | The above, plus the one trailing newline a committed file carries |
+| `expected_file_contents(&OpenApi)` | The above, plus the one trailing newline a committed file carries |
 | `documented_pairs(&OpenApi)` | Every `(METHOD, path)` pair in the document, as a `BTreeSet` |
-| `find_operation(&OpenApi, "GET", "/x")` | The `Operation` at a method+path, addressed the way a test table spells it |
+| `expected_pairs(&[("GET", "/x")])` | The expected side of that comparison, converted once here instead of in every consumer |
+| `find_operation(&OpenApi, "GET", "/x")` → `Result<&Operation, OperationNotFound>` | The `Operation` at a method+path, or which of the three ways the lookup missed |
+| `expect_operation(&OpenApi, "GET", "/x")` → `&Operation` | The same, panicking with that message — the test form |
 | `check_committed_spec(path, &OpenApi, cmd)` → `Result<(), SpecFreshnessError>` | Committed file vs. fresh export |
 | `assert_committed_spec_is_fresh(path, &OpenApi, cmd)` | The same, panicking with the report — the test form |
 
-That is the whole surface. The exhaustive method↔operation-slot mapping the
-top two are built on stays **private**: a public `ALL_HTTP_METHODS:
-[HttpMethod; 8]` would make the array's length part of the contract, so the
-day utoipa adds a ninth method, fixing the compile error the array exists to
-cause means writing `[HttpMethod; 9]` — a breaking change for anyone who
-named the type, for a reason unrelated to anything they were doing with it.
-`documented_pairs` and `find_operation` give the same guarantee without it.
+That is the whole surface. Two pairs of it are a typed-error primitive plus a
+panicking wrapper, because the test form is what a consumer writes and the
+`Result` form is what an `xtask` or CI helper needs; each pair renders one
+message, so the two can't drift. The exhaustive method↔operation-slot mapping
+underneath stays **private** — see the module docs for why publishing an
+`[HttpMethod; 8]` would make its *length* part of the contract.
 
 ### Wiring it up
 
@@ -275,17 +276,37 @@ fn main() {
 
 ```rust,ignore
 // tests/openapi_shape.rs
-use std::collections::BTreeSet;
-use stridelabs_http::openapi::{assert_committed_spec_is_fresh, documented_pairs};
+use stridelabs_http::openapi::{
+    assert_committed_spec_is_fresh, documented_pairs, expect_operation, expected_pairs,
+};
 
 #[test]
 fn the_documented_path_method_set_is_exact() {
-    let expected: BTreeSet<(String, String)> = [("GET", "/api/v1/session"), ("POST", "/api/v1/pat")]
-        .into_iter()
-        .map(|(m, p)| (m.to_string(), p.to_string()))
-        .collect();
+    assert_eq!(
+        documented_pairs(&svc::openapi::spec()),
+        expected_pairs(&[("GET", "/api/v1/session"), ("POST", "/api/v1/pat")]),
+    );
+}
 
-    assert_eq!(documented_pairs(&svc::openapi::spec()), expected);
+#[test]
+fn every_route_documents_its_expected_status_codes() {
+    let table: &[(&str, &str, &[&str])] = &[
+        ("GET", "/api/v1/session", &["200"]),
+        ("POST", "/api/v1/pat", &["201", "401", "422"]),
+    ];
+
+    let spec = svc::openapi::spec();
+    for (method, path, expected) in table {
+        // A miss says which of the three it was — no such path, no such
+        // method *on* that path (naming the ones it does document), or a
+        // typo'd method spelling. `find_operation` is the `Result` form if
+        // you'd rather render your own.
+        let operation = expect_operation(&spec, method, path);
+        let mut actual: Vec<&str> =
+            operation.responses.responses.keys().map(String::as_str).collect();
+        actual.sort_unstable();
+        assert_eq!(actual, *expected, "{method} {path} status codes");
+    }
 }
 
 #[test]
@@ -359,47 +380,25 @@ a different prefix, and neither one's document root is a thing the other
 could adopt. A "spec builder" here would have to guess at that shape and be
 wrong for at least one consumer.
 
-Two conventions are worth carrying between services even though they are not
-code and can't be enforced from a crate:
+### Two conventions that live in the module docs, not here
 
-- **Prefer structural exclusion to a maintained list — but know where the
-  hole is.** A route reaches the document by being registered with
-  `OpenApiRouter::routes(routes!(…))`, so the modules that must stay *out*
-  (health checks, webhooks, static fallbacks, reverse proxies with their own
-  contracts) stay out by never importing `utoipa` at all: no flag to flip and
-  no exclusion list to keep in sync. What this does **not** give you is "you
-  can't forget". `OpenApiRouter::route` and `OpenApiRouter::route_service`
-  are pass-throughs to their `axum::Router` equivalents — they register a
-  runtime route and add nothing to the document — so a route can be
-  undocumented without ever leaving `OpenApiRouter`. That is the escape
-  hatch, and it is silent. The guard is a route-pinning test: compare
-  `documented_pairs` against an expected set, and a route added with `.route`
-  instead of `.routes(routes!(…))` shows up as a missing pair.
-- **Apply a version prefix with `OpenApiRouter::nest`, never
-  `axum::Router::nest`.** `OpenApiRouter::nest(prefix, router)` prefixes both
-  halves — the OpenAPI path keys and the axum routes — which is what keeps
-  the document and the wire in agreement. (`OpenApiRouter::merge` takes no
-  prefix at all; it combines both halves as-is, which is why it is the right
-  tool for assembling sibling routers and the wrong one for versioning.) The
-  drift to avoid comes from converting to an `axum::Router` first and
-  nesting *that*: `axum::Router::nest` prefixes only the runtime routes, the
-  document keeps its unprefixed paths, and the spec then describes URLs the
-  service does not serve. `documented_pairs` against a committed expectation
-  catches this too.
+Two things are worth carrying between services even though they are not code
+and can't be enforced from a crate: **prefer structural exclusion to a
+maintained exclusion list** (and know where its silent hole is), and **apply a
+version prefix with `OpenApiRouter::nest`, never `axum::Router::nest`**.
 
-**On the exhaustive match:** `documented_pairs` enumerates all eight
-`HttpMethod` variants through a `match` with no `_` arm, so a `utoipa` that
-adds a variant is a compile error rather than routes quietly missing from
-every consumer's spec. The obvious review comment is "use
-`PathItem::operations`" — that map does not exist in utoipa 5.x (it was the
-utoipa 4 shape); 5.x stores eight independent `Option<Operation>` fields with
-no iterator over them, and utoipa's own `PathItem::new` matches an
-`HttpMethod` onto those same eight fields.
+Both are stated in full, once, in the `openapi` module docs —
+[`crates/http/src/openapi.rs`](src/openapi.rs), rendered by `cargo doc -p
+stridelabs-http --features openapi --open`. They are **not** restated here on
+purpose: this convention was previously written out at length in three places,
+and a wrong version of the `nest`/`merge` claim propagated into two
+repositories before review caught it (#11, slauth#35). One copy, next to the
+`documented_pairs` that guards both.
 
-**On `utoipa`'s features:** this crate enables none of the schema features
-(`uuid`, `time`, …) because it derives no schemas. A consumer declares its
-own `utoipa` dependency with whatever its types need; Cargo unifies the two
-into one crate.
+**On the exhaustive match** and **on `utoipa`'s features** (this crate enables
+no schema features because it derives no schemas; a consumer declares its own
+`utoipa` with whatever its types need and Cargo unifies them) — likewise the
+module docs, which carry the reasoning and the utoipa-5.x details.
 
 ## `proxy` feature — reverse-proxy primitives
 

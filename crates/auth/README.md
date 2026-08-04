@@ -36,10 +36,10 @@ Verification decodes keys from the JWKS, never from PEM, so put the feature in
 
 ```toml
 [dependencies]
-stridelabs-auth = { git = "ssh://git@github.com/charliek/stridelabs-rust.git", tag = "v0.1.0", features = ["axum", "http"] }
+stridelabs-auth = { git = "ssh://git@github.com/charliek/stridelabs-rust.git", tag = "v0.3.0", features = ["axum", "http"] }
 
 [dev-dependencies]
-stridelabs-auth = { git = "ssh://git@github.com/charliek/stridelabs-rust.git", tag = "v0.1.0", features = ["test-support"] }
+stridelabs-auth = { git = "ssh://git@github.com/charliek/stridelabs-rust.git", tag = "v0.3.0", features = ["test-support"] }
 ```
 
 (During development against an unreleased commit, pin `rev = "<sha>"` instead

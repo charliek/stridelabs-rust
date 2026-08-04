@@ -55,7 +55,7 @@ Once a version is tagged, pin the tag:
 
 ```toml
 [dependencies]
-stridelabs-config = { git = "ssh://git@github.com/charliek/stridelabs-rust.git", tag = "v0.1.0" }
+stridelabs-config = { git = "ssh://git@github.com/charliek/stridelabs-rust.git", tag = "v0.3.0" }
 ```
 
 Before the first tag exists — or when depending on a reviewed-but-unreleased
