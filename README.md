@@ -17,7 +17,7 @@ and each crate's own README for its full API and feature topology.
 |---|---|---|---|
 | `stridelabs-config` | Implemented | Env-var config helpers + layered file loading with field-pathed errors | spendwise-rs `config.rs`, limen `config/load.rs` |
 | `stridelabs-observability` | Implemented | tracing init (json/pretty), request-ID tower layer, Prometheus wiring | limen `observability/` |
-| `stridelabs-http` | Implemented | `AppError`→`IntoResponse` convention, security-headers + CORS layers, graceful shutdown, reverse-proxy primitives (feature `proxy`) | spendwise-rs `error.rs`, limen `http/` |
+| `stridelabs-http` | Implemented | `AppError`→`IntoResponse` convention, security-headers + CORS layers, graceful shutdown, reverse-proxy primitives (feature `proxy`), OpenAPI spec mechanics (feature `openapi`) | spendwise-rs `error.rs`, limen `http/`, slauth `http/openapi.rs` |
 | `stridelabs-auth` | Implemented | slauth resource-server client: rate-limited JWKS cache, RS256 verification, bearer extraction, PAT hashing, offline test-key minting | spendwise-rs `auth/` |
 | `stridelabs-testing` | Implemented | Fail-loud real-Postgres pool, `oneshot` axum router-test helpers, a one-line wiremock JSON stub | spendwise-rs test idioms, hardened |
 
@@ -197,6 +197,7 @@ turns on what.
 | `stridelabs-config` | *(none — everything is unconditional)* | — | — |
 | `stridelabs-observability` | `prometheus` | off | `metrics` + `metrics-exporter-prometheus`: recorder install, `status_class`, `DURATION_BUCKETS` |
 | `stridelabs-http` | `cors` | off | `cors_layer`, via `tower-http/cors` |
+| `stridelabs-http` | `openapi` | off | spec canonicalization, `(method, path)` enumeration, committed-spec freshness check, via `utoipa` |
 | `stridelabs-http` | `proxy` | off | reverse-proxy primitives, via `reqwest`/`url`/`bytes`/`futures` |
 | `stridelabs-auth` | `axum` | off | `bearer_token(&Parts)`, via the `http` types crate |
 | `stridelabs-auth` | `http` | off | `From<AuthError> for stridelabs_http::AppError` |

@@ -13,6 +13,7 @@ axum service wants all three, so gating them would only add friction.
 | Feature | Default | Adds |
 |---|---|---|
 | `cors` | off | `cors_layer`, via `tower-http/cors` |
+| `openapi` | off | the `openapi` module, via `utoipa` |
 | `proxy` | off | the `proxy` module, via `reqwest`/`url`/`bytes`/`futures` |
 
 `proxy` is the gate that matters: it pulls in an HTTP *client* and a TLS
@@ -36,6 +37,9 @@ stridelabs-http = { git = "ssh://git@github.com/charliek/stridelabs-rust.git", t
 
 # for a service that proxies to an upstream:
 stridelabs-http = { git = "ssh://git@github.com/charliek/stridelabs-rust.git", tag = "v0.1.0", features = ["proxy"] }
+
+# for a service that publishes an OpenAPI document:
+stridelabs-http = { git = "ssh://git@github.com/charliek/stridelabs-rust.git", tag = "v0.1.0", features = ["openapi"] }
 ```
 
 (During development against an unreleased commit, pin `rev = "<sha>"`
@@ -223,6 +227,133 @@ app-side.
 signal to the test process, which races every other test in the binary. Its
 body is a `select!` over two `tokio::signal` futures with no logic of its
 own. `wait_for_shutdown` is fully tested.
+
+## `openapi` feature — spec mechanics, not a spec
+
+The parts of publishing an OpenAPI document that every service gets wrong the
+same way, extracted from slauth's `src/http/openapi.rs` and
+`tests/openapi_shape.rs`. Everything here takes an
+`utoipa::openapi::OpenApi` the *caller* built and knows nothing about what is
+in it.
+
+| Item | What it does |
+|---|---|
+| `to_pretty_json(&OpenApi)` | Pretty JSON with alphabetical keys at every nesting level |
+| `committed_file_contents(&OpenApi)` | The above, plus the one trailing newline a committed file carries |
+| `documented_pairs(&OpenApi)` | Every `(METHOD, path)` pair in the document, as a `BTreeSet` |
+| `find_operation(&OpenApi, "GET", "/x")` | The `Operation` at a method+path, addressed the way a test table spells it |
+| `operation_for(&PathItem, &HttpMethod)` / `method_name(&HttpMethod)` / `ALL_HTTP_METHODS` | The exhaustive method↔slot mapping the two above are built on |
+| `check_committed_spec(path, &OpenApi, cmd)` → `Result<(), SpecFreshnessError>` | Committed file vs. fresh export |
+| `assert_committed_spec_is_fresh(path, &OpenApi, cmd)` | The same, panicking with the report — the test form |
+
+### Wiring it up
+
+An `openapi` CLI subcommand that writes the committed file, and the test that
+keeps it honest:
+
+```rust,ignore
+// src/main.rs — `svc openapi > openapi.json`
+fn main() {
+    if std::env::args().nth(1).as_deref() == Some("openapi") {
+        // No config, no database, no listener: `OpenApiRouter<S>` is generic
+        // over the state type until `with_state` is called, so the document
+        // builds from nothing.
+        println!("{}", stridelabs_http::openapi::to_pretty_json(&spec()));
+        return;
+    }
+    // …
+}
+```
+
+```rust,ignore
+// tests/openapi_shape.rs
+use std::collections::BTreeSet;
+use stridelabs_http::openapi::{assert_committed_spec_is_fresh, documented_pairs};
+
+#[test]
+fn the_documented_path_method_set_is_exact() {
+    let expected: BTreeSet<(String, String)> = [("GET", "/api/v1/session"), ("POST", "/api/v1/pat")]
+        .into_iter()
+        .map(|(m, p)| (m.to_string(), p.to_string()))
+        .collect();
+
+    assert_eq!(documented_pairs(&svc::openapi::spec()), expected);
+}
+
+#[test]
+fn the_committed_openapi_json_matches_a_fresh_export() {
+    assert_committed_spec_is_fresh(
+        concat!(env!("CARGO_MANIFEST_DIR"), "/openapi.json"),
+        &svc::openapi::spec(),
+        "cargo run --bin svc -- openapi > openapi.json",
+    );
+}
+```
+
+The regeneration command is a **parameter** because it differs per service —
+per binary, even — and it is reproduced verbatim in the failure message, so
+the person reading a red CI job gets a line they can paste rather than a
+diff they have to interpret.
+
+### Why `to_pretty_json` exists at all
+
+A committed `openapi.json` is only reviewable, and only checkable against a
+fresh export, if rendering the same document twice produces the same bytes —
+and a service does not control that on its own. `utoipa`'s `Paths` is a
+`BTreeMap` *unless* its `preserve_path_order` feature is on, and the nested
+`serde_json::Value` fields further down flip from sorted to insertion-ordered
+the moment **anything** in the dependency graph enables `serde_json`'s
+`preserve_order`. Cargo unifies features across the whole graph, so a
+transitive dependency three levels away can silently reorder a service's
+committed spec and fail its freshness test with a diff nobody can explain.
+Rebuilding every object through a `BTreeMap` here is immune to all of it.
+
+`check_committed_spec` also names the trailing-newline cases explicitly
+(missing, doubled), because those are the failures that produce a "the files
+look identical" diff: one invisible byte, changed by an editor setting or by
+an exporter switched from `println!` to `print!`.
+
+### What this deliberately does not do
+
+There is **no `ApiDoc`, no security schemes, no `info`/`servers`/`tags`
+block, no route list, no exclusion list, and no Swagger-UI wiring.** That is
+all policy: slauth documents a Kratos session cookie plus a `slp_live_…` PAT
+bearer, spendwise documents a slauth-issued JWT bearer plus a PAT bearer with
+a different prefix, and neither one's document root is a thing the other
+could adopt. A "spec builder" here would have to guess at that shape and be
+wrong for at least one consumer.
+
+Two conventions are worth carrying between services even though they are not
+code and can't be enforced from a crate:
+
+- **Exclusion should be structural, not a maintained list.** A route reaches
+  the document by its router module being an `OpenApiRouter` built with
+  `.routes(routes!(…))` — which is also that route's only way onto the wire.
+  Then forgetting to annotate a new route is a route that 404s in production
+  (loud), not a silent hole in the spec, and the modules that must stay out
+  (health checks, webhooks, static fallbacks, reverse proxies with their own
+  contracts) stay out because they never import `utoipa` at all. No flag to
+  flip, no list to sync.
+- **Apply a version prefix with `OpenApiRouter::nest`, never `merge`.**
+  `nest` rewrites the OpenAPI path keys with the same prefix it gives the
+  axum routes; `merge` prefixes only the axum routes and leaves the
+  documented paths at their unprefixed literals. The two then drift silently
+  and the document describes URLs the service does not serve.
+  `documented_pairs` against a committed expectation is the cheap guard.
+
+**On the exhaustive match:** `documented_pairs` enumerates all eight
+`HttpMethod` variants through a `match` with no `_` arm, so a `utoipa` that
+adds a variant is a compile error rather than routes quietly missing from
+every consumer's spec. The obvious review comment is "use
+`PathItem::operations`" — that map does not exist in utoipa 5.x (it was the
+utoipa 4 shape); 5.x stores eight independent `Option<Operation>` fields with
+no iterator over them, and utoipa's own `PathItem::new` matches an
+`HttpMethod` onto those same eight fields.
+
+**On `utoipa`'s features:** this crate enables none of the schema features
+(`uuid`, `time`, …) because it derives no schemas. A consumer declares its
+own `utoipa` dependency with whatever its types need; Cargo unifies the two
+into one crate.
 
 ## `proxy` feature — reverse-proxy primitives
 

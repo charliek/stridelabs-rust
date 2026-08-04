@@ -20,6 +20,7 @@
 //! | Feature | Default | Adds |
 //! |---|---|---|
 //! | `cors` | off | [`cors::cors_layer`], via `tower-http/cors` |
+//! | `openapi` | off | [`openapi`] — spec canonicalization, route enumeration and a freshness check, via `utoipa` |
 //! | `proxy` | off | [`proxy`] — reverse-proxy primitives, via `reqwest`/`url`/`bytes`/`futures` |
 //!
 //! `proxy` is the one that really earns its gate: it pulls in an HTTP
@@ -28,6 +29,13 @@
 //! being re-exported at the crate root — `filter_headers` and `relay_response`
 //! only mean anything in that context, and a dozen more names at the root
 //! would bury the four that every service uses.
+//!
+//! [`openapi`] stays namespaced for the same reason (and pays a smaller but
+//! real gate: `utoipa` drags a proc-macro crate in). It holds only the
+//! *mechanics* of publishing a spec — canonical serialization, `(method,
+//! path)` enumeration, a committed-file freshness check. The document itself
+//! — security schemes, `info`, tags, which routes are in it — is per-service
+//! policy and stays in the service; see that module's docs.
 //!
 //! # A deliberate exception to the workspace's "typed errors only" rule
 //!
@@ -48,6 +56,9 @@ pub mod shutdown;
 
 #[cfg(feature = "cors")]
 pub mod cors;
+
+#[cfg(feature = "openapi")]
+pub mod openapi;
 
 #[cfg(feature = "proxy")]
 pub mod proxy;
