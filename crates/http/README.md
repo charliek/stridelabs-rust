@@ -243,9 +243,16 @@ in it.
 | `committed_file_contents(&OpenApi)` | The above, plus the one trailing newline a committed file carries |
 | `documented_pairs(&OpenApi)` | Every `(METHOD, path)` pair in the document, as a `BTreeSet` |
 | `find_operation(&OpenApi, "GET", "/x")` | The `Operation` at a method+path, addressed the way a test table spells it |
-| `operation_for(&PathItem, &HttpMethod)` / `method_name(&HttpMethod)` / `ALL_HTTP_METHODS` | The exhaustive method↔slot mapping the two above are built on |
 | `check_committed_spec(path, &OpenApi, cmd)` → `Result<(), SpecFreshnessError>` | Committed file vs. fresh export |
 | `assert_committed_spec_is_fresh(path, &OpenApi, cmd)` | The same, panicking with the report — the test form |
+
+That is the whole surface. The exhaustive method↔operation-slot mapping the
+top two are built on stays **private**: a public `ALL_HTTP_METHODS:
+[HttpMethod; 8]` would make the array's length part of the contract, so the
+day utoipa adds a ninth method, fixing the compile error the array exists to
+cause means writing `[HttpMethod; 9]` — a breaking change for anyone who
+named the type, for a reason unrelated to anything they were doing with it.
+`documented_pairs` and `find_operation` give the same guarantee without it.
 
 ### Wiring it up
 
@@ -296,6 +303,25 @@ per binary, even — and it is reproduced verbatim in the failure message, so
 the person reading a red CI job gets a line they can paste rather than a
 diff they have to interpret.
 
+### Adoption checklist: pin the spec file to LF
+
+The freshness check compares bytes, and the export always writes LF. Add this
+to the repository's `.gitattributes` **as part of adopting the helper**, not
+after a contributor on Windows trips over it:
+
+```gitattributes
+openapi.json text eol=lf
+```
+
+Without it, a checkout with `core.autocrlf=true` materializes the
+LF-committed file with CRLF endings, and the check fails on every line,
+forever, with nothing wrong in the spec. Line endings are deliberately **not**
+normalized before comparing: normalizing would let a CRLF working copy pass
+and then hand a whole-document diff to whoever next regenerates the file,
+with the real cause (a checkout setting) nowhere in sight. Instead the CRLF
+case is detected and the report names it, along with the `.gitattributes`
+line that fixes it.
+
 ### Why `to_pretty_json` exists at all
 
 A committed `openapi.json` is only reviewable, and only checkable against a
@@ -309,10 +335,19 @@ transitive dependency three levels away can silently reorder a service's
 committed spec and fail its freshness test with a diff nobody can explain.
 Rebuilding every object through a `BTreeMap` here is immune to all of it.
 
-`check_committed_spec` also names the trailing-newline cases explicitly
-(missing, doubled), because those are the failures that produce a "the files
-look identical" diff: one invisible byte, changed by an editor setting or by
-an exporter switched from `println!` to `print!`.
+That claim is defended by tests that would otherwise be vacuous, which is
+worth knowing about before someone "cleans up" the wiring: with
+`preserve_order` off, a `serde_json::Map` **is** a `BTreeMap`, so a
+`Value::Object` is sorted before `canonicalize` ever sees it and deleting the
+function would fail no assertion. This crate's `[dev-dependencies]` therefore
+enable `serde_json/preserve_order` — which under resolver v2 reaches only
+test targets, never a `cargo build` or any consumer's graph — and one test
+asserts the hazard is actually reproduced before the others rely on it. Drop
+that dev-dependency and the suite says so.
+
+`check_committed_spec` also names the invisible-byte cases explicitly — CRLF
+line endings, a missing trailing newline, a doubled one — because those are
+the failures that otherwise produce a "the files look identical" diff.
 
 ### What this deliberately does not do
 

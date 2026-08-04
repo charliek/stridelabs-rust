@@ -61,6 +61,22 @@ futures = { workspace = true, optional = true }
 utoipa = { workspace = true, optional = true }
 
 [dev-dependencies]
+# `preserve_order` turns every `serde_json::Map` into an insertion-ordered
+# `IndexMap` instead of the default `BTreeMap` — which is precisely the
+# hazard `openapi::to_pretty_json` exists to be immune to, and which cannot
+# be reproduced any other way: with the feature off, a `Value::Object` IS a
+# `BTreeMap` and is sorted before `canonicalize` ever sees it, so the
+# canonicalization tests would assert nothing at all.
+#
+# Enabling it HERE, in dev-dependencies, is what keeps that honest without
+# inflicting it on anyone: under resolver v2 dev-dependency features are
+# unified into the build graph only for targets that need dev-deps (`cargo
+# test`, `cargo clippy --all-targets`), never for `cargo build` — so no
+# consumer's production graph is touched, and `--no-default-features` builds
+# are unaffected. The tests assert the feature is actually on before relying
+# on it, so if this line is ever dropped they fail loudly instead of going
+# quietly vacuous.
+serde_json = { workspace = true, features = ["preserve_order"] }
 # `test-util` (not part of tokio's `full`) gives `start_paused`, so the
 # shutdown tests assert "does not resolve yet" without a real sleep.
 tokio = { workspace = true, features = [

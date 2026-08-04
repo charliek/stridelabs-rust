@@ -39,6 +39,25 @@
 //!   not serve. [`documented_pairs`] plus a committed expectation is the
 //!   cheap guard against having got this wrong.
 //!
+//! # The committed spec file is LF, always
+//!
+//! [`check_committed_spec`] compares bytes, and the export side always writes
+//! LF. A repository that commits a spec file must therefore pin it to LF —
+//! one line in `.gitattributes`:
+//!
+//! ```text
+//! openapi.json text eol=lf
+//! ```
+//!
+//! Without it, a Windows checkout with `core.autocrlf=true` materializes the
+//! file with CRLF endings and the freshness check fails on every line,
+//! forever, with nothing wrong in the spec itself. Line endings are
+//! deliberately **not** normalized before comparing — see
+//! [`check_committed_spec`] for why silently accepting CRLF is worse than
+//! refusing it — but the CRLF case is detected and the report names this fix.
+//! A consumer should add the `.gitattributes` line as part of adopting this
+//! module.
+//!
 //! # Feature and dependency note
 //!
 //! `openapi` pulls `utoipa` (default features, so the derive macros come
@@ -68,11 +87,20 @@ use utoipa::openapi::OpenApi;
 /// 5.x — that was the utoipa 4 shape. 5.x's [`PathItem`] stores eight
 /// independent `Option<Operation>` fields (`get`/`put`/`post`/`delete`/
 /// `options`/`head`/`patch`/`trace`), exposes no iterator over them, and has
-/// no `PathItemType` type at all; `PathItem::new` and
-/// `PathItem::merge_operations` inside utoipa itself both `match` an
-/// `HttpMethod` onto those same eight fields. Driving them from an exhaustive
-/// match is the closest available equivalent.
-pub const ALL_HTTP_METHODS: [HttpMethod; 8] = [
+/// no `PathItemType` type at all; `PathItem::new` inside utoipa itself
+/// `match`es an `HttpMethod` onto those same eight fields. Driving them from
+/// an exhaustive match is the closest available equivalent.
+///
+/// **Deliberately private**, along with [`operation_for`] and
+/// [`method_name`]. A `pub const ALL_HTTP_METHODS: [HttpMethod; 8]` would make
+/// the array's *length* part of this crate's contract: the day utoipa adds a
+/// ninth method, fixing the compile error this array exists to cause means
+/// writing `[HttpMethod; 9]`, which is a breaking change for anyone who wrote
+/// the type down — for a reason that has nothing to do with what they were
+/// using it for. Consumers get the same guarantee through
+/// [`documented_pairs`] and [`find_operation`], which is all either known
+/// consumer ever needed.
+const ALL_HTTP_METHODS: [HttpMethod; 8] = [
     HttpMethod::Get,
     HttpMethod::Put,
     HttpMethod::Post,
@@ -88,7 +116,7 @@ pub const ALL_HTTP_METHODS: [HttpMethod; 8] = [
 /// The one place the eight `Option<Operation>` fields of a [`PathItem`] are
 /// turned back into a lookup — see [`ALL_HTTP_METHODS`] for why that mapping
 /// has to be written out by hand.
-pub fn operation_for<'a>(item: &'a PathItem, method: &HttpMethod) -> Option<&'a Operation> {
+fn operation_for<'a>(item: &'a PathItem, method: &HttpMethod) -> Option<&'a Operation> {
     match method {
         HttpMethod::Get => item.get.as_ref(),
         HttpMethod::Put => item.put.as_ref(),
@@ -108,7 +136,7 @@ pub fn operation_for<'a>(item: &'a PathItem, method: &HttpMethod) -> Option<&'a 
 /// this crate does not enable — no `Debug` either, so there is no way to name
 /// a method in an assertion message without this. Written out without a `_`
 /// arm for the same reason as [`operation_for`].
-pub fn method_name(method: &HttpMethod) -> &'static str {
+fn method_name(method: &HttpMethod) -> &'static str {
     match method {
         HttpMethod::Get => "GET",
         HttpMethod::Put => "PUT",
@@ -125,9 +153,11 @@ pub fn method_name(method: &HttpMethod) -> &'static str {
 /// uppercase wire spelling and paths exactly as the document keys them
 /// (`"/api/v1/pat/{pat_id}"`).
 ///
-/// Genuinely exhaustive over the operation slots `utoipa` models
-/// ([`ALL_HTTP_METHODS`]), so a route registered under a method the calling
-/// test never mentions by name still shows up. The `BTreeSet` return makes
+/// Genuinely exhaustive over the eight operation slots `utoipa` models —
+/// enumerated by a `match` with no `_` arm, so a `utoipa` that adds a method
+/// is a compile error here rather than routes silently missing from every
+/// consumer's spec — so a route registered under a method the calling test
+/// never mentions by name still shows up. The `BTreeSet` return makes
 /// `assert_eq!` against a hand-written expectation both order-insensitive and
 /// readable when it fails.
 ///
@@ -169,13 +199,14 @@ pub fn documented_pairs(spec: &OpenApi) -> BTreeSet<(String, String)> {
 ///
 /// Exists so a per-route assertion (documented status codes, security
 /// requirements, response schemas) doesn't have to re-derive the
-/// string-to-[`HttpMethod`] lookup that [`method_name`] already encodes.
+/// string-to-[`HttpMethod`] lookup, which is the same mapping
+/// [`documented_pairs`] emits on its way out.
 /// Returns `None` for both "no such path" and "no such method on that path" —
 /// a caller wanting to tell those apart should reach into `spec.paths.paths`
 /// itself.
 ///
-/// `method` is matched case-sensitively against [`method_name`]'s uppercase
-/// spellings; an unrecognized spelling is `None`, not a panic.
+/// `method` is matched case-sensitively against the uppercase wire spellings
+/// (`"GET"`, `"DELETE"`, …); an unrecognized spelling is `None`, not a panic.
 pub fn find_operation<'a>(spec: &'a OpenApi, method: &str, path: &str) -> Option<&'a Operation> {
     let item = spec.paths.paths.get(path)?;
     let method = ALL_HTTP_METHODS.iter().find(|m| method_name(m) == method)?;
@@ -238,7 +269,8 @@ fn canonicalize(value: serde_json::Value) -> serde_json::Value {
 }
 
 /// Exactly what a committed spec file must contain for [`check_committed_spec`]
-/// to accept it: [`to_pretty_json`] plus **one trailing newline**.
+/// to accept it: [`to_pretty_json`], **LF line endings**, plus **one trailing
+/// newline**.
 ///
 /// The newline is not decoration. The export side is a CLI subcommand that
 /// `println!`s the spec and is redirected to the file (`svc openapi >
@@ -246,6 +278,10 @@ fn canonicalize(value: serde_json::Value) -> serde_json::Value {
 /// end in a newline, and every editor, `git diff` and "no newline at end of
 /// file" marker agrees. Both halves of the convention are owned here so the
 /// exporter and the test cannot disagree about it.
+///
+/// **LF, not CRLF** — see [`check_committed_spec`] for why that is a
+/// requirement stated out loud rather than something normalized away, and for
+/// the one `.gitattributes` line that makes it true on every checkout.
 pub fn committed_file_contents(spec: &OpenApi) -> String {
     format!("{}\n", to_pretty_json(spec))
 }
@@ -253,8 +289,11 @@ pub fn committed_file_contents(spec: &OpenApi) -> String {
 /// Why a committed OpenAPI file failed its freshness check.
 ///
 /// [`std::fmt::Display`] is the whole point: it renders a multi-line report
-/// naming the file, the first line that differs, and the exact command to
-/// regenerate it. Callers are expected to surface it verbatim.
+/// naming the file, the first *useful* difference or boundary — the first
+/// differing line where there is one, and otherwise the specific structural
+/// problem (unreadable file, CRLF line endings, a missing or doubled trailing
+/// newline, one file being a truncation of the other) — and the exact command
+/// to regenerate it. Callers are expected to surface it verbatim.
 #[derive(Debug, thiserror::Error)]
 pub enum SpecFreshnessError {
     /// The committed file could not be read (missing, unreadable, not UTF-8).
@@ -291,8 +330,30 @@ pub enum SpecFreshnessError {
 /// error. Pass the real, copy-pasteable command:
 /// `cargo run --bin svc -- openapi > openapi.json`.
 ///
-/// The comparison is against [`committed_file_contents`], i.e. pretty JSON
-/// plus one trailing newline.
+/// The comparison is against [`committed_file_contents`] and is exact: pretty
+/// JSON, LF line endings, one trailing newline.
+///
+/// # LF is required, not normalized
+///
+/// A Windows checkout with `core.autocrlf=true` materializes an LF-committed
+/// spec on disk with CRLF endings, while the export always writes LF. That
+/// makes the byte comparison fail on every line, forever, through no fault of
+/// the spec's contents.
+///
+/// This function does **not** normalize line endings before comparing, on
+/// purpose. Normalizing would let a CRLF working copy pass the check and then
+/// blow up on whoever next regenerates the file — their editor writes LF, the
+/// diff is the entire document, and the real cause (a checkout setting, not
+/// their change) is nowhere in sight. Instead the CRLF case is detected and
+/// reported by name, with the fix: add
+///
+/// ```text
+/// openapi.json text eol=lf
+/// ```
+///
+/// to the repository's `.gitattributes` and re-checkout the file. A consumer
+/// adopting this helper should add that line as part of adoption rather than
+/// wait for a contributor on Windows to discover it.
 ///
 /// Returns `Result` rather than panicking so this is usable outside a test —
 /// a CI helper or an `xtask` that wants to print the report and exit
@@ -330,7 +391,7 @@ pub fn check_committed_spec(
     Err(SpecFreshnessError::Stale {
         path: path.to_path_buf(),
         regenerate_command: regenerate_command.to_string(),
-        detail: describe_difference(&committed, &fresh),
+        detail: describe_difference(path, &committed, &fresh),
     })
 }
 
@@ -341,9 +402,10 @@ pub fn check_committed_spec(
 /// line *is* the assertion, whereas the `Result` form makes every consumer
 /// write the same `if let Err(e) = … { panic!("{e}") }` three-liner and get
 /// the message formatting subtly different each time. The panic message is
-/// the error's `Display`, which already names the file, the first differing
-/// line and the regeneration command — so nothing is lost versus asserting by
-/// hand, and the "stale spec" diff stays identical across services.
+/// the error's `Display`, which already names the file, the first useful
+/// difference or boundary, and the regeneration command — so nothing is lost
+/// versus asserting by hand, and the "stale spec" diff stays identical across
+/// services.
 ///
 /// ```no_run
 /// # use utoipa::OpenApi;
@@ -375,14 +437,44 @@ pub fn assert_committed_spec_is_fresh(
 /// terminal several times and bury the line number that actually matters.
 const MAX_QUOTED_LINE: usize = 120;
 
-/// Describe the first way `committed` differs from `fresh`, in the terms
-/// someone staring at a red CI job needs.
+/// Describe the first useful difference (or structural boundary) between
+/// `committed` and `fresh`, in the terms someone staring at a red CI job
+/// needs.
 ///
-/// The trailing-newline cases are called out by name because they are the
-/// ones that produce a "the files look identical" diff: an editor configured
-/// to strip final newlines, or an exporter switched from `println!` to
-/// `print!`, changes exactly one invisible byte.
-fn describe_difference(committed: &str, fresh: &str) -> String {
+/// The line-ending and trailing-newline cases are called out by name because
+/// they are the ones that produce a "the files look identical" diff: a
+/// Windows checkout rewriting every line ending, an editor configured to
+/// strip final newlines, or an exporter switched from `println!` to `print!`
+/// each change bytes nobody can see.
+fn describe_difference(path: &Path, committed: &str, fresh: &str) -> String {
+    // Checked first, and before anything that walks lines: a CRLF working
+    // copy differs from the export on *every* line, yet `str::lines()` strips
+    // the trailing `\r` and would report the two as line-for-line identical,
+    // leaving only a baffling "these files are the same" failure. Serialized
+    // JSON never contains a literal CR — `serde_json` escapes control
+    // characters inside strings — so a CR here is always a line-ending
+    // artifact and never spec content.
+    if committed.contains('\r') {
+        let file = path.file_name().map_or_else(
+            || path.display().to_string(),
+            |n| n.to_string_lossy().into(),
+        );
+        let otherwise = if committed.replace("\r\n", "\n") == fresh {
+            "the content is otherwise identical"
+        } else {
+            "and there are content differences on top of that"
+        };
+        return format!(
+            "the committed file has CRLF line endings; the export always writes LF \
+             ({otherwise}).\n  \
+             This is a checkout artifact, not a code change — usually `core.autocrlf=true` on \
+             Windows. Line endings are NOT normalized before comparing, because a normalized \
+             pass would leave the next person to regenerate this file with a whole-document \
+             diff and no clue why. Pin the file to LF instead, then re-checkout it:\n    \
+             echo '{file} text eol=lf' >> .gitattributes"
+        );
+    }
+
     if committed.trim_end_matches('\n') == fresh.trim_end_matches('\n') {
         return match (committed.ends_with('\n'), committed.len().cmp(&fresh.len())) {
             (false, _) => "the content matches but the committed file has no trailing newline \
@@ -425,7 +517,12 @@ fn describe_difference(committed: &str, fresh: &str) -> String {
             fresh_lines.len(),
             quote(committed_lines[fresh_lines.len()])
         ),
-        std::cmp::Ordering::Equal => "the files differ only in line endings".to_string(),
+        // Defensive: equal line counts, no differing line, no CR, and the
+        // trailing-newline cases already returned above — there is no known
+        // input that lands here, so say only what is certainly true.
+        std::cmp::Ordering::Equal => {
+            "the files differ only in bytes that `str::lines()` does not surface".to_string()
+        }
     }
 }
 
@@ -527,23 +624,97 @@ mod tests {
         );
     }
 
-    #[test]
-    fn to_pretty_json_sorts_object_keys_at_every_nesting_level() {
-        // Exercises `canonicalize` directly with deliberately unsorted input,
-        // which is the only way to see the sort happen: whether the document
-        // types themselves arrive sorted depends on the very Cargo features
-        // this function exists to be immune to.
-        let value = serde_json::json!({
-            "zebra": 1,
-            "alpha": {"z": [{"c": 3, "a": 1}], "a": 2},
-        });
+    /// A value whose keys are in insertion order, not sorted order, at three
+    /// nesting levels: the top object, an object below it, and an object
+    /// inside an array.
+    ///
+    /// Built by hand through `Map::insert` rather than with `json!` for a
+    /// reason that is the whole point of these tests — see
+    /// [`the_test_build_reproduces_the_preserve_order_hazard`].
+    fn insertion_ordered_value() -> serde_json::Value {
+        fn object(pairs: &[(&str, i64)]) -> serde_json::Value {
+            let mut map = serde_json::Map::new();
+            for (k, v) in pairs {
+                map.insert((*k).to_string(), serde_json::Value::from(*v));
+            }
+            serde_json::Value::Object(map)
+        }
 
-        let rendered = serde_json::to_string(&canonicalize(value)).unwrap();
+        let mut outer = serde_json::Map::new();
+        outer.insert("zebra".to_string(), serde_json::Value::from(1));
+        outer.insert("alpha".to_string(), object(&[("z", 1), ("a", 2)]));
+        outer.insert(
+            "middle".to_string(),
+            serde_json::Value::Array(vec![object(&[("c", 3), ("a", 1)])]),
+        );
+        serde_json::Value::Object(outer)
+    }
+
+    /// The guard that keeps every canonicalization test below from going
+    /// vacuous.
+    ///
+    /// Without `serde_json`'s `preserve_order` feature a `serde_json::Map` is
+    /// a `BTreeMap`: every `Value::Object` is sorted the instant it is built,
+    /// `canonicalize` is a no-op, and deleting the whole function would not
+    /// fail a single assertion. This crate's `[dev-dependencies]` turn
+    /// `preserve_order` on (and only for test targets — see the comment
+    /// there), which is what makes the hazard reproducible in-process. If
+    /// that wiring is ever dropped, this test fails first and says why.
+    #[test]
+    fn the_test_build_reproduces_the_preserve_order_hazard() {
+        assert_eq!(
+            serde_json::to_string(&insertion_ordered_value()).unwrap(),
+            r#"{"zebra":1,"alpha":{"z":1,"a":2},"middle":[{"c":3,"a":1}]}"#,
+            "serde_json's `preserve_order` feature is not enabled in this test build, so a \
+             `Value::Object` is already sorted and the canonicalization tests below assert \
+             nothing — restore the `serde_json = {{ features = [\"preserve_order\"] }}` \
+             dev-dependency in crates/http/Cargo.toml"
+        );
+    }
+
+    #[test]
+    fn canonicalize_sorts_object_keys_at_every_nesting_level() {
+        let rendered = serde_json::to_string(&canonicalize(insertion_ordered_value())).unwrap();
 
         assert_eq!(
             rendered,
-            r#"{"alpha":{"a":2,"z":[{"a":1,"c":3}]},"zebra":1}"#
+            r#"{"alpha":{"a":2,"z":1},"middle":[{"a":1,"c":3}],"zebra":1}"#
         );
+    }
+
+    #[test]
+    fn to_pretty_json_sorts_a_document_utoipa_emits_in_declaration_order() {
+        // End-to-end, on a real document rather than a hand-built value:
+        // `utoipa`'s types serialize their fields in *declaration* order
+        // (`openapi` before `info`), and with `preserve_order` on that order
+        // survives into the `Value`. Only `canonicalize` sorts it — delete
+        // that call from `to_pretty_json` and this fails.
+        let spec = ApiDoc::openapi();
+
+        let uncanonicalized = top_level_keys(
+            &serde_json::to_string_pretty(&serde_json::to_value(&spec).unwrap()).unwrap(),
+        );
+        let mut sorted = uncanonicalized.clone();
+        sorted.sort();
+        assert_ne!(
+            uncanonicalized, sorted,
+            "this document's keys already come out sorted, so it cannot show canonicalization \
+             doing anything: {uncanonicalized:?}"
+        );
+
+        assert_eq!(top_level_keys(&to_pretty_json(&spec)), sorted);
+    }
+
+    /// The keys of a pretty-printed JSON object's top level, in the order
+    /// they appear in the text — `serde_json::to_string_pretty` indents them
+    /// by exactly two spaces.
+    fn top_level_keys(pretty: &str) -> Vec<String> {
+        pretty
+            .lines()
+            .filter_map(|line| line.strip_prefix("  \""))
+            .filter_map(|rest| rest.split_once("\":"))
+            .map(|(key, _)| key.to_string())
+            .collect()
     }
 
     #[test]
@@ -662,6 +833,54 @@ mod tests {
         assert!(msg.contains("trailing newline"), "{msg}");
     }
 
+    /// The regression guard for the failure that has no way out: a Windows
+    /// checkout with `core.autocrlf=true` rewrites the committed LF spec to
+    /// CRLF on disk, the export writes LF, and the byte comparison fails
+    /// forever. `str::lines()` strips the trailing `\r`, so without an
+    /// explicit CRLF check the report would say the two files are
+    /// line-for-line identical.
+    #[test]
+    fn a_crlf_checkout_is_named_as_such_and_told_how_to_fix_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = ApiDoc::openapi();
+        let crlf = committed_file_contents(&spec).replace('\n', "\r\n");
+        let path = write_spec_file(dir.path(), &crlf);
+
+        let err = check_committed_spec(&path, &spec, REGEN)
+            .expect_err("CRLF is not what the export writes");
+
+        let msg = err.to_string();
+        assert!(msg.contains("CRLF"), "{msg}");
+        assert!(
+            msg.contains("the content is otherwise identical"),
+            "only the line endings differ, and the report should say so: {msg}"
+        );
+        assert!(
+            msg.contains("openapi.json text eol=lf"),
+            "the report must name the exact .gitattributes line that fixes it: {msg}"
+        );
+        assert!(
+            !msg.contains("first difference at line"),
+            "a CRLF file must not be reported as an ordinary line diff: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_crlf_file_that_also_drifted_says_there_is_more_than_line_endings() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = ApiDoc::openapi();
+        let crlf = committed_file_contents(&spec)
+            .replace("/widgets", "/gadgets")
+            .replace('\n', "\r\n");
+        let path = write_spec_file(dir.path(), &crlf);
+
+        let err = check_committed_spec(&path, &spec, REGEN).expect_err("CRLF plus a rename");
+
+        let msg = err.to_string();
+        assert!(msg.contains("CRLF"), "{msg}");
+        assert!(msg.contains("content differences on top of that"), "{msg}");
+    }
+
     #[test]
     fn a_truncated_committed_file_says_where_it_stops() {
         let dir = tempfile::tempdir().unwrap();
@@ -679,7 +898,8 @@ mod tests {
     #[test]
     fn a_long_differing_line_is_truncated_in_the_report() {
         let long = "x".repeat(MAX_QUOTED_LINE * 2);
-        let detail = describe_difference(&format!("{long}\n"), "short\n");
+        let detail =
+            describe_difference(Path::new("openapi.json"), &format!("{long}\n"), "short\n");
 
         assert!(detail.contains("(truncated)"), "{detail}");
         assert!(detail.len() < long.len(), "{detail}");
