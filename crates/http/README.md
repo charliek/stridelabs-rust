@@ -38,8 +38,9 @@ stridelabs-http = { git = "ssh://git@github.com/charliek/stridelabs-rust.git", t
 # for a service that proxies to an upstream:
 stridelabs-http = { git = "ssh://git@github.com/charliek/stridelabs-rust.git", tag = "v0.1.0", features = ["proxy"] }
 
-# for a service that publishes an OpenAPI document:
-stridelabs-http = { git = "ssh://git@github.com/charliek/stridelabs-rust.git", tag = "v0.1.0", features = ["openapi"] }
+# for a service that publishes an OpenAPI document
+# (`openapi` landed after v0.1.0 — pin the first tag that carries it):
+stridelabs-http = { git = "ssh://git@github.com/charliek/stridelabs-rust.git", tag = "v0.2.0", features = ["openapi"] }
 ```
 
 (During development against an unreleased commit, pin `rev = "<sha>"`
