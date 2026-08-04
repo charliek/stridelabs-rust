@@ -19,6 +19,11 @@ cors = ["tower-http/cors"]
 # primitives drag in an HTTP *client* and a TLS stack, which is a large thing
 # to hand a service that only ever answers requests.
 proxy = ["dep:reqwest", "dep:url", "dep:bytes", "dep:futures"]
+# Off by default: `utoipa` brings a proc-macro crate (`utoipa-gen`, hence syn)
+# along with it, and a service that doesn't publish an OpenAPI document —
+# or one that publishes it some other way — shouldn't compile that to get
+# `AppError` and the security headers.
+openapi = ["dep:utoipa"]
 
 [lints]
 workspace = true
@@ -49,7 +54,29 @@ url = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
 
+# --- `openapi` only -------------------------------------------------------
+# Default features on, so `utoipa`'s derive macros (`macros` -> `utoipa-gen`)
+# come along: this module's own tests and doc examples build documents with
+# `#[derive(OpenApi)]`, and so does every consumer.
+utoipa = { workspace = true, optional = true }
+
 [dev-dependencies]
+# `preserve_order` turns every `serde_json::Map` into an insertion-ordered
+# `IndexMap` instead of the default `BTreeMap` — which is precisely the
+# hazard `openapi::to_pretty_json` exists to be immune to, and which cannot
+# be reproduced any other way: with the feature off, a `Value::Object` IS a
+# `BTreeMap` and is sorted before `canonicalize` ever sees it, so the
+# canonicalization tests would assert nothing at all.
+#
+# Enabling it HERE, in dev-dependencies, is what keeps that honest without
+# inflicting it on anyone: under resolver v2 dev-dependency features are
+# unified into the build graph only for targets that need dev-deps (`cargo
+# test`, `cargo clippy --all-targets`), never for `cargo build` — so no
+# consumer's production graph is touched, and `--no-default-features` builds
+# are unaffected. The tests assert the feature is actually on before relying
+# on it, so if this line is ever dropped they fail loudly instead of going
+# quietly vacuous.
+serde_json = { workspace = true, features = ["preserve_order"] }
 # `test-util` (not part of tokio's `full`) gives `start_paused`, so the
 # shutdown tests assert "does not resolve yet" without a real sleep.
 tokio = { workspace = true, features = [
@@ -61,3 +88,8 @@ tokio = { workspace = true, features = [
 # dev-dependencies cannot be feature-gated. It costs consumers nothing — dev
 # deps never enter a downstream graph.
 wiremock = { workspace = true }
+# Same deal: only the `openapi` tests use it, to write a committed-spec file
+# the freshness check can be pointed at. Matches `stridelabs-config`'s
+# dev-dependency on it (declared per-crate; nothing else in the workspace
+# shares the pin).
+tempfile = "3"

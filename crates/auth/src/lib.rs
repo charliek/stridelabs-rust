@@ -59,11 +59,18 @@
 //! `default = []`. Verification, the JWKS cache and [`pat`] are unconditional:
 //! they are the crate.
 //!
+//! Note that feature-gated items are named in plain code spans, never
+//! intra-doc links: they are off by default, so a link would be an
+//! unresolved-link warning on `cargo doc` without `--all-features` (which is
+//! how a consumer documenting its own graph usually builds). They appear in
+//! the sidebar once the matching feature is on, which is the only time they
+//! exist at all.
+//!
 //! | Feature | Default | Adds |
 //! |---|---|---|
-//! | `axum` | off | [`bearer_token`], via the `http` types crate |
+//! | `axum` | off | `bearer_token`, via the `http` types crate |
 //! | `http` | off | `From<AuthError> for stridelabs_http::AppError` |
-//! | `test-support` | off | [`test_support`] — offline JWT minting against two committed throwaway keypairs |
+//! | `test-support` | off | `test_support` — offline JWT minting against two committed throwaway keypairs |
 //!
 //! The `http` feature is named for the **stridelabs-http** crate it bridges
 //! to, not for the `http` types crate that `axum` pulls in. Both names are
