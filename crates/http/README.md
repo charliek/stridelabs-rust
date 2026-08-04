@@ -362,20 +362,30 @@ wrong for at least one consumer.
 Two conventions are worth carrying between services even though they are not
 code and can't be enforced from a crate:
 
-- **Exclusion should be structural, not a maintained list.** A route reaches
-  the document by its router module being an `OpenApiRouter` built with
-  `.routes(routes!(…))` — which is also that route's only way onto the wire.
-  Then forgetting to annotate a new route is a route that 404s in production
-  (loud), not a silent hole in the spec, and the modules that must stay out
+- **Prefer structural exclusion to a maintained list — but know where the
+  hole is.** A route reaches the document by being registered with
+  `OpenApiRouter::routes(routes!(…))`, so the modules that must stay *out*
   (health checks, webhooks, static fallbacks, reverse proxies with their own
-  contracts) stay out because they never import `utoipa` at all. No flag to
-  flip, no list to sync.
-- **Apply a version prefix with `OpenApiRouter::nest`, never `merge`.**
-  `nest` rewrites the OpenAPI path keys with the same prefix it gives the
-  axum routes; `merge` prefixes only the axum routes and leaves the
-  documented paths at their unprefixed literals. The two then drift silently
-  and the document describes URLs the service does not serve.
-  `documented_pairs` against a committed expectation is the cheap guard.
+  contracts) stay out by never importing `utoipa` at all: no flag to flip and
+  no exclusion list to keep in sync. What this does **not** give you is "you
+  can't forget". `OpenApiRouter::route` and `OpenApiRouter::route_service`
+  are pass-throughs to their `axum::Router` equivalents — they register a
+  runtime route and add nothing to the document — so a route can be
+  undocumented without ever leaving `OpenApiRouter`. That is the escape
+  hatch, and it is silent. The guard is a route-pinning test: compare
+  `documented_pairs` against an expected set, and a route added with `.route`
+  instead of `.routes(routes!(…))` shows up as a missing pair.
+- **Apply a version prefix with `OpenApiRouter::nest`, never
+  `axum::Router::nest`.** `OpenApiRouter::nest(prefix, router)` prefixes both
+  halves — the OpenAPI path keys and the axum routes — which is what keeps
+  the document and the wire in agreement. (`OpenApiRouter::merge` takes no
+  prefix at all; it combines both halves as-is, which is why it is the right
+  tool for assembling sibling routers and the wrong one for versioning.) The
+  drift to avoid comes from converting to an `axum::Router` first and
+  nesting *that*: `axum::Router::nest` prefixes only the runtime routes, the
+  document keeps its unprefixed paths, and the spec then describes URLs the
+  service does not serve. `documented_pairs` against a committed expectation
+  catches this too.
 
 **On the exhaustive match:** `documented_pairs` enumerates all eight
 `HttpMethod` variants through a `match` with no `_` arm, so a `utoipa` that

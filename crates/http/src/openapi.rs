@@ -22,22 +22,31 @@
 //! Two conventions are worth carrying across services even though they are
 //! not code and cannot be enforced from here:
 //!
-//! - **Exclusion should be structural, not a maintained list.** A route
-//!   reaches the document by its router module being an
-//!   `utoipa_axum::router::OpenApiRouter` built with `.routes(routes!(…))`,
-//!   which is also that route's only way onto the wire. Then forgetting to
-//!   annotate a new route is a route that 404s in production — loud —
-//!   rather than a silent hole in the spec, and the modules that must stay
-//!   *out* (health checks, webhooks, static fallbacks, reverse proxies that
-//!   publish their own contracts) stay out because they never import
-//!   `utoipa` at all. There is no flag to flip and no list to keep in sync.
-//! - **Apply a version prefix with `OpenApiRouter::nest`, never `merge`.**
-//!   `nest` rewrites the OpenAPI path keys with the same prefix it gives the
-//!   underlying axum routes; `merge` gives the axum routes the prefix and
-//!   leaves the documented paths at their unprefixed literals. The two then
-//!   drift apart silently, and the document describes URLs the service does
-//!   not serve. [`documented_pairs`] plus a committed expectation is the
-//!   cheap guard against having got this wrong.
+//! - **Prefer structural exclusion to a maintained list — but know where the
+//!   hole is.** A route reaches the document by being registered on an
+//!   `utoipa_axum::router::OpenApiRouter` with `.routes(routes!(…))`, so the
+//!   modules that must stay *out* (health checks, webhooks, static
+//!   fallbacks, reverse proxies that publish their own contracts) stay out by
+//!   never importing `utoipa` at all — no flag to flip, no exclusion list to
+//!   keep in sync. What that does **not** buy is "you can't forget":
+//!   `OpenApiRouter::route` and `OpenApiRouter::route_service` are
+//!   pass-throughs to their `axum::Router` equivalents, registering a runtime
+//!   route and adding nothing to the document, so a route can be undocumented
+//!   without ever leaving `OpenApiRouter`. That escape hatch is silent. The
+//!   guard is a route-pinning test: [`documented_pairs`] against an expected
+//!   set turns a `.route` that should have been `.routes(routes!(…))` into a
+//!   missing pair.
+//! - **Apply a version prefix with `OpenApiRouter::nest`, never
+//!   `axum::Router::nest`.** `OpenApiRouter::nest(prefix, router)` prefixes
+//!   both halves — the OpenAPI path keys and the axum routes — which is what
+//!   keeps the document and the wire in agreement. (`OpenApiRouter::merge`
+//!   takes no prefix at all and combines both halves as-is: the right tool
+//!   for assembling sibling routers, the wrong one for versioning.) The drift
+//!   worth warning about comes from converting to an `axum::Router` first and
+//!   nesting that — `axum::Router::nest` prefixes only the runtime routes,
+//!   the document keeps its unprefixed paths, and the spec then describes
+//!   URLs the service does not serve. [`documented_pairs`] plus a committed
+//!   expectation is the cheap guard against both mistakes.
 //!
 //! # The committed spec file is LF, always
 //!

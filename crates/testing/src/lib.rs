@@ -14,9 +14,16 @@
 //! `default = []`. `oneshot` and `wiremock` are unconditional — both are tiny
 //! and neither pulls in anything a test binary doesn't already need.
 //!
+//! Note that feature-gated items are named in plain code spans, never
+//! intra-doc links: they are off by default, so a link would be an
+//! unresolved-link warning on `cargo doc` without `--all-features` (which is
+//! how a consumer documenting its own graph usually builds). They appear in
+//! the sidebar once the matching feature is on, which is the only time they
+//! exist at all.
+//!
 //! | Feature | Default | Adds |
 //! |---|---|---|
-//! | `postgres` | off | [`postgres::require_postgres`], via `sqlx`/`url` |
+//! | `postgres` | off | `postgres::require_postgres`, via `sqlx`/`url` |
 //!
 //! `postgres` is gated because `sqlx`'s Postgres driver drags in a real
 //! network/TLS stack; a consumer whose tests never touch a database
@@ -24,7 +31,7 @@
 //!
 //! # Fail loud, never skip
 //!
-//! [`postgres::require_postgres`] **panics** — with a message naming the URL
+//! `postgres::require_postgres` **panics** — with a message naming the URL
 //! it tried (password redacted), the `DATABASE_URL` env var, and the command
 //! to start the database — rather than returning `None` for a test to shrug
 //! off. A green test suite must mean the behavior it claims to cover was
