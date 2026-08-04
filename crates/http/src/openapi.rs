@@ -252,33 +252,80 @@ pub fn expected_pairs(pairs: &[(&str, &str)]) -> BTreeSet<(String, String)> {
 /// what [`expect_operation`] does); a caller that wants to render its own
 /// message, group misses, or count them has the path, the method, and — for
 /// the near-miss case — the methods the path *does* document.
+///
+/// The variants do not overlap, because [`find_operation`] resolves them in a
+/// fixed order: the method spelling is validated **first** (it is wrong or
+/// right on its own terms, independent of what the document contains), then
+/// the path, then the operation. So a typo'd method is always
+/// [`UnknownMethod`](Self::UnknownMethod) — never masked by the path it
+/// happened to be paired with.
 #[derive(Debug, thiserror::Error)]
 pub enum OperationNotFound {
-    /// The document has no such path key at all.
+    /// The document has no such path key at all. `method` is a valid
+    /// spelling — an invalid one is [`UnknownMethod`](Self::UnknownMethod)
+    /// whether or not the path exists.
     #[error("the OpenAPI document has no path `{path}` (looking up `{method} {path}`)")]
     Path { method: String, path: String },
     /// The path is documented, but carries no operation under `method`.
     #[error(
-        "the OpenAPI document has path `{path}` but no `{method}` operation on it \
-         (it documents: {})",
-        .documented.join(", ")
+        "the OpenAPI document has path `{path}` but no `{method}` operation on it ({})",
+        describe_documented(.documented)
     )]
     Method {
         method: String,
         path: String,
-        /// The methods this path *does* document, in
-        /// [`documented_pairs`] order. Never empty: a [`PathItem`] with no
-        /// operations at all has no way into a `utoipa` document.
+        /// The methods this path *does* document, sorted lexicographically —
+        /// the same order [`documented_pairs`] yields them in, since that is
+        /// a `BTreeSet` of uppercase spellings.
+        ///
+        /// May be **empty**. A [`PathItem`] whose eight operation fields are
+        /// all `None` is constructible ([`PathItem`] derives `Default`) and
+        /// deserializable from `{"/x": {}}`, so a document can carry a path
+        /// key that documents nothing at all; `Display` phrases that case
+        /// separately rather than trailing off after "it documents:".
         documented: Vec<&'static str>,
     },
     /// `method` is not one of the eight uppercase wire spellings, so the
     /// lookup never got as far as the document. Almost always a typo in the
-    /// calling table (`"get"` for `"GET"`).
+    /// calling table (`"get"` for `"GET"`). Checked before the path, so this
+    /// is the answer even when `path` is also absent.
     #[error(
         "`{method}` is not an HTTP method spelling this lookup recognizes (looking up `{path}`); \
          they are uppercase: GET, PUT, POST, DELETE, OPTIONS, HEAD, PATCH, TRACE"
     )]
     UnknownMethod { method: String, path: String },
+}
+
+/// The parenthetical in [`OperationNotFound::Method`]'s message.
+///
+/// Split out because the empty case needs different *words*, not a list with
+/// nothing in it: `(it documents: )` reads like a truncated message and sends
+/// the reader looking for the bug in the wrong place.
+fn describe_documented(documented: &[&'static str]) -> String {
+    if documented.is_empty() {
+        "the path item documents no operations at all".to_string()
+    } else {
+        format!("it documents: {}", documented.join(", "))
+    }
+}
+
+/// The methods `item` documents, sorted lexicographically.
+///
+/// Sorted rather than left in [`ALL_HTTP_METHODS`] slot order, which is
+/// `utoipa`'s *field declaration* order (GET, PUT, POST, DELETE, …) and
+/// carries no meaning for either audience: a human reading a panic gets an
+/// arbitrary-looking sequence, and a caller comparing against anything this
+/// crate produces is comparing against [`documented_pairs`]' `BTreeSet`,
+/// which is lexicographic. Alphabetical is also what the rest of this module
+/// stakes itself on — see [`to_pretty_json`].
+fn documented_methods(item: &PathItem) -> Vec<&'static str> {
+    let mut methods: Vec<&'static str> = ALL_HTTP_METHODS
+        .iter()
+        .filter(|m| operation_for(item, m).is_some())
+        .map(method_name)
+        .collect();
+    methods.sort_unstable();
+    methods
 }
 
 /// The [`Operation`] documented at `method` + `path`, addressed the way a
@@ -320,15 +367,48 @@ pub enum OperationNotFound {
 /// One wrinkle worth knowing before it surprises you: `unwrap_err` and
 /// `expect_err` do **not** compile on this `Result`. Both require the *ok*
 /// type to be `Debug`, and `utoipa` implements `Debug` for [`Operation`] only
-/// under its `debug` feature, which this crate does not enable. `unwrap`,
-/// `expect` and `?` on the success side are all fine ([`OperationNotFound`]
-/// is `Debug`); a test that wants to assert on a miss should `match` or use
-/// `let Err(e) = … else`.
+/// under its `debug` feature. `unwrap`, `expect` and `?` on the success side
+/// are all fine ([`OperationNotFound`] is `Debug`). A test that wants to
+/// assert on a miss has two ways round it:
+///
+/// ```
+/// # use stridelabs_http::openapi::{find_operation, OperationNotFound};
+/// # use utoipa::OpenApi;
+/// # #[derive(OpenApi)]
+/// # #[openapi()]
+/// # struct ApiDoc;
+/// # let spec = ApiDoc::openapi();
+/// // Shortest, when you just want the error:
+/// let err = find_operation(&spec, "GET", "/nope").err().expect("expected a miss");
+///
+/// // Preferable when the success case should fail with its own message:
+/// let Err(err) = find_operation(&spec, "GET", "/nope") else {
+///     panic!("/nope should not be documented");
+/// };
+/// ```
+///
+/// Enabling `utoipa`'s `debug` feature here would also work, and is
+/// deliberately not done: Cargo unifies features across the graph, so every
+/// consumer would carry `Debug` impls on `utoipa`'s whole type tree to buy
+/// this crate's tests one method call.
 pub fn find_operation<'a>(
     spec: &'a OpenApi,
     method: &str,
     path: &str,
 ) -> Result<&'a Operation, OperationNotFound> {
+    // Method spelling first, deliberately: `"get"` is wrong on its own terms
+    // — nothing in the document can make it right — so validating it after
+    // the path lookup would report a typo'd method on a renamed route as
+    // `Path`, hiding the typo behind the rename and making the answer depend
+    // on which of the two mistakes you made second.
+    let http_method = ALL_HTTP_METHODS
+        .iter()
+        .find(|m| method_name(m) == method)
+        .ok_or_else(|| OperationNotFound::UnknownMethod {
+            method: method.to_string(),
+            path: path.to_string(),
+        })?;
+
     let item = spec
         .paths
         .paths
@@ -338,22 +418,10 @@ pub fn find_operation<'a>(
             path: path.to_string(),
         })?;
 
-    let http_method = ALL_HTTP_METHODS
-        .iter()
-        .find(|m| method_name(m) == method)
-        .ok_or_else(|| OperationNotFound::UnknownMethod {
-            method: method.to_string(),
-            path: path.to_string(),
-        })?;
-
     operation_for(item, http_method).ok_or_else(|| OperationNotFound::Method {
         method: method.to_string(),
         path: path.to_string(),
-        documented: ALL_HTTP_METHODS
-            .iter()
-            .filter(|m| operation_for(item, m).is_some())
-            .map(method_name)
-            .collect(),
+        documented: documented_methods(item),
     })
 }
 
@@ -787,7 +855,9 @@ mod tests {
     /// *ok* type to be `Debug`, and `utoipa`'s [`Operation`] implements
     /// `Debug` only under its `debug` feature, which this crate does not
     /// enable. Worth knowing before a consumer writes `.unwrap_err()` and is
-    /// confused by the bound — see [`find_operation`]'s docs, which name it.
+    /// confused by the bound — see [`find_operation`]'s docs, which name it
+    /// and give the two one-liner workarounds. This helper is the same thing
+    /// with a message worth reading when the lookup unexpectedly succeeds.
     #[track_caller]
     fn miss(result: Result<&Operation, OperationNotFound>) -> OperationNotFound {
         match result {
@@ -1033,6 +1103,97 @@ mod tests {
         assert!(
             msg.contains("/widgets"),
             "a typo'd lookup should still say what was being looked up: {msg}"
+        );
+    }
+
+    /// An unrecognized method spelling wins over a missing path, so the
+    /// answer never depends on which of the two mistakes the caller made.
+    /// The regression guard for a precedence bug: with the path looked up
+    /// first, `("get", "/nope")` reported `Path` and the typo vanished.
+    #[test]
+    fn an_unknown_method_spelling_outranks_a_missing_path() {
+        let err = miss(find_operation(&ApiDoc::openapi(), "get", "/nope"));
+
+        assert!(
+            matches!(err, OperationNotFound::UnknownMethod { .. }),
+            "a typo'd method must not be masked by the path it was paired with: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("`get` is not an HTTP method spelling"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("/nope"),
+            "the message should still name what was being looked up: {msg}"
+        );
+    }
+
+    /// The `documented` list is lexicographic — the order
+    /// [`documented_pairs`] yields for one path — not `ALL_HTTP_METHODS` slot
+    /// order.
+    ///
+    /// `/widgets/{id}` is the path that can tell those apart: it documents
+    /// six methods whose slot order (PUT, DELETE, OPTIONS, HEAD, PATCH,
+    /// TRACE) and lexicographic order (DELETE, HEAD, OPTIONS, PATCH, PUT,
+    /// TRACE) share no prefix. A two- or three-method path mostly cannot —
+    /// GET+POST, for instance, sorts the same either way, which would make
+    /// this test vacuous.
+    #[test]
+    fn the_documented_method_list_is_sorted_not_in_slot_order() {
+        let spec = ApiDoc::openapi();
+
+        // GET is the one method `/widgets/{id}` does not document.
+        let err = miss(find_operation(&spec, "GET", "/widgets/{id}"));
+
+        let OperationNotFound::Method { documented, .. } = &err else {
+            panic!("expected a missing-method miss: {err:?}");
+        };
+        assert_eq!(
+            documented,
+            &["DELETE", "HEAD", "OPTIONS", "PATCH", "PUT", "TRACE"],
+            "slot order would start PUT, DELETE, OPTIONS — this must be sorted"
+        );
+        assert!(
+            err.to_string()
+                .contains("it documents: DELETE, HEAD, OPTIONS, PATCH, PUT, TRACE"),
+            "{err}"
+        );
+
+        // The claim the field docs make, asserted rather than asserted-about:
+        // this is the order `documented_pairs` puts the same methods in.
+        let from_pairs: Vec<String> = documented_pairs(&spec)
+            .into_iter()
+            .filter(|(_, path)| path == "/widgets/{id}")
+            .map(|(method, _)| method)
+            .collect();
+        assert_eq!(from_pairs, *documented);
+    }
+
+    /// A path key that documents nothing at all. `PathItem` derives
+    /// `Default` and all eight operation fields are `Option`, so this is
+    /// constructible — and deserializable from `{"paths": {"/x": {}}}` —
+    /// which makes the empty `documented` list reachable rather than
+    /// theoretical. The message must not trail off after "it documents:".
+    #[test]
+    fn a_path_documenting_no_operations_is_phrased_as_such() {
+        let mut spec = ApiDoc::openapi();
+        spec.paths
+            .paths
+            .insert("/empty".to_string(), PathItem::default());
+
+        let err = miss(find_operation(&spec, "GET", "/empty"));
+
+        let OperationNotFound::Method { documented, .. } = &err else {
+            panic!("the path exists, so this is a missing-method miss: {err:?}");
+        };
+        assert!(documented.is_empty(), "{documented:?}");
+
+        let msg = err.to_string();
+        assert!(msg.contains("documents no operations at all"), "{msg}");
+        assert!(
+            !msg.contains("it documents: )") && !msg.ends_with("()"),
+            "an empty list must not render as a dangling parenthetical: {msg}"
         );
     }
 
