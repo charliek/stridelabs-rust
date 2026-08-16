@@ -15,7 +15,7 @@ axum service wants all three, so gating them would only add friction.
 |---|---|---|
 | `cors` | off | `cors_layer`, via `tower-http/cors` |
 | `openapi` | off | the `openapi` module — spec canonicalization, `(method, path)` enumeration, committed-spec freshness check — via `utoipa` |
-| `proxy` | off | the `proxy` module, via `reqwest`/`url`/`bytes`/`futures` |
+| `proxy` | off | the `proxy` module, via `reqwest`/`url`/`bytes`/`futures` (and `tokio/time`) |
 
 `proxy` is the gate that matters: it pulls in an HTTP *client* and a TLS
 stack. A service that only answers requests should never compile that, which
@@ -439,11 +439,13 @@ async fn proxy(
 | `connection_tokens(&HeaderMap)` | Header names banned by a `Connection` list |
 | `request_has_body(&HeaderMap)` | Body presence from framing headers alone |
 | `build_upstream_url(&Url, path, query)` | Origin + path/query, or `None` |
-| `Buffered` / `buffer_or_stream(resp, limit)` | Bounded buffering that still serves the body |
+| `Buffered` / `buffer_or_stream(resp, limit)` | Size-bounded buffering that still serves the body |
+| `buffer_or_stream_within(resp, limit, deadline)` | The same, also bounded in time |
+| `buffer_request_or_stream(body, limit)` | The same bound over an axum request `Body` |
 | `relay_response` / `response_from_parts` | `reqwest` → axum translation |
 | `UpstreamClient::build(verify, ca_pem)` | The pooled client |
 
-Four behaviors are worth knowing about, because each is a bug someone
+Five behaviors are worth knowing about, because each is a bug someone
 re-introduces every time this layer gets rewritten:
 
 - **Repeated headers stay repeated.** The header copy appends. An
@@ -465,7 +467,20 @@ re-introduces every time this layer gets rewritten:
   `TooLarge` carrying a `Body` of the already-read prefix chained to the rest
   of the upstream stream. The client is served every byte; only whatever
   wanted to *inspect* the bytes gives up. Exactly `limit` buffers,
-  `limit + 1` streams.
+  `limit + 1` streams. `buffer_request_or_stream` applies the identical bound
+  to an axum request `Body`, for a caller that needs the uploaded bytes twice.
+- **A size cap is not a time cap.** A body that trickles — or stalls outright
+  — stays under `limit` forever, so a size-bounded read waits as long as the
+  upstream cares to take. `buffer_or_stream_within` adds a deadline and
+  demotes to `TimedOut` (the same prefix-plus-remainder `Body`) when it
+  passes. The timer is one pinned `Sleep` given the `biased` first look in a
+  `select!`, deliberately *not* a per-chunk `tokio::time::timeout_at`: a fresh
+  `Sleep` is never ready on its first poll, so against an upstream whose
+  chunks are always immediately ready a `timeout_at` timer is never reached
+  and the deadline never fires. There is a test that fails on exactly and only
+  that revert.
+
+`Buffered` is `#[non_exhaustive]`, so a `match` on it needs a wildcard arm.
 
 `UpstreamClient::build` takes `(verify_certificates: bool, ca_bundle_pem:
 Option<&[u8]>)` rather than limen's config struct, so adopting these

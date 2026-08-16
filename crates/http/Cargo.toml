@@ -18,7 +18,12 @@ cors = ["tower-http/cors"]
 # Off by default for the same reason, only more so: the reverse-proxy
 # primitives drag in an HTTP *client* and a TLS stack, which is a large thing
 # to hand a service that only ever answers requests.
-proxy = ["dep:reqwest", "dep:url", "dep:bytes", "dep:futures"]
+#
+# `tokio/time` rides along rather than being unconditional: the always-on
+# `shutdown` module needs no clock, and only `buffer_or_stream_within`'s
+# pinned deadline timer does. Enabling it here keeps the timer driver out of
+# a non-proxy consumer's graph.
+proxy = ["dep:reqwest", "dep:url", "dep:bytes", "dep:futures", "tokio/time"]
 # Off by default: `utoipa` brings a proc-macro crate (`utoipa-gen`, hence syn)
 # along with it, and a service that doesn't publish an OpenAPI document —
 # or one that publishes it some other way — shouldn't compile that to get

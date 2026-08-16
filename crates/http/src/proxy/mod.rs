@@ -61,7 +61,7 @@ mod relay;
 #[cfg(test)]
 mod test_support;
 
-pub use body::{buffer_or_stream, Buffered};
+pub use body::{buffer_or_stream, buffer_or_stream_within, buffer_request_or_stream, Buffered};
 pub use client::{ClientBuildError, UpstreamClient};
 pub use filter::{connection_tokens, filter_headers, request_has_body, Direction, HOP_BY_HOP};
 pub use relay::{build_upstream_url, relay_response, response_from_parts};
