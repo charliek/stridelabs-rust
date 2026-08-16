@@ -5,7 +5,8 @@
 //! it that are not about limen: which headers may cross a hop, how to turn a
 //! client request's path into an upstream URL, how to hand a `reqwest`
 //! response back to axum, how to buffer a body without letting an unbounded
-//! one buffer, and how to build the upstream client.
+//! one buffer, how to state (rather than relay) the `X-Forwarded-*` context,
+//! and how to build the upstream client.
 //!
 //! What did change is the shape of the seams. Every one of these was private
 //! to limen, and two of them reached into limen's config types; here they are
@@ -57,6 +58,7 @@
 mod body;
 mod client;
 mod filter;
+mod forwarded;
 mod relay;
 #[cfg(test)]
 mod test_support;
@@ -64,4 +66,5 @@ mod test_support;
 pub use body::{buffer_or_stream, buffer_or_stream_within, buffer_request_or_stream, Buffered};
 pub use client::{ClientBuildError, UpstreamClient};
 pub use filter::{connection_tokens, filter_headers, request_has_body, Direction, HOP_BY_HOP};
+pub use forwarded::{apply_forwarded, ForwardedPolicy, XffPolicy, XfpPolicy};
 pub use relay::{build_upstream_url, relay_response, response_from_parts};

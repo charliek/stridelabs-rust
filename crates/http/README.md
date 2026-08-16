@@ -442,10 +442,11 @@ async fn proxy(
 | `Buffered` / `buffer_or_stream(resp, limit)` | Size-bounded buffering that still serves the body |
 | `buffer_or_stream_within(resp, limit, deadline)` | The same, also bounded in time |
 | `buffer_request_or_stream(body, limit)` | The same bound over an axum request `Body` |
+| `apply_forwarded(&mut HeaderMap, Option<IpAddr>, &ForwardedPolicy)` | `X-Forwarded-*` synthesis under an explicit trust policy |
 | `relay_response` / `response_from_parts` | `reqwest` → axum translation |
 | `UpstreamClient::build(verify, ca_pem)` | The pooled client |
 
-Five behaviors are worth knowing about, because each is a bug someone
+Six behaviors are worth knowing about, because each is a bug someone
 re-introduces every time this layer gets rewritten:
 
 - **Repeated headers stay repeated.** The header copy appends. An
@@ -479,6 +480,25 @@ re-introduces every time this layer gets rewritten:
   chunks are always immediately ready a `timeout_at` timer is never reached
   and the deadline never fires. There is a test that fails on exactly and only
   that revert.
+
+- **`X-Forwarded-*` is client input until a hop says otherwise.** An upstream
+  that reads `X-Forwarded-Proto` to decide "this request was secure" trusts
+  whichever hop wrote it — and if the proxy forwards a client-supplied value,
+  that hop is the client. `apply_forwarded` makes the choice explicit per leg:
+  `XfpPolicy::Override(scheme)` replaces every inbound line with one
+  authoritative value, `PreserveTrustedOrSet(scheme)` keeps what arrived
+  (correct only if the ingress strips or always sets the header), `Untouched`
+  does nothing. There is no `Default` on any of these types; the scheme is
+  applied *after* the generic `overrides` list, so the policy wins
+  structurally; and the header's authority lives in `XfpPolicy` alone —
+  naming `x-forwarded-proto` in `overrides` is a `debug_assert` under *any*
+  policy, and the pair is dropped in release. `Override` is fail-closed: the
+  inbound header is removed first, and a scheme that isn't a URI scheme per
+  RFC 3986 (`"https, http"` included) is not written, so the upstream sees no
+  header rather than the caller's claim. `XffPolicy` covers the chain:
+  `Append` (limen's multi-line-aware append, one combined line out, an
+  existing chain preserved when there is no peer) or `FillIfAbsent` (slauth's
+  post-allow-list fill).
 
 `Buffered` is `#[non_exhaustive]`, so a `match` on it needs a wildcard arm.
 
