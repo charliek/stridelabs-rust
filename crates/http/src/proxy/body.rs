@@ -77,6 +77,16 @@ pub async fn buffer_or_stream(resp: reqwest::Response, limit: usize) -> Buffered
 ///
 /// The deadline is absolute, not a duration, so a caller that has already
 /// spent part of a request budget elsewhere can pass what is left of it.
+///
+/// One caveat inherited from the reference implementation: the deadline is a
+/// timer, and a timer only fires if the runtime gets to drive it. A stream
+/// whose chunks are always immediately ready never returns `Poll::Pending`,
+/// so on a *current-thread* runtime the buffering loop starves the time
+/// driver and the deadline cannot fire (the size cap still binds). On a
+/// multi-thread runtime — what an axum service runs on — an idle worker
+/// drives the timer and the bound holds; the
+/// `an_always_ready_stream_still_trips_the_deadline` test below pins exactly
+/// that distinction.
 pub async fn buffer_or_stream_within(
     resp: reqwest::Response,
     limit: usize,
@@ -92,6 +102,12 @@ pub async fn buffer_or_stream_within(
 /// body is never fully held in memory, and the returned [`Buffered::TooLarge`]
 /// streams prefix + remainder to the upstream unchanged while the caller skips
 /// the replay.
+///
+/// "Unchanged" covers the data frames only: this reads via
+/// `Body::into_data_stream`, which discards HTTP trailers, so a request that
+/// carries them (rare outside gRPC) is forwarded without them on every path —
+/// buffered or streamed. Carried knowingly from the reference implementation,
+/// which has the same property.
 pub async fn buffer_request_or_stream(body: Body, limit: usize) -> Buffered {
     buffer_bounded(body.into_data_stream(), limit, None).await
 }

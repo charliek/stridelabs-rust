@@ -19,10 +19,12 @@ cors = ["tower-http/cors"]
 # primitives drag in an HTTP *client* and a TLS stack, which is a large thing
 # to hand a service that only ever answers requests.
 #
-# `tokio/time` rides along rather than being unconditional: the always-on
-# `shutdown` module needs no clock, and only `buffer_or_stream_within`'s
-# pinned deadline timer does. Enabling it here keeps the timer driver out of
-# a non-proxy consumer's graph.
+# `tokio/time` rides along because only `buffer_or_stream_within`'s pinned
+# deadline timer needs a clock — the always-on `shutdown` module does not.
+# Today the line is declarative rather than load-bearing: the workspace pins
+# tokio with `full` (root Cargo.toml), so `time` is in every consumer's graph
+# regardless. It stays here so the proxy feature keeps compiling on its own
+# terms if that workspace pin is ever narrowed.
 proxy = ["dep:reqwest", "dep:url", "dep:bytes", "dep:futures", "tokio/time"]
 # Off by default: `utoipa` brings a proc-macro crate (`utoipa-gen`, hence syn)
 # along with it, and a service that doesn't publish an OpenAPI document —
