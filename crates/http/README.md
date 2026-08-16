@@ -8,8 +8,9 @@ limen's `http/`, and slauth's `http/openapi.rs`.
 
 ## Feature topology
 
-`default = []`. `error`, `headers` and `shutdown` are unconditional — every
-axum service wants all three, so gating them would only add friction.
+`default = []`. `error`, `headers`, `methods` and `shutdown` are
+unconditional — every axum service wants all four, so gating them would only
+add friction.
 
 | Feature | Default | Adds |
 |---|---|---|
@@ -157,6 +158,87 @@ The return type is a named unit struct, `SecurityHeadersLayer`, so it can be
 stored in a struct field or named as a return type — and so that adding a
 fourth header later isn't a breaking change for anyone who wrote that name
 down. (It mirrors how `stridelabs-observability` exposes `RequestIdLayer`.)
+
+## `methods` — truthful method classification
+
+`axum::routing::MethodRouter` gets two things wrong for a route that only
+names the methods it serves: a bare `get()` route answers `HEAD` from the
+`GET` handler instead of `405`ing it, and every 405 it does produce carries
+axum's own auto-generated `Allow` header, which lists that same implicit
+`HEAD` even when the route never registered one. `methods` closes both,
+without pulling in anything the `proxy` feature exists to gate — it's pure
+`axum::routing`, so it's unconditional like `error`/`headers`/`shutdown`.
+
+```rust
+use axum::http::Method;
+use axum::routing::{get, MethodRouter};
+use axum::Router;
+use stridelabs_http::{default_refusal, refusing_unserved_over, CLASSIFIED_METHODS};
+
+let get_only: MethodRouter = refusing_unserved_over(
+    /* universe */ CLASSIFIED_METHODS.iter(),
+    /* served   */ &[Method::GET],
+    get(|| async { "hi" }),
+    default_refusal,
+);
+let app: Router = Router::new().route("/widgets", get_only);
+// HEAD, POST, PUT, … now 405 with `Allow: GET` — never a silent 200 from
+// the GET handler, never a lying `Allow: GET, HEAD`.
+```
+
+`universe` and `served` are both `&[Method]`-shaped (`served` literally is
+one; `universe`'s `impl IntoIterator<Item = &Method>` accepts one directly,
+no `.iter()` needed) — a call that transposes them compiles without error
+and silently classifies nothing the way the caller intended. There is no
+type-level guard against this; naming the two positions at the call site (as
+above) is the cheapest defense.
+
+| Item | What it does |
+|---|---|
+| `CLASSIFIED_METHODS` | The nine methods `MethodFilter` can represent — the right universe for a route that should 405 anything it doesn't serve |
+| `method_filter(methods)` → `Option<MethodFilter>` | OR-folds `methods`; `None` on an empty input (never a panic) |
+| `refusing_unserved_over(universe, served, router, refusal_builder)` | Adds a refusal endpoint for `universe` minus `served` to `router`, with a truthful `Allow` |
+| `default_refusal(allow)` | The crate's out-of-the-box refusal body: `405`, that `Allow` header, empty body |
+
+- **The universe is the caller's choice, not a hard-coded constant.** A
+  literal route passes `CLASSIFIED_METHODS` (all nine); a reverse proxy that
+  has never handled `CONNECT` on a given leg can pass
+  `CLASSIFIED_METHODS.iter().filter(|m| **m != Method::CONNECT)` instead, so
+  an unhandled `CONNECT` keeps falling through to axum's own fallback rather
+  than picking up a new (untested) truthful answer as a side effect of
+  adopting this helper. That's slauth's adoption shape, not a recommendation
+  — a service with no such history should classify all nine.
+- **Serving the whole universe is a no-op, not a panic.** If `served`
+  already covers everything in `universe`, `refusing_unserved_over` returns
+  `router` unchanged; there is nothing left to refuse. `method_filter`
+  mirrors this at one level down — an empty input is `None`, never a panic,
+  because a shared crate can't assume every caller derives its input from a
+  route's own non-empty method list the way the single adoption target
+  (slauth's `route_util.rs`) does.
+- **Duplicate methods are fine.** OR-ing the same `MethodFilter` bit twice
+  is a no-op, so a served or universe list with repeats folds the same as
+  its deduplicated form.
+- **An unsupported method is a programmer error, not a runtime one.** Every
+  `CLASSIFIED_METHODS` entry has a `MethodFilter`; a caller-constructed
+  extension method (`Method::from_bytes(b"CUSTOM")`) doesn't.
+  `method_filter` `debug_assert!`s on it in debug/test builds and silently
+  drops it from the fold in release, so one bad entry doesn't take the
+  route's whole method policy down with it.
+- **The refusal body is yours to shape.** `default_refusal` is `405` +
+  `Allow` + empty body. A consumer with its own error envelope (slauth's
+  `{"detail": "..."}`) passes its own closure instead — `refusal_builder`
+  only ever has to turn the already-computed, truthful `Allow` value into a
+  full response.
+- **Generic over the router's state**, with the same bounds
+  `MethodRouter::on` itself needs (`Clone + Send + Sync + 'static`) and
+  nothing more, so it composes under any axum service's own `AppState`.
+- **`OPTIONS` needs a CORS layer in front of it.** `CLASSIFIED_METHODS`
+  claims `OPTIONS`, which is only safe when a CORS layer answers preflight
+  **before** routing — a real preflight then never reaches this module's
+  refusal endpoint, only a bare `OPTIONS` does. With no such layer, judging
+  the full nine-method universe 405s real preflight requests, breaking every
+  cross-origin caller. Pair it with this crate's own `cors` feature
+  (`cors_layer`, applied outermost) or drop `OPTIONS` from `universe`.
 
 ## `cors` feature — an explicit-origin layer
 
