@@ -8,14 +8,15 @@ limen's `http/`, and slauth's `http/openapi.rs`.
 
 ## Feature topology
 
-`default = []`. `error`, `headers` and `shutdown` are unconditional — every
-axum service wants all three, so gating them would only add friction.
+`default = []`. `error`, `headers`, `methods` and `shutdown` are
+unconditional — every axum service wants all four, so gating them would only
+add friction.
 
 | Feature | Default | Adds |
 |---|---|---|
 | `cors` | off | `cors_layer`, via `tower-http/cors` |
 | `openapi` | off | the `openapi` module — spec canonicalization, `(method, path)` enumeration, committed-spec freshness check — via `utoipa` |
-| `proxy` | off | the `proxy` module, via `reqwest`/`url`/`bytes`/`futures` |
+| `proxy` | off | the `proxy` module — and `AppError::bad_gateway_upstream`, which takes a `reqwest::Error` — via `reqwest`/`url`/`bytes`/`futures` (and `tokio/time`) |
 
 `proxy` is the gate that matters: it pulls in an HTTP *client* and a TLS
 stack. A service that only answers requests should never compile that, which
@@ -31,21 +32,23 @@ build.
 
 ```toml
 [dependencies]
-stridelabs-http = { git = "ssh://git@github.com/charliek/stridelabs-rust.git", tag = "v0.3.0" }
+stridelabs-http = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.4.0" }
 
 # with the CORS layer builder:
-stridelabs-http = { git = "ssh://git@github.com/charliek/stridelabs-rust.git", tag = "v0.3.0", features = ["cors"] }
+stridelabs-http = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.4.0", features = ["cors"] }
 
 # for a service that proxies to an upstream:
-stridelabs-http = { git = "ssh://git@github.com/charliek/stridelabs-rust.git", tag = "v0.3.0", features = ["proxy"] }
+stridelabs-http = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.4.0", features = ["proxy"] }
 
 # for a service that publishes an OpenAPI document:
-stridelabs-http = { git = "ssh://git@github.com/charliek/stridelabs-rust.git", tag = "v0.3.0", features = ["openapi"] }
+stridelabs-http = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.4.0", features = ["openapi"] }
 ```
 
 (During development against an unreleased commit, pin `rev = "<sha>"`
 instead of `tag`; see the workspace root README for the local `[patch]`
-co-development snippet.)
+co-development snippet. If you're consuming a private fork rather than this
+repo directly, see that same README's "Private-fork / SSH consumption"
+appendix for the `ssh://` form instead.)
 
 ## `error` — `AppError` and the wire contract
 
@@ -95,6 +98,11 @@ Every error renders as the same body:
 
 `AppError::status()` is public, so a consumer can classify an error (metrics
 label, log field) without rendering it.
+
+`BadGateway`'s payload is verbatim like every other variant's, which is a trap
+when the thing that failed is a `reqwest` call — see
+`AppError::bad_gateway_upstream` under the `proxy` feature below, and the
+redaction bullet next to it.
 
 ### App-specific statuses
 
@@ -157,6 +165,87 @@ The return type is a named unit struct, `SecurityHeadersLayer`, so it can be
 stored in a struct field or named as a return type — and so that adding a
 fourth header later isn't a breaking change for anyone who wrote that name
 down. (It mirrors how `stridelabs-observability` exposes `RequestIdLayer`.)
+
+## `methods` — truthful method classification
+
+`axum::routing::MethodRouter` gets two things wrong for a route that only
+names the methods it serves: a bare `get()` route answers `HEAD` from the
+`GET` handler instead of `405`ing it, and every 405 it does produce carries
+axum's own auto-generated `Allow` header, which lists that same implicit
+`HEAD` even when the route never registered one. `methods` closes both,
+without pulling in anything the `proxy` feature exists to gate — it's pure
+`axum::routing`, so it's unconditional like `error`/`headers`/`shutdown`.
+
+```rust
+use axum::http::Method;
+use axum::routing::{get, MethodRouter};
+use axum::Router;
+use stridelabs_http::{default_refusal, refusing_unserved_over, CLASSIFIED_METHODS};
+
+let get_only: MethodRouter = refusing_unserved_over(
+    /* universe */ CLASSIFIED_METHODS.iter(),
+    /* served   */ &[Method::GET],
+    get(|| async { "hi" }),
+    default_refusal,
+);
+let app: Router = Router::new().route("/widgets", get_only);
+// HEAD, POST, PUT, … now 405 with `Allow: GET` — never a silent 200 from
+// the GET handler, never a lying `Allow: GET, HEAD`.
+```
+
+`universe` and `served` are both `&[Method]`-shaped (`served` literally is
+one; `universe`'s `impl IntoIterator<Item = &Method>` accepts one directly,
+no `.iter()` needed) — a call that transposes them compiles without error
+and silently classifies nothing the way the caller intended. There is no
+type-level guard against this; naming the two positions at the call site (as
+above) is the cheapest defense.
+
+| Item | What it does |
+|---|---|
+| `CLASSIFIED_METHODS` | The nine methods `MethodFilter` can represent — the right universe for a route that should 405 anything it doesn't serve |
+| `method_filter(methods)` → `Option<MethodFilter>` | OR-folds `methods`; `None` on an empty input (never a panic) |
+| `refusing_unserved_over(universe, served, router, refusal_builder)` | Adds a refusal endpoint for `universe` minus `served` to `router`, with a truthful `Allow` |
+| `default_refusal(allow)` | The crate's out-of-the-box refusal body: `405`, that `Allow` header, empty body |
+
+- **The universe is the caller's choice, not a hard-coded constant.** A
+  literal route passes `CLASSIFIED_METHODS` (all nine); a reverse proxy that
+  has never handled `CONNECT` on a given leg can pass
+  `CLASSIFIED_METHODS.iter().filter(|m| **m != Method::CONNECT)` instead, so
+  an unhandled `CONNECT` keeps falling through to axum's own fallback rather
+  than picking up a new (untested) truthful answer as a side effect of
+  adopting this helper. That's slauth's adoption shape, not a recommendation
+  — a service with no such history should classify all nine.
+- **Serving the whole universe is a no-op, not a panic.** If `served`
+  already covers everything in `universe`, `refusing_unserved_over` returns
+  `router` unchanged; there is nothing left to refuse. `method_filter`
+  mirrors this at one level down — an empty input is `None`, never a panic,
+  because a shared crate can't assume every caller derives its input from a
+  route's own non-empty method list the way the single adoption target
+  (slauth's `route_util.rs`) does.
+- **Duplicate methods are fine.** OR-ing the same `MethodFilter` bit twice
+  is a no-op, so a served or universe list with repeats folds the same as
+  its deduplicated form.
+- **An unsupported method is a programmer error, not a runtime one.** Every
+  `CLASSIFIED_METHODS` entry has a `MethodFilter`; a caller-constructed
+  extension method (`Method::from_bytes(b"CUSTOM")`) doesn't.
+  `method_filter` `debug_assert!`s on it in debug/test builds and silently
+  drops it from the fold in release, so one bad entry doesn't take the
+  route's whole method policy down with it.
+- **The refusal body is yours to shape.** `default_refusal` is `405` +
+  `Allow` + empty body. A consumer with its own error envelope (slauth's
+  `{"detail": "..."}`) passes its own closure instead — `refusal_builder`
+  only ever has to turn the already-computed, truthful `Allow` value into a
+  full response.
+- **Generic over the router's state**, with the same bounds
+  `MethodRouter::on` itself needs (`Clone + Send + Sync + 'static`) and
+  nothing more, so it composes under any axum service's own `AppState`.
+- **`OPTIONS` needs a CORS layer in front of it.** `CLASSIFIED_METHODS`
+  claims `OPTIONS`, which is only safe when a CORS layer answers preflight
+  **before** routing — a real preflight then never reaches this module's
+  refusal endpoint, only a bare `OPTIONS` does. With no such layer, judging
+  the full nine-method universe 405s real preflight requests, breaking every
+  cross-origin caller. Pair it with this crate's own `cors` feature
+  (`cors_layer`, applied outermost) or drop `OPTIONS` from `universe`.
 
 ## `cors` feature — an explicit-origin layer
 
@@ -374,11 +463,11 @@ the failures that otherwise produce a "the files look identical" diff.
 
 There is **no `ApiDoc`, no security schemes, no `info`/`servers`/`tags`
 block, no route list, no exclusion list, and no Swagger-UI wiring.** That is
-all policy: slauth documents a Kratos session cookie plus a `slp_live_…` PAT
-bearer, spendwise documents a slauth-issued JWT bearer plus a PAT bearer with
-a different prefix, and neither one's document root is a thing the other
-could adopt. A "spec builder" here would have to guess at that shape and be
-wrong for at least one consumer.
+all policy: slauth documents a Kratos session cookie plus a PAT bearer with
+its own fixed, recognizable prefix, spendwise documents a slauth-issued JWT
+bearer plus a PAT bearer with a different prefix, and neither one's document
+root is a thing the other could adopt. A "spec builder" here would have to
+guess at that shape and be wrong for at least one consumer.
 
 ### Two conventions that live in the module docs, not here
 
@@ -439,11 +528,17 @@ async fn proxy(
 | `connection_tokens(&HeaderMap)` | Header names banned by a `Connection` list |
 | `request_has_body(&HeaderMap)` | Body presence from framing headers alone |
 | `build_upstream_url(&Url, path, query)` | Origin + path/query, or `None` |
-| `Buffered` / `buffer_or_stream(resp, limit)` | Bounded buffering that still serves the body |
+| `Buffered` / `buffer_or_stream(resp, limit)` | Size-bounded buffering that still serves the body |
+| `buffer_or_stream_within(resp, limit, deadline)` | The same, also bounded in time |
+| `buffer_request_or_stream(body, limit)` | The same bound over an axum request `Body` |
+| `apply_forwarded(&mut HeaderMap, Option<IpAddr>, &ForwardedPolicy)` | `X-Forwarded-*` synthesis under an explicit trust policy |
 | `relay_response` / `response_from_parts` | `reqwest` → axum translation |
 | `UpstreamClient::build(verify, ca_pem)` | The pooled client |
+| `UpstreamFailure::classify(&reqwest::Error)` | The error reduced to predicates + a total `UpstreamCategory` — no URL, no message |
+| `UpstreamFailure::log(message)` | That classification as `tracing` fields, at `ERROR` |
+| `AppError::bad_gateway_upstream(&reqwest::Error)` | A `502` with a fixed body, logging the classification (also `_with_context` for a per-call-site log message) |
 
-Four behaviors are worth knowing about, because each is a bug someone
+Seven behaviors are worth knowing about, because each is a bug someone
 re-introduces every time this layer gets rewritten:
 
 - **Repeated headers stay repeated.** The header copy appends. An
@@ -465,7 +560,59 @@ re-introduces every time this layer gets rewritten:
   `TooLarge` carrying a `Body` of the already-read prefix chained to the rest
   of the upstream stream. The client is served every byte; only whatever
   wanted to *inspect* the bytes gives up. Exactly `limit` buffers,
-  `limit + 1` streams.
+  `limit + 1` streams. `buffer_request_or_stream` applies the identical bound
+  to an axum request `Body`, for a caller that needs the uploaded bytes twice.
+- **A size cap is not a time cap.** A body that trickles — or stalls outright
+  — stays under `limit` forever, so a size-bounded read waits as long as the
+  upstream cares to take. `buffer_or_stream_within` adds a deadline and
+  demotes to `TimedOut` (the same prefix-plus-remainder `Body`) when it
+  passes. The timer is one pinned `Sleep` given the `biased` first look in a
+  `select!`, deliberately *not* a per-chunk `tokio::time::timeout_at`: a fresh
+  `Sleep` is never ready on its first poll, so against an upstream whose
+  chunks are always immediately ready a `timeout_at` timer is never reached
+  and the deadline never fires. There is a test that fails on exactly and only
+  that revert.
+
+- **`X-Forwarded-*` is client input until a hop says otherwise.** An upstream
+  that reads `X-Forwarded-Proto` to decide "this request was secure" trusts
+  whichever hop wrote it — and if the proxy forwards a client-supplied value,
+  that hop is the client. `apply_forwarded` makes the choice explicit per leg:
+  `XfpPolicy::Override(scheme)` replaces every inbound line with one
+  authoritative value, `PreserveTrustedOrSet(scheme)` keeps what arrived
+  (correct only if the ingress strips or always sets the header), `Untouched`
+  does nothing. There is no `Default` on any of these types; the scheme is
+  applied *after* the generic `overrides` list, so the policy wins
+  structurally; and the header's authority lives in `XfpPolicy` alone —
+  naming `x-forwarded-proto` in `overrides` is a `debug_assert` under *any*
+  policy, and the pair is dropped in release. `Override` is fail-closed: the
+  inbound header is removed first, and a scheme that isn't a URI scheme per
+  RFC 3986 (`"https, http"` included) is not written, so the upstream sees no
+  header rather than the caller's claim. `XffPolicy` covers the chain:
+  `Append` (limen's multi-line-aware append, one combined line out, an
+  existing chain preserved when there is no peer) or `FillIfAbsent` (slauth's
+  post-allow-list fill).
+
+- **An upstream error is not a message you may show anyone.**
+  `reqwest::Error`'s `Display` ends with `" for url ({url})"` and its `Debug`
+  prints the same URL as a field — host, port, path *and query string*. So
+  `AppError::BadGateway(format!("upstream: {e}"))` hands the caller the
+  upstream's address (exactly the class of leak this module exists to close
+  — an internal provider base URL configured via environment is a realistic
+  example), and `tracing::error!(error = ?e, …)` puts it in the logs.
+  `UpstreamFailure::classify` is the alternative: four `reqwest` predicates,
+  the `Option<StatusCode>` that only `error_for_status` ever produces, and a
+  **total** `category` — because all four predicates can be false at once
+  (a builder-, redirect- or decode-class error), and an all-false log line
+  says nothing. `AppError::bad_gateway_upstream` is the constructor on top:
+  the client message is a constant, so the body is byte-identical whatever
+  failed and against whichever URL. A service with a **different error
+  envelope** (slauth's `{"detail": …}`) adopts `classify` + `log` only and
+  keeps its own error type and bodies — which is why the classification is a
+  separate primitive rather than a method on `AppError`.
+
+`Buffered` is `#[non_exhaustive]`, so a `match` on it needs a wildcard arm.
+`UpstreamFailure` and `UpstreamCategory` are too — the first because
+`reqwest` can grow a predicate, the second because it can grow an error kind.
 
 `UpstreamClient::build` takes `(verify_certificates: bool, ca_bundle_pem:
 Option<&[u8]>)` rather than limen's config struct, so adopting these

@@ -14,8 +14,12 @@
 //! # Feature topology
 //!
 //! `default = []`. Everything unconditional here (`error`, `headers`,
-//! `shutdown`) is wanted by every axum service, so gating it would only add
-//! friction.
+//! `methods`, `shutdown`) is wanted by every axum service, so gating it
+//! would only add friction. `methods` is pure `axum::routing` — no
+//! `reqwest`, no client, nothing the `proxy` gate exists to keep out — which
+//! is why it sits alongside `error`/`headers`/`shutdown` rather than behind
+//! `proxy`, even though its first consumer (slauth) uses it mostly on
+//! reverse-proxy routes.
 //!
 //! Note that the feature-gated modules below are named in plain code spans,
 //! never intra-doc links: every one of them is off by default, so a link
@@ -28,7 +32,7 @@
 //! |---|---|---|
 //! | `cors` | off | `cors::cors_layer`, via `tower-http/cors` |
 //! | `openapi` | off | `openapi` — spec canonicalization, route enumeration and a freshness check, via `utoipa` |
-//! | `proxy` | off | `proxy` — reverse-proxy primitives, via `reqwest`/`url`/`bytes`/`futures` |
+//! | `proxy` | off | `proxy` — reverse-proxy primitives, plus `AppError::bad_gateway_upstream` (it takes a `reqwest::Error`) — via `reqwest`/`url`/`bytes`/`futures` (and `tokio/time`) |
 //!
 //! `proxy` is the one that really earns its gate: it pulls in an HTTP
 //! *client* and a TLS stack, which no service that merely answers requests
@@ -59,6 +63,7 @@
 
 pub mod error;
 pub mod headers;
+pub mod methods;
 pub mod shutdown;
 
 #[cfg(feature = "cors")]
@@ -72,6 +77,7 @@ pub mod proxy;
 
 pub use error::{AppError, AppResult};
 pub use headers::{security_headers, SecurityHeadersLayer};
+pub use methods::{default_refusal, method_filter, refusing_unserved_over, CLASSIFIED_METHODS};
 pub use shutdown::{shutdown_signal, wait_for_shutdown};
 
 #[cfg(feature = "cors")]

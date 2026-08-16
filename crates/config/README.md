@@ -13,12 +13,14 @@ to turn off.
 
 ```toml
 [dependencies]
-stridelabs-config = { git = "ssh://git@github.com/charliek/stridelabs-rust.git", tag = "v0.3.0" }
+stridelabs-config = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.4.0" }
 ```
 
 (During development against an unreleased commit, pin `rev = "<sha>"`
 instead of `tag`; see the workspace root README for the local `[patch]`
-co-development snippet.)
+co-development snippet. If you're consuming a private fork rather than this
+repo directly, see that same README's "Private-fork / SSH consumption"
+appendix for the `ssh://` form instead.)
 
 ## `env` — 12-factor environment variables
 

@@ -6,6 +6,15 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+  # Weekly, so `audit`'s time-varying RustSec findings get re-checked even
+  # when nobody opens a PR for a while — a new advisory can land against a
+  # dependency with no code change here. `build-test`/`ci-success` are
+  # skipped on this trigger (see their own `if:` below) since there's
+  # nothing PR-specific to build; GitHub's required-check gating is
+  # PR-scoped, so a scheduled run that never reports `ci-success` doesn't
+  # block anything.
+  schedule:
+    - cron: "0 6 * * 1"
 
 permissions:
   contents: read
@@ -16,6 +25,11 @@ concurrency:
 
 jobs:
   build-test:
+    # Scheduled (weekly) runs exist only to re-check `audit`'s time-varying
+    # advisories, not to rebuild the workspace — skip this job on that
+    # trigger so a cron run doesn't burn a full build-test matrix for
+    # nothing.
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
 
     # Postgres for stridelabs-testing's fail-loud integration tests. Mapped to
@@ -39,12 +53,17 @@ jobs:
       DATABASE_URL: postgres://postgres:localdev@localhost:5438/stridelabs_test
 
     steps:
-      - uses: actions/checkout@v6
+      # fetch-depth: 0 (full history + tags) is needed below by
+      # `git describe --tags` for the cargo-semver-checks baseline — a
+      # shallow, depth-1 checkout wouldn't have any tag objects to describe
+      # against.
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
+          fetch-depth: 0
 
       - name: Install Rust toolchain (from rust-toolchain.toml)
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
 
       - name: Format
         run: cargo fmt --all -- --check
@@ -58,18 +77,166 @@ jobs:
       - name: Test (all features)
         run: cargo test --workspace --all-features --locked
 
+      # The `#[cfg(not(debug_assertions))]` counterparts of the
+      # `custom_client`/`method_filter`/XFP-override misuse tests in
+      # error.rs, methods.rs and proxy/forwarded.rs only compile in (and the
+      # debug-only `#[cfg(debug_assertions)]` arms only compile out) under a
+      # release profile — `cargo test` above always runs the crate's dev/test
+      # profile, which keeps `debug_assert!` live regardless of `--release`
+      # being passed to *other* commands. Without this step those
+      # release-only arms are never exercised by CI at all.
+      - name: Test (stridelabs-http, release profile)
+        run: cargo test -p stridelabs-http --release --all-features --locked
+
       - name: Build (no default features)
         run: cargo build --workspace --no-default-features --locked
 
       - name: Doc
         run: cargo doc --workspace --all-features --no-deps --locked
 
+      # deny.toml's license/bans/sources gates (verified clean locally:
+      # `cargo deny check licenses bans sources`). Deliberately does NOT
+      # include `advisories` in this list — that would duplicate the
+      # separate, non-required `audit` job below. See deny.toml's
+      # `[advisories]` comment for why that split exists: exactly one tool
+      # (cargo-audit) is the authority on "is there a live advisory," and it
+      # must stay out of this required job so a new RUSTSEC ID can't brick
+      # unrelated PRs. (The action's default `arguments` input already
+      # passes `--all-features`, matching deny.toml's own `[graph]
+      # all-features = true` — redundant but harmless, kept as the belt to
+      # the config file's suspenders rather than relying on the action's
+      # default not changing.)
+      - name: cargo-deny (licenses, bans, sources)
+        uses: EmbarkStudios/cargo-deny-action@b66acf5e9fe20f8aba065be86778a8a4c846f902 # v2
+        with:
+          command: check
+          command-arguments: licenses bans sources
+
+      - name: Determine cargo-semver-checks baseline tag
+        id: semver-baseline
+        run: |
+          tag="$(git describe --tags --abbrev=0 --match 'v*')"
+          echo "Baseline tag: $tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Install cargo-semver-checks
+        uses: taiki-e/install-action@288e746965032cfcc232e09af2daf5f23c14d780 # v2
+        with:
+          tool: cargo-semver-checks
+
+      # ADVISORY, not a hard gate, until v0.4.0 is tagged. The baseline above
+      # resolves to the latest reachable `v*` tag — currently v0.3.0, since
+      # this PR is what will *become* v0.4.0 — while `[workspace.package]
+      # .version` in this PR is already bumped to 0.4.0 ahead of the tag
+      # (CHANGELOG.md's v0.4.0 entry, including the `Buffered
+      # #[non_exhaustive]` break, documents why). Once current != baseline
+      # at a major-version distance, cargo-semver-checks treats *any* change
+      # as already covered by that version bump and skips its lints
+      # entirely (verified locally: "0 checks: 0 pass, 254 skip, Summary no
+      # semver update required" for all five crates against v0.3.0) — so
+      # right up until the tag is actually pushed, this step is structurally
+      # unable to catch a *new* breaking change landing on top of this one;
+      # it would ride under the same already-declared major bump. That's the
+      # real reason `continue-on-error: true` stays even though the known
+      # `Buffered` finding itself no longer reproduces post-bump: the step
+      # isn't protecting anything meaningful pre-tag. Once v0.4.0 is tagged
+      # (this baseline becomes v0.4.0 too, current == baseline again), a
+      # future PR should drop `continue-on-error` so this becomes a real gate
+      # against the new baseline — don't carry the tolerance forward
+      # indefinitely.
+      #
+      # Every crate here has `publish = false` (crates/*/Cargo.toml) — a
+      # `--workspace` cargo-semver-checks invocation silently NO-OPS against
+      # a workspace where every member opts out of publishing (verified: its
+      # entire output is a single "Cloning <tag>" line, no "Checking"/
+      # "Summary" line, exit 0, no warning). This MUST stay a per-crate `-p`
+      # loop; do not "simplify" it back to `--workspace`.
+      #
+      # The loop below also guards against that same no-op reappearing
+      # *inside* a per-crate `-p` invocation in some future tool version: a
+      # real check always prints a line starting with "Summary" (verified
+      # locally against cargo-semver-checks 0.50.0 — "Summary no semver
+      # update required" / "Summary semver requires new..."). If that line
+      # is missing, the crate was silently skipped rather than actually
+      # checked, and that is treated as a hard failure of this step
+      # regardless of cargo-semver-checks's own exit code — a vacuously
+      # "passing" check is worse than a loudly failing one.
+      - name: cargo-semver-checks (advisory until v0.4.0 tags)
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          baseline="${{ steps.semver-baseline.outputs.tag }}"
+          status=0
+          for crate in stridelabs-config stridelabs-observability stridelabs-http stridelabs-auth stridelabs-testing; do
+            echo "::group::cargo semver-checks -p $crate (baseline $baseline)"
+            out="$(cargo semver-checks check-release -p "$crate" --all-features --baseline-rev "$baseline" 2>&1)"
+            check_exit=$?
+            echo "$out"
+            if ! grep -q "Summary" <<<"$out"; then
+              echo "::error::cargo semver-checks produced no 'Summary' line for $crate — it did not actually run the check (e.g. the --workspace publish=false no-op reappearing under -p). Failing loudly instead of passing vacuously."
+              status=1
+            elif [ "$check_exit" -ne 0 ]; then
+              status=1
+            fi
+            echo "::endgroup::"
+          done
+          exit "$status"
+
+  # Deliberately NOT in ci-success's `needs` below, and deliberately its own
+  # job rather than a step in build-test: RustSec advisories are time-varying
+  # (a new RUSTSEC ID can be published against a dependency this repo hasn't
+  # touched between one commit and the next), so a *required* check gated on
+  # them would brick unrelated PRs the day that happens. This job runs on
+  # every push/PR for visibility, but a red run here is a signal for manual
+  # triage (see c7-disclosure-and-advisory.md's Part B for the standing
+  # methodology), not a merge blocker. deny.toml's `[advisories]` section
+  # mirrors this job's currently-assessed-benign findings for anyone running
+  # the full `cargo deny check` locally, but does not run in CI itself.
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@288e746965032cfcc232e09af2daf5f23c14d780 # v2
+        with:
+          tool: cargo-audit
+
+      # --ignore entries mirror deny.toml's [advisories].ignore list exactly
+      # (keep the two in sync): both advisories are assessed unreachable in
+      # c7-disclosure-and-advisory.md §B1 (rsa's Marvin timing side-channel
+      # is dead weight from sqlx-mysql being compiled unconditionally by
+      # sqlx-macros-core, never used — this workspace is Postgres-only; the
+      # event-listener unsound warning is transitive via sqlx-postgres and
+      # already downgraded to informational by cargo-audit's own default
+      # policy). Ignoring them here keeps this job green in the normal case
+      # so a genuinely NEW advisory stands out instead of being lost in
+      # permanent red noise; remove an entry the moment its advisory is
+      # fixed upstream or the reachability assessment changes.
+      - name: cargo audit
+        run: |
+          cargo audit \
+            --ignore RUSTSEC-2023-0071 \
+            --ignore RUSTSEC-2026-0221
+
   # Single required status check the branch ruleset gates on. Keeping it a
   # separate aggregator job means the required check name stays stable even as
-  # the matrix of jobs grows.
+  # the matrix of jobs grows. `audit` is intentionally excluded — see its own
+  # comment above.
   ci-success:
     needs: [build-test]
-    if: always()
+    # `always()` so this still reports on a failed/cancelled build-test
+    # (that's the whole point of the aggregator); `github.event_name !=
+    # 'schedule'` so the weekly cron run — which skips build-test entirely,
+    # see its own `if:` above — doesn't report a stray success/failure with
+    # nothing behind it. Required-check gating is PR-scoped regardless, so
+    # this is about a clean Actions run list, not correctness.
+    if: always() && github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - name: Require all jobs to have passed

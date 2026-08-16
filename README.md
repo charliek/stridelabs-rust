@@ -46,8 +46,14 @@ each crate turns on by default versus behind a feature flag.
 ## Consuming these crates
 
 None of these crates are published to crates.io (`publish = false`
-everywhere) — they're consumed as a **git dependency** over SSH, pinned to
-either a release tag or a commit rev.
+everywhere) — they're consumed as a **git dependency**, pinned to either a
+release tag or a commit rev, fetched over plain `https`.
+
+If this repository (or whatever fork you're pointed at) isn't reachable over
+`https` — a private fork, or a clone from before this repo's own public flip
+— use the SSH + deploy-key recipe in the
+[Appendix: Private-fork / SSH consumption](#appendix-private-fork--ssh-consumption)
+instead. Everything else below assumes the `https` path.
 
 ### Adding the dependency
 
@@ -55,7 +61,7 @@ Once a version is tagged, pin the tag:
 
 ```toml
 [dependencies]
-stridelabs-config = { git = "ssh://git@github.com/charliek/stridelabs-rust.git", tag = "v0.3.0" }
+stridelabs-config = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.4.0" }
 ```
 
 Before the first tag exists — or when depending on a reviewed-but-unreleased
@@ -63,7 +69,7 @@ change — pin the exact commit instead:
 
 ```toml
 [dependencies]
-stridelabs-config = { git = "ssh://git@github.com/charliek/stridelabs-rust.git", rev = "<full commit sha>" }
+stridelabs-config = { git = "https://github.com/charliek/stridelabs-rust.git", rev = "<full commit sha>" }
 ```
 
 `rev` pins are meant to be temporary: once the corresponding change is
@@ -80,7 +86,7 @@ consumer's root `Cargo.toml` — never committed, since it points outside that
 repository:
 
 ```toml
-[patch."ssh://git@github.com/charliek/stridelabs-rust.git"]
+[patch."https://github.com/charliek/stridelabs-rust.git"]
 stridelabs-config = { path = "../stridelabs-rust/crates/config" }
 stridelabs-observability = { path = "../stridelabs-rust/crates/observability" }
 stridelabs-http = { path = "../stridelabs-rust/crates/http" }
@@ -95,16 +101,68 @@ or transitively (e.g. `stridelabs-auth`'s `http` feature depends on
 that feature). A patch entry for a crate the consumer doesn't depend on is
 harmless — Cargo only applies the ones that match a real dependency — so
 listing all five up front, as above, is the simplest thing that stays correct
-as a consumer's dependency set grows.
+as a consumer's dependency set grows. The `[patch]` key must match whichever
+source URL the consumer's `[dependencies]` actually used — `https://…` for
+the primary path above, or the `ssh://…` URL from the appendix if the
+consumer is on that path instead.
 
-### CI authentication for the private git dependency
+### Feature topology (all five crates)
 
-`git@github.com:charliek/stridelabs-rust.git` is a private repo, so a
-consumer's CI needs its own credentials to fetch it — separate from whatever
-`GITHUB_TOKEN` that CI run already has, since `GITHUB_TOKEN` is scoped to the
-*consumer's* repo, not this one. The recipe is a **read-only deploy key**
-registered on this repo, whose private half lives only as an Actions secret
-on the consumer.
+Every crate that defines optional features defaults to `default = []` — a
+consumer opts into the heavier parts of its dependency graph (a TLS stack, a
+database driver, a metrics exporter) explicitly, one feature at a time.
+`stridelabs-config` is the exception: it has no feature flags at all, since
+everything it provides is unconditional. Full detail — including *why* each
+gate exists — lives in each crate's own README; this is the map of what turns
+on what.
+
+| Crate | Feature | Default | Adds |
+|---|---|---|---|
+| `stridelabs-config` | *(none — everything is unconditional)* | — | — |
+| `stridelabs-observability` | `prometheus` | off | `metrics` + `metrics-exporter-prometheus`: recorder install, `status_class`, `DURATION_BUCKETS` |
+| `stridelabs-http` | `cors` | off | `cors_layer`, via `tower-http/cors` |
+| `stridelabs-http` | `openapi` | off | spec canonicalization, `(method, path)` enumeration, committed-spec freshness check, via `utoipa` |
+| `stridelabs-http` | `proxy` | off | reverse-proxy primitives, via `reqwest`/`url`/`bytes`/`futures` |
+| `stridelabs-auth` | `axum` | off | `bearer_token(&Parts)`, via the `http` types crate |
+| `stridelabs-auth` | `http` | off | `From<AuthError> for stridelabs_http::AppError` |
+| `stridelabs-auth` | `test-support` | off | offline JWT minting against two committed throwaway keypairs |
+| `stridelabs-testing` | `postgres` | off | `require_postgres`, via `sqlx`'s Postgres driver + `url` |
+
+`stridelabs-testing`'s `oneshot` and `wiremock` modules have no feature gate
+of their own — both are cheap and every consumer of the crate wants them; only
+the Postgres driver is worth gating.
+
+## Appendix: Private-fork / SSH consumption
+
+Everything above assumes you can `git clone` the repo anonymously over plain
+`https` — true once this repo is public, and true of a public fork regardless
+of this one's own status. If instead you're consuming this repo (or a fork of
+it) while it's **private** — today's state, or a private fork you maintain —
+`https` won't authenticate and you need this appendix's SSH + deploy-key
+recipe instead. The mechanics are the same as the primary path —
+`[dependencies]` with `git =`, `[patch]` for local co-development — just with
+an `ssh://` URL and a deploy key standing in for the credential-free `https`
+fetch.
+
+### Adding the dependency over SSH
+
+```toml
+[dependencies]
+stridelabs-config = { git = "ssh://git@github.com/charliek/stridelabs-rust.git", tag = "v0.4.0" }
+```
+
+Everything from [Adding the dependency](#adding-the-dependency) above
+applies the same way — `rev` pins for pre-tag/unreleased work, one tag/rev
+per consumer regardless of how many of the five crates it uses — just with
+this URL scheme.
+
+### CI authentication for a private git dependency
+
+A consumer's CI needs its own credentials to fetch a private `ssh://` remote
+— separate from whatever `GITHUB_TOKEN` that CI run already has, since
+`GITHUB_TOKEN` is scoped to the *consumer's* repo, not this one. The recipe
+is a **read-only deploy key** registered on the repo being cloned, whose
+private half lives only as an Actions secret on the consumer.
 
 **One-time setup, per consumer repo** (needs admin on both repos; not part of
 any commit — this is an operational step, see the plan's preflight):
@@ -183,27 +241,3 @@ both need their own fetch of this dependency.
 There is no in-place "update" — a rotation is always delete-then-recreate, so
 a compromised key is fully revoked (not merely superseded) the moment step 1
 completes.
-
-### Feature topology (all five crates)
-
-Every crate defaults to `default = []` — a consumer opts into the heavier
-parts of its dependency graph (a TLS stack, a database driver, a metrics
-exporter) explicitly, one feature at a time. Full detail — including *why*
-each gate exists — lives in each crate's own README; this is the map of what
-turns on what.
-
-| Crate | Feature | Default | Adds |
-|---|---|---|---|
-| `stridelabs-config` | *(none — everything is unconditional)* | — | — |
-| `stridelabs-observability` | `prometheus` | off | `metrics` + `metrics-exporter-prometheus`: recorder install, `status_class`, `DURATION_BUCKETS` |
-| `stridelabs-http` | `cors` | off | `cors_layer`, via `tower-http/cors` |
-| `stridelabs-http` | `openapi` | off | spec canonicalization, `(method, path)` enumeration, committed-spec freshness check, via `utoipa` |
-| `stridelabs-http` | `proxy` | off | reverse-proxy primitives, via `reqwest`/`url`/`bytes`/`futures` |
-| `stridelabs-auth` | `axum` | off | `bearer_token(&Parts)`, via the `http` types crate |
-| `stridelabs-auth` | `http` | off | `From<AuthError> for stridelabs_http::AppError` |
-| `stridelabs-auth` | `test-support` | off | offline JWT minting against two committed throwaway keypairs |
-| `stridelabs-testing` | `postgres` | off | `require_postgres`, via `sqlx`'s Postgres driver + `url` |
-
-`stridelabs-testing`'s `oneshot` and `wiremock` modules have no feature gate
-of their own — both are cheap and every consumer of the crate wants them; only
-the Postgres driver is worth gating.

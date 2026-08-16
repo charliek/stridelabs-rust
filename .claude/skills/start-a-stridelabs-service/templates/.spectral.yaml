@@ -1,0 +1,22 @@
+# Spectral config for <service>/openapi.json.
+#
+# Verify locally from the service's crate root:
+#
+#   cargo run --bin <service> -- openapi > openapi.json
+#   bunx @stoplight/spectral-cli@6.16.2 lint openapi.json --fail-severity=warn
+#
+# The version above is PINNED — CI's Spectral step must run the exact same
+# `bunx @stoplight/spectral-cli@6.16.2 lint openapi.json --fail-severity=warn`
+# command so a local pass and a CI pass mean the same thing. Bump it here
+# (and in CI, in the same commit) deliberately, not implicitly via an
+# unpinned `bunx @stoplight/spectral-cli`.
+#
+# No rules disabled: every warning `spectral:oas` raises (missing `servers`,
+# missing per-operation `description`, …) should be fixed by adding real
+# content — a `servers(...)` entry in the `#[derive(OpenApi)]` block, an
+# explicit `description = "..."` on any `#[utoipa::path]` whose doc comment
+# utoipa folds entirely into `summary` — rather than suppressed here. If a
+# rule genuinely does not apply, override it with a comment naming *why*,
+# not a silent deletion.
+extends:
+  - spectral:oas

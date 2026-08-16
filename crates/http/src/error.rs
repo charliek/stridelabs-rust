@@ -126,6 +126,104 @@ impl AppError {
     }
 }
 
+/// Constructing a `502` from a `reqwest::Error` without leaking the upstream
+/// URL (feature `proxy`).
+///
+/// Gated because it takes a `reqwest::Error`, not because `AppError` is:
+/// `AppError` stays always-on, and this `impl` block simply does not exist
+/// without the feature that puts an HTTP client in the graph.
+#[cfg(feature = "proxy")]
+impl AppError {
+    /// The one message every upstream failure shows a client.
+    ///
+    /// Public because a call site that wants its own log message (see
+    /// [`AppError::bad_gateway_upstream_with_context`]) or its own control
+    /// flow can still produce a byte-identical body:
+    /// `AppError::BadGateway(AppError::UPSTREAM_FAILED_MESSAGE.into())`.
+    ///
+    /// It is deliberately the same string spendwise-rs already returns, so
+    /// adopting these constructors changes that service's wire output by
+    /// exactly nothing.
+    pub const UPSTREAM_FAILED_MESSAGE: &'static str = "upstream request failed";
+
+    /// A `502` for an upstream failure: a fixed, detail-free client message,
+    /// and the error's *classification* — never the error — in the log.
+    ///
+    /// [`AppError::BadGateway`]'s payload is returned to the client verbatim
+    /// (only [`AppError::Internal`] is redacted), and `reqwest::Error`'s
+    /// `Display` ends with `" for url ({url})"` — host, port, path and query
+    /// string. So the obvious line,
+    /// `AppError::BadGateway(format!("upstream: {e}"))`, hands the caller the
+    /// upstream's address and whatever was in its query string. This
+    /// constructor is the version that cannot do that: the message is a
+    /// constant, and the diagnosis goes to the log as the structured fields of
+    /// [`UpstreamFailure`](crate::proxy::UpstreamFailure).
+    ///
+    /// `502` rather than [`AppError::Internal`]'s free redaction because a
+    /// failed upstream call genuinely *is* a bad gateway and clients retry
+    /// `502`, not `500`. Redaction is achieved by putting nothing secret in
+    /// the message in the first place.
+    ///
+    /// # For services on this crate's error envelope only
+    ///
+    /// This renders `{"error": {"message", "type"}}`. A service with its own
+    /// wire shape — slauth returns `{"detail": …}` and has its own
+    /// `HydraFailure` variants — **cannot** use it without changing its
+    /// clients' contract, and should not try to. What such a service adopts is
+    /// the layer underneath: `UpstreamFailure::classify` plus
+    /// `UpstreamFailure::log`, keeping its own error type and its own literal
+    /// bodies. That split is the whole reason the classification is a separate,
+    /// envelope-agnostic primitive.
+    ///
+    /// ```no_run
+    /// use stridelabs_http::{AppError, AppResult};
+    ///
+    /// async fn fetch(client: &reqwest::Client, url: &str) -> AppResult<bytes::Bytes> {
+    ///     let response = client
+    ///         .get(url)
+    ///         .send()
+    ///         .await
+    ///         .map_err(|e| AppError::bad_gateway_upstream(&e))?;
+    ///     response
+    ///         .bytes()
+    ///         .await
+    ///         .map_err(|e| AppError::bad_gateway_upstream(&e))
+    /// }
+    /// ```
+    pub fn bad_gateway_upstream(err: &reqwest::Error) -> AppError {
+        AppError::bad_gateway_upstream_with_context(err, AppError::UPSTREAM_FAILED_MESSAGE)
+    }
+
+    /// [`AppError::bad_gateway_upstream`] with a call-site-specific **log**
+    /// message. The client-visible body is identical either way.
+    ///
+    /// The log event is emitted from inside this crate, so its module path,
+    /// file and line all name `stridelabs_http` rather than the call site.
+    /// A service with more than one upstream call — spendwise has a send arm
+    /// and a body-read arm — needs some other way to tell two failures apart
+    /// in a log, and this is it:
+    ///
+    /// ```no_run
+    /// # use stridelabs_http::AppError;
+    /// # async fn example(client: &reqwest::Client, url: &str) -> Result<(), AppError> {
+    /// let response = client.get(url).send().await.map_err(|e| {
+    ///     AppError::bad_gateway_upstream_with_context(&e, "upstream chat-completions request failed")
+    /// })?;
+    /// let _body = response.bytes().await.map_err(|e| {
+    ///     AppError::bad_gateway_upstream_with_context(&e, "reading upstream chat-completions response failed")
+    /// })?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// `context` must be a fixed string. Formatting the error into it puts the
+    /// URL straight back into the log, which no constructor can prevent.
+    pub fn bad_gateway_upstream_with_context(err: &reqwest::Error, context: &str) -> AppError {
+        crate::proxy::UpstreamFailure::classify(err).log(context);
+        AppError::BadGateway(AppError::UPSTREAM_FAILED_MESSAGE.to_string())
+    }
+}
+
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let status = self.status();
@@ -274,11 +372,29 @@ mod tests {
     }
 
     #[test]
+    #[cfg(debug_assertions)]
     #[should_panic(expected = "AppError::custom_client is for 4xx statuses")]
     fn custom_client_rejects_server_errors_in_debug_builds() {
         // `debug_assert!` is compiled in for `cargo test`, so this documents
         // the contract *and* proves the guard is live in CI.
         let _ = AppError::custom_client(StatusCode::BAD_GATEWAY, "oops");
+    }
+
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn custom_client_passes_server_errors_through_in_release_builds() {
+        // `debug_assert!` compiles out in a release build (this crate's test
+        // suite only reaches this arm under `cargo test --release`, since the
+        // workspace's dev/test profile keeps debug assertions on — see
+        // `custom_client_rejects_server_errors_in_debug_builds` for that
+        // path). The misuse no longer panics; it builds the `Custom` variant
+        // with the caller's status kept as-is.
+        // `server_error_custom_is_redacted_in_response` (below) is what
+        // proves the second line of defense — `IntoResponse` redacting that
+        // message — still holds regardless of build profile, so this test
+        // only needs to show construction itself doesn't abort the process.
+        let err = AppError::custom_client(StatusCode::BAD_GATEWAY, "oops");
+        assert_eq!(err.status(), StatusCode::BAD_GATEWAY);
     }
 
     #[tokio::test]

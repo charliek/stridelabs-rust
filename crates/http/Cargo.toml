@@ -18,7 +18,14 @@ cors = ["tower-http/cors"]
 # Off by default for the same reason, only more so: the reverse-proxy
 # primitives drag in an HTTP *client* and a TLS stack, which is a large thing
 # to hand a service that only ever answers requests.
-proxy = ["dep:reqwest", "dep:url", "dep:bytes", "dep:futures"]
+#
+# `tokio/time` rides along because only `buffer_or_stream_within`'s pinned
+# deadline timer needs a clock — the always-on `shutdown` module does not.
+# Today the line is declarative rather than load-bearing: the workspace pins
+# tokio with `full` (root Cargo.toml), so `time` is in every consumer's graph
+# regardless. It stays here so the proxy feature keeps compiling on its own
+# terms if that workspace pin is ever narrowed.
+proxy = ["dep:reqwest", "dep:url", "dep:bytes", "dep:futures", "tokio/time"]
 # Off by default: `utoipa` brings a proc-macro crate (`utoipa-gen`, hence syn)
 # along with it, and a service that doesn't publish an OpenAPI document —
 # or one that publishes it some other way — shouldn't compile that to get
@@ -88,6 +95,12 @@ tokio = { workspace = true, features = [
 # dev-dependencies cannot be feature-gated. It costs consumers nothing — dev
 # deps never enter a downstream graph.
 wiremock = { workspace = true }
+# The `proxy::upstream` leak tests install a capturing subscriber and assert on
+# the bytes it wrote — that no upstream URL or query string is among them.
+# Nothing short of a real subscriber can prove that: `tracing` on its own
+# records fields into a visitor that, with no subscriber installed, is never
+# called. Dev-only, so no consumer's graph is touched.
+tracing-subscriber = { workspace = true }
 # Same deal: only the `openapi` tests use it, to write a committed-spec file
 # the freshness check can be pointed at. Matches `stridelabs-config`'s
 # dev-dependency on it (declared per-crate; nothing else in the workspace

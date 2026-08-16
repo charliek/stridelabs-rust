@@ -12,12 +12,13 @@
 //!
 //! There is no `ApiDoc` here, no security schemes, no `info`/`servers`/`tags`
 //! block, no route list, no exclusion list, and no Swagger-UI wiring. All of
-//! that is **policy**: slauth documents a Kratos session cookie plus a
-//! `slp_live_…` PAT bearer, spendwise documents a slauth-issued JWT bearer
-//! plus a PAT bearer with a different prefix, and neither one's document root
-//! is a thing the other could adopt. A "spec builder" in a shared crate would
-//! have to guess at that shape and would be wrong for at least one consumer,
-//! so the shape stays in the service and only the mechanics live here.
+//! that is **policy**: slauth documents a Kratos session cookie plus a PAT
+//! bearer with its own fixed, recognizable prefix, spendwise documents a
+//! slauth-issued JWT bearer plus a PAT bearer with a different prefix, and
+//! neither one's document root is a thing the other could adopt. A "spec
+//! builder" in a shared crate would have to guess at that shape and would be
+//! wrong for at least one consumer, so the shape stays in the service and
+//! only the mechanics live here.
 //!
 //! # Two conventions worth carrying across services
 //!
