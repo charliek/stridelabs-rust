@@ -1,0 +1,72 @@
+name: CI
+
+# Skeleton CI for a service scaffolded from start-a-stridelabs-service.
+# Fill in <service> (crate/binary name) and adjust the toolchain version to
+# match the pinned one in rust-toolchain.toml / .mise.toml.
+#
+# This assumes the service depends on the stridelabs-* crates as a real git
+# dependency (`git = "https://github.com/charliek/stridelabs-rust.git", tag
+# = "..."`), NOT as a `[patch]` path override — a CI runner has no sibling
+# checkout of stridelabs-rust on disk. If the service's Cargo.toml still has
+# a `[patch]` path override left over from local/offline scaffolding (see
+# the skill's "Choosing how to consume the crates" step), switch it to the
+# git form before this workflow can pass. If stridelabs-rust is still
+# private when this lands, add the ssh-agent + known-hosts +
+# CARGO_NET_GIT_FETCH_WITH_CLI steps from stridelabs-rust's root README
+# ("Appendix: Private-fork / SSH consumption") to every job below that runs
+# `cargo`.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: "1.97.1" # match rust-toolchain.toml / .mise.toml
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (all targets, all features)
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Doc
+        run: cargo doc --all-features --no-deps --locked
+
+      # openapi.json's freshness (a fresh `<service> openapi` export
+      # matching the committed file) is already asserted by `cargo test`
+      # above (tests/openapi_shape.rs's the_committed_openapi_json_matches_a_fresh_export)
+      # — this step only lints the CONTENT of the committed spec.
+      # --fail-severity=warn matches .spectral.yaml's stated policy (no
+      # rules disabled): every spectral:oas rule is severity `warn`, so
+      # without this flag the step exits 0 regardless of warnings and a
+      # newly undocumented route would pass green.
+      - name: Lint openapi.json (Spectral)
+        run: bunx @stoplight/spectral-cli@6.16.2 lint openapi.json --fail-severity=warn
+
+  ci-success:
+    needs: [build-test]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require build-test to have passed
+        run: |
+          if [ "${{ needs.build-test.result }}" != "success" ]; then
+            echo "::error::build-test='${{ needs.build-test.result }}'"
+            exit 1
+          fi

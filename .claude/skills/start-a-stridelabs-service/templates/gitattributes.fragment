@@ -1,0 +1,10 @@
+# --- openapi freshness (stridelabs-http's openapi feature) ---------------
+# The committed OpenAPI spec is compared BYTE-FOR-BYTE against a fresh
+# export (stridelabs_http::openapi::check_committed_spec), and the export
+# side always writes LF. Without this line, a checkout with
+# core.autocrlf=true materializes the file with CRLF endings and the
+# freshness test fails on every line, forever, with nothing wrong in the
+# spec itself. Line endings are deliberately NOT normalized by the check —
+# see stridelabs-http's openapi module docs for why silently accepting CRLF
+# is worse than refusing it.
+openapi.json text eol=lf
