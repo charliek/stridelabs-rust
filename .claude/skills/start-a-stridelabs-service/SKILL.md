@@ -122,9 +122,10 @@ A new service is a plain Cargo **package** (not a workspace) with both a
 lib target is what lets `tests/openapi_shape.rs` (an integration test,
 outside the crate) import the service's own `openapi::spec()`.
 
-```
+```text
 <service>/
   Cargo.toml
+  Cargo.lock                  # generated + COMMITTED before the first CI run — see below
   rust-toolchain.toml        # pin the same toolchain stridelabs-rust pins (see its rust-toolchain.toml)
   .mise.toml                  # same pin, mise form — see "Reaching cargo" above
   .gitattributes             # the templates/gitattributes.fragment line
@@ -146,6 +147,15 @@ Copy `templates/.spectral.yaml` and `templates/ci.yml` verbatim (filling in
 the `<service>` name and toolchain version in the CI file's comments/
 `toolchain:` line). Append `templates/gitattributes.fragment`'s content to
 `.gitattributes` (create the file if the service has none yet).
+
+**Generate and commit `Cargo.lock` before enabling CI.** `templates/ci.yml`
+runs `cargo clippy`, `cargo test`, `cargo build` and `cargo doc` all with
+`--locked` — that flag makes Cargo error out, rather than write a fresh
+lockfile, whenever `Cargo.lock` is missing or stale. Run `cargo build` (or
+`mise exec -- cargo build`) once locally after `Cargo.toml` has its real
+dependency set (Step 2) to generate the file, then commit it alongside the
+rest of the scaffold — a scaffold pushed without it fails every `--locked`
+step in the first CI run.
 
 ## Step 2 — `Cargo.toml`
 
@@ -197,6 +207,11 @@ stridelabs-http = { path = "../stridelabs-rust/crates/http", features = ["openap
 # off; see crates/auth/README.md's feature table before your first
 # protected route.
 stridelabs-auth = { path = "../stridelabs-rust/crates/auth" }
+
+# The one sanctioned `anyhow` boundary — see the requirement right below.
+# Declared here, not left implicit, so the Step 3 handler example (which
+# does `?` into `anyhow::Result`) actually compiles as written.
+anyhow = "1"
 
 [dev-dependencies]
 stridelabs-testing = { path = "../stridelabs-rust/crates/testing" }

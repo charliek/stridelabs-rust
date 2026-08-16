@@ -5,7 +5,7 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning is lockstep across all five crates in this workspace (one
 `[workspace.package].version`, bumped together regardless of which crate(s)
-changed) rather than [Semantic Versioning](https://semver.org/) per crate —
+changed) rather than independent per-crate versioning —
 see the root README's "Consuming these crates" section for what that means
 for a consumer's pin.
 

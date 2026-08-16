@@ -108,11 +108,13 @@ consumer is on that path instead.
 
 ### Feature topology (all five crates)
 
-Every crate defaults to `default = []` — a consumer opts into the heavier
-parts of its dependency graph (a TLS stack, a database driver, a metrics
-exporter) explicitly, one feature at a time. Full detail — including *why*
-each gate exists — lives in each crate's own README; this is the map of what
-turns on what.
+Every crate that defines optional features defaults to `default = []` — a
+consumer opts into the heavier parts of its dependency graph (a TLS stack, a
+database driver, a metrics exporter) explicitly, one feature at a time.
+`stridelabs-config` is the exception: it has no feature flags at all, since
+everything it provides is unconditional. Full detail — including *why* each
+gate exists — lives in each crate's own README; this is the map of what turns
+on what.
 
 | Crate | Feature | Default | Adds |
 |---|---|---|---|
