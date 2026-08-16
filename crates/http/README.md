@@ -16,7 +16,7 @@ add friction.
 |---|---|---|
 | `cors` | off | `cors_layer`, via `tower-http/cors` |
 | `openapi` | off | the `openapi` module — spec canonicalization, `(method, path)` enumeration, committed-spec freshness check — via `utoipa` |
-| `proxy` | off | the `proxy` module, via `reqwest`/`url`/`bytes`/`futures` (and `tokio/time`) |
+| `proxy` | off | the `proxy` module — and `AppError::bad_gateway_upstream`, which takes a `reqwest::Error` — via `reqwest`/`url`/`bytes`/`futures` (and `tokio/time`) |
 
 `proxy` is the gate that matters: it pulls in an HTTP *client* and a TLS
 stack. A service that only answers requests should never compile that, which
@@ -96,6 +96,11 @@ Every error renders as the same body:
 
 `AppError::status()` is public, so a consumer can classify an error (metrics
 label, log field) without rendering it.
+
+`BadGateway`'s payload is verbatim like every other variant's, which is a trap
+when the thing that failed is a `reqwest` call — see
+`AppError::bad_gateway_upstream` under the `proxy` feature below, and the
+redaction bullet next to it.
 
 ### App-specific statuses
 
@@ -527,8 +532,11 @@ async fn proxy(
 | `apply_forwarded(&mut HeaderMap, Option<IpAddr>, &ForwardedPolicy)` | `X-Forwarded-*` synthesis under an explicit trust policy |
 | `relay_response` / `response_from_parts` | `reqwest` → axum translation |
 | `UpstreamClient::build(verify, ca_pem)` | The pooled client |
+| `UpstreamFailure::classify(&reqwest::Error)` | The error reduced to predicates + a total `UpstreamCategory` — no URL, no message |
+| `UpstreamFailure::log(message)` | That classification as `tracing` fields, at `ERROR` |
+| `AppError::bad_gateway_upstream(&reqwest::Error)` | A `502` with a fixed body, logging the classification (also `_with_context` for a per-call-site log message) |
 
-Six behaviors are worth knowing about, because each is a bug someone
+Seven behaviors are worth knowing about, because each is a bug someone
 re-introduces every time this layer gets rewritten:
 
 - **Repeated headers stay repeated.** The header copy appends. An
@@ -582,7 +590,26 @@ re-introduces every time this layer gets rewritten:
   existing chain preserved when there is no peer) or `FillIfAbsent` (slauth's
   post-allow-list fill).
 
+- **An upstream error is not a message you may show anyone.**
+  `reqwest::Error`'s `Display` ends with `" for url ({url})"` and its `Debug`
+  prints the same URL as a field — host, port, path *and query string*. So
+  `AppError::BadGateway(format!("upstream: {e}"))` hands the caller the
+  upstream's address (spendwise-rs shipped exactly that, leaking its provider
+  base URL), and `tracing::error!(error = ?e, …)` puts it in the logs.
+  `UpstreamFailure::classify` is the alternative: four `reqwest` predicates,
+  the `Option<StatusCode>` that only `error_for_status` ever produces, and a
+  **total** `category` — because all four predicates can be false at once
+  (a builder-, redirect- or decode-class error), and an all-false log line
+  says nothing. `AppError::bad_gateway_upstream` is the constructor on top:
+  the client message is a constant, so the body is byte-identical whatever
+  failed and against whichever URL. A service with a **different error
+  envelope** (slauth's `{"detail": …}`) adopts `classify` + `log` only and
+  keeps its own error type and bodies — which is why the classification is a
+  separate primitive rather than a method on `AppError`.
+
 `Buffered` is `#[non_exhaustive]`, so a `match` on it needs a wildcard arm.
+`UpstreamFailure` and `UpstreamCategory` are too — the first because
+`reqwest` can grow a predicate, the second because it can grow an error kind.
 
 `UpstreamClient::build` takes `(verify_certificates: bool, ca_bundle_pem:
 Option<&[u8]>)` rather than limen's config struct, so adopting these

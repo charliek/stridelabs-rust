@@ -95,6 +95,12 @@ tokio = { workspace = true, features = [
 # dev-dependencies cannot be feature-gated. It costs consumers nothing — dev
 # deps never enter a downstream graph.
 wiremock = { workspace = true }
+# The `proxy::upstream` leak tests install a capturing subscriber and assert on
+# the bytes it wrote — that no upstream URL or query string is among them.
+# Nothing short of a real subscriber can prove that: `tracing` on its own
+# records fields into a visitor that, with no subscriber installed, is never
+# called. Dev-only, so no consumer's graph is touched.
+tracing-subscriber = { workspace = true }
 # Same deal: only the `openapi` tests use it, to write a committed-spec file
 # the freshness check can be pointed at. Matches `stridelabs-config`'s
 # dev-dependency on it (declared per-crate; nothing else in the workspace

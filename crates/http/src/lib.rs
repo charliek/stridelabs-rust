@@ -32,7 +32,7 @@
 //! |---|---|---|
 //! | `cors` | off | `cors::cors_layer`, via `tower-http/cors` |
 //! | `openapi` | off | `openapi` — spec canonicalization, route enumeration and a freshness check, via `utoipa` |
-//! | `proxy` | off | `proxy` — reverse-proxy primitives, via `reqwest`/`url`/`bytes`/`futures` (and `tokio/time`) |
+//! | `proxy` | off | `proxy` — reverse-proxy primitives, plus `AppError::bad_gateway_upstream` (it takes a `reqwest::Error`) — via `reqwest`/`url`/`bytes`/`futures` (and `tokio/time`) |
 //!
 //! `proxy` is the one that really earns its gate: it pulls in an HTTP
 //! *client* and a TLS stack, which no service that merely answers requests

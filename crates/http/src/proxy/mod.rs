@@ -6,7 +6,8 @@
 //! client request's path into an upstream URL, how to hand a `reqwest`
 //! response back to axum, how to buffer a body without letting an unbounded
 //! one buffer, how to state (rather than relay) the `X-Forwarded-*` context,
-//! and how to build the upstream client.
+//! how to build the upstream client, and how to say what went wrong upstream
+//! without handing anyone the upstream's URL.
 //!
 //! What did change is the shape of the seams. Every one of these was private
 //! to limen, and two of them reached into limen's config types; here they are
@@ -62,9 +63,11 @@ mod forwarded;
 mod relay;
 #[cfg(test)]
 mod test_support;
+mod upstream;
 
 pub use body::{buffer_or_stream, buffer_or_stream_within, buffer_request_or_stream, Buffered};
 pub use client::{ClientBuildError, UpstreamClient};
 pub use filter::{connection_tokens, filter_headers, request_has_body, Direction, HOP_BY_HOP};
 pub use forwarded::{apply_forwarded, ForwardedPolicy, XffPolicy, XfpPolicy};
 pub use relay::{build_upstream_url, relay_response, response_from_parts};
+pub use upstream::{UpstreamCategory, UpstreamFailure};
