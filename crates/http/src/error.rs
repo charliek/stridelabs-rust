@@ -372,11 +372,29 @@ mod tests {
     }
 
     #[test]
+    #[cfg(debug_assertions)]
     #[should_panic(expected = "AppError::custom_client is for 4xx statuses")]
     fn custom_client_rejects_server_errors_in_debug_builds() {
         // `debug_assert!` is compiled in for `cargo test`, so this documents
         // the contract *and* proves the guard is live in CI.
         let _ = AppError::custom_client(StatusCode::BAD_GATEWAY, "oops");
+    }
+
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn custom_client_passes_server_errors_through_in_release_builds() {
+        // `debug_assert!` compiles out in a release build (this crate's test
+        // suite only reaches this arm under `cargo test --release`, since the
+        // workspace's dev/test profile keeps debug assertions on — see
+        // `custom_client_rejects_server_errors_in_debug_builds` for that
+        // path). The misuse no longer panics; it builds the `Custom` variant
+        // with the caller's status kept as-is.
+        // `server_error_custom_is_redacted_in_response` (below) is what
+        // proves the second line of defense — `IntoResponse` redacting that
+        // message — still holds regardless of build profile, so this test
+        // only needs to show construction itself doesn't abort the process.
+        let err = AppError::custom_client(StatusCode::BAD_GATEWAY, "oops");
+        assert_eq!(err.status(), StatusCode::BAD_GATEWAY);
     }
 
     #[tokio::test]

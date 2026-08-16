@@ -37,8 +37,8 @@
 //! about a slauth deployment, not a contract of the token format; treat it as
 //! an opaque OIDC subject.
 //!
-//! Two deliberate hardenings over the spendwise original, both pinned in the
-//! plan this crate was written from:
+//! Two deliberate hardenings over the original implementation this crate
+//! replaced, both pinned in the plan this crate was written from:
 //!
 //! - **An empty `sub` is rejected** ([`AuthError::MissingSubject`]). The
 //!   original accepted `""` and would have keyed a user row on it.

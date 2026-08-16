@@ -132,7 +132,8 @@ impl Verifier {
         // set_issuer/set_audience only validate the claims WHEN PRESENT —
         // jsonwebtoken's `Validation::new` requires only `exp`, so without
         // this line a token that simply omits `iss` or `aud` sails through.
-        // (The spendwise original has this hole; hardening, not parity.)
+        // (The original implementation this crate replaced omitted this
+        // line and had that hole; hardening, not parity.)
         validation.set_required_spec_claims(&["exp", "iss", "aud"]);
 
         let data = decode::<Claims>(token, &key, &validation).map_err(|err| invalid_token(&err))?;
@@ -146,9 +147,9 @@ impl Verifier {
             .filter(|email| !email.is_empty())
             .ok_or(AuthError::MissingEmail)?;
 
-        // Hardening over the spendwise original, which accepted `sub: ""`.
-        // An empty subject is the same collapse-to-one-user failure as an
-        // empty email, one layer down.
+        // Hardening over the original implementation this crate replaced,
+        // which accepted `sub: ""`. An empty subject is the same
+        // collapse-to-one-user failure as an empty email, one layer down.
         if data.claims.sub.is_empty() {
             return Err(AuthError::MissingSubject);
         }
@@ -212,9 +213,10 @@ mod tests {
     fn rejects_a_token_missing_its_issuer_or_audience() {
         // `set_issuer`/`set_audience` alone validate those claims only when
         // they are PRESENT — `set_required_spec_claims` is what makes
-        // omission fatal. Regression test for a review-found hole (present
-        // in the spendwise original too): without it, dropping `iss` or
-        // `aud` from an otherwise-valid token bypassed both checks.
+        // omission fatal. Regression test for a review-found hole (the
+        // original implementation this crate replaced had the same gap):
+        // without it, dropping `iss` or `aud` from an otherwise-valid token
+        // bypassed both checks.
         for claim in ["iss", "aud"] {
             let mut claims = claims()
                 .subject("kratos-uuid-1")

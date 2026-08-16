@@ -42,7 +42,7 @@
 //! cache. Holding a lock across an await is usually a smell; here it is the
 //! mechanism.
 //!
-//! # Departures from the spendwise original
+//! # Departures from the original implementation this crate replaced
 //!
 //! The cache is an *instance*, not a `static OnceLock`, and it holds an
 //! injected `reqwest::Client` instead of calling `reqwest::get` (which builds

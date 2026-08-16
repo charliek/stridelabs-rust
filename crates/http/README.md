@@ -32,21 +32,23 @@ build.
 
 ```toml
 [dependencies]
-stridelabs-http = { git = "ssh://git@github.com/charliek/stridelabs-rust.git", tag = "v0.3.0" }
+stridelabs-http = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.4.0" }
 
 # with the CORS layer builder:
-stridelabs-http = { git = "ssh://git@github.com/charliek/stridelabs-rust.git", tag = "v0.3.0", features = ["cors"] }
+stridelabs-http = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.4.0", features = ["cors"] }
 
 # for a service that proxies to an upstream:
-stridelabs-http = { git = "ssh://git@github.com/charliek/stridelabs-rust.git", tag = "v0.3.0", features = ["proxy"] }
+stridelabs-http = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.4.0", features = ["proxy"] }
 
 # for a service that publishes an OpenAPI document:
-stridelabs-http = { git = "ssh://git@github.com/charliek/stridelabs-rust.git", tag = "v0.3.0", features = ["openapi"] }
+stridelabs-http = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.4.0", features = ["openapi"] }
 ```
 
 (During development against an unreleased commit, pin `rev = "<sha>"`
 instead of `tag`; see the workspace root README for the local `[patch]`
-co-development snippet.)
+co-development snippet. If you're consuming a private fork rather than this
+repo directly, see that same README's "Private-fork / SSH consumption"
+appendix for the `ssh://` form instead.)
 
 ## `error` — `AppError` and the wire contract
 
@@ -461,11 +463,11 @@ the failures that otherwise produce a "the files look identical" diff.
 
 There is **no `ApiDoc`, no security schemes, no `info`/`servers`/`tags`
 block, no route list, no exclusion list, and no Swagger-UI wiring.** That is
-all policy: slauth documents a Kratos session cookie plus a `slp_live_…` PAT
-bearer, spendwise documents a slauth-issued JWT bearer plus a PAT bearer with
-a different prefix, and neither one's document root is a thing the other
-could adopt. A "spec builder" here would have to guess at that shape and be
-wrong for at least one consumer.
+all policy: slauth documents a Kratos session cookie plus a PAT bearer with
+its own fixed, recognizable prefix, spendwise documents a slauth-issued JWT
+bearer plus a PAT bearer with a different prefix, and neither one's document
+root is a thing the other could adopt. A "spec builder" here would have to
+guess at that shape and be wrong for at least one consumer.
 
 ### Two conventions that live in the module docs, not here
 
@@ -594,8 +596,9 @@ re-introduces every time this layer gets rewritten:
   `reqwest::Error`'s `Display` ends with `" for url ({url})"` and its `Debug`
   prints the same URL as a field — host, port, path *and query string*. So
   `AppError::BadGateway(format!("upstream: {e}"))` hands the caller the
-  upstream's address (spendwise-rs shipped exactly that, leaking its provider
-  base URL), and `tracing::error!(error = ?e, …)` puts it in the logs.
+  upstream's address (exactly the class of leak this module exists to close
+  — an internal provider base URL configured via environment is a realistic
+  example), and `tracing::error!(error = ?e, …)` puts it in the logs.
   `UpstreamFailure::classify` is the alternative: four `reqwest` predicates,
   the `Option<StatusCode>` that only `error_for_status` ever produces, and a
   **total** `category` — because all four predicates can be false at once

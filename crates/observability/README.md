@@ -22,15 +22,17 @@ unless asked for.
 
 ```toml
 [dependencies]
-stridelabs-observability = { git = "ssh://git@github.com/charliek/stridelabs-rust.git", tag = "v0.3.0" }
+stridelabs-observability = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.4.0" }
 
 # with Prometheus wiring:
-stridelabs-observability = { git = "ssh://git@github.com/charliek/stridelabs-rust.git", tag = "v0.3.0", features = ["prometheus"] }
+stridelabs-observability = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.4.0", features = ["prometheus"] }
 ```
 
 (During development against an unreleased commit, pin `rev = "<sha>"`
 instead of `tag`; see the workspace root README for the local `[patch]`
-co-development snippet.)
+co-development snippet. If you're consuming a private fork rather than this
+repo directly, see that same README's "Private-fork / SSH consumption"
+appendix for the `ssh://` form instead.)
 
 ## `logging` — tracing subscriber setup
 

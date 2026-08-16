@@ -36,14 +36,17 @@ Verification decodes keys from the JWKS, never from PEM, so put the feature in
 
 ```toml
 [dependencies]
-stridelabs-auth = { git = "ssh://git@github.com/charliek/stridelabs-rust.git", tag = "v0.3.0", features = ["axum", "http"] }
+stridelabs-auth = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.4.0", features = ["axum", "http"] }
 
 [dev-dependencies]
-stridelabs-auth = { git = "ssh://git@github.com/charliek/stridelabs-rust.git", tag = "v0.3.0", features = ["test-support"] }
+stridelabs-auth = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.4.0", features = ["test-support"] }
 ```
 
 (During development against an unreleased commit, pin `rev = "<sha>"` instead
-of `tag`; see the workspace root README for the local `[patch]` snippet.)
+of `tag`; see the workspace root README for the local `[patch]` snippet. If
+you're consuming a private fork rather than this repo directly, see that
+same README's "Private-fork / SSH consumption" appendix for the `ssh://`
+form instead.)
 
 ## Verifying a token
 
@@ -93,7 +96,8 @@ no such variant, so a token carrying it fails to parse before any check runs.
 happens to be the Kratos identity UUID and services key their user rows on it,
 but nothing here parses or validates its shape.
 
-Two deliberate hardenings over the spendwise original:
+Two deliberate hardenings over the original implementation this crate
+replaced:
 
 - **An empty `sub` is rejected** (`AuthError::MissingSubject`). The original
   accepted `""`, which would key every emptily-subjected token onto one user.
@@ -144,8 +148,9 @@ strings end up in logs.
 `AuthError::InvalidToken` is the only variant whose payload derives from the
 token at all, and it is a *classification*: the `jsonwebtoken` error kind is
 mapped to one of a fixed set of phrases, never rendered with `Display`. That
-is a departure from spendwise's `format!("token rejected: {e}")`, whose output
-for a malformed-claims error can quote the claim value that failed to parse.
+is a departure from the original implementation this crate replaced, whose
+`format!("token rejected: {e}")` could quote the claim value that failed to
+parse.
 
 With the `http` feature:
 

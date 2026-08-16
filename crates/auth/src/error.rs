@@ -14,9 +14,9 @@
 //! the token at all, and even it is a *classification*: the `jsonwebtoken`
 //! error kind is mapped to one of a fixed set of phrases by the crate's
 //! `invalid_token`, never rendered with `Display`. That is a deliberate
-//! departure from spendwise's `format!("token rejected: {e}")`, whose output
-//! for a malformed-claims error can quote the claim value that failed to
-//! deserialize.
+//! departure from the original implementation this crate replaced, whose
+//! `format!("token rejected: {e}")` could quote the claim value that failed
+//! to deserialize.
 //!
 //! # Why this crate has its own error type
 //!

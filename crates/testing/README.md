@@ -25,12 +25,14 @@ just to get the `oneshot` helpers.
 
 ```toml
 [dev-dependencies]
-stridelabs-testing = { git = "ssh://git@github.com/charliek/stridelabs-rust.git", tag = "v0.3.0", features = ["postgres"] }
+stridelabs-testing = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.4.0", features = ["postgres"] }
 ```
 
 (During development against an unreleased commit, pin `rev = "<sha>"` instead
 of `tag`; see the workspace root README for the local `[patch]` co-development
-snippet.)
+snippet. If you're consuming a private fork rather than this repo directly,
+see that same README's "Private-fork / SSH consumption" appendix for the
+`ssh://` form instead.)
 
 ## `postgres` — fail loud, never skip
 

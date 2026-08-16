@@ -1,0 +1,128 @@
+# cargo-deny configuration.
+#
+# Cribbed from limen's deny.toml (the org's other cargo-deny adopter) and
+# extended to match this workspace's own dependency graph — the allow-list
+# below was derived from a real `mise exec -- cargo deny check licenses` run
+# against this repo's Cargo.lock under `--all-features` (315 crates, 12
+# distinct license terms once dev-only/all-features-only branches like
+# stridelabs-testing's sqlx feature are included), not copied blind. See the
+# C5 commit / plan 002 §W5 for the source audit.
+#
+# Wired into CI as a three-section check (`cargo deny check licenses bans
+# sources`, see .github/workflows/ci.yml's build-test job) — the
+# `[advisories]` section below exists for local/manual `cargo deny check`
+# (all sections) runs, but deliberately does NOT run as a CI gate; see the
+# note on `[advisories]` for why.
+#
+# Docs: https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+# The workspace's own dependency graph across every feature combination —
+# `--all-features` is what CI's clippy/test/doc steps already build with, and
+# is what the license/advisory sweep in c7-disclosure-and-advisory.md audited
+# against, so this must match. (EmbarkStudios/cargo-deny-action's own
+# `arguments` input also defaults to `--all-features` on the CI side — a
+# harmless overlap with this setting, not a conflict; this file is the
+# authoritative source of truth either way, since it's also what a local
+# `mise exec -- cargo deny check` picks up with no flags at all.)
+all-features = true
+
+[advisories]
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+# Deliberately NOT run in CI (see .github/workflows/ci.yml: the build-test
+# job's cargo-deny step is scoped to `check licenses bans sources` only). A
+# separate, non-required `audit` job runs `cargo-audit` instead —
+# advisories are time-varying (a new RUSTSEC ID can land between commits
+# with no code change), so gating a *required* check on them would brick
+# unrelated PRs.
+# Splitting the concerns this way means exactly one tool (cargo-audit) owns
+# "is there a live advisory," and cargo-deny here owns licenses/bans/sources
+# only. This section is kept accurate anyway for whoever runs the full
+# `cargo deny check` locally, so it doesn't disagree with the audit job's
+# published assessment.
+ignore = [
+    # rsa 0.9.10, Marvin Attack timing side-channel. Reachable only through
+    # sqlx-mysql's caching_sha2_password/sha256_password auth exchange;
+    # sqlx-mysql is compiled in only because sqlx-macros-core depends on all
+    # three backend crates unconditionally for its proc-macro query
+    # checking. This workspace's actual sqlx feature selection
+    # (workspace.dependencies.sqlx in Cargo.toml) is Postgres-only — no
+    # `mysql` feature, no MySQL connection ever opened. Assessed unreachable
+    # in c7-disclosure-and-advisory.md §B1; no fix is available upstream.
+    "RUSTSEC-2023-0071",
+    # event-listener 5.4.1, unsound `!Send` crossing a thread boundary via
+    # StackSlot. Transitive via sqlx-core/sqlx-postgres (the path this
+    # workspace actually uses); cargo-audit's own default policy already
+    # treats this as an informational "allowed warning," not a
+    # severity-scored vulnerability. Assessed unreachable in
+    # c7-disclosure-and-advisory.md §B1.
+    "RUSTSEC-2026-0221",
+]
+
+[licenses]
+# Licenses allowed for any crate in the dependency graph. Base set cribbed
+# from limen's deny.toml (the permissive baseline: MIT / Apache-2.0 /
+# Apache-2.0 WITH LLVM-exception / BSD-2-Clause / BSD-3-Clause), extended
+# with the non-obvious entries this graph actually needs, each justified from
+# the real `cargo deny list` output (c7-disclosure-and-advisory.md §B3):
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    # unicode-ident and friends (unicode-ident, unicode-width, ...) ship
+    # under the Unicode data-and-software license's 2024 successor term.
+    # Permissive; same rationale limen already recorded for it.
+    "Unicode-3.0",
+    # ring (TLS crypto primitives, transitively via rustls/reqwest).
+    # Permissive; same rationale limen already recorded for it.
+    "ISC",
+    # webpki-roots (Mozilla's root CA bundle, pulled in transitively by
+    # reqwest's rustls-tls-native-roots feature). A data license covering the
+    # cert bundle, not code — permissive in substance. Same rationale limen
+    # already recorded for it.
+    "CDLA-Permissive-2.0",
+    # ryu (float-to-string formatting, transitive via serde_json). Permissive
+    # (Boost Software License). Not present in limen's graph/allow-list —
+    # new to this workspace's dependency set.
+    "BSL-1.0",
+    # aho-corasick / memchr (both dual-license "MIT OR Unlicense"; regex's
+    # dependency chain). Permissive public-domain-equivalent. Not present in
+    # limen's graph/allow-list — new to this workspace's dependency set.
+    "Unlicense",
+    # foldhash (transitive via hashbrown, itself transitive via sqlx-core and
+    # metrics-util). Permissive; the same term limen's deny.toml already
+    # allows, cribbed unchanged. Only shows up under `--all-features`
+    # (stridelabs-testing's sqlx feature), which is why an
+    # all-features-only-graph scan is required to find it — see `[graph]`
+    # above.
+    "Zlib",
+]
+# r-efi 5.3.0/6.0.0 is NOT in the allow-list above despite carrying
+# LGPL-2.1-or-later: its actual Cargo.toml license field is the disjunctive
+# SPDX expression "MIT OR Apache-2.0 OR LGPL-2.1-or-later" (verified via the
+# crate's own manifest, both versions in the lockfile). cargo-deny satisfies
+# an OR expression if ANY one term is allowed — MIT and Apache-2.0 already
+# are — so no `licenses.exceptions` entry is needed; the LGPL branch is
+# simply the alternative this graph doesn't take. r-efi itself is also
+# target-gated: it reaches the graph only via getrandom's UEFI backend
+# (`cargo tree -i r-efi@5.3.0/6.0.0 --target all --all-features`), never
+# compiled for the linux/macos targets this workspace actually ships to.
+confidence-threshold = 0.8
+
+[bans]
+# Default posture kept: multiple versions of the same crate in the graph
+# (e.g. r-efi 5.3.0 AND 6.0.0, syn 1.x AND 2.x) are normal in a 315-crate
+# resolved graph and not, by themselves, a problem worth failing CI over.
+multiple-versions = "allow"
+
+[sources]
+# Defaults kept — every dependency here resolves from crates.io; nothing in
+# this workspace pulls a crate from an arbitrary git remote or a private
+# registry, so denying unknown sources costs nothing and catches a future
+# supply-chain surprise (e.g. a typo'd `git =` dependency) for free.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

@@ -14,9 +14,9 @@
 //! AppError::BadGateway(format!("upstream: {e}"))    // to the CLIENT -> leaks
 //! ```
 //!
-//! What is in that URL is service-specific and rarely harmless: spendwise's
-//! is `FIREWORKS_BASE_URL` (an internal provider endpoint — and this is
-//! exactly the leak that repo shipped), slauth's carries Hydra's
+//! What is in that URL is service-specific and rarely harmless: one service's
+//! is an internal provider endpoint configured via environment — exactly the
+//! class of leak this redaction exists to close — slauth's carries Hydra's
 //! login/consent/logout **challenge tokens** in the query, and a proxy's
 //! carries the caller's own query string, which it then hands back to the
 //! caller in an error body.
@@ -744,9 +744,9 @@ mod tests {
     /// Characterization, not aspiration: `AppError::BadGateway(String)` still
     /// renders its payload to the client verbatim, exactly as its own docs
     /// promise. That contract is unchanged by this module — which is *why*
-    /// `bad_gateway_upstream` exists: the naive line below is the one
-    /// spendwise-rs shipped, and it hands the caller the upstream URL and its
-    /// query string.
+    /// `bad_gateway_upstream` exists: the naive line below is the shape an
+    /// upstream-calling service ships without this constructor, and it hands
+    /// the caller the upstream URL and its query string.
     ///
     /// It runs both paths side by side so the difference is the test: the same
     /// error, one line that leaks it and one that cannot. If someone ever makes
