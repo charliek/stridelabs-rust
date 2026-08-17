@@ -45,6 +45,12 @@ pin, matching `stridelabs-rust`'s (Step 1 lists this file):
 rust = "1.97.1"
 ```
 
+Run `mise trust` once from the new service's directory before the first
+`mise exec` call — a `.mise.toml` mise has never seen before (any fresh
+clone or, here, a scaffold that just wrote its own) is untrusted by default,
+and `mise exec` refuses to read it until you do, failing with a trust
+prompt rather than silently falling back to a bare `cargo`.
+
 With that in place, every `cargo` invocation below — from inside the new
 service's directory — is `mise exec -- cargo ...`. If `mise` genuinely isn't
 installed in a given environment, a bare `cargo`/`rustc` on PATH is the
@@ -147,6 +153,11 @@ Copy `templates/.spectral.yaml` and `templates/ci.yml` verbatim (filling in
 the `<service>` name and toolchain version in the CI file's comments/
 `toolchain:` line). Append `templates/gitattributes.fragment`'s content to
 `.gitattributes` (create the file if the service has none yet).
+
+`.spectral.yaml` is a dotfile — a bare `ls` in the new service's root won't
+show it, so a copy that silently failed (wrong destination, typo'd filename)
+is easy to miss. Confirm it's actually there with `ls -a` (or `ls -la`)
+before moving on.
 
 **Generate and commit `Cargo.lock` before enabling CI.** `templates/ci.yml`
 runs `cargo clippy`, `cargo test`, `cargo build` and `cargo doc` all with
@@ -345,7 +356,16 @@ pub struct Pong {
     pub message: String,
 }
 
-#[utoipa::path(get, path = "/ping", tag = "ping", responses((status = 200, body = Pong)))]
+// The explicit `description =` matters: Spectral's operation-description
+// rule runs at Step 7's `--fail-severity=warn`, and a doc comment alone
+// becomes only the `summary` (see templates/.spectral.yaml's header).
+#[utoipa::path(
+    get,
+    path = "/ping",
+    tag = "ping",
+    description = "Liveness example — returns a static pong body.",
+    responses((status = 200, body = Pong))
+)]
 async fn ping() -> axum::Json<Pong> {
     axum::Json(Pong { message: "pong".to_string() })
 }
@@ -364,10 +384,40 @@ use crate::state::AppState;
 
 #[derive(OpenApiDerive)]
 #[openapi(
-    info(title = "pingd", version = "0.1.0"),
+    info(
+        title = "pingd",
+        version = "0.1.0",
+        // Spectral's info-description rule wants more than the title
+        // restated — replace this with a real paragraph covering what the
+        // service's API surface is and what it deliberately excludes
+        // (health checks, internal-only routes), same as slauth
+        // backend-rs's `src/http/openapi.rs`.
+        description = "Example ping service scaffolded by the \
+                        start-a-stridelabs-service skill — replace this \
+                        with a real description of the service's API \
+                        surface.",
+        // Satisfies Spectral's info-contact rule (contact-properties, off
+        // by default, additionally wants all three of name/url/email — cheap
+        // to satisfy now). Replace with this service's real owner/contact.
+        contact(
+            name = "StrideLabs",
+            url = "https://github.com/charliek/stridelabs-rust",
+            email = "engineering@stridelabs.example"
+        )
+    ),
     // Spectral's oas3-api-servers rule wants a non-empty `servers` array —
     // see templates/.spectral.yaml's header comment.
-    servers((url = "/", description = "This service, relative to wherever it is deployed."))
+    servers((url = "/", description = "This service, relative to wherever it is deployed.")),
+    // The load-bearing rule here is operation-tag-defined: every tag a
+    // route uses (here, `ping.rs`'s `#[utoipa::path(tag = "ping")]`) must
+    // be declared in this document-level `tags` array — declaring it here,
+    // not just on the route, is what avoids a fix-and-regenerate cycle at
+    // Step 7's Spectral lint. Add one entry per tag the service actually
+    // uses. (openapi-tags/tag-description are off by default; the
+    // description is cheap to carry anyway.)
+    tags(
+        (name = "ping", description = "Liveness/example route — replace with this service's real tags.")
+    )
 )]
 struct ApiDoc;
 
