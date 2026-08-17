@@ -49,7 +49,7 @@ Run `mise trust` once from the new service's directory before the first
 `mise exec` call — a `.mise.toml` mise has never seen before (any fresh
 clone or, here, a scaffold that just wrote its own) is untrusted by default,
 and `mise exec` refuses to read it until you do, failing with a trust
-prompt rather than silently falling back to a bare `cargo`.
+error rather than silently falling back to a bare `cargo`.
 
 With that in place, every `cargo` invocation below — from inside the new
 service's directory — is `mise exec -- cargo ...`. If `mise` genuinely isn't
@@ -357,8 +357,9 @@ pub struct Pong {
 }
 
 // The explicit `description =` matters: Spectral's operation-description
-// rule runs at Step 7's `--fail-severity=warn`, and a doc comment alone
-// becomes only the `summary` (see templates/.spectral.yaml's header).
+// rule runs at Step 7's `--fail-severity=warn`, and a one-line doc comment
+// becomes only the `summary` — utoipa maps only lines after the first to
+// `description` (see templates/.spectral.yaml's header).
 #[utoipa::path(
     get,
     path = "/ping",
