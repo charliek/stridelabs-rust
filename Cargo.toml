@@ -81,7 +81,7 @@ jsonwebtoken = { version = "9", default-features = false }
 sha2 = "0.10"
 
 # Misc
-rand = "0.9"
+rand = "0.10"
 uuid = { version = "1", features = ["v4", "serde"] }
 time = { version = "0.3", features = ["serde"] }
 bytes = "1"
