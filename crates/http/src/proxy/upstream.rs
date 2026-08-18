@@ -16,7 +16,8 @@
 //!
 //! What is in that URL is service-specific and rarely harmless: one service's
 //! is an internal provider endpoint configured via environment — exactly the
-//! class of leak this redaction exists to close — slauth's carries Hydra's
+//! class of leak this redaction exists to close; the one belonging to slauth,
+//! the StrideLabs auth service, carries Hydra's
 //! login/consent/logout **challenge tokens** in the query, and a proxy's
 //! carries the caller's own query string, which it then hands back to the
 //! caller in an error body.
@@ -53,7 +54,7 @@ use http::StatusCode;
 ///
 /// Built only by [`UpstreamFailure::classify`]. The fields keep `reqwest`'s
 /// `is_*` spelling on purpose — they are exactly the predicates it exposes,
-/// and exactly the field names slauth and spendwise already emit, so adopting
+/// and exactly the field names existing consumers already emit, so adopting
 /// this type doesn't rename a field an operator has a query saved against.
 ///
 /// `#[non_exhaustive]`: `reqwest` can grow a predicate (this crate deliberately
@@ -76,7 +77,7 @@ pub struct UpstreamFailure {
     /// Narrower than it looks: a *truncated response body* read through
     /// `Response::bytes()` is a **decode** error in reqwest 0.12, not a body
     /// error, so this stays false and [`UpstreamFailure::category`] reports
-    /// [`UpstreamCategory::Decode`]. Both slauth and spendwise log
+    /// [`UpstreamCategory::Decode`]. Existing consumers log
     /// `is_body` at their body-read sites today and get `false` for exactly
     /// the failure they are logging; the category is what fixes that.
     pub is_body: bool,
@@ -85,8 +86,8 @@ pub struct UpstreamFailure {
     ///
     /// Usually `None`, and that is not a defect: a failure that reached a
     /// status at all is a response the caller already has in hand, so most
-    /// call sites never build a `reqwest::Error` from one (neither slauth nor
-    /// spendwise nor limen uses `error_for_status`). It is here so the field
+    /// call sites never build a `reqwest::Error` from one (none of the
+    /// originating services uses `error_for_status`). It is here so the field
     /// exists for the sites that do, rather than being silently dropped.
     pub status: Option<StatusCode>,
     /// The single most specific name for this failure — total, so a log line
@@ -257,8 +258,8 @@ impl UpstreamFailure {
     ///
     /// - **`message` must be a fixed string.** Formatting the error into it
     ///   (`&format!("{e}")`) puts the URL back, and no helper can stop that.
-    ///   Pass a literal that names the call site, the way spendwise's two
-    ///   sites do ("upstream chat-completions request failed" vs. "reading
+    ///   Pass a literal that names the call site, the way a two-site consumer
+    ///   does ("upstream chat-completions request failed" vs. "reading
     ///   upstream chat-completions response failed").
     /// - **The event's callsite metadata is this crate's**, not yours:
     ///   `target`, module path, file and line all point at

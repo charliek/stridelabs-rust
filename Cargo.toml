@@ -33,9 +33,9 @@ http = "1"
 stridelabs-http = { path = "crates/http" }
 
 # HTTP client (proxy primitives, JWKS fetch). rustls with BOTH webpki and
-# OS-native roots — matching limen, whose client these primitives are ported
+# OS-native roots — matching the reverse proxy these primitives were extracted
 # from: without native roots, upstreams trusted via the system store (mkcert
-# local CAs, corporate roots) verify in limen but fail here. Still no openssl.
+# local CAs, corporate roots) verify there but fail here. Still no openssl.
 reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls",
     "rustls-tls-native-roots",

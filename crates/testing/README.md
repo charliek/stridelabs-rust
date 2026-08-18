@@ -2,8 +2,8 @@
 
 Test-only helpers for StrideLabs services: a fail-loud real-Postgres pool, a
 `tower::ServiceExt::oneshot` wrapper for axum `Router`s, and a one-line
-wiremock JSON stub. Extracted from the ad hoc idioms duplicated across
-spendwise-rs's integration tests.
+wiremock JSON stub. Extracted from the ad hoc idioms duplicated across an
+existing service's integration tests.
 
 This crate is meant to sit in a consumer's **`[dev-dependencies]`**, never
 `[dependencies]` — nothing here has any business in a production binary.
@@ -50,8 +50,8 @@ connection can't be established within 2 seconds, **it panics** — naming the
 URL it tried (password redacted), the `DATABASE_URL` env var, and the command
 to bring the database up (`docker compose up -d`, or `make up`).
 
-This is a direct replacement for the pattern nine of spendwise-rs's eleven
-test files carried: a `setup()`/`pool_or_skip()` pair that printed a note to
+This is a direct replacement for the pattern nine of eleven test files in one
+service carried: a `setup()`/`pool_or_skip()` pair that printed a note to
 stderr and returned `None` when Postgres wasn't reachable, silently skipping
 every test built on top of it. A green `cargo test` under that pattern proved
 nothing — the database-backed behavior might never have run. There is no
@@ -66,14 +66,14 @@ business knowing an app's migration runner or schema. Build your own
 use sqlx::PgPool;
 use stridelabs_testing::require_postgres;
 
-const DEFAULT_DATABASE_URL: &str = "postgres://postgres:localdev@localhost:5437/spendwise_test";
+const DEFAULT_DATABASE_URL: &str = "postgres://postgres:localdev@localhost:5437/myapp_test";
 
 /// A pool against a real, migrated database. Every test that touches the
 /// database calls this — never `require_postgres` directly — so the
 /// migration runner is wired in exactly one place.
 pub async fn migrated_pool() -> PgPool {
     let pool = require_postgres(DEFAULT_DATABASE_URL).await;
-    spendwise::db::migrate(&pool).await.expect("run migrations");
+    myapp::db::migrate(&pool).await.expect("run migrations");
     pool
 }
 
@@ -87,7 +87,7 @@ pub async fn seeded_pool() -> PgPool {
 
 **Test isolation is explicitly out of scope for this version.** There is no
 schema-per-test or transactional rollback here; consumers keep whatever
-shared-database strategy they already use (spendwise-rs: random UUID
+shared-database strategy they already use (for example: random UUID
 identifiers per test, so concurrent tests never collide on a unique
 constraint). Schema-per-test is future work, not a silent limitation — it's
 a decision, recorded here.
@@ -132,8 +132,8 @@ let body = body_json(response).await;
 - `body_json(response)` — read a response body to completion and parse it as
   `serde_json::Value`.
 
-Ported from the `get`/`body_json` pair duplicated across spendwise-rs's
-integration tests (e.g. `tests/auth.rs:42-53`) and the same
+Carried over from the `get`/`body_json` pair duplicated across an existing
+service's integration tests, and the same
 `tower::ServiceExt::oneshot` idiom `stridelabs-http`'s own `cors` tests
 already use — one router built once, then driven with plain
 `http::Request`/`Response` values instead of a bound socket and a real HTTP

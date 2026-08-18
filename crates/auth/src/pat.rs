@@ -6,8 +6,8 @@
 //! (`sw_a1b2c3d4`) that lets a user tell their tokens apart in a list. The raw
 //! value is shown once, at creation, and never again.
 //!
-//! Ported from spendwise-rs's `auth::token`, with the prefix turned into a
-//! parameter: `sw_` is that service's brand, not a shared crate's.
+//! The prefix is a parameter: `sw_` is one service's brand, not a shared
+//! crate's.
 //!
 //! # What this module is not
 //!
@@ -136,8 +136,8 @@ impl PatFormat {
 
     /// Does `raw` start with this prefix?
     ///
-    /// **A `starts_with` and nothing more** — deliberately, and matching what
-    /// spendwise checks inline today. It is a cheap "this looks like one of
+    /// **A `starts_with` and nothing more** — deliberately, matching what
+    /// consuming services check inline. It is a cheap "this looks like one of
     /// ours" filter that lets a service skip a database round-trip for a
     /// bearer token that is obviously a JWT instead. It validates neither the
     /// length nor the alphabet of what follows, and a `true` here says

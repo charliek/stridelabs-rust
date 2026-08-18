@@ -1,8 +1,8 @@
 //! An explicit-origin CORS layer builder (feature `cors`).
 //!
-//! New API rather than a port: spendwise-rs parses a `cors_origins` config
-//! list and then never uses it, and limen has no browser-facing surface at
-//! all. This is the shape both should have had — the policy comes entirely
+//! New API rather than a port: one originating service parses a `cors_origins`
+//! config list and then never uses it, and the other has no browser-facing
+//! surface at all. This is the shape both should have had — the policy comes entirely
 //! from the caller (origins, methods, headers), so nothing about one
 //! service's front-end is baked into a shared crate.
 //!

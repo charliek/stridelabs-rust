@@ -1,7 +1,8 @@
 //! Graceful-shutdown primitives.
 //!
-//! Ported from limen's `http::server`, where both functions were private
-//! helpers. Only these two are extracted: limen's *bounded drain* (stop
+//! Carried over from a production reverse proxy's `http::server`, where both
+//! functions were private helpers. Only these two are extracted: that
+//! proxy's *bounded drain* (stop
 //! accepting, then wait out in-flight requests up to a configured timeout)
 //! is embedded in its `serve_with_shutdown` and is entangled with that
 //! service's config and its background refresh task — there is no standalone

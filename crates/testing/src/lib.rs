@@ -2,11 +2,11 @@
 //! (feature `postgres`), `tower::ServiceExt::oneshot` helpers for axum
 //! `Router`s, and a one-line wiremock JSON stub.
 //!
-//! Extracted from the ad hoc idioms duplicated across spendwise-rs's
+//! Extracted from the ad hoc idioms duplicated across an existing service's
 //! integration tests: nine of its eleven test files carried their own
 //! `setup()`/`pool_or_skip()` pair that **silently skipped** whenever
 //! Postgres wasn't reachable, and its own copy of the `get`/`body_json`
-//! oneshot pair (e.g. `tests/auth.rs:23-53`). This crate exists to kill the
+//! oneshot pair. This crate exists to kill the
 //! first pattern outright and let the second be written once.
 //!
 //! # Feature topology

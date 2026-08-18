@@ -1,9 +1,9 @@
 //! Truthful method classification for axum routes: which methods a route
 //! actually serves, and a truthful `405` for every other one.
 //!
-//! Ported from slauth's `backend-rs/src/http/route_util.rs`
+//! Carried over from a service's route-classification helpers
 //! (`CLASSIFIED_METHODS`, `route_serving_over`/`refusing_unserved_over`,
-//! `method_filter`), which exists because `axum::routing::MethodRouter`
+//! `method_filter`), which exist because `axum::routing::MethodRouter`
 //! gets two things wrong for a route that only names the methods it serves:
 //!
 //! | request | a plain `get()`/`post()`/… route | what a truthful route should do |
@@ -36,7 +36,8 @@
 //! [`CLASSIFIED_METHODS`] is all nine methods axum's `MethodFilter` can
 //! represent (`GET`, `HEAD`, `POST`, `PUT`, `DELETE`, `CONNECT`, `OPTIONS`,
 //! `TRACE`, `PATCH`) — the right universe for a route that should 405
-//! *anything* it doesn't serve. But slauth's reverse proxies deliberately
+//! *anything* it doesn't serve. But the reverse proxies in slauth, the
+//! StrideLabs auth service, deliberately
 //! judge against only **eight** of them: a proxy leg that has never handled
 //! `CONNECT` keeps falling through to axum's own (untruthful) fallback
 //! for `CONNECT` specifically, because closing that gap would be a new

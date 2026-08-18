@@ -3,9 +3,10 @@
 //! graceful-shutdown primitives, and (behind a feature) the mechanical layer
 //! of a reverse proxy.
 //!
-//! Extracted from spendwise-rs's `error.rs` (the [`error::AppError`] enum and
-//! its redacting [`axum::response::IntoResponse`] impl) and limen's
-//! `http::{server,proxy,body,client}` (the shutdown pair and the whole of
+//! Extracted from an existing service's `error.rs` (the [`error::AppError`]
+//! enum and its redacting [`axum::response::IntoResponse`] impl) and a
+//! production reverse proxy's `http::{server,proxy,body,client}` (the
+//! shutdown pair and the whole of
 //! `proxy`). The pieces that were only ever
 //! *implicit* in those services — a security-headers layer, an
 //! explicit-origin CORS builder — are written here as first-class API so
@@ -18,7 +19,7 @@
 //! would only add friction. `methods` is pure `axum::routing` — no
 //! `reqwest`, no client, nothing the `proxy` gate exists to keep out — which
 //! is why it sits alongside `error`/`headers`/`shutdown` rather than behind
-//! `proxy`, even though its first consumer (slauth) uses it mostly on
+//! `proxy`, even though its first consumer uses it mostly on
 //! reverse-proxy routes.
 //!
 //! Note that the feature-gated modules below are named in plain code spans,

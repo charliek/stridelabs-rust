@@ -1,8 +1,8 @@
 //! A real `tower` layer for request-id resolution and propagation.
 //!
-//! Ported from limen's `observability::request_id`, which exposed the
-//! resolve/generate logic as free functions called by hand at the proxy's
-//! call site (`http/proxy.rs`). That only works because limen has exactly
+//! Carried over from an existing service's `observability::request_id`, which
+//! exposed the resolve/generate logic as free functions called by hand at the
+//! proxy's call site. That only works because that service has exactly
 //! one call site; a shared crate needs the behavior to attach to *any*
 //! axum/tower service declaratively, so this is rebuilt as a proper
 //! [`tower::Layer`]/[`tower::Service`] pair: add [`RequestIdLayer`] to a

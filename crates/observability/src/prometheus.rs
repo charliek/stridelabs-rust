@@ -4,10 +4,11 @@
 //! off) — most consumers don't render `/metrics`, and the exporter +
 //! `metrics` facade would be dead weight for the ones that don't.
 //!
-//! Ported from limen's `observability::prometheus` (`install`,
-//! `status_class`, `DURATION_BUCKETS`). Deliberately NOT ported: limen's
-//! domain metric wrappers (`record_request`, `InFlight`, the shadow-traffic
-//! and circuit-breaker gauges, …) — those are bound to limen's specific
+//! Carried over from an existing service's `observability::prometheus`
+//! (`install`, `status_class`, `DURATION_BUCKETS`). Deliberately NOT
+//! extracted: that service's domain metric wrappers (`record_request`,
+//! `InFlight`, the shadow-traffic and circuit-breaker gauges, …) — those are
+//! bound to its specific
 //! metric names and shadow-proxy domain, not a generic primitive. A consumer
 //! defines its own metric names and emits through the `metrics` facade
 //! directly; this module only owns recorder installation and the

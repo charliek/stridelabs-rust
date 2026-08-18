@@ -7,19 +7,18 @@ patterns and practices live here once, so services stay consistent.
 **Status: all five crates implemented.** The workspace scaffold (Cargo
 workspace, CI, toolchain pins) and `stridelabs-config`,
 `stridelabs-observability`, `stridelabs-http`, `stridelabs-auth` and
-`stridelabs-testing` are all in place. Next up is adopting them into
-spendwise-rs. See `slauth/plans/rust-migration.md` for scope and sequencing,
-and each crate's own README for its full API and feature topology.
+`stridelabs-testing` are all in place. See each crate's own README for its
+full API and feature topology.
 
 ## Crates
 
 | Crate | Status | Contents | Seeded from |
 |---|---|---|---|
-| `stridelabs-config` | Implemented | Env-var config helpers + layered file loading with field-pathed errors | spendwise-rs `config.rs`, limen `config/load.rs` |
-| `stridelabs-observability` | Implemented | tracing init (json/pretty), request-ID tower layer, Prometheus wiring | limen `observability/` |
-| `stridelabs-http` | Implemented | `AppError`→`IntoResponse` convention, security-headers + CORS layers, graceful shutdown, reverse-proxy primitives (feature `proxy`), OpenAPI spec mechanics (feature `openapi`) | spendwise-rs `error.rs`, limen `http/`, slauth `http/openapi.rs` |
-| `stridelabs-auth` | Implemented | slauth resource-server client: rate-limited JWKS cache, RS256 verification, bearer extraction, PAT hashing, offline test-key minting | spendwise-rs `auth/` |
-| `stridelabs-testing` | Implemented | Fail-loud real-Postgres pool, `oneshot` axum router-test helpers, a one-line wiremock JSON stub | spendwise-rs test idioms, hardened |
+| `stridelabs-config` | Implemented | Env-var config helpers + layered file loading with field-pathed errors | Two existing services' config loaders |
+| `stridelabs-observability` | Implemented | tracing init (json/pretty), request-ID tower layer, Prometheus wiring | A production reverse proxy's `observability` module |
+| `stridelabs-http` | Implemented | `AppError`→`IntoResponse` convention, security-headers + CORS layers, graceful shutdown, reverse-proxy primitives (feature `proxy`), OpenAPI spec mechanics (feature `openapi`) | An existing service's `error.rs`, a reverse proxy's HTTP layer, and the `http/openapi.rs` of slauth, the StrideLabs auth service |
+| `stridelabs-auth` | Implemented | slauth resource-server client: rate-limited JWKS cache, RS256 verification, bearer extraction, PAT hashing, offline test-key minting | An existing service's `auth/` module |
+| `stridelabs-testing` | Implemented | Fail-loud real-Postgres pool, `oneshot` axum router-test helpers, a one-line wiremock JSON stub | Existing integration-test idioms, hardened |
 
 See [§ Feature topology](#feature-topology-all-five-crates) below for what
 each crate turns on by default versus behind a feature flag.
@@ -35,7 +34,7 @@ each crate turns on by default versus behind a feature flag.
   `stridelabs-testing::require_postgres` is the concrete example: it panics
   with a message naming the env var and the compose/`make up` command rather
   than silently skipping the test, which is exactly the `pool_or_skip()`
-  pattern it exists to replace (nine of spendwise-rs's eleven test files had
+  pattern it exists to replace (nine of eleven test files in one service had
   their own copy). A green test suite must mean the behavior it claims to
   cover actually ran.
 - OpenAPI default for services: utoipa 5 + utoipa-axum, Swagger UI dev-gated,

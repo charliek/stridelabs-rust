@@ -5,8 +5,9 @@
 //! resolved base directory so callers can locate sibling files referenced
 //! relative to the config (e.g. a TLS bundle path, a contract file).
 //!
-//! This generalizes limen's `config::load::load` (which hardcoded one
-//! `Config` type and one format, YAML) over any `DeserializeOwned` type and
+//! This generalizes the original loader it was extracted from (which
+//! hardcoded one `Config` type and one format, YAML) over any
+//! `DeserializeOwned` type and
 //! exposes both YAML and JSON as separate functions — no by-extension format
 //! dispatch, so there is no surprise when a `.yml` file is fed to the JSON
 //! loader or vice versa.
