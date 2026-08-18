@@ -7,7 +7,7 @@ services:
       POSTGRES_PASSWORD: localdev
       POSTGRES_DB: stridelabs_test
     ports:
-      # 5438, not spendwise-rs's 5437, so both stacks can run locally at once.
+      # 5438 to avoid colliding with other local stacks.
       - "5438:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data

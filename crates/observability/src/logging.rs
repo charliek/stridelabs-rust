@@ -1,7 +1,8 @@
 //! `tracing` subscriber setup.
 //!
-//! Ported from limen's `observability::logging::init`, which hard-codes the
-//! format switch behind a `LIMEN_LOG_FORMAT` env-var read taken inside the
+//! Carried over from an existing service's `observability::logging::init`,
+//! which hard-codes the format switch behind a service-specific env-var read
+//! taken inside the
 //! function. A shared crate can't assume every consumer wants that exact
 //! variable name (or wants an env var at all — a test harness might want to
 //! force JSON unconditionally), so here the format is a plain parameter;

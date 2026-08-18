@@ -1,13 +1,13 @@
 //! The house application error type and its HTTP representation.
 //!
-//! Ported from spendwise-rs's `backend/src/error.rs`. The wire contract is
+//! Carried over from an existing service's `error.rs`. The wire contract is
 //! preserved exactly — status mapping, the redaction of internal detail, and
 //! the `{"error": {"message", "type"}}` body shape — because services already
 //! ship clients that read it.
 //!
 //! Two deliberate departures from the original:
 //!
-//! - **No `PaymentRequired` variant.** It exists in spendwise because that
+//! - **No `PaymentRequired` variant.** It exists in the original because that
 //!   service has a monthly budget; a shared crate has no business knowing
 //!   about budgets. Apps that need it define a one-line helper over
 //!   [`AppError::custom_client`] instead of growing the shared enum.
@@ -49,7 +49,7 @@ pub enum AppError {
     #[error("{0}")]
     BadGateway(String),
     /// An app-specific client error, for statuses this enum has no variant
-    /// for (spendwise's `402 Payment Required`, a `409`-adjacent `423
+    /// for (a `402 Payment Required`, a `409`-adjacent `423
     /// Locked`, …).
     ///
     /// Marked `#[non_exhaustive]` so it cannot be built with struct-literal
@@ -141,9 +141,9 @@ impl AppError {
     /// flow can still produce a byte-identical body:
     /// `AppError::BadGateway(AppError::UPSTREAM_FAILED_MESSAGE.into())`.
     ///
-    /// It is deliberately the same string spendwise-rs already returns, so
-    /// adopting these constructors changes that service's wire output by
-    /// exactly nothing.
+    /// It is deliberately the same string the service this was extracted from
+    /// already returns, so adopting these constructors changes that
+    /// service's wire output by exactly nothing.
     pub const UPSTREAM_FAILED_MESSAGE: &'static str = "upstream request failed";
 
     /// A `502` for an upstream failure: a fixed, detail-free client message,
@@ -199,8 +199,8 @@ impl AppError {
     ///
     /// The log event is emitted from inside this crate, so its module path,
     /// file and line all name `stridelabs_http` rather than the call site.
-    /// A service with more than one upstream call — spendwise has a send arm
-    /// and a body-read arm — needs some other way to tell two failures apart
+    /// A service with more than one upstream call — a send arm
+    /// and a body-read arm, say — needs some other way to tell two failures apart
     /// in a log, and this is it:
     ///
     /// ```no_run

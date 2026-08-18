@@ -1,8 +1,8 @@
 //! Helpers over `tower::ServiceExt::oneshot` for driving an axum `Router`
 //! directly in tests, without binding a socket.
 //!
-//! Ported from the ad hoc `get`/`body_json` pair duplicated across
-//! spendwise-rs's integration tests (e.g. `tests/auth.rs:42-53`) and the same
+//! Carried over from the ad hoc `get`/`body_json` pair duplicated across an
+//! existing service's integration tests, and the same
 //! oneshot idiom this workspace's own `stridelabs-http` crate already uses in
 //! its `cors` tests. [`req`] is the general form the other three are built
 //! from, for the request shapes they don't cover (a non-GET/POST method, a

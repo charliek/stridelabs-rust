@@ -1,9 +1,9 @@
-//! The resource-server half of slauth: verify the RS256 access tokens that
-//! slauth (Ory Hydra) issues, and hash the personal access tokens a service
-//! issues for itself.
+//! The resource-server half of slauth, the StrideLabs auth service: verify the
+//! RS256 access tokens that slauth (Ory Hydra) issues, and hash the personal
+//! access tokens a service issues for itself.
 //!
-//! Extracted from spendwise-rs's `auth::{slauth, token, mod}`. A service that
-//! adopts this crate holds one [`Verifier`] in its application state, hands it
+//! A service that adopts this crate holds one [`Verifier`] in its
+//! application state, hands it
 //! a bearer token per request, and gets back a [`VerifiedIdentity`]. Mapping
 //! that identity to a database row — find-or-create, linking, admin checks —
 //! stays in the service: it is the part that differs everywhere.
@@ -14,9 +14,9 @@
 //!
 //! let verifier = Verifier::new(
 //!     SlauthConfig {
-//!         issuer: "https://auth.stridelabs.ai".into(),
-//!         jwks_url: "https://auth.stridelabs.ai/.well-known/jwks.json".into(),
-//!         audience: "spendwise".into(),
+//!         issuer: "https://auth.example.com".into(),
+//!         jwks_url: "https://auth.example.com/.well-known/jwks.json".into(),
+//!         audience: "my-service".into(),
 //!         pat_validate_url: None,
 //!     },
 //!     reqwest::Client::new(),

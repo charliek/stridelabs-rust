@@ -2,9 +2,8 @@
 //! (feature `openapi`): a canonicalizing serializer, an exhaustive
 //! `(method, path)` enumerator, and a committed-spec freshness check.
 //!
-//! Extracted from slauth's `src/http/openapi.rs` and
-//! `tests/openapi_shape.rs`, which had all three and needed none of them to
-//! be about slauth. Every function here takes a
+//! Extracted from a service that had all three and needed none of them to
+//! be service-specific. Every function here takes a
 //! [`utoipa::openapi::OpenApi`] that the *caller* built and knows nothing
 //! about what is in it.
 //!
@@ -12,8 +11,9 @@
 //!
 //! There is no `ApiDoc` here, no security schemes, no `info`/`servers`/`tags`
 //! block, no route list, no exclusion list, and no Swagger-UI wiring. All of
-//! that is **policy**: slauth documents a Kratos session cookie plus a PAT
-//! bearer with its own fixed, recognizable prefix, spendwise documents a
+//! that is **policy**: slauth, the StrideLabs auth service, documents a
+//! Kratos session cookie plus a PAT bearer with its own fixed, recognizable
+//! prefix, while a resource server documents a
 //! slauth-issued JWT bearer plus a PAT bearer with a different prefix, and
 //! neither one's document root is a thing the other could adopt. A "spec
 //! builder" in a shared crate would have to guess at that shape and would be
@@ -217,7 +217,7 @@ pub fn documented_pairs(spec: &OpenApi) -> BTreeSet<(String, String)> {
 /// are cloned out of the document — so every consumer that compares against a
 /// hand-written list needs the same `.map(|(m, p)| (m.to_string(),
 /// p.to_string())).collect()`. Three independent copies of that closure
-/// existed before this function did: slauth's, this README's, and this
+/// existed before this function did: a consumer's, this README's, and this
 /// module's own tests'. It lives here so the conversion tracks
 /// [`documented_pairs`]' return type by construction; the tests below use it
 /// for exactly that reason, so a change to one side cannot compile against a

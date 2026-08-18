@@ -3,8 +3,7 @@
 The house `AppError` → HTTP convention, a security-headers layer, an
 explicit-origin CORS builder, graceful-shutdown primitives, the mechanical
 layer of a reverse proxy, and the mechanics of publishing an OpenAPI document,
-for StrideLabs axum services. Extracted from spendwise-rs's `error.rs`,
-limen's `http/`, and slauth's `http/openapi.rs`.
+for StrideLabs axum services.
 
 ## Feature topology
 
@@ -46,9 +45,7 @@ stridelabs-http = { git = "https://github.com/charliek/stridelabs-rust.git", tag
 
 (During development against an unreleased commit, pin `rev = "<sha>"`
 instead of `tag`; see the workspace root README for the local `[patch]`
-co-development snippet. If you're consuming a private fork rather than this
-repo directly, see that same README's "Private-fork / SSH consumption"
-appendix for the `ssh://` form instead.)
+co-development snippet.)
 
 ## `error` — `AppError` and the wire contract
 
@@ -106,7 +103,7 @@ redaction bullet next to it.
 
 ### App-specific statuses
 
-There is no `PaymentRequired` variant — a budget is spendwise's concern, not
+There is no `PaymentRequired` variant — a budget is one service's concern, not
 a shared crate's. Statuses this enum doesn't name go through the one
 constructor for `Custom`:
 
@@ -213,15 +210,15 @@ above) is the cheapest defense.
   `CLASSIFIED_METHODS.iter().filter(|m| **m != Method::CONNECT)` instead, so
   an unhandled `CONNECT` keeps falling through to axum's own fallback rather
   than picking up a new (untested) truthful answer as a side effect of
-  adopting this helper. That's slauth's adoption shape, not a recommendation
-  — a service with no such history should classify all nine.
+  adopting this helper. That's the adoption shape of slauth, the StrideLabs
+  auth service — not a recommendation; a service with no such history should
+  classify all nine.
 - **Serving the whole universe is a no-op, not a panic.** If `served`
   already covers everything in `universe`, `refusing_unserved_over` returns
   `router` unchanged; there is nothing left to refuse. `method_filter`
   mirrors this at one level down — an empty input is `None`, never a panic,
   because a shared crate can't assume every caller derives its input from a
-  route's own non-empty method list the way the single adoption target
-  (slauth's `route_util.rs`) does.
+  route's own non-empty method list the way slauth's own route list does.
 - **Duplicate methods are fine.** OR-ing the same `MethodFilter` bit twice
   is a no-op, so a served or universe list with repeats folds the same as
   its deduplicated form.
@@ -306,8 +303,9 @@ axum::serve(listener, app)
   makes a one-sender/many-servers fan-out correct. It also returns when every
   sender is dropped.
 
-**Not extracted:** limen's bounded drain (stop accepting, then wait out
-in-flight requests up to a timeout). It's embedded in that service's
+**Not extracted:** the bounded drain of the reverse proxy these primitives
+came from (stop accepting, then
+wait out in-flight requests up to a timeout). It's embedded in that service's
 `serve_with_shutdown` and entangled with its config and background tasks —
 there is no standalone primitive to lift, and inventing one here would be
 designing a new API rather than sharing a proven one. The drain stays
@@ -321,8 +319,7 @@ own. `wait_for_shutdown` is fully tested.
 ## `openapi` feature — spec mechanics, not a spec
 
 The parts of publishing an OpenAPI document that every service gets wrong the
-same way, extracted from slauth's `src/http/openapi.rs` and
-`tests/openapi_shape.rs`. Everything here takes an
+same way. Everything here takes an
 `utoipa::openapi::OpenApi` the *caller* built and knows nothing about what is
 in it.
 
@@ -464,7 +461,8 @@ the failures that otherwise produce a "the files look identical" diff.
 There is **no `ApiDoc`, no security schemes, no `info`/`servers`/`tags`
 block, no route list, no exclusion list, and no Swagger-UI wiring.** That is
 all policy: slauth documents a Kratos session cookie plus a PAT bearer with
-its own fixed, recognizable prefix, spendwise documents a slauth-issued JWT
+its own fixed, recognizable prefix, while a resource server documents a
+slauth-issued JWT
 bearer plus a PAT bearer with a different prefix, and neither one's document
 root is a thing the other could adopt. A "spec builder" here would have to
 guess at that shape and be wrong for at least one consumer.
@@ -481,7 +479,7 @@ Both are stated in full, once, in the `openapi` module docs —
 stridelabs-http --features openapi --open`. They are **not** restated here on
 purpose: this convention was previously written out at length in three places,
 and a wrong version of the `nest`/`merge` claim propagated into two
-repositories before review caught it (#11, slauth#35). One copy, next to the
+repositories before review caught it (#11). One copy, next to the
 `documented_pairs` that guards both.
 
 **On the exhaustive match** and **on `utoipa`'s features** (this crate enables
@@ -491,9 +489,10 @@ module docs, which carry the reasoning and the utoipa-5.x details.
 
 ## `proxy` feature — reverse-proxy primitives
 
-Ported from limen (a reverse proxy for service migrations) with no behavior
-change — specifically the parts that are generic HTTP-proxy plumbing rather
-than limen's own shadow-traffic and comparison machinery, which stays there.
+Carried over from a production reverse proxy (used for service migrations)
+with no behavior change — specifically the parts that are generic HTTP-proxy
+plumbing rather than that proxy's own shadow-traffic and comparison
+machinery, which stays there.
 
 ```rust
 use stridelabs_http::proxy::{
@@ -588,7 +587,7 @@ re-introduces every time this layer gets rewritten:
   inbound header is removed first, and a scheme that isn't a URI scheme per
   RFC 3986 (`"https, http"` included) is not written, so the upstream sees no
   header rather than the caller's claim. `XffPolicy` covers the chain:
-  `Append` (limen's multi-line-aware append, one combined line out, an
+  `Append` (the originating reverse proxy's multi-line-aware append, one combined line out, an
   existing chain preserved when there is no peer) or `FillIfAbsent` (slauth's
   post-allow-list fill).
 
@@ -615,8 +614,8 @@ re-introduces every time this layer gets rewritten:
 `reqwest` can grow a predicate, the second because it can grow an error kind.
 
 `UpstreamClient::build` takes `(verify_certificates: bool, ca_bundle_pem:
-Option<&[u8]>)` rather than limen's config struct, so adopting these
-primitives doesn't mean adopting limen's configuration model. Reading the
+Option<&[u8]>)` rather than the originating reverse proxy's config struct, so adopting
+these primitives doesn't mean adopting that proxy's configuration model. Reading the
 bundle is the caller's job — hence bytes, and hence no `CaRead` variant in
 `ClientBuildError`. Per-request timeouts are also left to call sites: they
 are per-route policy and don't belong on a client shared by every route.

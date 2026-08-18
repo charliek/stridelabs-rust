@@ -1,8 +1,8 @@
 //! A fail-loud real-Postgres pool for integration tests (feature `postgres`).
 //!
-//! Ported from the `setup()`/`pool_or_skip()` pair duplicated across nine of
-//! spendwise-rs's eleven test files (e.g. `tests/auth.rs:23-40`,
-//! `tests/db.rs:14-31`), minus the one thing that made it worth replacing:
+//! Carried over from the `setup()`/`pool_or_skip()` pair duplicated across
+//! nine of eleven test files in an existing service, minus the one thing that
+//! made it worth replacing:
 //! when Postgres wasn't reachable, those helpers printed a note to stderr and
 //! returned `None`, and every call site treated that as "skip this test". A
 //! green `cargo test` run under that pattern proves nothing about whether the
@@ -25,8 +25,9 @@
 //!
 //! Test isolation beyond that (a fresh schema per test, transactional
 //! rollback) is explicitly out of scope for this crate's first version;
-//! spendwise-rs keeps its existing shared-database, random-UUID-identifier
-//! strategy. Schema-per-test is future work.
+//! adopting services keep whatever shared-database strategy they already use
+//! (for example random UUID identifiers per test). Schema-per-test is future
+//! work.
 
 use std::time::Duration;
 

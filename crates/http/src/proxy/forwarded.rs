@@ -23,7 +23,8 @@
 //!
 //! ## The set-if-absent coincidence (the canonical warning)
 //!
-//! slauth's Hydra leg copies request headers through a static allow-list and
+//! The Hydra leg of slauth, the StrideLabs auth service, copies request
+//! headers through a static allow-list and
 //! then applies its overrides. `x-forwarded-proto` is not in that allow-list,
 //! so a client-sent value never survives the copy, so set-if-absent and
 //! override produce byte-identical requests today. That equivalence is a
@@ -37,10 +38,11 @@
 //! rather than being spelled `SetIfAbsent`, which reads like a mere absence
 //! check instead of the trust delegation it is.
 //!
-//! # Ported from
+//! # Carried over from
 //!
-//! limen's `http::forwarded::apply` (the XFF append semantics, exactly —
-//! including the parts one would not choose fresh; they are called out at
+//! A production reverse proxy's `http::forwarded::apply` (the XFF append
+//! semantics, exactly — including the parts one would not choose fresh; they
+//! are called out at
 //! [`XffPolicy::Append`]) and slauth's `ProxyPolicy` override list. Neither
 //! service's own header names, allow-lists or scheme constants come with it.
 
@@ -58,7 +60,8 @@ const X_FORWARDED_PROTO: &str = "x-forwarded-proto";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum XffPolicy {
     /// Append this hop's view of the peer to whatever chain arrived — standard
-    /// reverse-proxy semantics, carried from limen unchanged. Four details are
+    /// reverse-proxy semantics, carried unchanged from the reverse proxy this
+    /// was extracted from. Four details are
     /// load-bearing and all four are pinned by tests:
     ///
     /// - **Multi-line aware.** A `HeaderMap` can hold one name as several
@@ -73,7 +76,7 @@ pub enum XffPolicy {
     ///   a fronting load balancer recorded. With no peer the header is left
     ///   exactly as it arrived, lines and all — nothing is re-rendered.
     /// - **Empty and non-UTF-8 existing lines are dropped**, silently. This is
-    ///   limen's behavior carried knowingly rather than a decision defended on
+    ///   the original's behavior carried knowingly rather than a decision defended on
     ///   the merits: such a line cannot name a real hop, and no rendering of
     ///   it would be read the same way by a downstream parser. It is worth
     ///   knowing when reading a chain that is shorter than expected.
@@ -339,7 +342,7 @@ fn is_uri_scheme(scheme: &str) -> bool {
         && bytes.all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
 }
 
-/// limen's append: every existing line, then this hop's peer, written back as
+/// The original's append: every existing line, then this hop's peer, written back as
 /// one line — and nothing at all when there is no peer, which is what leaves an
 /// existing chain untouched instead of re-rendered.
 fn append_forwarded_for(headers: &mut HeaderMap, client_ip: Option<IpAddr>) {
@@ -513,7 +516,7 @@ mod tests {
 
     #[test]
     fn empty_and_non_utf8_existing_lines_are_dropped() {
-        // Carried knowingly from limen: a line that is empty or not visible
+        // Carried knowingly from the original: a line that is empty or not visible
         // ASCII is skipped rather than propagated. It cannot be a real hop,
         // and there is no rendering of it that a downstream parser would read
         // the same way.

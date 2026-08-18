@@ -1,8 +1,8 @@
 # stridelabs-auth
 
-The resource-server half of slauth: verify the RS256 access tokens slauth (Ory
-Hydra) issues, and hash the personal access tokens a service issues for
-itself. Extracted from spendwise-rs's `auth::{slauth, token, mod}`.
+The resource-server half of slauth, the StrideLabs auth service: verify the
+RS256 access tokens slauth (Ory Hydra) issues, and hash the personal access
+tokens a service issues for itself.
 
 A service holds one `Verifier` in its application state, hands it a bearer
 token per request, and gets back a `VerifiedIdentity`. Turning that identity
@@ -43,10 +43,7 @@ stridelabs-auth = { git = "https://github.com/charliek/stridelabs-rust.git", tag
 ```
 
 (During development against an unreleased commit, pin `rev = "<sha>"` instead
-of `tag`; see the workspace root README for the local `[patch]` snippet. If
-you're consuming a private fork rather than this repo directly, see that
-same README's "Private-fork / SSH consumption" appendix for the `ssh://`
-form instead.)
+of `tag`; see the workspace root README for the local `[patch]` snippet.)
 
 ## Verifying a token
 
@@ -55,9 +52,9 @@ use stridelabs_auth::{SlauthConfig, Verifier};
 
 let verifier = Verifier::new(
     SlauthConfig {
-        issuer: "https://auth.stridelabs.ai".into(),
-        jwks_url: "https://auth.stridelabs.ai/.well-known/jwks.json".into(),
-        audience: "spendwise".into(),
+        issuer: "https://auth.example.com".into(),
+        jwks_url: "https://auth.example.com/.well-known/jwks.json".into(),
+        audience: "my-service".into(),
         pat_validate_url: None,
     },
     http_client.clone(),
@@ -202,11 +199,11 @@ if format.has_prefix(raw) {
 }
 ```
 
-- The prefix is a parameter (`sw_` is spendwise's brand, not a shared crate's),
+- The prefix is a parameter (`sw_` is one service's brand, not a shared crate's),
   validated as non-empty, ≤ 16 bytes, ASCII alphanumeric/`_`/`-`. The ASCII
   rule is load-bearing: the display prefix is a byte slice.
-- `has_prefix` is **a `starts_with` and nothing more** — deliberately, matching
-  what spendwise checks inline today. It is a cheap "looks like one of ours"
+- `has_prefix` is **a `starts_with` and nothing more** — deliberately. It is a
+  cheap "looks like one of ours"
   filter that skips a database round-trip for an obvious JWT. It validates
   neither the length nor the alphabet of the rest, and a `true` says nothing
   about validity; only the hash lookup does.

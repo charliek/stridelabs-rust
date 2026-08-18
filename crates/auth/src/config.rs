@@ -13,12 +13,12 @@ use serde::Deserialize;
 /// performs; it stays in the consuming app's config next to its redirect URI.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SlauthConfig {
-    /// Expected `iss` claim, e.g. `https://auth.stridelabs.ai`. Compared
+    /// Expected `iss` claim, e.g. `https://auth.example.com`. Compared
     /// exactly — a trailing slash mismatch is a rejected token, not a
     /// near-miss.
     pub issuer: String,
     /// Where the issuer publishes its signing keys, e.g.
-    /// `https://auth.stridelabs.ai/.well-known/jwks.json`.
+    /// `https://auth.example.com/.well-known/jwks.json`.
     pub jwks_url: String,
     /// Expected `aud` claim: this service's identifier at the issuer.
     pub audience: String,

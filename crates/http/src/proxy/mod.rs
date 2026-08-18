@@ -1,8 +1,8 @@
 //! Reverse-proxy primitives (feature `proxy`).
 //!
-//! Ported from limen's `src/http/{proxy,body,client}.rs` with **no behavior
-//! change** — limen is a production reverse proxy, and these are the pieces of
-//! it that are not about limen: which headers may cross a hop, how to turn a
+//! Carried over from a production reverse proxy's
+//! `http::{proxy,body,client}` with **no behavior change** — these are the
+//! pieces of it that are not domain-specific: which headers may cross a hop, how to turn a
 //! client request's path into an upstream URL, how to hand a `reqwest`
 //! response back to axum, how to buffer a body without letting an unbounded
 //! one buffer, how to state (rather than relay) the `X-Forwarded-*` context,
@@ -10,10 +10,10 @@
 //! without handing anyone the upstream's URL.
 //!
 //! What did change is the shape of the seams. Every one of these was private
-//! to limen, and two of them reached into limen's config types; here they are
+//! to that proxy, and two of them reached into its config types; here they are
 //! free functions over plain arguments ([`UpstreamClient::build`] takes a bool
 //! and PEM bytes rather than a `UpstreamTlsConfig`), so a second proxy can
-//! adopt them without adopting limen's configuration model.
+//! adopt them without adopting that configuration model.
 //!
 //! # What this is not
 //!

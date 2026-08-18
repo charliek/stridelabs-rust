@@ -5,9 +5,9 @@
 //! domain-specific (URL schemes, route-ID uniqueness, cross-field rules)
 //! stays in the consuming crate/service; this module only owns the pattern.
 //!
-//! Ported from limen's `config::validate` (`Errors` accumulator,
-//! `validate_socket_addr`, `validate_fraction`), generalized from a
-//! module-private helper into this crate's public API.
+//! Carried over from an existing service's `config::validate` (`Errors`
+//! accumulator, `validate_socket_addr`, `validate_fraction`), generalized
+//! from a module-private helper into this crate's public API.
 
 use std::fmt;
 use std::net::SocketAddr;

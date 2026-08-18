@@ -2,13 +2,13 @@
 //! subscriber setup, a real tower request-id layer, and (behind the
 //! `prometheus` feature) Prometheus recorder wiring.
 //!
-//! Extracted from limen's `observability` module (`logging`, `request_id`,
-//! `prometheus`). Two deliberate departures from the limen originals, both
-//! because a shared crate can't assume a specific service's env-var or
+//! Extracted from an existing service's `observability` module (`logging`,
+//! `request_id`, `prometheus`). Two deliberate departures from the originals,
+//! both because a shared crate can't assume a specific service's env-var or
 //! metric-naming conventions:
 //!
 //! - [`logging::init_logging`] takes its [`logging::LogFormat`] as a
-//!   parameter instead of reading a hard-coded env var (`LIMEN_LOG_FORMAT`)
+//!   parameter instead of reading a hard-coded, service-specific env var
 //!   inside the function — callers source the format from their own config
 //!   (e.g. via `stridelabs_config::env_or`).
 //! - `request_id` is a real [`tower::Layer`]/[`tower::Service`] pair

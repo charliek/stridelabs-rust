@@ -1,8 +1,7 @@
 # stridelabs-observability
 
 `tracing` subscriber setup, a real `tower` request-id layer, and (behind a
-feature) Prometheus recorder wiring, for StrideLabs services. Extracted from
-limen's `observability` module.
+feature) Prometheus recorder wiring, for StrideLabs services.
 
 ## Feature topology
 
@@ -30,9 +29,7 @@ stridelabs-observability = { git = "https://github.com/charliek/stridelabs-rust.
 
 (During development against an unreleased commit, pin `rev = "<sha>"`
 instead of `tag`; see the workspace root README for the local `[patch]`
-co-development snippet. If you're consuming a private fork rather than this
-repo directly, see that same README's "Private-fork / SSH consumption"
-appendix for the `ssh://` form instead.)
+co-development snippet.)
 
 ## `logging` — tracing subscriber setup
 
@@ -53,9 +50,8 @@ init_logging(format, "info");
 `init_logging(format, default_filter)`:
 
 - Filter: `RUST_LOG` if set, else `default_filter` — pass your own
-  service-specific fallback string (e.g. spendwise-rs keeps its current
-  fallback string unchanged at adoption; this crate doesn't own that
-  string).
+  service-specific fallback string (an adopting service keeps its existing
+  fallback string unchanged; this crate doesn't own that string).
 - Format: `LogFormat::Text` (human-readable) or `LogFormat::Json`
   (line-delimited, for production log aggregation) — a plain parameter, not
   an env var read inside the function, so callers control how the format is
@@ -128,10 +124,10 @@ let class = status_class(response_status.as_u16()); // "2xx", "4xx", ...
   reuse the same boundaries even outside the `duration_seconds`-suffix
   convention `install()` applies automatically.
 
-**Not ported from limen:** the domain-specific metric wrappers
+**Deliberately not extracted:** the domain-specific metric wrappers
 (`record_request`, the `InFlight` RAII gauge guard, shadow-traffic and
-circuit-breaker gauges, …). Those are bound to limen's shadow-proxy domain
-and its specific metric names — not a generic primitive. A consumer defines
+circuit-breaker gauges, …). Those are bound to the originating service's own proxy
+domain and its specific metric names — not a generic primitive. A consumer defines
 its own metric names and emits through the `metrics` facade directly
 (`counter!`, `histogram!`, `gauge!`); this module only owns recorder
 installation and the `status_class`/`DURATION_BUCKETS` conventions.

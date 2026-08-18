@@ -5,8 +5,9 @@ description: Scaffold a new StrideLabs axum service from scratch, wired onto the
 
 # Start a StrideLabs service
 
-This skill scaffolds a new axum-based Rust service the way slauth's
-`backend-rs` and this workspace's own conventions expect: the five
+This skill scaffolds a new axum-based Rust service the way the `backend-rs`
+service of slauth, the StrideLabs auth service, and this workspace's own
+conventions expect: the five
 `stridelabs-*` crates as dependencies, `AppError` from `stridelabs-http`
 instead of a hand-rolled error type, and an OpenAPI document that is
 committed, tested for freshness, and pinned to an exact route list from
@@ -88,8 +89,7 @@ relative to the new service's root:
   what a production service's committed `Cargo.toml` should carry, and what
   CI will actually fetch. Pin a tag if one is cut; otherwise pin the exact
   commit `rev`. See the root README's "Consuming these crates" section for
-  the exact `tag =` / `rev =` forms and the SSH appendix (needed only while
-  `stridelabs-rust` is still a private repo).
+  the exact `tag =` / `rev =` forms.
 
   ```toml
   [dependencies]
@@ -124,7 +124,7 @@ copy-pasted and renamed anyway.
 ## Step 1 — crate layout
 
 A new service is a plain Cargo **package** (not a workspace) with both a
-`[lib]` and a `[[bin]]` target, matching `slauth/backend-rs`'s shape — the
+`[lib]` and a `[[bin]]` target, matching the shape of slauth's `backend-rs` — the
 lib target is what lets `tests/openapi_shape.rs` (an integration test,
 outside the crate) import the service's own `openapi::spec()`.
 
@@ -297,7 +297,7 @@ async fn main() {
 
     // split_for_parts() hands back the plain axum Router<AppState> half to
     // merge here, and the OpenApi document half — the proven pattern this
-    // is lifted from (slauth backend-rs's src/http/server.rs). Do NOT call
+    // is lifted from (slauth's backend-rs `src/http/server.rs`). Do NOT call
     // `.with_state()` on the OpenApiRouter directly and try to convert that
     // into a plain Router to merge — split first, merge the axum half, and
     // apply `.with_state()` once at the very end of the whole Router chain,
@@ -339,7 +339,8 @@ This is the load-bearing part. `stridelabs_http::openapi` (feature
 `openapi`) already carries the spec MECHANICS this used to require
 hand-writing (canonical JSON serializer, exhaustive `(method, path)`
 enumeration, committed-file freshness check) — extracted from exactly this
-pattern in slauth. **Use its functions directly; do not re-derive them.**
+pattern in slauth's own service. **Use its functions directly; do not
+re-derive them.**
 The service only writes the document's *policy*: what `info`/`tags`/
 `servers` say, which routers get merged in, and the version prefix.
 
@@ -391,8 +392,7 @@ use crate::state::AppState;
         // Spectral's info-description rule wants more than the title
         // restated — replace this with a real paragraph covering what the
         // service's API surface is and what it deliberately excludes
-        // (health checks, internal-only routes), same as slauth
-        // backend-rs's `src/http/openapi.rs`.
+        // (health checks, internal-only routes).
         description = "Example ping service scaffolded by the \
                         start-a-stridelabs-service skill — replace this \
                         with a real description of the service's API \

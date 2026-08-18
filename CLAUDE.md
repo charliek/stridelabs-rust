@@ -8,11 +8,11 @@ coding agents). Read this before making changes.
 Shared Rust crates for StrideLabs services — the Rust twin of
 [stridelabs-python](https://github.com/charliek/stridelabs-python). Patterns
 that show up in every service (config loading, observability, HTTP
-error/CORS/proxy plumbing, slauth JWT verification, test harnesses) are solved
-once here instead of copy-pasted per repo. The crates are extracted from
-[limen](https://github.com/charliek/limen) and
-[spendwise-rs](https://github.com/charliek/spendwise-rs) (same author, near
-identical conventions), then proven by adopting them back into spendwise-rs.
+error/CORS/proxy plumbing, JWT verification against slauth — the StrideLabs
+auth service — test harnesses) are solved once here instead of copy-pasted per
+repo. The crates are extracted from existing StrideLabs services (same
+author, near identical conventions), then proven by adopting them back into
+one of them.
 
 This is a **library-only workspace, never a running service**: no binary, no
 `main.rs`, no deployed container. `docker-compose.yml` exists solely to give
@@ -39,8 +39,8 @@ against.
 - `.cargo/config.toml` sets `resolver.incompatible-rust-versions = "fallback"`
   so the dependency graph resolves against the pinned compiler instead of
   grabbing a transitive crate that needs a newer rustc.
-- Local infra: `docker compose up -d` (Postgres 16 on host port 5438 — offset
-  from spendwise-rs's 5437 so both stacks run at once).
+- Local infra: `docker compose up -d` (Postgres 16 on host port 5438 rather than
+  5432, so it doesn't collide with other local Postgres stacks).
 
 ## Quality gate (run before every commit)
 
@@ -69,8 +69,7 @@ it will not silently skip.
 ## Crate map
 
 All five crates are implemented: `stridelabs-config`, `stridelabs-observability`,
-`stridelabs-http`, `stridelabs-auth` and `stridelabs-testing`. Next up (see
-the work breakdown) is adopting them into spendwise-rs.
+`stridelabs-http`, `stridelabs-auth` and `stridelabs-testing`.
 
 | Crate | Status | Contents |
 |---|---|---|
@@ -108,7 +107,7 @@ Each crate documents its own **feature topology** in its README — most are
 
 ## Commits
 
-Each commit in the work breakdown: implement → quality gate green → simplify
+Each commit: implement → quality gate green → simplify
 pass → review → quality gate green → commit. Keep commits scoped to a crate or
 a coherent slice of one; feature branches land as a reviewed PR (not committed
 directly to `main`).

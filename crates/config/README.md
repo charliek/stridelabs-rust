@@ -1,8 +1,7 @@
 # stridelabs-config
 
 Env-var config helpers + layered YAML/JSON file loading with field-pathed
-errors, for StrideLabs services. Extracted from limen's `config::load` /
-`config::validate` and spendwise-rs's `config.rs`.
+errors, for StrideLabs services.
 
 **No feature flags.** Everything in this crate is small and used widely
 enough that gating any of it behind a feature would only add friction for
@@ -18,9 +17,7 @@ stridelabs-config = { git = "https://github.com/charliek/stridelabs-rust.git", t
 
 (During development against an unreleased commit, pin `rev = "<sha>"`
 instead of `tag`; see the workspace root README for the local `[patch]`
-co-development snippet. If you're consuming a private fork rather than this
-repo directly, see that same README's "Private-fork / SSH consumption"
-appendix for the `ssh://` form instead.)
+co-development snippet.)
 
 ## `env` — 12-factor environment variables
 
@@ -96,11 +93,10 @@ fn validate(listen_addr: &str, sample_rate: f64) -> Result<(), Vec<stridelabs_co
 
 ## What's not here
 
-limen's `ConfigOverrides` (a merged env/CLI overlay applied on top of a
-parsed file) is domain-bound to that service's specific set of overridable
+A `ConfigOverrides`-style type (a merged env/CLI overlay applied on top of a
+parsed file) is domain-bound to a given service's specific set of overridable
 knobs — it isn't a generic primitive, so it wasn't extracted. If a consumer
 needs the same shape, define its own `Overrides` struct with `Option<T>`
 fields, build it via `env::env_or`/`env_parse` against `Option`-wrapped
-defaults, and apply it with a small `fn apply(&self, config: &mut Config)`
-(see limen's `src/config/load.rs` for the pattern this crate deliberately
-left in the consuming service).
+defaults, and apply it with a small `fn apply(&self, config: &mut Config)`.
+That pattern deliberately stays in the consuming service.

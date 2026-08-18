@@ -1,6 +1,6 @@
 //! Baseline security response headers, as one tower layer.
 //!
-//! New API rather than a port: limen and spendwise-rs both set (some of)
+//! New API rather than a port: both originating services set (some of)
 //! these ad hoc, which means "did we remember it on this router?" is a
 //! per-service question. Here it's one call, applied to every response the
 //! wrapped service produces — successes, 4xx, 5xx alike, since the setters
