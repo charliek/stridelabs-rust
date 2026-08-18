@@ -43,10 +43,7 @@ stridelabs-auth = { git = "https://github.com/charliek/stridelabs-rust.git", tag
 ```
 
 (During development against an unreleased commit, pin `rev = "<sha>"` instead
-of `tag`; see the workspace root README for the local `[patch]` snippet. If
-you're consuming a private fork rather than this repo directly, see that
-same README's "Private-fork / SSH consumption" appendix for the `ssh://`
-form instead.)
+of `tag`; see the workspace root README for the local `[patch]` snippet.)
 
 ## Verifying a token
 

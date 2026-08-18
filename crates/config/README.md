@@ -18,9 +18,7 @@ stridelabs-config = { git = "https://github.com/charliek/stridelabs-rust.git", t
 
 (During development against an unreleased commit, pin `rev = "<sha>"`
 instead of `tag`; see the workspace root README for the local `[patch]`
-co-development snippet. If you're consuming a private fork rather than this
-repo directly, see that same README's "Private-fork / SSH consumption"
-appendix for the `ssh://` form instead.)
+co-development snippet.)
 
 ## `env` — 12-factor environment variables
 

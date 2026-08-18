@@ -88,8 +88,7 @@ relative to the new service's root:
   what a production service's committed `Cargo.toml` should carry, and what
   CI will actually fetch. Pin a tag if one is cut; otherwise pin the exact
   commit `rev`. See the root README's "Consuming these crates" section for
-  the exact `tag =` / `rev =` forms and the SSH appendix (needed only while
-  `stridelabs-rust` is still a private repo).
+  the exact `tag =` / `rev =` forms.
 
   ```toml
   [dependencies]

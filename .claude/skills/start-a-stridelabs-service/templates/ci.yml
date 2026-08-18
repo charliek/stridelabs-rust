@@ -10,11 +10,7 @@ name: CI
 # checkout of stridelabs-rust on disk. If the service's Cargo.toml still has
 # a `[patch]` path override left over from local/offline scaffolding (see
 # the skill's "Choosing how to consume the crates" step), switch it to the
-# git form before this workflow can pass. If stridelabs-rust is still
-# private when this lands, add the ssh-agent + known-hosts +
-# CARGO_NET_GIT_FETCH_WITH_CLI steps from stridelabs-rust's root README
-# ("Appendix: Private-fork / SSH consumption") to every job below that runs
-# `cargo`.
+# git form before this workflow can pass.
 
 on:
   push:
