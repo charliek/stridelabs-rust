@@ -218,7 +218,7 @@ above) is the cheapest defense.
   `router` unchanged; there is nothing left to refuse. `method_filter`
   mirrors this at one level down — an empty input is `None`, never a panic,
   because a shared crate can't assume every caller derives its input from a
-  route's own non-empty method list the way the single adoption target does.
+  route's own non-empty method list the way slauth's own route list does.
 - **Duplicate methods are fine.** OR-ing the same `MethodFilter` bit twice
   is a no-op, so a served or universe list with repeats folds the same as
   its deduplicated form.
@@ -303,7 +303,8 @@ axum::serve(listener, app)
   makes a one-sender/many-servers fan-out correct. It also returns when every
   sender is dropped.
 
-**Not extracted:** the originating proxy's bounded drain (stop accepting, then
+**Not extracted:** the bounded drain of the reverse proxy these primitives
+came from (stop accepting, then
 wait out in-flight requests up to a timeout). It's embedded in that service's
 `serve_with_shutdown` and entangled with its config and background tasks —
 there is no standalone primitive to lift, and inventing one here would be
@@ -478,7 +479,7 @@ Both are stated in full, once, in the `openapi` module docs —
 stridelabs-http --features openapi --open`. They are **not** restated here on
 purpose: this convention was previously written out at length in three places,
 and a wrong version of the `nest`/`merge` claim propagated into two
-repositories before review caught it. One copy, next to the
+repositories before review caught it (#11). One copy, next to the
 `documented_pairs` that guards both.
 
 **On the exhaustive match** and **on `utoipa`'s features** (this crate enables
@@ -586,7 +587,7 @@ re-introduces every time this layer gets rewritten:
   inbound header is removed first, and a scheme that isn't a URI scheme per
   RFC 3986 (`"https, http"` included) is not written, so the upstream sees no
   header rather than the caller's claim. `XffPolicy` covers the chain:
-  `Append` (the originating proxy's multi-line-aware append, one combined line out, an
+  `Append` (the originating reverse proxy's multi-line-aware append, one combined line out, an
   existing chain preserved when there is no peer) or `FillIfAbsent` (slauth's
   post-allow-list fill).
 
@@ -613,7 +614,7 @@ re-introduces every time this layer gets rewritten:
 `reqwest` can grow a predicate, the second because it can grow an error kind.
 
 `UpstreamClient::build` takes `(verify_certificates: bool, ca_bundle_pem:
-Option<&[u8]>)` rather than the originating proxy's config struct, so adopting
+Option<&[u8]>)` rather than the originating reverse proxy's config struct, so adopting
 these primitives doesn't mean adopting that proxy's configuration model. Reading the
 bundle is the caller's job — hence bytes, and hence no `CaRead` variant in
 `ClientBuildError`. Per-request timeouts are also left to call sites: they

@@ -136,8 +136,8 @@ impl PatFormat {
 
     /// Does `raw` start with this prefix?
     ///
-    /// **A `starts_with` and nothing more** — deliberately, matching what
-    /// consuming services check inline. It is a cheap "this looks like one of
+    /// **A `starts_with` and nothing more** — deliberately. It is a cheap
+    /// "this looks like one of
     /// ours" filter that lets a service skip a database round-trip for a
     /// bearer token that is obviously a JWT instead. It validates neither the
     /// length nor the alphabet of what follows, and a `true` here says

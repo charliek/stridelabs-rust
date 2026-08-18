@@ -5,8 +5,8 @@
 //! Extracted from the config loaders of two existing services (the
 //! `serde_path_to_error` load skeleton, the `Loaded`/base-dir pattern, the
 //! error accumulator, the socket/fraction checks, and the
-//! `env_or`/`env_parse`/`parse_string_array` helpers), so the
-//! same patterns aren't reinvented per service. What is deliberately **not**
+//! `env_or`/`env_parse`/`parse_string_array` helpers), so the same patterns
+//! aren't reinvented per service. What is deliberately **not**
 //! extracted: the env/CLI-overlay `ConfigOverrides` pattern — it is bound
 //! to a given service's specific set of overridable knobs, not a generic
 //! primitive (see this crate's README for the recommended equivalent).

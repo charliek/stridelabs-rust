@@ -39,7 +39,7 @@ snippet.)
 # async fn example() {
 use stridelabs_testing::require_postgres;
 
-let pool = require_postgres("postgres://postgres:localdev@localhost:5437/myapp_test").await;
+let pool = require_postgres("postgres://postgres:localdev@localhost:5438/myapp_test").await;
 # let _ = pool;
 # }
 ```
@@ -66,7 +66,7 @@ business knowing an app's migration runner or schema. Build your own
 use sqlx::PgPool;
 use stridelabs_testing::require_postgres;
 
-const DEFAULT_DATABASE_URL: &str = "postgres://postgres:localdev@localhost:5437/myapp_test";
+const DEFAULT_DATABASE_URL: &str = "postgres://postgres:localdev@localhost:5438/myapp_test";
 
 /// A pool against a real, migrated database. Every test that touches the
 /// database calls this — never `require_postgres` directly — so the

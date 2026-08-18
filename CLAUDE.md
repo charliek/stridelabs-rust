@@ -10,7 +10,7 @@ Shared Rust crates for StrideLabs services — the Rust twin of
 that show up in every service (config loading, observability, HTTP
 error/CORS/proxy plumbing, JWT verification against slauth — the StrideLabs
 auth service — test harnesses) are solved once here instead of copy-pasted per
-repo. The crates are extracted from two existing StrideLabs services (same
+repo. The crates are extracted from existing StrideLabs services (same
 author, near identical conventions), then proven by adopting them back into
 one of them.
 
@@ -39,8 +39,8 @@ against.
 - `.cargo/config.toml` sets `resolver.incompatible-rust-versions = "fallback"`
   so the dependency graph resolves against the pinned compiler instead of
   grabbing a transitive crate that needs a newer rustc.
-- Local infra: `docker compose up -d` (Postgres 16 on host port 5438 — offset
-  from the default so this stack doesn't collide with other local stacks).
+- Local infra: `docker compose up -d` (Postgres 16 on host port 5438 rather than
+  5432, so it doesn't collide with other local Postgres stacks).
 
 ## Quality gate (run before every commit)
 

@@ -141,9 +141,9 @@ impl AppError {
     /// flow can still produce a byte-identical body:
     /// `AppError::BadGateway(AppError::UPSTREAM_FAILED_MESSAGE.into())`.
     ///
-    /// It is deliberately the same string existing consumers already return,
-    /// so adopting these constructors changes their wire output by
-    /// exactly nothing.
+    /// It is deliberately the same string the service this was extracted from
+    /// already returns, so adopting these constructors changes that
+    /// service's wire output by exactly nothing.
     pub const UPSTREAM_FAILED_MESSAGE: &'static str = "upstream request failed";
 
     /// A `502` for an upstream failure: a fixed, detail-free client message,

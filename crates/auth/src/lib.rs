@@ -2,8 +2,8 @@
 //! RS256 access tokens that slauth (Ory Hydra) issues, and hash the personal
 //! access tokens a service issues for itself.
 //!
-//! A service that
-//! adopts this crate holds one [`Verifier`] in its application state, hands it
+//! A service that adopts this crate holds one [`Verifier`] in its
+//! application state, hands it
 //! a bearer token per request, and gets back a [`VerifiedIdentity`]. Mapping
 //! that identity to a database row — find-or-create, linking, admin checks —
 //! stays in the service: it is the part that differs everywhere.

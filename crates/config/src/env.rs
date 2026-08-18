@@ -8,8 +8,8 @@
 //! wrapper around a private `*_from` variant that takes an injectable lookup
 //! closure (`impl Fn(&str) -> Option<String>`); the public API always plugs
 //! in `std::env::var(..).ok()`, and unit tests plug in a fake `HashMap`
-//! lookup instead. This is the `from_lookup` seam of the config loader this
-//! was extracted from, generalized to these three helpers.
+//! lookup instead. This is the `from_lookup` seam from one of the originating
+//! config loaders, generalized to these three helpers.
 
 use std::fmt;
 use std::str::FromStr;

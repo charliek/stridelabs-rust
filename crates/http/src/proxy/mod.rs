@@ -1,9 +1,8 @@
 //! Reverse-proxy primitives (feature `proxy`).
 //!
-//! Carried over unchanged from a production reverse proxy's
-//! `http::{proxy,body,client}` — **no behavior
-//! change** — and these are the pieces of
-//! it that are not domain-specific: which headers may cross a hop, how to turn a
+//! Carried over from a production reverse proxy's
+//! `http::{proxy,body,client}` with **no behavior change** — these are the
+//! pieces of it that are not domain-specific: which headers may cross a hop, how to turn a
 //! client request's path into an upstream URL, how to hand a `reqwest`
 //! response back to axum, how to buffer a body without letting an unbounded
 //! one buffer, how to state (rather than relay) the `X-Forwarded-*` context,

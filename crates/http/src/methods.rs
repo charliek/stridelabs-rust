@@ -1,7 +1,7 @@
 //! Truthful method classification for axum routes: which methods a route
 //! actually serves, and a truthful `405` for every other one.
 //!
-//! Carried over from a service's route-classification helpers
+//! Carried over from slauth's route-classification helpers
 //! (`CLASSIFIED_METHODS`, `route_serving_over`/`refusing_unserved_over`,
 //! `method_filter`), which exist because `axum::routing::MethodRouter`
 //! gets two things wrong for a route that only names the methods it serves:

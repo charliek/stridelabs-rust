@@ -35,8 +35,7 @@ pub enum AuthError {
     #[error("malformed token")]
     MalformedToken,
     /// The JWT header has no `kid`, so there is no way to say which of the
-    /// issuer's keys should have signed it. The issuers this crate targets
-    /// always set one.
+    /// issuer's keys should have signed it. slauth always sets one.
     #[error("token is missing a key id")]
     MissingKid,
     /// The token's `kid` is not in the issuer's JWKS — after a refetch, or

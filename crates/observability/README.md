@@ -126,7 +126,7 @@ let class = status_class(response_status.as_u16()); // "2xx", "4xx", ...
 
 **Deliberately not extracted:** the domain-specific metric wrappers
 (`record_request`, the `InFlight` RAII gauge guard, shadow-traffic and
-circuit-breaker gauges, …). Those are bound to the original's shadow-proxy
+circuit-breaker gauges, …). Those are bound to the originating service's own proxy
 domain and its specific metric names — not a generic primitive. A consumer defines
 its own metric names and emits through the `metrics` facade directly
 (`counter!`, `histogram!`, `gauge!`); this module only owns recorder
