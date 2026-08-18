@@ -23,7 +23,7 @@ tokio = { version = "1", features = ["full"] }
 # HTTP server / middleware
 axum = "0.8"
 tower = { version = "0.5", features = ["util"] }
-tower-http = "0.6"
+tower-http = "0.7"
 # Request/response types for tower layers that stay axum-compatible without
 # depending on axum itself (axum re-exports this same `http` crate).
 http = "1"
