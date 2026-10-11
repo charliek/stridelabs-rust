@@ -1,7 +1,7 @@
 //! Layered file loading: parse a YAML or JSON file into a caller-supplied
 //! type, with field-pathed error messages courtesy of `serde_path_to_error`
 //! (so "which nested field was wrong" survives into the error instead of
-//! collapsing to a bare `serde_yaml`/`serde_json` message), plus the
+//! collapsing to a bare `yaml_serde`/`serde_json` message), plus the
 //! resolved base directory so callers can locate sibling files referenced
 //! relative to the config (e.g. a TLS bundle path, a contract file).
 //!
@@ -57,7 +57,7 @@ pub enum FileError {
 /// (trailing-content rejection) matters.
 pub fn load_yaml<T: DeserializeOwned>(path: &Path) -> Result<Loaded<T>, FileError> {
     load_with(path, |text| {
-        let de = serde_yaml::Deserializer::from_str(text);
+        let de = yaml_serde::Deserializer::from_str(text);
         serde_path_to_error::deserialize(de).map_err(|e| e.to_string())
     })
 }
@@ -185,6 +185,46 @@ mod tests {
             }
             other => panic!("expected Parse error, got {other:?}"),
         }
+    }
+
+    /// The parse message of a YAML file, for the exact-rendering pins below.
+    fn yaml_parse_message(contents: &str) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.yaml");
+        std::fs::write(&path, contents).unwrap();
+
+        match load_yaml::<Sample>(&path).unwrap_err() {
+            FileError::Parse { message, .. } => message,
+            other => panic!("expected Parse error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_type_error_renders_its_field_path_and_position_exactly() {
+        // Pinned whole, not with `contains`: the path/line/column wording is
+        // what a service operator reads, and it comes from the YAML crate, so
+        // this is what notices a YAML-crate swap or bump changing it. The path
+        // appears twice because `serde_path_to_error` prefixes it and the YAML
+        // crate's own message names it again.
+        let message = yaml_parse_message("name: svc\nnested:\n  port: \"not-a-number\"\n");
+
+        assert_eq!(
+            message,
+            "nested.port: nested.port: invalid type: string \"not-a-number\", expected u16 at line 3 column 9"
+        );
+    }
+
+    #[test]
+    fn a_syntax_error_renders_its_position_and_parser_context_exactly() {
+        // A tab where indentation belongs is rejected by the YAML parser
+        // itself (libyaml), before any type is consulted, so this pins the
+        // parser's own wording and its line/column rendering.
+        let message = yaml_parse_message("name: svc\nnested:\n\tport: 1\n");
+
+        assert_eq!(
+            message,
+            "nested: found character that cannot start any token at line 3 column 1, while scanning for the next token"
+        );
     }
 
     #[test]

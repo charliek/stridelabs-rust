@@ -84,6 +84,12 @@ consumers pin a commit (`rev = "…"`), not a tag.
   (`stridelabs-auth`). Neither crate's types appear in a public signature,
   and `pat::hash` output is unchanged: lowercase SHA-256 hex, pinned by a
   known-vector test, so stored token hashes stay valid.
+- Internal dependency swap, no API change: `serde_yaml` 0.9 (archived) →
+  `yaml_serde` 0.10, the YAML organization's maintained fork
+  (`stridelabs-config`; the parser underneath moves from `unsafe-libyaml` to
+  its fork `libyaml-rs`). `FileError::Parse` messages are unchanged —
+  field path, line/column and parser context render identically — and are now
+  pinned by two exact-message tests.
 
 ### Not done
 
