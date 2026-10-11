@@ -8,11 +8,11 @@ on:
   workflow_dispatch:
   # Weekly, so `audit`'s time-varying RustSec findings get re-checked even
   # when nobody opens a PR for a while — a new advisory can land against a
-  # dependency with no code change here. `build-test`/`ci-success` are
-  # skipped on this trigger (see their own `if:` below) since there's
-  # nothing PR-specific to build; GitHub's required-check gating is
-  # PR-scoped, so a scheduled run that never reports `ci-success` doesn't
-  # block anything.
+  # dependency with no code change here. `build-test` is skipped on this
+  # trigger (see its own `if:` below) since there's nothing to rebuild;
+  # `ci-success` still runs and requires `audit`, so the run's conclusion
+  # reflects the advisory result, and a failing `audit` also opens or
+  # updates a `security` issue (`audit-issue` below) so it isn't missed.
   schedule:
     - cron: "0 6 * * 1"
 
@@ -57,7 +57,7 @@ jobs:
       # `git describe --tags` for the cargo-semver-checks baseline — a
       # shallow, depth-1 checkout wouldn't have any tag objects to describe
       # against.
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           fetch-depth: 0
@@ -97,17 +97,17 @@ jobs:
       # deny.toml's license/bans/sources gates (verified clean locally:
       # `cargo deny check licenses bans sources`). Deliberately does NOT
       # include `advisories` in this list — that would duplicate the
-      # separate, non-required `audit` job below. See deny.toml's
-      # `[advisories]` comment for why that split exists: exactly one tool
-      # (cargo-audit) is the authority on "is there a live advisory," and it
-      # must stay out of this required job so a new RUSTSEC ID can't brick
-      # unrelated PRs. (The action's default `arguments` input already
-      # passes `--all-features`, matching deny.toml's own `[graph]
-      # all-features = true` — redundant but harmless, kept as the belt to
-      # the config file's suspenders rather than relying on the action's
-      # default not changing.)
+      # separate `audit` job below. See deny.toml's `[advisories]` comment
+      # for why that split exists: exactly one tool (cargo-audit) is the
+      # authority on "is there a live advisory," and it stays out of this
+      # job so a new RUSTSEC ID can't brick unrelated PRs (`audit` is
+      # advisory on pull requests; see `ci-success`). (The action's default
+      # `arguments` input already passes `--all-features`, matching
+      # deny.toml's own `[graph] all-features = true` — redundant but
+      # harmless, kept as the belt to the config file's suspenders rather
+      # than relying on the action's default not changing.)
       - name: cargo-deny (licenses, bans, sources)
-        uses: EmbarkStudios/cargo-deny-action@b66acf5e9fe20f8aba065be86778a8a4c846f902 # v2
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
         with:
           command: check
           command-arguments: licenses bans sources
@@ -119,31 +119,22 @@ jobs:
           echo "Baseline tag: $tag"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
+      # Pinned: an unpinned install floats to the newest release, so a tool
+      # upgrade could change what this gate reports with no change here.
       - name: Install cargo-semver-checks
-        uses: taiki-e/install-action@288e746965032cfcc232e09af2daf5f23c14d780 # v2
+        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2
         with:
-          tool: cargo-semver-checks
+          tool: cargo-semver-checks@0.51.0
 
-      # ADVISORY, not a hard gate, until v0.4.0 is tagged. The baseline above
-      # resolves to the latest reachable `v*` tag — currently v0.3.0, since
-      # this PR is what will *become* v0.4.0 — while `[workspace.package]
-      # .version` in this PR is already bumped to 0.4.0 ahead of the tag
-      # (CHANGELOG.md's v0.4.0 entry, including the `Buffered
-      # #[non_exhaustive]` break, documents why). Once current != baseline
-      # at a major-version distance, cargo-semver-checks treats *any* change
-      # as already covered by that version bump and skips its lints
-      # entirely (verified locally: "0 checks: 0 pass, 254 skip, Summary no
-      # semver update required" for all five crates against v0.3.0) — so
-      # right up until the tag is actually pushed, this step is structurally
-      # unable to catch a *new* breaking change landing on top of this one;
-      # it would ride under the same already-declared major bump. That's the
-      # real reason `continue-on-error: true` stays even though the known
-      # `Buffered` finding itself no longer reproduces post-bump: the step
-      # isn't protecting anything meaningful pre-tag. Once v0.4.0 is tagged
-      # (this baseline becomes v0.4.0 too, current == baseline again), a
-      # future PR should drop `continue-on-error` so this becomes a real gate
-      # against the new baseline — don't carry the tolerance forward
-      # indefinitely.
+      # The baseline above is the latest reachable `v*` tag. `continue-on-error`
+      # stays only until the commit that bumps `[workspace.package].version`
+      # to 0.5.0, which removes it: until then the workspace is still 0.4.0,
+      # equal to the baseline, while stridelabs-observability's `LogFormat`
+      # became `#[non_exhaustive]` (a real break, see CHANGELOG
+      # `[Unreleased]`), so this step is expected to be red and must not
+      # block. After the bump, a 0.x minor bump covers that break and this
+      # step is a real gate; each later breaking PR must bump the version
+      # itself. Don't carry the tolerance forward past that commit.
       #
       # Every crate here has `publish = false` (crates/*/Cargo.toml) — a
       # `--workspace` cargo-semver-checks invocation silently NO-OPS against
@@ -152,21 +143,30 @@ jobs:
       # "Summary" line, exit 0, no warning). This MUST stay a per-crate `-p`
       # loop; do not "simplify" it back to `--workspace`.
       #
-      # The loop below also guards against that same no-op reappearing
+      # `set +e`: Actions runs `run:` blocks under `bash -e`, and `set -uo
+      # pipefail` alone does not clear that, so the `out="$(…)"` assignment
+      # below would abort the whole script the first time a crate fails —
+      # silently skipping every crate after it (and its diagnostics, because
+      # `echo "$out"` never ran). With -e off, every crate is checked and
+      # printed, failures are accumulated, and the step exits non-zero once
+      # at the end.
+      #
+      # The loop also guards against the `--workspace` no-op reappearing
       # *inside* a per-crate `-p` invocation in some future tool version: a
-      # real check always prints a line starting with "Summary" (verified
-      # locally against cargo-semver-checks 0.50.0 — "Summary no semver
+      # real check always prints a line containing "Summary" (verified
+      # locally against cargo-semver-checks 0.51.0 — "Summary no semver
       # update required" / "Summary semver requires new..."). If that line
       # is missing, the crate was silently skipped rather than actually
       # checked, and that is treated as a hard failure of this step
       # regardless of cargo-semver-checks's own exit code — a vacuously
       # "passing" check is worse than a loudly failing one.
-      - name: cargo-semver-checks (advisory until v0.4.0 tags)
+      - name: cargo-semver-checks (all five crates)
         continue-on-error: true
         run: |
-          set -uo pipefail
+          set +e -uo pipefail
           baseline="${{ steps.semver-baseline.outputs.tag }}"
           status=0
+          failed=""
           for crate in stridelabs-config stridelabs-observability stridelabs-http stridelabs-auth stridelabs-testing; do
             echo "::group::cargo semver-checks -p $crate (baseline $baseline)"
             out="$(cargo semver-checks check-release -p "$crate" --all-features --baseline-rev "$baseline" 2>&1)"
@@ -175,27 +175,33 @@ jobs:
             if ! grep -q "Summary" <<<"$out"; then
               echo "::error::cargo semver-checks produced no 'Summary' line for $crate — it did not actually run the check (e.g. the --workspace publish=false no-op reappearing under -p). Failing loudly instead of passing vacuously."
               status=1
+              failed="$failed $crate"
             elif [ "$check_exit" -ne 0 ]; then
               status=1
+              failed="$failed $crate"
             fi
             echo "::endgroup::"
           done
+          if [ "$status" -ne 0 ]; then
+            echo "::error::cargo semver-checks failed for:$failed"
+          fi
           exit "$status"
 
-  # Deliberately NOT in ci-success's `needs` below, and deliberately its own
-  # job rather than a step in build-test: RustSec advisories are time-varying
-  # (a new RUSTSEC ID can be published against a dependency this repo hasn't
-  # touched between one commit and the next), so a *required* check gated on
-  # them would brick unrelated PRs the day that happens. This job runs on
-  # every push/PR for visibility, but a red run here is a signal for manual
-  # triage (see c7-disclosure-and-advisory.md's Part B for the standing
-  # methodology), not a merge blocker. deny.toml's `[advisories]` section
-  # mirrors this job's currently-assessed-benign findings for anyone running
-  # the full `cargo deny check` locally, but does not run in CI itself.
+  # Its own job rather than a step in build-test: RustSec advisories are
+  # time-varying (a new RUSTSEC ID can be published against a dependency this
+  # repo hasn't touched between one commit and the next). `ci-success` therefore
+  # requires it on every event except `pull_request` — main (push), manual
+  # dispatch and the weekly schedule must be advisory-clean, so a red audit
+  # can't sit unnoticed on main — while on a PR it is advisory, so a newly
+  # published advisory can't brick an unrelated PR. A red run on a PR is a
+  # signal for manual triage (see c7-disclosure-and-advisory.md's Part B for
+  # the standing methodology). deny.toml's `[advisories]` section mirrors
+  # this job's currently-assessed-benign findings for anyone running the
+  # full `cargo deny check` locally, but does not run in CI itself.
   audit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -203,45 +209,99 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
 
       - name: Install cargo-audit
-        uses: taiki-e/install-action@288e746965032cfcc232e09af2daf5f23c14d780 # v2
+        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2
         with:
           tool: cargo-audit
 
       # --ignore entries mirror deny.toml's [advisories].ignore list exactly
-      # (keep the two in sync): both advisories are assessed unreachable in
+      # (keep the two in sync): the one advisory is assessed unreachable in
       # c7-disclosure-and-advisory.md §B1 (rsa's Marvin timing side-channel
       # is dead weight from sqlx-mysql being compiled unconditionally by
-      # sqlx-macros-core, never used — this workspace is Postgres-only; the
-      # event-listener unsound warning is transitive via sqlx-postgres and
-      # already downgraded to informational by cargo-audit's own default
-      # policy). Ignoring them here keeps this job green in the normal case
-      # so a genuinely NEW advisory stands out instead of being lost in
-      # permanent red noise; remove an entry the moment its advisory is
-      # fixed upstream or the reachability assessment changes.
+      # sqlx-macros-core, never used — this workspace is Postgres-only).
+      # Ignoring it here keeps this job green in the normal case so a
+      # genuinely NEW advisory stands out instead of being lost in permanent
+      # red noise; remove an entry the moment its advisory is fixed upstream
+      # or the reachability assessment changes — and only after `cargo audit`
+      # on the committed lock shows it gone (`cargo tree` cannot prove that:
+      # lock-only entries are invisible to it).
       - name: cargo audit
         run: |
-          cargo audit \
-            --ignore RUSTSEC-2023-0071 \
-            --ignore RUSTSEC-2026-0221
+          cargo audit --ignore RUSTSEC-2023-0071
 
   # Single required status check the branch ruleset gates on. Keeping it a
   # separate aggregator job means the required check name stays stable even as
-  # the matrix of jobs grows. `audit` is intentionally excluded — see its own
-  # comment above.
+  # the matrix of jobs grows.
+  #
+  # Per-event policy (every needed job's result is printed first):
+  #   - build-test: must be `success`, except on `schedule`, where its own
+  #     `if:` skips it, so `skipped` (or `success`) is accepted there.
+  #   - audit: must be `success` on every event except `pull_request`; on a
+  #     PR its result is printed but does not decide the outcome.
+  # A `skipped` or `cancelled` result never counts as success otherwise.
+  #
+  # `always()` so this still reports on a failed/cancelled needed job (that's
+  # the whole point of the aggregator). It also runs on `schedule` so the
+  # weekly run's conclusion reflects the audit result.
   ci-success:
-    needs: [build-test]
-    # `always()` so this still reports on a failed/cancelled build-test
-    # (that's the whole point of the aggregator); `github.event_name !=
-    # 'schedule'` so the weekly cron run — which skips build-test entirely,
-    # see its own `if:` above — doesn't report a stray success/failure with
-    # nothing behind it. Required-check gating is PR-scoped regardless, so
-    # this is about a clean Actions run list, not correctness.
-    if: always() && github.event_name != 'schedule'
+    needs: [build-test, audit]
+    if: always()
     runs-on: ubuntu-latest
     steps:
       - name: Require all jobs to have passed
+        env:
+          EVENT: ${{ github.event_name }}
+          BUILD_TEST: ${{ needs.build-test.result }}
+          AUDIT: ${{ needs.audit.result }}
         run: |
-          if [ "${{ needs.build-test.result }}" != "success" ]; then
-            echo "::error::build-test='${{ needs.build-test.result }}'"
-            exit 1
+          echo "event=$EVENT build-test=$BUILD_TEST audit=$AUDIT"
+          status=0
+          if [ "$EVENT" = "schedule" ]; then
+            if [ "$BUILD_TEST" != "skipped" ] && [ "$BUILD_TEST" != "success" ]; then
+              echo "::error::build-test='$BUILD_TEST' on schedule (expected skipped)"
+              status=1
+            fi
+          elif [ "$BUILD_TEST" != "success" ]; then
+            echo "::error::build-test='$BUILD_TEST'"
+            status=1
+          fi
+          if [ "$EVENT" = "pull_request" ]; then
+            echo "audit='$AUDIT' is advisory on pull_request (not required)"
+          elif [ "$AUDIT" != "success" ]; then
+            echo "::error::audit='$AUDIT' (required on $EVENT)"
+            status=1
+          fi
+          exit "$status"
+
+  # A failing scheduled audit means a new advisory landed against a dependency
+  # with no change here, and nobody is looking at the weekly run. Open an issue
+  # labelled `security` (or comment on the one already open) so it is seen.
+  # No checkout: `gh` only needs the repo name and the job's token, and
+  # `issues: write` is granted to this job alone (the workflow default stays
+  # `contents: read`).
+  audit-issue:
+    needs: audit
+    if: always() && github.event_name == 'schedule' && needs.audit.result == 'failure'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Open or update the scheduled-audit issue
+        run: |
+          set -euo pipefail
+          title="Scheduled cargo audit is failing"
+          labels="$(gh label list --search security --json name --jq '.[].name')"
+          if ! grep -qx security <<<"$labels"; then
+            gh label create security --color D93F0B --description "Security advisories and hardening"
+          fi
+          number="$(gh issue list --label security --state open --limit 100 --json number,title \
+            --jq "map(select(.title == \"$title\")) | first | .number // empty")"
+          if [ -n "$number" ]; then
+            gh issue comment "$number" --body "The scheduled \`cargo audit\` is still failing: $RUN_URL"
+          else
+            gh issue create --title "$title" --label security \
+              --body "The scheduled \`cargo audit\` failed, so a RustSec advisory now applies to a locked dependency. Run: $RUN_URL"
           fi
