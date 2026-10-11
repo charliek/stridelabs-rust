@@ -74,6 +74,22 @@ manifest reads the same way for everyone, forever. Every crate is versioned
 in lockstep (one `[workspace.package].version` for the whole workspace), so a
 consumer pins **one** tag/rev for however many of the five crates it uses.
 
+### MSRV policy
+
+The minimum supported Rust version is `rust-version` in the workspace
+`Cargo.toml` (currently 1.97, in force since v0.2.0). It tracks the minor
+version of the pinned toolchain (`rust-toolchain.toml`, currently 1.97.1):
+a patch bump of the toolchain leaves it alone, and moving the pin to a new
+minor moves it too. Cargo rejects a consumer on an older compiler from the
+declared `rust-version` alone, even where the source would still build, so an
+MSRV bump is a minor release (0.x), and its CHANGELOG section carries this
+line, with X the new version:
+
+> Minimum supported Rust version raised to X. Consumers must be on Rust X or newer. Earlier tags are unaffected.
+
+A tag is immutable, so a consumer pinned to an earlier tag keeps resolving
+and building with the compiler that tag declares.
+
 ### Local co-development
 
 While iterating on a change to this workspace *and* a consumer at the same

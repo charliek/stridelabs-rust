@@ -17,6 +17,9 @@ next release must be a minor bump (0.x): `LogFormat` became
 `#[non_exhaustive]`. None of this is in `v0.4.0`: until it is released,
 consumers pin a commit (`rev = "…"`), not a tag.
 
+The minimum supported Rust version is unchanged at 1.97 (raised in v0.2.0;
+see the README's "MSRV policy").
+
 ### Added
 
 - `LogFormat::Cloud`: one Google Cloud Logging structured JSON object per
@@ -184,6 +187,12 @@ contract corrected to match what it actually returns.
 `stridelabs-http` gained an optional `openapi` feature (canonicalizing
 serializer, exhaustive `(method, path)` enumeration, committed-spec
 freshness check), and the pinned Rust toolchain moved to 1.97.1.
+
+Amended later: the toolchain bump also raised the workspace `rust-version`
+(the MSRV) from 1.96 to 1.97, and this entry did not say so. `v0.1.0`
+declares 1.96; `v0.2.0` and every later tag declare 1.97. Minimum supported
+Rust version raised to 1.97. Consumers must be on Rust 1.97 or newer.
+Earlier tags are unaffected.
 
 ## [0.1.0] - 2026-07-25
 

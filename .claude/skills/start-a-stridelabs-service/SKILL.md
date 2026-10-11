@@ -64,15 +64,20 @@ errors.
 
 ### 1. Choosing how to consume the crates
 
-Check whether a local checkout of `stridelabs-rust` exists as a **sibling
-directory** of the new service — i.e. `../stridelabs-rust/crates` exists
-relative to the new service's root:
+Check whether a local checkout of `stridelabs-rust` exists **relative to the
+new service's root** — a sibling (`../stridelabs-rust/crates`), or anywhere up
+an ancestor path. A service scaffolded inside an existing monorepo, at
+`repo/service/`, reaches a checkout beside the monorepo at
+`../../stridelabs-rust/crates`; each further level of nesting adds one `../`:
 
 - **If it exists** (local co-development, or a sandboxed/offline
   environment with no guaranteed GitHub auth — including a cold-run of this
-  very skill): use **path dependencies** straight into that checkout. No
-  network fetch, no auth needed, and it always resolves to exactly the code
-  on disk. This is the mechanism this skill's own cold-run tests use.
+  very skill): use **path dependencies** straight into that checkout, with
+  whatever `../` prefix reaches it from the service's root. No network
+  fetch, no auth needed, and it always resolves to exactly the code on disk.
+  This is the mechanism this skill's own cold-run tests use. The snippets
+  here and in Step 2 show the sibling form; a nested service lengthens the
+  prefix (`../../stridelabs-rust/crates/config`) and nothing else.
 
   ```toml
   [dependencies]
@@ -102,10 +107,12 @@ relative to the new service's root:
   # ... the same git =/rev = for the other four crates, feature flags as below
   ```
 
-A service that starts in path-dependency mode (local co-dev) and later
-moves to a real repo should switch every `stridelabs-*` line to the git
-form before its first CI run — CI has no sibling checkout on disk. The
-`templates/ci.yml` skeleton below assumes the git form and says so.
+A service that starts in path-dependency mode — sibling or ancestor-relative,
+and whether it later moves to a real repo or already sits inside one — should
+switch every `stridelabs-*` line to the git form before its first CI run: CI
+has no checkout of `stridelabs-rust` at that relative path (or anywhere) on
+disk. Leave a loud comment beside the path lines saying so while they stand.
+The `templates/ci.yml` skeleton below assumes the git form and says so.
 
 Don't try to detect this automatically inside `Cargo.toml` itself (Cargo has
 no conditional dependency sources) — decide once, at scaffold time, and
@@ -158,6 +165,13 @@ Copy `templates/.spectral.yaml` and `templates/ci.yml` verbatim (filling in
 the `<service>` name and toolchain version in the CI file's comments/
 `toolchain:` line). Append `templates/gitattributes.fragment`'s content to
 `.gitattributes` (create the file if the service has none yet).
+
+**A service nested in a monorepo (`repo/service/`) gets an inert
+`.github/workflows/ci.yml`:** workflows run only from the repository root's
+`.github/workflows/`, so the copy inside the service directory never fires.
+Fold its lanes into the root workflow as a job for this service (steps under
+`working-directory: service`, plus a `paths:` filter if the monorepo uses
+them) and drop the nested file.
 
 `.spectral.yaml` is a dotfile — a bare `ls` in the new service's root won't
 show it, so a copy that silently failed (wrong destination, typo'd filename)
