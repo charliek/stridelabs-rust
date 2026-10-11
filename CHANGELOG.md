@@ -132,10 +132,13 @@ see the README's "MSRV policy").
   complete bucket or quantile sets, each with its own sum and count
   (`x_sum{route_path="/a"} 1` and `x_sum{route_path="/a"} 3`, each beside an
   `x_count{route_path="/a"} 1`), in no fixed order. Two samples with one name
-  and label set cannot be two series in Prometheus, so a scraper keeps at most
-  one of them. Use ONE spelling per label key (letters, digits and `_`, the
-  same at every call site). Different label values, or keys that differ in
-  case, were never merged and are unchanged. Four tests, one per kind, pin the
+  and label set cannot be two series in Prometheus; ingesting such duplicates
+  is undefined, so do not rely on which one a scraper keeps. Use ONE spelling
+  per label key (letters, digits and `_`, the same at every call site). Label
+  values that render differently, and keys that differ only in case, were
+  never merged and are unchanged; two values the exporter's escaping renders
+  identically (e.g. differing only in backslash runs) split the same way.
+  Four tests, one per kind, pin the
   0.18.3 rendering as observed, so an exporter release that merges them again
   shows up as a deliberate change. 0.18's fix that puts
   the `_total` suffix on a counter's `# HELP` and `# TYPE` lines applies only
@@ -183,9 +186,11 @@ see the README's "MSRV policy").
   `title` or `default` loses its `oneOf` wrapper; a response declared with an
   empty description serializes as `{}` instead of `{"description":""}`, which
   OpenAPI 3.1 rejects (`description` is required), so give every response a
-  description; and an `#[schema(inline, title = …)]` unit enum field derives
-  an `allOf` of the string enum and `{"type":"object"}`, a schema no value
-  satisfies, so drop the `title` or the `inline`. `documented_pairs` does not
+  description; and an `inline` unit-enum field that also carries a `title`, a
+  description (a doc comment counts), a `default`, `read_only` or
+  `write_only` derives an `allOf` of the string enum and `{"type":"object"}`,
+  a schema no value satisfies, so do not inline such a field (reference the
+  enum instead). `documented_pairs` does not
   list the two path-item slots utoipa 6 added for OpenAPI 3.2 (`query` and
   `additional_operations`): they have no `HttpMethod` variant, so the
   exhaustive match cannot see them, and neither the derive macro nor

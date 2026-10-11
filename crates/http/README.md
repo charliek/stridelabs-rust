@@ -518,8 +518,10 @@ a one-line diff. Known differences: a derived `Option<T>` field's `oneOf` lists
 the `$ref` first and `null` second; a non-nullable `$ref` field with `title` or
 `default` loses its `oneOf` wrapper; an empty response description serializes
 as `{}`, which OpenAPI 3.1 rejects (always give a description); and an
-`#[schema(inline, title = …)]` unit enum derives an unsatisfiable `allOf` (drop
-the `title` or the `inline`). See the CHANGELOG's 0.5.0 entry.
+`inline` unit-enum field that also carries a title, a description (a doc
+comment counts), a default, `read_only` or `write_only` derives an
+unsatisfiable `allOf` (reference the enum instead of inlining it). See the
+CHANGELOG's 0.5.0 entry.
 
 ## `proxy` feature — reverse-proxy primitives
 
