@@ -115,18 +115,32 @@ error.
   anyone can mint a syntactically valid token carrying a random `kid` and turn
   every request into an outbound HTTPS call — a request amplifier pointed at
   the one service every other service depends on. Inside the interval the
-  answer comes from memory: the cached set if it happens to contain the kid (a
-  stale key beats a spurious 401 — the interval protects the issuer, it does
-  not expire keys), otherwise `AuthError::UnknownKid` — unless nothing has ever
-  been cached, in which case the last *fetch* failed and the error is
-  `Jwks`, not a verdict on the caller's token.
+  answer comes from memory, and only from a set within the *stale bound*
+  (next bullet): that set if it contains the kid (a stale key beats a spurious
+  401 — the interval protects the issuer), otherwise `AuthError::UnknownKid`.
+  With no set within the bound — nothing ever cached, or a set past it — the
+  last *fetch* failed and the error is `Jwks` (a 500 under the `http`
+  feature), not a verdict on the caller's token.
+- **The stale bound is `JWKS_TTL + MIN_REFETCH_INTERVAL` (3630 s), measured
+  from the last *successful* fetch.** Every failed attempt opens a new
+  interval, so without the bound a set would outlive any issuer outage: a key
+  the issuer retired (say, because it leaked) would keep verifying for as long
+  as the outage lasted. With it, a retired key stops verifying at most 3630 s
+  after the last successful fetch, however many attempts fail after that.
 - A fetch *attempt* starts the interval, successful or not. A failing issuer
-  is exactly when hammering it helps least.
+  is exactly when hammering it helps least. The attempt that fails answers
+  `Jwks` itself; it never falls back to the cached set.
 
 The cost is bounded and worth naming: **a key rotation landing within 30
 seconds of the last fetch is invisible for the rest of that interval**, so
 tokens signed by the brand-new key are rejected for up to 30 seconds. Issuers
 roll keys on the order of days.
+
+`JwksCache::with_ttl` and `JwksCache::with_min_refetch_interval` replace the
+two durations (the stale bound follows them), for tests that need to watch a
+set expire or an interval close without sleeping. The defaults are the
+contract: a zero interval turns the floor off, and `Verifier::new` always
+builds its cache with the defaults.
 
 Concurrency: the fetch happens under the write lock and the hit-check is
 repeated after acquiring it (double-checked locking), so a thundering herd of

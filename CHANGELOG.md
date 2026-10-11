@@ -49,6 +49,11 @@ consumers pin a commit (`rev = "…"`), not a tag.
   target.
 - `stridelabs-observability` feature `axum` (off by default): the
   `remoteIp` fallback to axum's `ConnectInfo<SocketAddr>` peer address.
+- `JwksCache::with_ttl(Duration)` and
+  `JwksCache::with_min_refetch_interval(Duration)`: builders replacing the
+  cache's two durations (defaults `JWKS_TTL` and `MIN_REFETCH_INTERVAL`), so
+  a consumer's tests can watch a set expire or the interval close without
+  sleeping. `Verifier::new` still builds its cache with the defaults.
 
 ### Changed
 
@@ -61,6 +66,31 @@ consumers pin a commit (`rev = "…"`), not a tag.
   so behind an outer `RequestLogLayer` it echoes the id that was logged.
 - `LogFormat::Json`'s documentation now lists the `span`/`spans` keys its
   lines have always carried inside a span; the format itself is unchanged.
+- **BREAKING (behaviour, for `Verifier` and `JwksCache` users):** the JWKS
+  stale bound. Inside the refetch interval the cache serves only a set whose
+  last *successful* fetch is younger than `JWKS_TTL + MIN_REFETCH_INTERVAL`.
+  Before, it served a set holding the kid however old it was, and every
+  failed fetch attempt opened a fresh interval, so during an issuer outage a
+  key the issuer had retired (say, because it leaked) kept verifying for as
+  long as the outage lasted. Now **a retired key stops verifying at most
+  `JWKS_TTL + MIN_REFETCH_INTERVAL` (3630 s) after the last successful
+  fetch.** Past the bound a suppressed lookup fails with `AuthError::Jwks`
+  (500 under the `http` feature), not `UnknownKid` (401), whether or not the
+  set has the kid: inside the interval only a failed or cancelled attempt
+  leaves a set that old, which is an outage rather than a verdict on the
+  token, and a 401 would sign users out during it. Both fail closed.
+
+### Not done
+
+Two more `JwksCache` entry points were weighed alongside the builders and
+deliberately left out:
+
+- an all-keys accessor, for verifying a token that carries no `kid`: the
+  access tokens slauth issues all carry one, and `Verifier` keeps rejecting
+  a kid-less token with `MissingKid`;
+- a public `refresh()` forcing a refetch, for an issuer that reuses a `kid`
+  mid-rotation: slauth's issuer rotates by publishing a new `kid`, which the
+  unknown-kid refetch already picks up.
 
 ## [0.4.0] - 2026-08-16
 
