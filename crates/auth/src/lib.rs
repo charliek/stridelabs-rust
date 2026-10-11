@@ -31,8 +31,9 @@
 //! # What verification actually checks
 //!
 //! RS256 signature against a key from the issuer's JWKS (selected by the
-//! token's `kid`), `iss`, `aud`, `exp`, a non-empty `email` claim, and a
-//! non-empty `sub`. Nothing else — in particular this crate does not know or
+//! token's `kid`, and only an RSA key whose `alg`, `use` and `key_ops`, where
+//! present, allow RS256 signatures), `iss`, `aud`, `exp`, a non-empty `email`
+//! claim, and a non-empty `sub`. Nothing else — in particular this crate does not know or
 //! care what a `sub` *looks like*. That it is a Kratos identity UUID is a fact
 //! about a slauth deployment, not a contract of the token format; treat it as
 //! an opaque OIDC subject.

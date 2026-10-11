@@ -287,13 +287,16 @@ see the README's "MSRV policy").
   `VerifiedIdentity` are plain structs, `AuthError` holds no jsonwebtoken
   error as a source (`InvalidToken` carries a fixed classification phrase),
   and `TestKey::{pem, jwks_json, mint, mint_with_kid}` deal in strings and
-  `Serialize` claims. `AuthError::InvalidToken`'s classification is
-  unchanged; jsonwebtoken 11's new error kinds (`InvalidClaimFormat`,
-  `UnsupportedAlgorithm`, `InvalidEddsaKey`, `Signing`, `Provider`) fall into
-  its existing "token is malformed" arm. `InvalidClaimFormat` (a malformed
-  `exp`/`nbf`) cannot reach it from `Verifier`: `exp` is a required claim, so
-  a malformed one is still "a required claim is missing", and `nbf` is not
-  validated.
+  `Serialize` claims. How rejections are classified changes only as "only a
+  key fit for RS256 signatures verifies" below says. jsonwebtoken 11's new error
+  kinds (`InvalidClaimFormat`, `UnsupportedAlgorithm`, `InvalidEddsaKey`,
+  `Signing`, `Provider`) fall into `InvalidToken`'s existing "token is
+  malformed" arm, and none of them arises on `Verifier`'s RS256 path:
+  `InvalidClaimFormat` (a malformed `exp`/`nbf`) because `exp` is a required
+  claim, so a malformed one is still "a required claim is missing", and `nbf`
+  is not validated; `UnsupportedAlgorithm` (a JWK of unknown key type) because
+  only RSA keys reach `DecodingKey::from_jwk`; the other three belong to
+  signing, EdDSA keys and custom providers.
 - **BREAKING (behaviour): one jsonwebtoken backend per graph.** jsonwebtoken
   10+ chooses its crypto from crate features, which Cargo unifies across a
   consumer's whole graph, and with none or both of `aws_lc_rs` and
@@ -314,6 +317,30 @@ see the README's "MSRV policy").
   step (a listing of every member's compiled graph, all features and targets)
   fails if it is again. `Cargo.lock` still lists ring, through optional edges
   nothing compiles, which is why the guard does not grep the lock.
+- **BREAKING (behaviour, security): only a key fit for RS256 signatures
+  verifies.** `Verifier` verifies a token with a JWK under its `kid` only if
+  the key is RSA and its `alg`, `use` and `key_ops`, where present, say RS256,
+  `sig` and `verify`; keys sharing a kid are all considered. Before, any key
+  under the kid was used: `DecodingKey::from_jwk` ignores those labels, so an
+  RSA key the issuer published for encryption (`use: enc`, `alg: RSA-OAEP`)
+  verified tokens in 0.4.0, and jsonwebtoken 11 widened that to labels 9 did
+  not know (`alg: RSA-OAEP-512` now parses, as `UNKNOWN_ALGORITHM`). A kid
+  with no fit key is now `AuthError::UnknownKid` (a 401 under the `http`
+  feature), not `Jwks`: there is no verification key by that name, and since
+  the kid is the caller's choice, a 500 would let anyone raise the service's
+  error rate against an issuer that publishes encryption keys. Against 0.4.0,
+  for a token naming that kid:
+  - an RSA key labelled for something else (any `alg` but RS256, a `use`
+    other than `sig`, `key_ops` without `verify`): verified, now `UnknownKid`;
+  - a non-RSA key (EC, OKP, `oct`): `InvalidToken("algorithm is not
+    accepted")`, now `UnknownKid` (both 401);
+  - a key jsonwebtoken 9 could not parse at all (an `alg` it did not know, or
+    an unknown `kty`): 0.4.0 rejected the whole set, so every token failed
+    with `Jwks` (500); jsonwebtoken 11 parses the set, tokens under its other
+    kids verify, and one naming that key is `UnknownKid`.
+
+  A correctly labelled signing key, or one with no labels, verifies as
+  before. Rejections not listed here are classified as before.
 
 ### Fixed
 

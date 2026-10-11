@@ -114,10 +114,20 @@ can test its own wiring without an HTTP client.
 
 ### What is checked
 
-In order: the token's `kid` is present in the issuer's key set; the key is
-usable; the **RS256** signature; `exp`; `iss` equals the configured issuer;
-`aud` contains the configured audience; a **non-empty `email`** claim; a
-**non-empty `sub`**.
+In order: the issuer's key set has a key under the token's `kid` that is
+**fit for RS256 signatures**; the key is usable; the **RS256** signature;
+`exp`; `iss` equals the configured issuer; `aud` contains the configured
+audience; a **non-empty `email`** claim; a **non-empty `sub`**.
+
+"Fit" means an RSA key whose `alg`, `use` and `key_ops`, where present, say
+RS256, `sig` and `verify`. jsonwebtoken builds a verifier from a JWK without
+reading any of them, so without this an RSA key the issuer published for
+encryption (`use: enc`, `alg: RSA-OAEP`) would verify a token that names its
+kid. A kid with only unfit keys is `UnknownKid` (401), not `Jwks` (500): there
+is no verification key by that name, and the kid is the caller's to choose, so
+a 500 would hand anyone a way to raise the error rate whenever the issuer
+publishes encryption keys next to its signing keys. Keys sharing a kid are all
+considered, so a listed-first encryption key cannot hide the signing key.
 
 Pinning the algorithm to RS256 is what rules out the two classic forgeries
 (`alg: none`, and HS256 signed with the issuer's public key as an HMAC

@@ -39,7 +39,9 @@ pub enum AuthError {
     #[error("token is missing a key id")]
     MissingKid,
     /// The token's `kid` is not in the issuer's JWKS — after a refetch, or
-    /// after a refetch was suppressed by [`crate::MIN_REFETCH_INTERVAL`].
+    /// after a refetch was suppressed by [`crate::MIN_REFETCH_INTERVAL`] — or
+    /// names only keys unfit for RS256 signatures: not RSA, or an `alg`,
+    /// `use` or `key_ops` that says otherwise (an encryption key, say).
     #[error("token signed by an unknown key")]
     UnknownKid,
     /// Signature, `iss`, `aud`, `exp` or claim-shape check failed. The
