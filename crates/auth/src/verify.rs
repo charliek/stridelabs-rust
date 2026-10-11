@@ -54,6 +54,10 @@ pub struct Verifier {
     inner: Arc<Inner>,
 }
 
+// `Debug` stays derived here and on `Verifier`: the only URL either holds is
+// inside `SlauthConfig` and `JwksCache`, whose own `Debug` impls redact it.
+// `jwks::tests::debug_never_renders_url_material` renders a `Verifier` to
+// hold the composition to that.
 #[derive(Debug)]
 struct Inner {
     config: SlauthConfig,

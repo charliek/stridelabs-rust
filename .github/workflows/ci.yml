@@ -101,9 +101,9 @@ jobs:
       - name: Doc
         run: cargo doc --workspace --all-features --no-deps --locked
 
-      # Dependency-graph guards. A consumer's test build unifies features across
-      # its whole graph, so what stridelabs-testing enables is what the consumer
-      # compiles; these steps fail the moment a forbidden crate re-enters.
+      # Dependency-graph guards. A consumer's build unifies features across its
+      # whole graph, so what a crate here enables is what the consumer compiles;
+      # these steps fail the moment a forbidden crate re-enters.
       #
       # Each asserts on a package LISTING (`cargo tree ... --prefix none
       # --format '{p}'`, first word of each line, de-duplicated), never on
@@ -146,6 +146,63 @@ jobs:
             exit 1
           fi
           echo "ok: ring absent, sqlx present"
+
+      # The same panic from the other side: stridelabs-auth sits in consumers'
+      # PRODUCTION graphs, and a TLS feature on its reqwest would put rustls's
+      # aws-lc-rs provider next to whatever provider the consumer chose (ring,
+      # for redis-rs or sqlx `tls-rustls-ring`). It never builds a client
+      # outside its tests (`Verifier::new`/`JwksCache::new` take the
+      # consumer's), so it has no TLS feature at all and the TLS stack stays the
+      # consumer's choice. Two listings. Default features, as a consumer that
+      # names the crate with no `features` gets it. Then every feature: a
+      # consumer of `stridelabs-auth[http]` (the usual production shape) also
+      # gets whatever auth's features pull from stridelabs-http, and
+      # stridelabs-http's `proxy` IS TLS, so a feature edge to it would put
+      # aws-lc-rs in that consumer's graph with the default listing still
+      # green. Features only add crates, so rustls absent with all of them on
+      # is absent from every combination; `stridelabs-http` is that listing's
+      # second positive control, proving the feature edge was walked.
+      - name: "Guard: stridelabs-auth pulls no rustls"
+        run: |
+          set -euo pipefail
+          pkgs="$(mktemp)"
+          trap 'rm -f "$pkgs"' EXIT
+          cargo tree --locked --target all -e normal -p stridelabs-auth \
+            --prefix none --format '{p}' | awk '{print $1}' | sort -u > "$pkgs"
+          echo "$(wc -l < "$pkgs") packages in stridelabs-auth's normal graph"
+          if [ ! -s "$pkgs" ]; then
+            echo "::error::the stridelabs-auth package listing is empty; the guard proved nothing"
+            exit 1
+          fi
+          if ! grep -qx jsonwebtoken "$pkgs"; then
+            echo "::error::positive control failed: jsonwebtoken is not in stridelabs-auth's graph, so this listing is not the one the guard means to inspect"
+            exit 1
+          fi
+          if grep -qx rustls "$pkgs"; then
+            echo "::error::rustls is in stridelabs-auth's graph; a reqwest TLS feature on it picks a rustls provider for every consumer"
+            cargo tree --locked --target all -e normal -p stridelabs-auth -i rustls || true
+            exit 1
+          fi
+          echo "ok: rustls absent, jsonwebtoken present"
+          cargo tree --locked --target all -e normal -p stridelabs-auth --all-features \
+            --prefix none --format '{p}' | awk '{print $1}' | sort -u > "$pkgs"
+          echo "$(wc -l < "$pkgs") packages in stridelabs-auth[all features]'s normal graph"
+          if [ ! -s "$pkgs" ]; then
+            echo "::error::the stridelabs-auth[all features] package listing is empty; the guard proved nothing"
+            exit 1
+          fi
+          for control in jsonwebtoken stridelabs-http; do
+            if ! grep -qx "$control" "$pkgs"; then
+              echo "::error::positive control failed: $control is not in stridelabs-auth[all features]'s graph, so this listing is not the one the guard means to inspect"
+              exit 1
+            fi
+          done
+          if grep -qx rustls "$pkgs"; then
+            echo "::error::rustls is in stridelabs-auth[all features]'s graph; a stridelabs-auth feature turns on TLS (an edge to stridelabs-http's proxy, say) for every consumer that enables it"
+            cargo tree --locked --target all -e normal -p stridelabs-auth --all-features -i rustls || true
+            exit 1
+          fi
+          echo "ok: rustls absent with every feature on, jsonwebtoken and stridelabs-http present"
 
       # rsa (RUSTSEC-2023-0071, no upstream fix) has to stay out of the lock
       # entirely: cargo-audit reads Cargo.lock, so even a crate that is never

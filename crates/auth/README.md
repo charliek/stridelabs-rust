@@ -32,6 +32,17 @@ machinery (~13 transitive crates), which only offline minting needs.
 Verification decodes keys from the JWKS, never from PEM, so put the feature in
 `dev-dependencies` and release graphs never see it.
 
+**No TLS, in any feature.** The crate's `reqwest` (0.13) has `json` and
+nothing else: it never builds a client outside its own tests —
+`Verifier::new` and `JwksCache::new` take yours — so the TLS stack, and with
+it the process's rustls crypto provider, is your choice. To fetch an
+`https://` JWKS, enable a TLS feature on your own `reqwest` 0.13 (`rustls`:
+the aws-lc-rs provider plus the OS trust store), and keep one rustls provider
+in your graph: rustls `ring` from something else (redis-rs `tls-rustls`, sqlx
+`tls-rustls-ring`) next to aws-lc-rs makes `rustls::ClientConfig::builder()`
+panic. CI's "Guard: stridelabs-auth pulls no rustls" keeps rustls out of this
+crate's graph.
+
 ## Adding the dependency
 
 ```toml
@@ -162,6 +173,17 @@ mapped to one of a fixed set of phrases, never rendered with `Display`. That
 is a departure from the original implementation this crate replaced, whose
 `format!("token rejected: {e}")` could quote the claim value that failed to
 parse.
+
+Nor do they echo the JWKS URL, and neither does any type's `Debug`.
+`AuthError::Jwks` renders a failed fetch's `reqwest::Error` with
+`without_url()`: a `reqwest::Error` otherwise ends `for url (…)` with the
+query string, and a JWKS URL is configuration that can carry a credential.
+`SlauthConfig`, `JwksCache` and `Verifier` print it in `Debug` as
+`scheme://host[:port]/path` (userinfo, query and fragment dropped; so is
+`pat_validate_url`'s), so `tracing::info!(?config)` is safe. A canary test
+pins both: a URL with a token in the query and userinfo in the authority,
+checked in the error's `Display`/`Debug`, in the line the `http` feature logs
+for the 500, and in each type's `Debug`.
 
 With the `http` feature:
 

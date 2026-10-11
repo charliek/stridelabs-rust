@@ -15,12 +15,24 @@ add friction.
 |---|---|---|
 | `cors` | off | `cors_layer`, via `tower-http/cors` |
 | `openapi` | off | the `openapi` module — spec canonicalization, `(method, path)` enumeration, committed-spec freshness check — via `utoipa` |
-| `proxy` | off | the `proxy` module — and `AppError::bad_gateway_upstream`, which takes a `reqwest::Error` — via `reqwest`/`url`/`bytes`/`futures` (and `tokio/time`) |
+| `proxy` | off | the `proxy` module — and `AppError::bad_gateway_upstream`, which takes a `reqwest::Error` — via `reqwest` 0.13 (with its `rustls` TLS feature)/`url`/`bytes`/`futures` (and `tokio/time`) |
 
 `proxy` is the gate that matters: it pulls in an HTTP *client* and a TLS
 stack. A service that only answers requests should never compile that, which
 is why the proxy primitives live behind a feature instead of in a crate
 everyone already depends on.
+
+It is also the **only** TLS feature in this workspace. reqwest 0.13's `rustls`
+means rustls's aws-lc-rs provider (unless the process installed a default
+provider first; aws-lc-sys is a C build) and `rustls-platform-verifier`: the
+OS trust store plus `UpstreamClient::build`'s `ca_bundle_pem`, and **no
+bundled roots** — 0.12's webpki roots are gone. On Linux that store is the
+system CA bundle (`SSL_CERT_FILE`/`SSL_CERT_DIR` respected), so an image
+without `ca-certificates` fails `UpstreamClient::build(true, None)` with
+`ClientBuildError::Build`. Keep aws-lc-rs the only rustls provider in the
+consumer's graph: rustls `ring` from anywhere else (redis-rs `tls-rustls`,
+sqlx `tls-rustls-ring`) next to it makes `rustls::ClientConfig::builder()`
+panic.
 
 `tokio` is a **non-optional** dependency (`signal`, `sync`, `macros`) because
 `shutdown` is signal/watch machinery. A service with no tokio in its graph
@@ -601,7 +613,10 @@ re-introduces every time this layer gets rewritten:
   `AppError::BadGateway(format!("upstream: {e}"))` hands the caller the
   upstream's address (exactly the class of leak this module exists to close
   — an internal provider base URL configured via environment is a realistic
-  example), and `tracing::error!(error = ?e, …)` puts it in the logs.
+  example), and `tracing::error!(error = ?e, …)` puts it in the logs. Since
+  reqwest 0.13 that includes a body-read failure from `Response::bytes()` or
+  `json()`, which 0.12 rendered without one; `e.without_url()` strips it when
+  rendering the error is really what you want.
   `UpstreamFailure::classify` is the alternative: four `reqwest` predicates,
   the `Option<StatusCode>` that only `error_for_status` ever produces, and a
   **total** `category` — because all four predicates can be false at once

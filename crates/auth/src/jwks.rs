@@ -62,12 +62,14 @@
 //! meant two verifiers in one process — the shape every test that wanted an
 //! isolated cache needs — silently shared one key set.
 
+use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use jsonwebtoken::jwk::JwkSet;
 use tokio::sync::RwLock;
 
+use crate::config::redact_url;
 use crate::error::AuthError;
 
 /// How long a fetched key set is considered fresh.
@@ -85,12 +87,25 @@ pub const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 ///
 /// Cheap to share (`&self` methods only); a [`crate::Verifier`] owns one
 /// inside its `Arc`, which is the intended way to hold it.
-#[derive(Debug)]
+///
+/// `Debug` prints the JWKS URL without its userinfo, query or fragment, as
+/// [`crate::SlauthConfig`]'s does.
 pub struct JwksCache {
     jwks_url: String,
     http: reqwest::Client,
     tuning: Tuning,
     state: RwLock<State>,
+}
+
+impl fmt::Debug for JwksCache {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("JwksCache")
+            .field("jwks_url", &redact_url(&self.jwks_url))
+            .field("http", &self.http)
+            .field("tuning", &self.tuning)
+            .field("state", &self.state)
+            .finish()
+    }
 }
 
 /// The two durations of the cache contract: [`JWKS_TTL`] and
@@ -294,23 +309,32 @@ impl JwksCache {
         // every verification in the process until the socket died on its own.
         // reqwest::Client has NO default timeout, and we can't assume the
         // injected client configured one.
+        //
+        // Every `reqwest::Error` is rendered `without_url()`: its `Display`
+        // otherwise ends " for url (…)", query string included (reqwest moves
+        // only userinfo out, into an `Authorization` header), and
+        // `AuthError::Jwks` lands in logs — the `http` feature's 500 logs it
+        // in full. A JWKS URL is configuration, and configuration can carry a
+        // token. The operator knows which issuer they configured.
         let response = self
             .http
             .get(&self.jwks_url)
             .timeout(FETCH_TIMEOUT)
             .send()
             .await
-            .map_err(|err| AuthError::Jwks(format!("fetch failed: {err}")))?;
+            .map_err(|err| AuthError::Jwks(format!("fetch failed: {}", err.without_url())))?;
 
         let status = response.status();
         if !status.is_success() {
             return Err(AuthError::Jwks(format!("endpoint returned {status}")));
         }
 
-        response
-            .json::<JwkSet>()
-            .await
-            .map_err(|err| AuthError::Jwks(format!("response was not a valid JWKS: {err}")))
+        response.json::<JwkSet>().await.map_err(|err| {
+            AuthError::Jwks(format!(
+                "response was not a valid JWKS: {}",
+                err.without_url()
+            ))
+        })
     }
 }
 
@@ -830,6 +854,169 @@ mod tests {
         let err = cache.jwks_for_kid(PRIMARY_KID).await.unwrap_err();
 
         assert!(matches!(err, AuthError::Jwks(_)), "{err}");
+    }
+
+    // --- the URL canary ----------------------------------------------------
+    //
+    // A JWKS URL is configuration, and configuration can carry a credential:
+    // userinfo in the authority, a token in the query. Each marker stands for
+    // one of them, and any of them in a rendered `AuthError` — or in the line
+    // the `http` feature logs for it — is the leak `fetch`'s `without_url()`
+    // closes; in the `Debug` of a type holding the URL, the leak the
+    // redacting `Debug` impls close.
+
+    const CANARY_MARKERS: &[&str] = &["CANARY-user", "CANARY-pass", "CANARY-token"];
+
+    /// A JWKS URL at `authority` (`host:port`) carrying every marker.
+    fn canary_url(authority: impl std::fmt::Display) -> String {
+        format!("http://CANARY-user:CANARY-pass@{authority}/jwks?token=CANARY-token")
+    }
+
+    #[track_caller]
+    fn assert_no_canary(haystack: &str, what: &str) {
+        for marker in CANARY_MARKERS {
+            assert!(
+                !haystack.contains(marker),
+                "{what} leaked JWKS URL material ({marker:?}): {haystack}"
+            );
+        }
+    }
+
+    /// What the naive fetch — `send()`, then `json()` — fails with, unredacted.
+    async fn naive_fetch_error(url: &str) -> reqwest::Error {
+        match reqwest::Client::new().get(url).send().await {
+            Err(err) => err,
+            Ok(response) => response
+                .json::<JwkSet>()
+                .await
+                .expect_err("no fixture here serves a JWKS"),
+        }
+    }
+
+    /// One failure per arm of `fetch`: `send()` (nothing listens on port 1),
+    /// the status check (a 503) and `json()` (a 200 that is not a JWKS).
+    #[tokio::test]
+    async fn a_jwks_failure_never_renders_url_material() {
+        // Two requests each: the naive fetch's, then the cache's.
+        let unavailable = issuer(ResponseTemplate::new(503), 2).await;
+        let not_a_jwks = issuer(jwks_body("{\"keys\": \"not a list\"}"), 2).await;
+        let cases = [
+            ("send", canary_url("127.0.0.1:1")),
+            ("status", canary_url(unavailable.address())),
+            ("decode", canary_url(not_a_jwks.address())),
+        ];
+
+        for (name, url) in cases {
+            // The control: reqwest renders the query (it moves userinfo into
+            // an `Authorization` header itself). Without this, a fixture
+            // whose URL never reached the error would pass everything below.
+            let naive = naive_fetch_error(&url).await;
+            assert!(
+                naive.to_string().contains("CANARY-token"),
+                "{name}: reqwest no longer renders the URL, so this test is vacuous: {naive}"
+            );
+
+            let err = cache_at(url, NO_THROTTLE)
+                .jwks_for_kid(PRIMARY_KID)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, AuthError::Jwks(_)), "{name}: {err}");
+            assert_no_canary(&format!("{err} / {err:?}"), name);
+            #[cfg(feature = "http")]
+            assert_no_canary(&http_log::logged_as_500(err), name);
+        }
+    }
+
+    /// The other road from configuration to a log: `?config`, `?verifier`.
+    /// None of the three types holding the JWKS URL may print its userinfo or
+    /// query, and each must still name the endpoint — redacted, not dropped.
+    #[test]
+    fn debug_never_renders_url_material() {
+        let url = canary_url("jwks.example:8443");
+        let config = crate::SlauthConfig {
+            issuer: "https://issuer.example".into(),
+            jwks_url: url.clone(),
+            audience: "svc".into(),
+            pat_validate_url: Some(url.clone()),
+        };
+        let cache = JwksCache::new(url, reqwest::Client::new());
+        let verifier = crate::Verifier::new(config.clone(), reqwest::Client::new());
+
+        for (name, debug) in [
+            ("SlauthConfig", format!("{config:?}")),
+            ("JwksCache", format!("{cache:?}")),
+            ("Verifier", format!("{verifier:?}")),
+        ] {
+            assert!(
+                !debug.contains("CANARY"),
+                "{name}'s Debug leaked JWKS URL material: {debug}"
+            );
+            assert!(
+                debug.contains(r#""http://jwks.example:8443/jwks""#),
+                "{name}'s Debug no longer names the JWKS endpoint: {debug}"
+            );
+        }
+    }
+
+    /// The `http` feature's log line: `From<AuthError> for AppError` makes a
+    /// JWKS failure `AppError::Internal`, whose `IntoResponse` logs it in full.
+    #[cfg(feature = "http")]
+    mod http_log {
+        use std::sync::{Arc, Mutex};
+
+        use axum::response::IntoResponse as _;
+        use tracing_subscriber::fmt::MakeWriter;
+
+        use crate::AuthError;
+
+        /// A `MakeWriter` that keeps every byte the fmt subscriber writes —
+        /// the same capture `stridelabs-http`'s upstream leak tests use.
+        #[derive(Clone, Default)]
+        struct LogSink(Arc<Mutex<Vec<u8>>>);
+
+        impl std::io::Write for LogSink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("log sink").extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> MakeWriter<'a> for LogSink {
+            type Writer = LogSink;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        /// Everything logged while `err` is rendered as the 500 it becomes.
+        /// A thread-local subscriber (`with_default`), so tests running in
+        /// parallel never write into each other's capture.
+        pub(super) fn logged_as_500(err: AuthError) -> String {
+            let app: stridelabs_http::AppError = err.into();
+            // `AppError::Internal` is `#[error(transparent)]`, so this is the
+            // JWKS detail exactly as the line carries it.
+            let expected = app.to_string();
+            let sink = LogSink::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(sink.clone())
+                .with_ansi(false)
+                .finish();
+            tracing::subscriber::with_default(subscriber, || drop(app.into_response()));
+
+            let logs = String::from_utf8(sink.0.lock().expect("log sink").clone())
+                .expect("utf-8 log output");
+            // Absence proves nothing unless the line was captured, detail and
+            // all. (Any `err` but a JWKS failure becomes a 401, logs nothing,
+            // and fails here too.)
+            assert!(
+                logs.contains("internal error") && logs.contains(&expected),
+                "the 500's log line was not captured with its detail: {logs}"
+            );
+            logs
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

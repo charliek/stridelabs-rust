@@ -55,7 +55,9 @@ pub enum AuthError {
     MissingSubject,
     /// The issuer's JWKS could not be fetched or parsed. This is the one
     /// failure here that is the *server's* fault, and the only one that maps
-    /// to a 5xx.
+    /// to a 5xx. The payload names the failure but never the JWKS URL, whose
+    /// query string or userinfo may hold a credential: a `reqwest::Error` is
+    /// rendered `without_url()`.
     #[error("JWKS unavailable: {0}")]
     Jwks(String),
 }

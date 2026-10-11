@@ -157,6 +157,58 @@ see the README's "MSRV policy").
   longer compiles `rsa` (MySQL's RSA auth is behind its opt-in `mysql-rsa`
   feature), so `Cargo.lock` has no `rsa` entry and `cargo audit` runs with no
   ignores. A "Guard: no rsa in Cargo.lock" CI step keeps it that way.
+- `reqwest` 0.12 → 0.13 (0.13.5). **BREAKING** for a consumer that hands
+  these crates a reqwest type or names one they return: it must be on reqwest
+  0.13 too (two majors are two unrelated `Client` types). `stridelabs-auth`:
+  `Verifier::new` and `JwksCache::new` take a `reqwest::Client`.
+  `stridelabs-http` (`proxy` feature): `UpstreamClient::inner()` returns
+  `&reqwest::Client`; `ClientBuildError::Build` and `ClientBuildError::CaParse`
+  carry a `reqwest::Error`; `UpstreamFailure::classify`,
+  `AppError::bad_gateway_upstream` and
+  `AppError::bad_gateway_upstream_with_context` take a `&reqwest::Error`;
+  `buffer_or_stream`, `buffer_or_stream_within` and `relay_response` take a
+  `reqwest::Response`.
+- **BREAKING (features):** where TLS is turned on. Nothing turns on a reqwest
+  TLS feature at workspace level any more, and `stridelabs-auth` turns on none:
+  it never builds a client outside its tests, so the TLS stack (and with it
+  the process's rustls provider) is the consumer's choice. A consumer that
+  fetched an `https://` JWKS through a client whose TLS came from
+  stridelabs-auth's reqwest must now enable a TLS feature on its own reqwest
+  0.13. Only `stridelabs-http`'s `proxy` enables one: `rustls`, reqwest 0.13's
+  rename of 0.12's `rustls-tls` (`rustls-tls-native-roots` no longer exists).
+  CI's "Guard: stridelabs-auth pulls no rustls" fails if `stridelabs-auth`'s
+  normal graph, with default features or with all of them, ever contains
+  `rustls` again.
+- **BREAKING (behaviour, `proxy`):** the TLS trust model. reqwest 0.13's
+  `rustls` uses rustls's aws-lc-rs provider (unless the process installed a
+  default provider first) and `rustls-platform-verifier`: **the OS trust store
+  plus any extra roots, with no bundled webpki roots** (0.12's `rustls-tls`
+  carried Mozilla's). `UpstreamClient::build`'s `ca_bundle_pem` is merged into
+  that store, as before. On Linux the store is the system CA bundle
+  (`SSL_CERT_FILE`/`SSL_CERT_DIR` respected), so **a consumer's image needs
+  `ca-certificates`**: without a bundle, `UpstreamClient::build(true, None)`
+  fails with `ClientBuildError::Build`. mkcert and corporate roots installed in
+  the OS store still verify. aws-lc-sys, a C build, joins every `proxy`
+  consumer's graph. If that graph also enables rustls's `ring` (redis-rs's
+  `tls-rustls`, sqlx's `tls-rustls-ring`), rustls has two providers and every
+  `rustls::ClientConfig::builder()` relying on the crate-feature default
+  panics: keep aws-lc-rs the only one.
+- reqwest errors are now rendered without URLs. `AuthError::Jwks` renders the
+  `reqwest::Error` from a failed JWKS fetch or JSON decode with
+  `without_url()`; before, it ended `for url (…)` with the JWKS URL's query
+  string, which reached logs (the `http` feature's 500 logs it in full).
+  Userinfo never reached it: reqwest moves it into an `Authorization` header.
+  A canary test, a JWKS URL carrying both, pins the error's `Display` and
+  `Debug` and the `http` feature's log line. In `proxy` nothing changes:
+  `UpstreamFailure` and `bad_gateway_upstream` never render the error. But
+  reqwest 0.13 now attaches the URL to a `Response::bytes()`/`json()` failure
+  too, so a consumer that logs `%err` or `?err` from a body read now leaks the
+  URL and its query string where 0.12 did not: call `.without_url()` first, or
+  log `UpstreamFailure` instead.
+- `Debug` for `SlauthConfig`, `JwksCache` and `Verifier` no longer prints a
+  URL's userinfo, query or fragment: the JWKS URL (and `pat_validate_url`)
+  renders as `scheme://host[:port]/path`, and a string that does not parse as
+  a URL with a host as `<unparseable URL>`.
 
 ### Fixed
 

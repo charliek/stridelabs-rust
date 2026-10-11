@@ -62,12 +62,15 @@ allow = [
     # under the Unicode data-and-software license's 2024 successor term.
     # Permissive.
     "Unicode-3.0",
-    # ring (TLS crypto primitives, transitively via rustls/reqwest).
-    # Permissive.
+    # The crypto underneath TLS and JWT: aws-lc-rs/aws-lc-sys (rustls's
+    # provider under reqwest 0.13's `rustls`), ring (jsonwebtoken), and
+    # rustls-webpki, untrusted, simple_asn1. Permissive.
     "ISC",
-    # webpki-roots (Mozilla's root CA bundle, pulled in transitively by
-    # reqwest's rustls-tls-native-roots feature). A data license covering the
-    # cert bundle, not code — permissive in substance.
+    # webpki-root-certs (Mozilla's root CA bundle). reqwest 0.13 bundles no
+    # roots any more (0.12's webpki-roots is gone from the lock); this one is
+    # rustls-platform-verifier's wasm32-only fallback, so nothing built for a
+    # real target compiles it, but this file's graph spans every target. A data
+    # license covering the cert bundle, not code — permissive in substance.
     "CDLA-Permissive-2.0",
     # ryu (float-to-string formatting, transitive via serde_json). Permissive
     # (Boost Software License).

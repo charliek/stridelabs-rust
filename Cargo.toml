@@ -32,14 +32,16 @@ http = "1"
 # every other dependency, and moving a crate is a one-line edit.
 stridelabs-http = { path = "crates/http" }
 
-# HTTP client (proxy primitives, JWKS fetch). rustls with BOTH webpki and
-# OS-native roots — matching the reverse proxy these primitives were extracted
-# from: without native roots, upstreams trusted via the system store (mkcert
-# local CAs, corporate roots) verify there but fail here. Still no openssl.
-reqwest = { version = "0.12", default-features = false, features = [
-    "rustls-tls",
-    "rustls-tls-native-roots",
-] }
+# HTTP client (proxy primitives, JWKS fetch). Deliberately NO TLS feature
+# here: whatever is listed at workspace level reaches every member's graph, and
+# so every consumer's. reqwest 0.13's `rustls` switches on rustls's aws-lc-rs
+# provider, and next to a consumer's rustls `ring` (redis-rs, sqlx
+# `tls-rustls-ring`) every `rustls::ClientConfig::builder()` that relies on the
+# crate-feature default panics. Only stridelabs-http's `proxy` builds a client
+# of its own, so only it turns TLS on (crates/http/Cargo.toml).
+# stridelabs-auth is handed the consumer's client and must not pick a TLS
+# stack for it; CI's "Guard: stridelabs-auth pulls no rustls" holds it to that.
+reqwest = { version = "0.13", default-features = false }
 
 # OpenAPI. No schema features (`uuid`, `time`, …) here: the shared crate
 # derives no schemas of its own, and a consumer that does declares its own

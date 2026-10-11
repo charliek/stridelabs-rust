@@ -133,7 +133,7 @@ on what.
 | `stridelabs-observability` | `axum` | off | `RequestLogLayer`'s peer-address fallback for `remoteIp`, read from axum's `ConnectInfo<SocketAddr>` |
 | `stridelabs-http` | `cors` | off | `cors_layer`, via `tower-http/cors` |
 | `stridelabs-http` | `openapi` | off | spec canonicalization, `(method, path)` enumeration, committed-spec freshness check, via `utoipa` |
-| `stridelabs-http` | `proxy` | off | reverse-proxy primitives, via `reqwest`/`url`/`bytes`/`futures` |
+| `stridelabs-http` | `proxy` | off | reverse-proxy primitives, via `reqwest` (with `rustls`: the aws-lc-rs provider and the OS trust store)/`url`/`bytes`/`futures` |
 | `stridelabs-auth` | `axum` | off | `bearer_token(&Parts)`, via the `http` types crate |
 | `stridelabs-auth` | `http` | off | `From<AuthError> for stridelabs_http::AppError` |
 | `stridelabs-auth` | `test-support` | off | offline JWT minting against two committed throwaway keypairs |
@@ -142,3 +142,8 @@ on what.
 `stridelabs-testing`'s `oneshot` and `wiremock` modules have no feature gate
 of their own — both are cheap and every consumer of the crate wants them; only
 the Postgres driver is worth gating.
+
+`stridelabs-http`'s `proxy` is the only feature anywhere here that turns on
+TLS. `stridelabs-auth` has none — it takes the consumer's `reqwest::Client`,
+so the TLS stack and the process's rustls provider stay the consumer's choice —
+and `stridelabs-testing`'s Postgres pool talks to its database in the clear.
