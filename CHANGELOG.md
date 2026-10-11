@@ -174,15 +174,22 @@ see the README's "MSRV policy").
   byte-identical to 0.2.0, so the module docs' nest/merge guidance stands.
   `to_pretty_json` output is unchanged for an unchanged spec, now pinned
   byte for byte by a test of a fixed document that passed unchanged across the
-  bump. One derived difference, not ours: the `oneOf` of an `Option<T>` field
-  now lists the `$ref` first and `{"type":"null"}` second (utoipa 5 listed
-  `null` first), so a committed `openapi.json` with an optional field gains
-  exactly that diff when regenerated; the canonicalizer sorts object keys
-  only, never arrays, and the uncanonicalized `serde_json::to_value` already
-  has the new order. `documented_pairs` does not list the two path-item slots
-  utoipa 6 added for OpenAPI 3.2 (`query` and `additional_operations`): they
-  have no `HttpMethod` variant, so the exhaustive match cannot see them, and
-  neither the derive macro nor utoipa-axum can fill them; a test pins this.
+  bump. What utoipa-gen 6 *derives* does change, though, so a consumer must
+  diff its regenerated `openapi.json` and run its validator (Spectral or
+  similar) rather than assume a one-line diff. Known upstream differences:
+  the `oneOf` of an `Option<T>` field now lists the `$ref` first and
+  `{"type":"null"}` second (utoipa 5 listed `null` first; the canonicalizer
+  sorts object keys only, never arrays); a non-nullable `$ref` field carrying
+  `title` or `default` loses its `oneOf` wrapper; a response declared with an
+  empty description serializes as `{}` instead of `{"description":""}`, which
+  OpenAPI 3.1 rejects (`description` is required), so give every response a
+  description; and an `#[schema(inline, title = …)]` unit enum field derives
+  an `allOf` of the string enum and `{"type":"object"}`, a schema no value
+  satisfies, so drop the `title` or the `inline`. `documented_pairs` does not
+  list the two path-item slots utoipa 6 added for OpenAPI 3.2 (`query` and
+  `additional_operations`): they have no `HttpMethod` variant, so the
+  exhaustive match cannot see them, and neither the derive macro nor
+  utoipa-axum can fill them; a test pins this.
 - `sqlx` 0.8 → 0.9 (0.9.0, `stridelabs-testing`'s `postgres` feature).
   **BREAKING** for a consumer that names sqlx types from this crate:
   `require_postgres` returns an `sqlx::PgPool`, the only sqlx type in any

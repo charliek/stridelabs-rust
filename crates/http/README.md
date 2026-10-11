@@ -512,10 +512,14 @@ unrelated `OpenApi` types. A service that registers routes through
 release that requires utoipa 6; 0.2 only supports utoipa 5. The
 `nest`/`merge`/`route` behaviour described in the module docs is unchanged by
 the move: utoipa-axum's `router.rs` is byte-identical in 0.2.0 and 0.3.0.
-Moving from utoipa 5 to 6 also changes the `oneOf` element order a derived
-`Option<T>` field serializes with (the `$ref` now comes first, `null` second),
-so a committed `openapi.json` with an optional field gains that one diff when
-regenerated.
+Moving from utoipa 5 to 6 also changes what utoipa-gen derives, so diff a
+regenerated `openapi.json` and run your OpenAPI validator rather than expecting
+a one-line diff. Known differences: a derived `Option<T>` field's `oneOf` lists
+the `$ref` first and `null` second; a non-nullable `$ref` field with `title` or
+`default` loses its `oneOf` wrapper; an empty response description serializes
+as `{}`, which OpenAPI 3.1 rejects (always give a description); and an
+`#[schema(inline, title = …)]` unit enum derives an unsatisfiable `allOf` (drop
+the `title` or the `inline`). See the CHANGELOG's 0.5.0 entry.
 
 ## `proxy` feature — reverse-proxy primitives
 
