@@ -134,6 +134,29 @@ see the README's "MSRV policy").
   `security_headers` differs from 0.6 (status, headers, values and header
   order compared over 15 request shapes), so `Vary` is the only change
   guarded.
+- `utoipa` 5 → 6 (6.0.0 with utoipa-gen 6.0.1, both from 2026-09-22/23;
+  `stridelabs-http`'s `openapi` feature). **BREAKING** for every consumer of
+  the module: `documented_pairs`, `find_operation`, `expect_operation`,
+  `to_pretty_json`, `expected_file_contents`, `check_committed_spec` and
+  `assert_committed_spec_is_fresh` take a `&utoipa::openapi::OpenApi`, and
+  `find_operation` / `expect_operation` return a
+  `&utoipa::openapi::path::Operation`, so the caller must be on utoipa 6 (two
+  majors are two unrelated `OpenApi` types). Those are the only utoipa types in
+  the public API. A service that builds its router with
+  `utoipa_axum::router::OpenApiRouter` moves to utoipa-axum 0.3, the release
+  that requires utoipa 6; its `router.rs` (`nest`, `merge`, `route`) is
+  byte-identical to 0.2.0, so the module docs' nest/merge guidance stands.
+  `to_pretty_json` output is unchanged for an unchanged spec, now pinned
+  byte for byte by a test of a fixed document that passed unchanged across the
+  bump. One derived difference, not ours: the `oneOf` of an `Option<T>` field
+  now lists the `$ref` first and `{"type":"null"}` second (utoipa 5 listed
+  `null` first), so a committed `openapi.json` with an optional field gains
+  exactly that diff when regenerated; the canonicalizer sorts object keys
+  only, never arrays, and the uncanonicalized `serde_json::to_value` already
+  has the new order. `documented_pairs` does not list the two path-item slots
+  utoipa 6 added for OpenAPI 3.2 (`query` and `additional_operations`): they
+  have no `HttpMethod` variant, so the exhaustive match cannot see them, and
+  neither the derive macro nor utoipa-axum can fill them; a test pins this.
 - `sqlx` 0.8 → 0.9 (0.9.0, `stridelabs-testing`'s `postgres` feature).
   **BREAKING** for a consumer that names sqlx types from this crate:
   `require_postgres` returns an `sqlx::PgPool`, the only sqlx type in any

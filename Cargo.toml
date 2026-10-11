@@ -45,8 +45,11 @@ reqwest = { version = "0.13", default-features = false }
 
 # OpenAPI. No schema features (`uuid`, `time`, …) here: the shared crate
 # derives no schemas of its own, and a consumer that does declares its own
-# `utoipa` with whatever its types need — Cargo unifies the two.
-utoipa = "5"
+# `utoipa` with whatever its types need — Cargo unifies the two. A consumer
+# that routes through `utoipa_axum::OpenApiRouter` pairs this major with
+# utoipa-axum 0.3 (0.2 supports only utoipa 5); this workspace does not
+# depend on utoipa-axum itself.
+utoipa = "6"
 
 # Serialization / config parsing
 serde = { version = "1", features = ["derive"] }

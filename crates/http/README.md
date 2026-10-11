@@ -501,7 +501,21 @@ repositories before review caught it (#11). One copy, next to the
 **On the exhaustive match** and **on `utoipa`'s features** (this crate enables
 no schema features because it derives no schemas; a consumer declares its own
 `utoipa` with whatever its types need and Cargo unifies them) — likewise the
-module docs, which carry the reasoning and the utoipa-5.x details.
+module docs, which carry the reasoning and the utoipa 5.x/6.x details.
+
+**Version pairing.** This crate builds against `utoipa` 6, and every function
+above takes a `utoipa::openapi::OpenApi` (`find_operation` and
+`expect_operation` also return a `utoipa::openapi::path::Operation`), so a
+consumer must be on utoipa 6 too: two `utoipa` majors in one graph are two
+unrelated `OpenApi` types. A service that registers routes through
+`utoipa_axum::router::OpenApiRouter` pairs it with **utoipa-axum 0.3**, the
+release that requires utoipa 6; 0.2 only supports utoipa 5. The
+`nest`/`merge`/`route` behaviour described in the module docs is unchanged by
+the move: utoipa-axum's `router.rs` is byte-identical in 0.2.0 and 0.3.0.
+Moving from utoipa 5 to 6 also changes the `oneOf` element order a derived
+`Option<T>` field serializes with (the `$ref` now comes first, `null` second),
+so a committed `openapi.json` with an optional field gains that one diff when
+regenerated.
 
 ## `proxy` feature — reverse-proxy primitives
 

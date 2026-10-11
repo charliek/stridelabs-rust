@@ -37,7 +37,7 @@ each crate turns on by default versus behind a feature flag.
   pattern it exists to replace (nine of eleven test files in one service had
   their own copy). A green test suite must mean the behavior it claims to
   cover actually ran.
-- OpenAPI default for services: utoipa 5 + utoipa-axum, Swagger UI dev-gated,
+- OpenAPI default for services: utoipa 6 + utoipa-axum 0.3, Swagger UI dev-gated,
   spec exported and linted in CI.
 - Issuer-side JWT helpers stay app-local until a second issuer exists (same
   "defer until a second consumer" rule as stridelabs-python).

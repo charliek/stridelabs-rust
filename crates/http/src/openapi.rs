@@ -77,12 +77,16 @@
 //!
 //! # Feature and dependency note
 //!
-//! `openapi` pulls `utoipa` (default features, so the derive macros come
-//! along) into this crate's graph. A consumer that derives schemas for
-//! `Uuid`/`OffsetDateTime` still declares its **own** `utoipa` dependency
-//! with the feature flags its types need (`uuid`, `time`, …); Cargo unifies
-//! the two into one crate. This crate enables no schema features of its own
-//! because it derives no schemas.
+//! `openapi` pulls `utoipa` 6 (default features, so the derive macros come
+//! along) into this crate's graph. A service that routes through
+//! `utoipa_axum::router::OpenApiRouter` pairs it with `utoipa-axum` 0.3, the
+//! release that requires utoipa 6; 0.2 supports only utoipa 5, and mixing the
+//! two puts two `utoipa` crates in the graph, which fails with a type or
+//! trait-bound error rather than a version error. A consumer that derives
+//! schemas for `Uuid`/`OffsetDateTime` still declares its **own** `utoipa`
+//! dependency with the feature flags its types need (`uuid`, `time`, …);
+//! Cargo unifies the two into one crate. This crate enables no schema
+//! features of its own because it derives no schemas.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -101,12 +105,14 @@ use utoipa::openapi::OpenApi;
 ///
 /// A `PathItem::operations` map would make all of this unnecessary, and the
 /// obvious review comment is to ask for one. It does not exist in `utoipa`
-/// 5.x — that was the utoipa 4 shape. 5.x's [`PathItem`] stores eight
-/// independent `Option<Operation>` fields (`get`/`put`/`post`/`delete`/
-/// `options`/`head`/`patch`/`trace`), exposes no iterator over them, and has
-/// no `PathItemType` type at all; `PathItem::new` inside utoipa itself
-/// `match`es an `HttpMethod` onto those same eight fields. Driving them from
-/// an exhaustive match is the closest available equivalent.
+/// 5.x or 6.x — that was the utoipa 4 shape. [`PathItem`] stores independent
+/// `Option<Operation>` fields, eight of them one per [`HttpMethod`] variant
+/// (`get`/`put`/`post`/`delete`/`options`/`head`/`patch`/`trace`), exposes no
+/// iterator over them, and has no `PathItemType` type at all; `PathItem::new`
+/// inside utoipa itself `match`es an `HttpMethod` onto those same eight
+/// fields. Driving them from an exhaustive match is the closest available
+/// equivalent. (6.x adds two slots that have no `HttpMethod` variant — see
+/// [`documented_pairs`] for what that leaves uncovered.)
 ///
 /// **Deliberately private**, along with [`operation_for`] and
 /// [`method_name`]. A `pub const ALL_HTTP_METHODS: [HttpMethod; 8]` would make
@@ -170,13 +176,24 @@ fn method_name(method: &HttpMethod) -> &'static str {
 /// uppercase wire spelling and paths exactly as the document keys them
 /// (`"/api/v1/pat/{pat_id}"`).
 ///
-/// Genuinely exhaustive over the eight operation slots `utoipa` models —
-/// enumerated by a `match` with no `_` arm, so a `utoipa` that adds a method
-/// is a compile error here rather than routes silently missing from every
-/// consumer's spec — so a route registered under a method the calling test
-/// never mentions by name still shows up. The `BTreeSet` return makes
-/// `assert_eq!` against a hand-written expectation both order-insensitive and
-/// readable when it fails.
+/// Exhaustive over every [`HttpMethod`] variant — the eight methods
+/// `#[utoipa::path]` and `utoipa-axum` can register — enumerated by a `match`
+/// with no `_` arm, so a `utoipa` that adds a method variant is a compile
+/// error here rather than routes silently missing from every consumer's
+/// spec — so a route registered under a method the calling test never
+/// mentions by name still shows up. The `BTreeSet` return makes `assert_eq!`
+/// against a hand-written expectation both order-insensitive and readable
+/// when it fails.
+///
+/// **Not covered: the two slots utoipa 6 added for OpenAPI 3.2.** A 6.x
+/// [`PathItem`] also carries a `query` operation and an `additional_operations`
+/// map. Neither has an [`HttpMethod`] variant, so the compile-time guarantee
+/// above cannot see them, and an operation stored there is not listed. That
+/// cannot happen through the derive macro or `utoipa-axum` (they only place
+/// operations under the eight methods); it takes a hand-built or deserialized
+/// document. Extending the enumeration would also change
+/// [`OperationNotFound`], so it is left for the day a consumer needs it, and a
+/// test pins the current behaviour so that change is deliberate.
 ///
 /// This is the primitive behind the "the documented surface is exactly this
 /// list" test: a route added without `#[utoipa::path]`, or annotated when it
@@ -980,6 +997,198 @@ mod tests {
             .collect()
     }
 
+    /// Replace the `info` block with a fixed one. `#[derive(OpenApi)]` fills
+    /// `info` from the building crate's own Cargo metadata (description,
+    /// license, contact, version), which would make a byte-for-byte pin break
+    /// on an unrelated manifest edit.
+    fn with_pinned_info(mut spec: OpenApi) -> OpenApi {
+        spec.info = utoipa::openapi::InfoBuilder::new()
+            .title("Pinned")
+            .version("1.0.0")
+            .build();
+        spec
+    }
+
+    #[test]
+    fn to_pretty_json_output_is_pinned_byte_for_byte() {
+        // The committed-spec workflow compares these exact bytes against a
+        // file in a consumer's repository, so a `utoipa` bump that changes
+        // them (key spelling, defaults, OpenAPI version, field order) must
+        // fail HERE, in this crate, rather than as a freshness failure in
+        // every service on the next upgrade. Covers: the sorted key order at
+        // every level, `paths` with three operations on two paths, a plain
+        // component schema, and arrays keeping THEIR order (`required` stays
+        // in field-declaration order: only object keys are sorted).
+        #[derive(utoipa::ToSchema)]
+        #[allow(dead_code)]
+        struct Hours {
+            open: String,
+            close: String,
+        }
+
+        #[derive(utoipa::OpenApi)]
+        #[openapi(
+            paths(
+                handlers::list_widgets,
+                handlers::create_widget,
+                handlers::replace_widget
+            ),
+            components(schemas(Hours))
+        )]
+        struct PinnedDoc;
+
+        assert_eq!(
+            to_pretty_json(&with_pinned_info(PinnedDoc::openapi())),
+            r##"{
+  "components": {
+    "schemas": {
+      "Hours": {
+        "properties": {
+          "close": {
+            "type": "string"
+          },
+          "open": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "open",
+          "close"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "title": "Pinned",
+    "version": "1.0.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/widgets": {
+      "get": {
+        "operationId": "list_widgets",
+        "responses": {
+          "200": {
+            "description": "ok"
+          }
+        },
+        "tags": [
+          "handlers"
+        ]
+      },
+      "post": {
+        "operationId": "create_widget",
+        "responses": {
+          "201": {
+            "description": "created"
+          }
+        },
+        "tags": [
+          "handlers"
+        ]
+      }
+    },
+    "/widgets/{id}": {
+      "put": {
+        "operationId": "replace_widget",
+        "responses": {
+          "200": {
+            "description": "ok"
+          }
+        },
+        "tags": [
+          "handlers"
+        ]
+      }
+    }
+  }
+}"##
+        );
+    }
+
+    #[test]
+    fn an_optional_field_serializes_as_a_one_of_null_and_ref_pair() {
+        // `Option<T>` on a `ToSchema` field becomes a two-element `oneOf` of
+        // the `$ref` and a `null` type. The ELEMENT ORDER is the derive
+        // macro's, not ours: `canonicalize` sorts object keys and never
+        // reorders an array, and the uncanonicalized `serde_json::to_value`
+        // already has this order. utoipa 5 emitted `null` first and utoipa 6
+        // emits the `$ref` first, so a committed spec with an `Option<T>`
+        // field gains exactly this one diff on the bump. It is pinned apart
+        // from the test above, which passed unchanged across the bump, so a
+        // future change of this kind shows up as this test alone.
+        #[derive(utoipa::ToSchema)]
+        #[allow(dead_code)]
+        struct Hours {
+            open: String,
+            close: String,
+        }
+
+        #[derive(utoipa::ToSchema)]
+        #[allow(dead_code)]
+        struct Brewery {
+            name: String,
+            hours: Option<Hours>,
+        }
+
+        #[derive(utoipa::OpenApi)]
+        #[openapi(components(schemas(Brewery, Hours)))]
+        struct OptionalDoc;
+
+        assert_eq!(
+            to_pretty_json(&with_pinned_info(OptionalDoc::openapi())),
+            r##"{
+  "components": {
+    "schemas": {
+      "Brewery": {
+        "properties": {
+          "hours": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Hours"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      },
+      "Hours": {
+        "properties": {
+          "close": {
+            "type": "string"
+          },
+          "open": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "open",
+          "close"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "title": "Pinned",
+    "version": "1.0.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {}
+}"##
+        );
+    }
+
     #[test]
     fn to_pretty_json_emits_no_trailing_newline() {
         // The exporter's `println!` supplies it; `expected_file_contents` is
@@ -1007,6 +1216,24 @@ mod tests {
                 ("TRACE", "/widgets/{id}"),
             ])
         );
+    }
+
+    #[test]
+    fn documented_pairs_does_not_list_the_openapi_32_only_slots() {
+        // utoipa 6's `PathItem` has a `query` operation and an
+        // `additional_operations` map that no `HttpMethod` variant reaches,
+        // so the exhaustive match cannot cover them (see `documented_pairs`).
+        // Pins the CURRENT behaviour — they are not listed — so extending the
+        // enumeration is a deliberate change to this test, not a surprise.
+        let mut item = utoipa::openapi::path::PathItem::default();
+        item.get = Some(Operation::new());
+        item.query = Some(Operation::new());
+        item.additional_operations
+            .insert("LINK".to_string(), Operation::new());
+        let mut spec = EmptyDoc::openapi();
+        spec.paths.paths.insert("/q".to_string(), item);
+
+        assert_eq!(documented_pairs(&spec), expected_pairs(&[("GET", "/q")]));
     }
 
     #[test]

@@ -214,12 +214,13 @@ tracing = "0.1"
 
 # utoipa: default features on, so the derive macros come along. Pin the
 # same MAJOR this workspace's stridelabs-http/openapi feature builds
-# against (utoipa = "5") — verify against stridelabs-rust/Cargo.toml if in
+# against (utoipa = "6") — verify against stridelabs-rust/Cargo.toml if in
 # doubt, since a mismatched major here vs. what utoipa-axum expects fails
 # to compile with a confusing trait-not-satisfied error, not a version
-# error.
-utoipa = { version = "5" }
-utoipa-axum = "0.2"
+# error. utoipa-axum 0.3 is the release that requires utoipa 6 (0.2 only
+# supports utoipa 5).
+utoipa = { version = "6" }
+utoipa-axum = "0.3"
 
 # The five stridelabs-* crates — see "Choosing how to consume the crates"
 # above for path vs. git dependency form. `stridelabs-http` needs its
@@ -512,11 +513,13 @@ into a failing assertion instead of a quiet gap.
 
 ### Gotcha 2 — `OpenApiRouter::nest`, never `merge`, never `axum::Router::nest`
 
-**Verified against this workspace's own vendored `utoipa-axum` 0.2.0
-source** (`~/.cargo/registry/src/.../utoipa-axum-0.2.0/src/router.rs`,
+**Verified against the vendored `utoipa-axum` 0.3.0 source**
+(`~/.cargo/registry/src/.../utoipa-axum-0.3.0/src/router.rs`,
 `nest`/`merge` — this claim has been stated wrong in this fleet's docs
 twice before, so it is stated here only after reading the actual
-implementation, not carried forward from memory):
+implementation, not carried forward from memory; `router.rs` is
+byte-identical in 0.2.0, which an earlier version of this section was
+verified against, so nothing below changed with the move to utoipa 6):
 
 - `OpenApiRouter::nest(prefix, router)` prefixes **both halves**: it calls
   `self.0.nest(path, router.0)` on the underlying `axum::Router` AND
