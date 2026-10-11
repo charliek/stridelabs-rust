@@ -208,21 +208,19 @@ jobs:
           tool: cargo-audit
 
       # --ignore entries mirror deny.toml's [advisories].ignore list exactly
-      # (keep the two in sync): both advisories are assessed unreachable in
+      # (keep the two in sync): the one advisory is assessed unreachable in
       # c7-disclosure-and-advisory.md §B1 (rsa's Marvin timing side-channel
       # is dead weight from sqlx-mysql being compiled unconditionally by
-      # sqlx-macros-core, never used — this workspace is Postgres-only; the
-      # event-listener unsound warning is transitive via sqlx-postgres and
-      # already downgraded to informational by cargo-audit's own default
-      # policy). Ignoring them here keeps this job green in the normal case
-      # so a genuinely NEW advisory stands out instead of being lost in
-      # permanent red noise; remove an entry the moment its advisory is
-      # fixed upstream or the reachability assessment changes.
+      # sqlx-macros-core, never used — this workspace is Postgres-only).
+      # Ignoring it here keeps this job green in the normal case so a
+      # genuinely NEW advisory stands out instead of being lost in permanent
+      # red noise; remove an entry the moment its advisory is fixed upstream
+      # or the reachability assessment changes — and only after `cargo audit`
+      # on the committed lock shows it gone (`cargo tree` cannot prove that:
+      # lock-only entries are invisible to it).
       - name: cargo audit
         run: |
-          cargo audit \
-            --ignore RUSTSEC-2023-0071 \
-            --ignore RUSTSEC-2026-0221
+          cargo audit --ignore RUSTSEC-2023-0071
 
   # Single required status check the branch ruleset gates on. Keeping it a
   # separate aggregator job means the required check name stays stable even as

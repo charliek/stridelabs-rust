@@ -50,13 +50,6 @@ ignore = [
     # `mysql` feature, no MySQL connection ever opened. Assessed unreachable
     # in c7-disclosure-and-advisory.md §B1; no fix is available upstream.
     "RUSTSEC-2023-0071",
-    # event-listener 5.4.1, unsound `!Send` crossing a thread boundary via
-    # StackSlot. Transitive via sqlx-core/sqlx-postgres (the path this
-    # workspace actually uses); cargo-audit's own default policy already
-    # treats this as an informational "allowed warning," not a
-    # severity-scored vulnerability. Assessed unreachable in
-    # c7-disclosure-and-advisory.md §B1.
-    "RUSTSEC-2026-0221",
 ]
 
 [licenses]
