@@ -90,6 +90,27 @@ consumers pin a commit (`rev = "…"`), not a tag.
   its fork `libyaml-rs`). `FileError::Parse` messages are unchanged —
   field path, line/column and parser context render identically — and are now
   pinned by two exact-message tests.
+- `metrics-exporter-prometheus` 0.17 → 0.18 (0.18.3; 0.18.2 is yanked).
+  **BREAKING** for a consumer that names `PrometheusHandle`, which
+  `prometheus::install` returns: it must depend on `metrics-exporter-prometheus`
+  0.18 too (`metrics` stays 0.24). The scrape text `install` produces is
+  unchanged — `# HELP`, `# TYPE` and sample lines for a counter, gauge and
+  `*duration_seconds` histogram are now pinned by a test. 0.18's fix that puts
+  the `_total` suffix on a counter's `# HELP` and `# TYPE` lines applies only
+  with the new `with_recommended_naming(true)`, which `install` does not set; a
+  consumer building its own exporter with it gets `# HELP x_total`,
+  `# TYPE x_total counter` and `x_total{…} N` for a counter registered as `x`.
+  Likewise `set_enable_unit_suffix(true)` (deprecated in 0.18; `install` does
+  not set it) now suffixes `# HELP`/`# TYPE` like the samples and no longer
+  repeats a unit already in the name (`x_seconds_seconds_bucket`).
+
+### Fixed
+
+- `prometheus::install` is now safe to call from several threads at once.
+  Two first callers could both find no handle yet, and the loser failed with
+  "attempted to set a recorder after the metrics system was already
+  initialized"; the first install is now serialized, so every caller gets
+  `Ok` with the same handle.
 
 ### Not done
 

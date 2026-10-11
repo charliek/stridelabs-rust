@@ -14,7 +14,7 @@
 //! directly; this module only owns recorder installation and the
 //! `status_class`/`DURATION_BUCKETS` conventions.
 
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock, PoisonError};
 
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 
@@ -29,6 +29,11 @@ pub const DURATION_BUCKETS: &[f64] = &[
 
 static HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
 
+/// Held across the whole first install. `OnceLock` alone cannot serialize it:
+/// two first callers can both find `HANDLE` empty, and the loser's
+/// `install_recorder` then fails because the global recorder is already set.
+static INSTALL: Mutex<()> = Mutex::new(());
+
 /// [`install`] could not set the global recorder — in practice, because
 /// something outside this crate already installed one.
 #[derive(Debug, thiserror::Error)]
@@ -38,30 +43,47 @@ pub struct PrometheusInstallError(String);
 /// Install the global Prometheus recorder (idempotent) and return a handle
 /// for rendering `/metrics`.
 ///
-/// Safe to call more than once — `metrics`'s global recorder can only be set
-/// once per process, so only the first call actually installs one; every
-/// call, first or later, returns a clone of that same handle.
+/// Safe to call more than once, and from several threads at once —
+/// `metrics`'s global recorder can only be set once per process, so only the
+/// first call actually installs one; every call, first or later, concurrent or
+/// not, returns a clone of that same handle.
 /// Returns an error rather than panicking when the recorder cannot be
-/// installed: `OnceLock` only serializes *this* crate's callers, so a host
-/// that installed its own global recorder first is a real, recoverable
-/// condition — and a library has no business aborting the process over it.
+/// installed: this crate's own callers are serialized, but a host that
+/// installed its own global recorder first is a real, recoverable condition —
+/// and a library has no business aborting the process over it.
 pub fn install() -> Result<PrometheusHandle, PrometheusInstallError> {
+    // Fast path once installed: no lock on the hot read.
     if let Some(handle) = HANDLE.get() {
         return Ok(handle.clone());
     }
 
-    let handle = PrometheusBuilder::new()
+    // The mutex guards no data, so a poisoned lock (a panic mid-install) is
+    // safe to step over; the re-check below decides whether to install.
+    let _first_install = INSTALL.lock().unwrap_or_else(PoisonError::into_inner);
+
+    // A caller that waited on the lock finds the winner's handle here.
+    if let Some(handle) = HANDLE.get() {
+        return Ok(handle.clone());
+    }
+
+    let handle = builder()?
+        .install_recorder()
+        .map_err(|err| PrometheusInstallError(err.to_string()))?;
+
+    // Only this critical section ever fills the cell, so it is still empty.
+    Ok(HANDLE.get_or_init(|| handle).clone())
+}
+
+/// The exporter configuration [`install`] applies. Split out so a test can
+/// render through the same wiring on a local recorder: the process-global one
+/// can be set only once, so two tests installing it in parallel race.
+fn builder() -> Result<PrometheusBuilder, PrometheusInstallError> {
+    PrometheusBuilder::new()
         .set_buckets_for_metric(
             Matcher::Suffix("duration_seconds".to_string()),
             DURATION_BUCKETS,
         )
-        .map_err(|err| PrometheusInstallError(err.to_string()))?
-        .install_recorder()
-        .map_err(|err| PrometheusInstallError(err.to_string()))?;
-
-    // A racing caller may have won `set`; either way the stored handle is
-    // the live one, so hand back whatever is in the cell.
-    Ok(HANDLE.get_or_init(|| handle).clone())
+        .map_err(|err| PrometheusInstallError(err.to_string()))
 }
 
 /// The status *class* label for a numeric HTTP status code: `"1xx"` through
@@ -80,6 +102,8 @@ pub fn status_class(status: u16) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Barrier};
+
     use super::*;
 
     #[test]
@@ -89,6 +113,121 @@ mod tests {
         // Both calls hand back a handle over the same underlying registry,
         // so they must render identical output.
         assert_eq!(a.render(), b.render());
+    }
+
+    #[test]
+    fn concurrent_first_installs_all_succeed_with_the_same_handle() {
+        // The first `install()` in a process sets the global recorder; callers
+        // racing for that first install must all get `Ok` rather than the
+        // losers hitting "recorder already set". The barrier releases every
+        // thread together so they all reach the not-yet-installed state at
+        // once. (Another test may have installed already, in which case this
+        // degrades to a concurrent-idempotence check; run alone it is the
+        // first caller in the process.)
+        const THREADS: usize = 16;
+        let barrier = Arc::new(Barrier::new(THREADS));
+
+        let workers: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    install()
+                })
+            })
+            .collect();
+
+        let renders: Vec<String> = workers
+            .into_iter()
+            .map(|worker| {
+                worker
+                    .join()
+                    .expect("a worker thread panicked")
+                    .expect("every concurrent install succeeds")
+                    .render()
+            })
+            .collect();
+
+        // Nothing records into the global registry in this test binary, so
+        // handles over the one installed recorder render identically.
+        assert!(
+            renders.windows(2).all(|pair| pair[0] == pair[1]),
+            "handles disagree: {renders:?}"
+        );
+    }
+
+    /// Every rendered line that names `metric`, in render order: its `# HELP`
+    /// and `# TYPE` lines and every sample.
+    fn lines_naming<'a>(scrape: &'a str, metric: &str) -> Vec<&'a str> {
+        scrape.lines().filter(|l| l.contains(metric)).collect()
+    }
+
+    #[test]
+    fn the_scrape_output_for_a_counter_gauge_and_duration_histogram_is_pinned() {
+        // This is the text a Prometheus server parses, so a bump of the
+        // exporter that changes it (naming, suffixes, bucket lines) must show
+        // up here as a failing test rather than as a surprise on a dashboard.
+        // `builder()` is the configuration `install()` uses: it applies
+        // DURATION_BUCKETS to `*duration_seconds`, which is what makes that
+        // one a real histogram. A local recorder keeps the test off the
+        // process-global one.
+        let recorder = builder().expect("bucket config is valid").build_recorder();
+        let handle = recorder.handle();
+
+        metrics::with_local_recorder(&recorder, || {
+            metrics::describe_counter!("pin_requests", "Requests handled.");
+            metrics::counter!("pin_requests", "route" => "/a").increment(3);
+            metrics::describe_gauge!("pin_in_flight", "Requests in flight.");
+            metrics::gauge!("pin_in_flight").set(2.0);
+            metrics::describe_histogram!("pin_handler_duration_seconds", "Handler latency.");
+            metrics::histogram!("pin_handler_duration_seconds").record(0.03);
+        });
+
+        let scrape = handle.render();
+
+        assert_eq!(
+            lines_naming(&scrape, "pin_requests"),
+            [
+                "# HELP pin_requests Requests handled.",
+                "# TYPE pin_requests counter",
+                "pin_requests{route=\"/a\"} 3",
+            ],
+            "counter lines in:\n{scrape}"
+        );
+        assert_eq!(
+            lines_naming(&scrape, "pin_in_flight"),
+            [
+                "# HELP pin_in_flight Requests in flight.",
+                "# TYPE pin_in_flight gauge",
+                "pin_in_flight 2",
+            ],
+            "gauge lines in:\n{scrape}"
+        );
+        // One observation of 0.03 s: it falls in the 0.05 bucket and every
+        // bucket above it, none below. The `le` values are DURATION_BUCKETS.
+        assert_eq!(
+            lines_naming(&scrape, "pin_handler_duration_seconds"),
+            [
+                "# HELP pin_handler_duration_seconds Handler latency.",
+                "# TYPE pin_handler_duration_seconds histogram",
+                "pin_handler_duration_seconds_bucket{le=\"0.001\"} 0",
+                "pin_handler_duration_seconds_bucket{le=\"0.005\"} 0",
+                "pin_handler_duration_seconds_bucket{le=\"0.01\"} 0",
+                "pin_handler_duration_seconds_bucket{le=\"0.025\"} 0",
+                "pin_handler_duration_seconds_bucket{le=\"0.05\"} 1",
+                "pin_handler_duration_seconds_bucket{le=\"0.1\"} 1",
+                "pin_handler_duration_seconds_bucket{le=\"0.25\"} 1",
+                "pin_handler_duration_seconds_bucket{le=\"0.5\"} 1",
+                "pin_handler_duration_seconds_bucket{le=\"1\"} 1",
+                "pin_handler_duration_seconds_bucket{le=\"2.5\"} 1",
+                "pin_handler_duration_seconds_bucket{le=\"5\"} 1",
+                "pin_handler_duration_seconds_bucket{le=\"10\"} 1",
+                "pin_handler_duration_seconds_bucket{le=\"+Inf\"} 1",
+                "pin_handler_duration_seconds_sum 0.03",
+                "pin_handler_duration_seconds_count 1",
+            ],
+            "histogram lines in:\n{scrape}"
+        );
     }
 
     #[test]
