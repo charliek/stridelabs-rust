@@ -34,7 +34,9 @@ pub enum LogFormat {
     /// Human-readable, for local development.
     Text,
     /// tracing-subscriber's line-delimited JSON
-    /// (`{timestamp, level, fields: {message, …}, target, span}`).
+    /// (`{timestamp, level, fields: {message, …}, target}`, plus — for an
+    /// event inside a span — `span`, the innermost span's fields, and
+    /// `spans`, every entered span's fields root first).
     Json,
     /// One Google Cloud Logging structured JSON object per line (`severity`,
     /// a top-level `message`, `httpRequest`, request/trace correlation) —

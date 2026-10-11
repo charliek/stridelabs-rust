@@ -28,9 +28,21 @@ impl Capture {
     where
         L: Layer<Registry> + Send + Sync + 'static,
     {
+        Self::run_with(make_layer, |_| f())
+    }
+
+    /// [`Capture::run`], handing `f` the capture so it can read what was
+    /// written so far while still under the subscriber.
+    pub(crate) fn run_with<L>(
+        make_layer: impl FnOnce(Capture) -> L,
+        f: impl FnOnce(&Capture),
+    ) -> Self
+    where
+        L: Layer<Registry> + Send + Sync + 'static,
+    {
         let capture = Self::default();
         let subscriber = tracing_subscriber::registry().with(make_layer(capture.clone()));
-        tracing::subscriber::with_default(subscriber, f);
+        tracing::subscriber::with_default(subscriber, || f(&capture));
         capture
     }
 
