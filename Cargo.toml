@@ -62,10 +62,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
 
-# Database
-sqlx = { version = "0.8", default-features = false, features = [
+# Database. Deliberately NO `tls-*` feature: stridelabs-testing's pool talks to
+# a local/CI Postgres without TLS, and any TLS feature here would unify into a
+# consumer's test graph (`ring` next to reqwest 0.13's aws-lc-rs makes
+# `rustls::ClientConfig::builder()` panic). CI's "Guard: stridelabs-testing
+# pulls no ring" step fails if one is re-enabled.
+sqlx = { version = "0.9", default-features = false, features = [
     "runtime-tokio",
-    "tls-rustls-ring",
     "postgres",
     "uuid",
     "time",

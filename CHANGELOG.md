@@ -121,6 +121,29 @@ see the README's "MSRV policy").
   `security_headers` differs from 0.6 (status, headers, values and header
   order compared over 15 request shapes), so `Vary` is the only change
   guarded.
+- `sqlx` 0.8 → 0.9 (0.9.0, `stridelabs-testing`'s `postgres` feature).
+  **BREAKING** for a consumer that names sqlx types from this crate:
+  `require_postgres` returns an `sqlx::PgPool`, the only sqlx type in any
+  public signature, so a consumer that names `PgPool` or hands the pool to its
+  own sqlx code must be on sqlx 0.9 too (two sqlx majors are two unrelated
+  `PgPool` types). The one query this crate runs is a `&'static str`, so
+  sqlx 0.9's `SqlSafeStr` bound (dynamic SQL needs `AssertSqlSafe`) changes
+  nothing here; it does apply to a consumer's own `format!`-built queries.
+- `stridelabs-testing` has no TLS. The `postgres` feature's sqlx is built with
+  no `tls-*` feature (it used to enable `tls-rustls-ring`) because the pool
+  talks to a local or CI Postgres in the clear, and a TLS feature there
+  unifies into every consumer's test graph, where `ring` next to the aws-lc-rs
+  provider of reqwest 0.13's `rustls` makes `rustls::ClientConfig::builder()`
+  panic. Behaviour change for a consumer whose test URL demands TLS:
+  `sslmode=require` (or `verify-ca`/`verify-full`) now panics with sqlx's
+  "built without TLS support" error, pinned by a test; the default `prefer`
+  connects in the clear. CI's "Guard: stridelabs-testing pulls no ring" step
+  fails if a TLS feature comes back.
+- The RUSTSEC-2023-0071 (`rsa`, Marvin timing side-channel; no upstream fix)
+  ignore is gone from CI's `cargo audit` step and `deny.toml`: sqlx 0.9 no
+  longer compiles `rsa` (MySQL's RSA auth is behind its opt-in `mysql-rsa`
+  feature), so `Cargo.lock` has no `rsa` entry and `cargo audit` runs with no
+  ignores. A "Guard: no rsa in Cargo.lock" CI step keeps it that way.
 
 ### Fixed
 

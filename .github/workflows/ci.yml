@@ -101,6 +101,67 @@ jobs:
       - name: Doc
         run: cargo doc --workspace --all-features --no-deps --locked
 
+      # Dependency-graph guards. A consumer's test build unifies features across
+      # its whole graph, so what stridelabs-testing enables is what the consumer
+      # compiles; these steps fail the moment a forbidden crate re-enters.
+      #
+      # Each asserts on a package LISTING (`cargo tree ... --prefix none
+      # --format '{p}'`, first word of each line, de-duplicated), never on
+      # `cargo tree -i`: `-i` exits 101 when the crate is absent, which is
+      # indistinguishable from cargo breaking, so a guard built on it either
+      # always fails or passes vacuously. A listing is checked for the
+      # forbidden crate being ABSENT and for a positive control being PRESENT:
+      # without the control, an empty or mis-scoped listing (a dropped
+      # `--features`, a wrong `-p`) would pass for the wrong reason. An empty
+      # listing or a cargo error fails the step (`set -euo pipefail`).
+      # `--target all` so a platform-gated edge cannot hide the crate; `-e
+      # normal` because that is what reaches a consumer's build.
+      #
+      # `ring` enabled on rustls next to the aws-lc-rs provider that reqwest
+      # 0.13's `rustls` feature brings leaves rustls with no unambiguous
+      # process-level CryptoProvider, so `rustls::ClientConfig::builder()`
+      # panics at runtime, on a TLS connect no dev or CI test reaches. sqlx's
+      # `tls-rustls-ring` is how ring got into stridelabs-testing, so its pool
+      # is built with no sqlx TLS feature (it talks to a local Postgres without
+      # TLS).
+      - name: "Guard: stridelabs-testing pulls no ring"
+        run: |
+          set -euo pipefail
+          pkgs="$(mktemp)"
+          trap 'rm -f "$pkgs"' EXIT
+          cargo tree --locked --target all -e normal -p stridelabs-testing --features postgres \
+            --prefix none --format '{p}' | awk '{print $1}' | sort -u > "$pkgs"
+          echo "$(wc -l < "$pkgs") packages in stridelabs-testing[postgres]'s normal graph"
+          if [ ! -s "$pkgs" ]; then
+            echo "::error::the stridelabs-testing package listing is empty; the guard proved nothing"
+            exit 1
+          fi
+          if ! grep -qx sqlx "$pkgs"; then
+            echo "::error::positive control failed: sqlx is not in stridelabs-testing[postgres]'s graph, so this listing is not the one the guard means to inspect"
+            exit 1
+          fi
+          if grep -qx ring "$pkgs"; then
+            echo "::error::ring is in stridelabs-testing[postgres]'s graph; re-enabling a sqlx tls-rustls-ring feature puts it in every consumer's test graph"
+            cargo tree --locked --target all -e normal -p stridelabs-testing --features postgres -i ring || true
+            exit 1
+          fi
+          echo "ok: ring absent, sqlx present"
+
+      # rsa (RUSTSEC-2023-0071, no upstream fix) has to stay out of the lock
+      # entirely: cargo-audit reads Cargo.lock, so even a crate that is never
+      # compiled would put the advisory back, and `cargo tree` cannot see
+      # lock-only entries. It left with sqlx 0.9 (mysql auth needs the opt-in
+      # `mysql-rsa` feature); jsonwebtoken's `rust_crypto` backend would bring
+      # it back. Checked on the lock itself, not on a listing. (`if`, not a
+      # bare `! grep`: a negated command never trips `bash -e`.)
+      - name: "Guard: no rsa in Cargo.lock"
+        run: |
+          if grep -qx 'name = "rsa"' Cargo.lock; then
+            echo "::error::rsa is in Cargo.lock (RUSTSEC-2023-0071, no fix); find what pulls it with: cargo tree --locked --target all --all-features -i rsa"
+            exit 1
+          fi
+          echo "ok: no rsa in Cargo.lock"
+
       # deny.toml's license/bans/sources gates (verified clean locally:
       # `cargo deny check licenses bans sources`). Deliberately does NOT
       # include `advisories` in this list — that would duplicate the
@@ -201,10 +262,10 @@ jobs:
   # dispatch and the weekly schedule must be advisory-clean, so a red audit
   # can't sit unnoticed on main — while on a PR it is advisory, so a newly
   # published advisory can't brick an unrelated PR. A red run on a PR is a
-  # signal for manual triage (see c7-disclosure-and-advisory.md's Part B for
-  # the standing methodology). deny.toml's `[advisories]` section mirrors
-  # this job's currently-assessed-benign findings for anyone running the
-  # full `cargo deny check` locally, but does not run in CI itself.
+  # signal for manual triage. The job carries no `--ignore` entries, and
+  # deny.toml's `[advisories]` section none either (keep the two in sync if one
+  # is ever added); the section exists for anyone running the full
+  # `cargo deny check` locally, but does not run in CI itself.
   audit:
     runs-on: ubuntu-latest
     steps:
@@ -220,20 +281,17 @@ jobs:
         with:
           tool: cargo-audit
 
-      # --ignore entries mirror deny.toml's [advisories].ignore list exactly
-      # (keep the two in sync): the one advisory is assessed unreachable in
-      # c7-disclosure-and-advisory.md §B1 (rsa's Marvin timing side-channel
-      # is dead weight from sqlx-mysql being compiled unconditionally by
-      # sqlx-macros-core, never used — this workspace is Postgres-only).
-      # Ignoring it here keeps this job green in the normal case so a
-      # genuinely NEW advisory stands out instead of being lost in permanent
-      # red noise; remove an entry the moment its advisory is fixed upstream
-      # or the reachability assessment changes — and only after `cargo audit`
-      # on the committed lock shows it gone (`cargo tree` cannot prove that:
-      # lock-only entries are invisible to it).
+      # No `--ignore` entries, so every advisory is live and a genuinely NEW one
+      # stands out. If one is ever added it must be mirrored in deny.toml's
+      # [advisories].ignore, assessed in writing, and removed the moment it is
+      # fixed upstream or the reachability assessment changes — and only after
+      # `cargo audit` on the committed lock shows it gone (`cargo tree` cannot
+      # prove that: lock-only entries are invisible to it). The last one,
+      # RUSTSEC-2023-0071 (rsa), was removed that way when sqlx 0.9 dropped
+      # rsa from the lock; the "no rsa" guard in build-test keeps it out.
       - name: cargo audit
         run: |
-          cargo audit --ignore RUSTSEC-2023-0071
+          cargo audit
 
   # Single required status check the branch ruleset gates on. Keeping it a
   # separate aggregator job means the required check name stays stable even as

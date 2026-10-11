@@ -171,6 +171,22 @@ mod tests {
         assert_eq!(row.0, 1);
     }
 
+    /// Pins "stridelabs-testing has no TLS": sqlx is built without any `tls-*`
+    /// feature (one would unify `ring` into every consumer's test graph), so
+    /// a URL that demands TLS must fail loudly instead of being downgraded to
+    /// plaintext. Aimed at the database the test above reaches (read-only env
+    /// lookup, same precedence as `require_postgres`), so the refusal seen is
+    /// sqlx's and not a connection error.
+    #[tokio::test]
+    #[should_panic(expected = "built without TLS support")]
+    async fn a_url_that_requires_tls_is_refused_not_downgraded() {
+        let base = std::env::var(DATABASE_URL_VAR).unwrap_or_else(|_| COMPOSE_URL.to_string());
+        let mut url = url::Url::parse(&base).expect("parse the test database URL");
+        url.query_pairs_mut().append_pair("sslmode", "require");
+
+        let _ = require_postgres_at(url.as_str()).await;
+    }
+
     #[tokio::test]
     #[should_panic(expected = "could not connect to Postgres")]
     async fn an_unreachable_database_panics_with_an_actionable_message() {

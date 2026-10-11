@@ -40,17 +40,11 @@ db-urls = ["https://github.com/rustsec/advisory-db"]
 # only. This section is kept accurate anyway for whoever runs the full
 # `cargo deny check` locally, so it doesn't disagree with the audit job's
 # published assessment.
-ignore = [
-    # rsa 0.9.10, Marvin Attack timing side-channel. Reachable only through
-    # sqlx-mysql's caching_sha2_password/sha256_password auth exchange;
-    # sqlx-mysql is compiled in only because sqlx-macros-core depends on all
-    # three backend crates unconditionally for its proc-macro query
-    # checking. This workspace's actual sqlx feature selection
-    # (workspace.dependencies.sqlx in Cargo.toml) is Postgres-only — no
-    # `mysql` feature, no MySQL connection ever opened. Assessed unreachable
-    # in c7-disclosure-and-advisory.md §B1; no fix is available upstream.
-    "RUSTSEC-2023-0071",
-]
+#
+# No `ignore` entries, and none on CI's `cargo audit` step either (keep the two
+# in sync if one is ever added). The last one, RUSTSEC-2023-0071 (rsa, Marvin
+# timing side-channel, no upstream fix), was dropped once sqlx 0.9 took `rsa`
+# out of Cargo.lock; CI's "Guard: no rsa in Cargo.lock" step keeps it out.
 
 [licenses]
 # Licenses allowed for any crate in the dependency graph. Base set is the
