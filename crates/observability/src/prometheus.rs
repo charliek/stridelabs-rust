@@ -102,58 +102,27 @@ pub fn status_class(status: u16) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Barrier};
-
     use super::*;
 
     #[test]
     fn install_is_idempotent_and_returns_a_handle_both_times() {
         let a = install().expect("first install succeeds in a fresh process");
         let b = install().expect("second install returns the memoized handle");
-        // Both calls hand back a handle over the same underlying registry,
-        // so they must render identical output.
-        assert_eq!(a.render(), b.render());
-    }
-
-    #[test]
-    fn concurrent_first_installs_all_succeed_with_the_same_handle() {
-        // The first `install()` in a process sets the global recorder; callers
-        // racing for that first install must all get `Ok` rather than the
-        // losers hitting "recorder already set". The barrier releases every
-        // thread together so they all reach the not-yet-installed state at
-        // once. (Another test may have installed already, in which case this
-        // degrades to a concurrent-idempotence check; run alone it is the
-        // first caller in the process.)
-        const THREADS: usize = 16;
-        let barrier = Arc::new(Barrier::new(THREADS));
-
-        let workers: Vec<_> = (0..THREADS)
-            .map(|_| {
-                let barrier = Arc::clone(&barrier);
-                std::thread::spawn(move || {
-                    barrier.wait();
-                    install()
-                })
-            })
-            .collect();
-
-        let renders: Vec<String> = workers
-            .into_iter()
-            .map(|worker| {
-                worker
-                    .join()
-                    .expect("a worker thread panicked")
-                    .expect("every concurrent install succeeds")
-                    .render()
-            })
-            .collect();
-
-        // Nothing records into the global registry in this test binary, so
-        // handles over the one installed recorder render identically.
-        assert!(
-            renders.windows(2).all(|pair| pair[0] == pair[1]),
-            "handles disagree: {renders:?}"
-        );
+        // Both calls hand back a handle over the same underlying registry.
+        // Two empty renders would be equal for unrelated registries too, so
+        // record one sample through the global recorder and require both
+        // handles to expose it. (The race between FIRST callers is covered by
+        // tests/prometheus_concurrent_install.rs, a process of its own.)
+        metrics::counter!("idempotent_install_probe_total").increment(1);
+        for (which, handle) in [("first", &a), ("second", &b)] {
+            let scrape = handle.render();
+            assert!(
+                scrape
+                    .lines()
+                    .any(|l| l == "idempotent_install_probe_total 1"),
+                "the {which} handle does not see the probe sample:\n{scrape}"
+            );
+        }
     }
 
     /// Every rendered line that names `metric`, in render order: its `# HELP`
@@ -227,6 +196,95 @@ mod tests {
                 "pin_handler_duration_seconds_count 1",
             ],
             "histogram lines in:\n{scrape}"
+        );
+    }
+
+    /// What a default-summary histogram (no buckets configured for its name)
+    /// renders for `metric` after observing 1.0 and 3.0 through `builder()`'s
+    /// configuration: the quantile labels in render order, then every other
+    /// line naming it (`# HELP`, `# TYPE`, `_sum`, `_count`). The quantile
+    /// VALUES are left out on purpose: they are sketch estimates (the 0.5
+    /// quantile of {1, 3} renders as 0.9998999999999999), not wire shape.
+    fn summary_render(metric: &'static str, help: &'static str) -> (Vec<String>, Vec<String>) {
+        let recorder = builder().expect("bucket config is valid").build_recorder();
+        let handle = recorder.handle();
+
+        metrics::with_local_recorder(&recorder, || {
+            metrics::describe_histogram!(metric, help);
+            metrics::histogram!(metric).record(1.0);
+            metrics::histogram!(metric).record(3.0);
+        });
+
+        let scrape = handle.render();
+        let lines = lines_naming(&scrape, metric);
+        let quantiles = lines
+            .iter()
+            .filter_map(|l| l.split_once("quantile=\"")?.1.split_once('"'))
+            .map(|(q, _)| q.to_string())
+            .collect();
+        let rest = lines
+            .iter()
+            .filter(|l| !l.contains("quantile=\""))
+            .map(|l| l.to_string())
+            .collect();
+        (quantiles, rest)
+    }
+
+    const DEFAULT_QUANTILES: [&str; 7] = ["0", "0.5", "0.9", "0.95", "0.99", "0.999", "1"];
+
+    #[test]
+    fn a_histogram_without_buckets_renders_as_a_summary_with_sum_and_count() {
+        // Only `*duration_seconds` gets buckets from `install()`; every other
+        // histogram is a summary. Pinned so an exporter bump that changes the
+        // quantile set or the `_sum`/`_count` series fails here.
+        let (quantiles, rest) = summary_render("pin_payload_size", "Payload bytes.");
+
+        assert_eq!(quantiles, DEFAULT_QUANTILES);
+        assert_eq!(
+            rest,
+            [
+                "# HELP pin_payload_size Payload bytes.",
+                "# TYPE pin_payload_size summary",
+                "pin_payload_size_sum 4",
+                "pin_payload_size_count 2",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_summary_whose_name_ends_in_count_or_sum_loses_that_series_suffix() {
+        // metrics-exporter-prometheus 0.18.3 appends `_count`/`_sum` to a
+        // summary's name only when the name does not already END WITH
+        // "count"/"sum" (`add_suffix_if_missing` in its formatting.rs is a
+        // plain `ends_with("count")`, with no `_` in the comparison). So
+        // `discount` renders its count series as `discount 2` where 0.17.2
+        // rendered `discount_count 2`, and `checksum`'s sum as `checksum 4`
+        // where 0.17.2 rendered `checksum_sum 4`. This is an upstream quirk,
+        // pinned as OBSERVED so that an exporter release that fixes it shows
+        // up as a deliberate edit to this test (and to the CHANGELOG entry
+        // that documents it), not as a dashboard that quietly changed twice.
+        let (quantiles, rest) = summary_render("pin_discount", "Ends in count.");
+        assert_eq!(quantiles, DEFAULT_QUANTILES);
+        assert_eq!(
+            rest,
+            [
+                "# HELP pin_discount Ends in count.",
+                "# TYPE pin_discount summary",
+                "pin_discount_sum 4",
+                "pin_discount 2",
+            ]
+        );
+
+        let (quantiles, rest) = summary_render("pin_checksum", "Ends in sum.");
+        assert_eq!(quantiles, DEFAULT_QUANTILES);
+        assert_eq!(
+            rest,
+            [
+                "# HELP pin_checksum Ends in sum.",
+                "# TYPE pin_checksum summary",
+                "pin_checksum 4",
+                "pin_checksum_count 2",
+            ]
         );
     }
 

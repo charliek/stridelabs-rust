@@ -97,8 +97,21 @@ see the README's "MSRV policy").
   **BREAKING** for a consumer that names `PrometheusHandle`, which
   `prometheus::install` returns: it must depend on `metrics-exporter-prometheus`
   0.18 too (`metrics` stays 0.24). The scrape text `install` produces is
-  unchanged — `# HELP`, `# TYPE` and sample lines for a counter, gauge and
-  `*duration_seconds` histogram are now pinned by a test. 0.18's fix that puts
+  unchanged for counters, gauges, `*duration_seconds` histograms (the only
+  ones `install` gives buckets) and ordinary default-summary histograms: their
+  `# HELP`, `# TYPE` and sample lines are pinned by tests. One exception, a
+  renamed series: a histogram that falls back to the default summary (any
+  histogram not ending `duration_seconds`) whose name ENDS IN `count` or `sum`
+  loses that suffix on the matching series. 0.18's suffix helper skips a suffix
+  the name already ends with, comparing `ends_with("count")` without the `_`
+  (upstream `formatting.rs`, `add_suffix_if_missing`), so after `install()`
+  `metrics::histogram!("discount")` renders `discount{…} 2` where 0.17.2
+  rendered `discount_count{…} 2`, and `checksum{…} 4` where it rendered
+  `checksum_sum{…} 4`; the other series of the summary (`discount_sum`,
+  `checksum_count`, the quantiles) are unchanged. A consumer with such a metric
+  must rename it or update the queries and alerts that read its `_count`/`_sum`
+  series. A test pins this as observed on 0.18.3, so an exporter release that
+  fixes it shows up as a deliberate change. 0.18's fix that puts
   the `_total` suffix on a counter's `# HELP` and `# TYPE` lines applies only
   with the new `with_recommended_naming(true)`, which `install` does not set; a
   consumer building its own exporter with it gets `# HELP x_total`,
