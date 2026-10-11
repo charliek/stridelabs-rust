@@ -9,6 +9,59 @@ changed) rather than independent per-crate versioning —
 see the root README's "Consuming these crates" section for what that means
 for a consumer's pin.
 
+## [Unreleased]
+
+`stridelabs-observability` writes Google Cloud Logging lines and request
+logs, bringing Rust services to parity with Python `stridelabs-logging`. The
+next release must be a minor bump (0.x): `LogFormat` became
+`#[non_exhaustive]`. None of this is in `v0.4.0`: until it is released,
+consumers pin a commit (`rev = "…"`), not a tag.
+
+### Added
+
+- `LogFormat::Cloud`: one Google Cloud Logging structured JSON object per
+  line — `severity`, a top-level `message`, `logger`, an RFC 3339
+  `timestamp`, `httpRequest` assembled from `httpRequest.*` fields, and
+  `requestId`/`logging.googleapis.com/trace` lifted from the enclosing
+  request span — the shape of Python's `CloudLoggingFormatter`.
+- `LogFormat::from_environment(env)`: `Text` for exactly `"development"`,
+  `Cloud` for anything else.
+- `CloudLayer`, the `tracing-subscriber` layer behind `LogFormat::Cloud`,
+  for composing a subscriber by hand; and the request-span contract
+  constants `REQUEST_SPAN_NAME`, `REQUEST_ID_FIELD` and `TRACE_FIELD`.
+- `RequestLogLayer` / `RequestLogService` / `RequestLogConfig`: an
+  outermost tower layer that establishes each request's id (extension, else
+  a valid `x-request-id`, else generated), opens the request span with the
+  Cloud Trace id from `X-Cloud-Trace-Context` when a GCP project is
+  configured (`GOOGLE_CLOUD_PROJECT`, else `GOOGLE_PROJECT_ID`), and writes
+  one `stridelabs.request` entry per request (`"METHOD PATH STATUS"`,
+  `httpRequest.{requestMethod, requestUrl, status, latency, protocol,
+  userAgent, remoteIp}`; ERROR ≥ 500 or on an inner error or panic, WARN ≥
+  400, 499 WARN for a dropped response future). Sensitive query values are
+  redacted (`DEFAULT_REDACTED_QUERY_PARAMS`, names matched after
+  percent-decoding and Unicode lowercasing); userinfo is stripped from the
+  logged host, and a malformed `Host` or a non-`http(s)` `X-Forwarded-Proto`
+  is never copied into `requestUrl`; request headers other than
+  `User-Agent` and bodies are never logged; it writes no response header.
+  The entry is written when the response head is ready, and the span covers
+  the response future only (a streamed body or a spawned task needs
+  `.instrument(Span::current())`). `REQUEST_LOG_TARGET` names the entry's
+  target.
+- `stridelabs-observability` feature `axum` (off by default): the
+  `remoteIp` fallback to axum's `ConnectInfo<SocketAddr>` peer address.
+
+### Changed
+
+- **BREAKING:** `LogFormat` is now `#[non_exhaustive]` (to add `Cloud`
+  without every future format being a breaking change). A `match` on
+  `LogFormat` outside the crate without a wildcard arm (`_ => ...`) no
+  longer compiles.
+- `RequestIdLayer` reuses an existing `RequestId` request extension (held
+  to the same validity rule as the header) before the `x-request-id` header,
+  so behind an outer `RequestLogLayer` it echoes the id that was logged.
+- `LogFormat::Json`'s documentation now lists the `span`/`spans` keys its
+  lines have always carried inside a span; the format itself is unchanged.
+
 ## [0.4.0] - 2026-08-16
 
 ### Added

@@ -74,7 +74,7 @@ All five crates are implemented: `stridelabs-config`, `stridelabs-observability`
 | Crate | Status | Contents |
 |---|---|---|
 | `stridelabs-config` | Implemented | Env-var helpers (`env_or`/`env_parse`/`parse_string_array`), layered YAML/JSON file loading with field-pathed errors, a validation-error accumulator + socket/fraction checks |
-| `stridelabs-observability` | Implemented | tracing init (json/pretty), a `RequestIdLayer` tower middleware, optional Prometheus wiring |
+| `stridelabs-observability` | Implemented | tracing init (text/JSON/Google Cloud Logging lines, `LogFormat::from_environment`), a `RequestLogLayer` (outermost: request id, request/trace span, one `httpRequest` entry per request) and a `RequestIdLayer` tower middleware, optional Prometheus wiring |
 | `stridelabs-http` | Implemented | `AppError`→`IntoResponse` convention, security-headers layer, CORS layer (feature `cors`), graceful-shutdown helpers, reverse-proxy primitives (feature `proxy`), OpenAPI spec mechanics — canonical serialization, route enumeration, committed-spec freshness (feature `openapi`) |
 | `stridelabs-auth` | Implemented | slauth resource-server client: rate-limited JWKS cache, RS256 verification, bearer extraction (feature `axum`), PAT hashing, offline test-key minting (feature `test-support`) |
 | `stridelabs-testing` | Implemented | Fail-loud real-Postgres pool (feature `postgres`), `oneshot` axum router-test helpers, a one-line wiremock JSON stub |

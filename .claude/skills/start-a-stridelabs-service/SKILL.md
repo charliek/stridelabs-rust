@@ -19,7 +19,7 @@ this skill tells you *which* function to reach for and *why the pitfalls
 exist*, not what every parameter does:
 
 - `crates/config/README.md` — env-var + layered-file config
-- `crates/observability/README.md` — tracing init, request-id layer, Prometheus
+- `crates/observability/README.md` — tracing init (Cloud Logging lines), request-log and request-id layers, Prometheus
 - `crates/http/README.md` — `AppError`, security headers, `methods`, `openapi`, `proxy`
 - `crates/auth/README.md` — JWKS verification, PAT hashing
 - `crates/testing/README.md` — fail-loud Postgres pool, oneshot router tests, wiremock stub
@@ -87,14 +87,19 @@ relative to the new service's root:
 
 - **If it does not exist**: use the real **git dependency** form — this is
   what a production service's committed `Cargo.toml` should carry, and what
-  CI will actually fetch. Pin a tag if one is cut; otherwise pin the exact
-  commit `rev`. See the root README's "Consuming these crates" section for
-  the exact `tag =` / `rev =` forms.
+  CI will actually fetch. Pin a tag only if that tag contains every API this
+  skill uses; otherwise pin the exact commit `rev`. See the root README's
+  "Consuming these crates" section for the exact `tag =` / `rev =` forms.
+
+  **Today that means `rev`:** Step 3's logging defaults
+  (`LogFormat::from_environment`, `RequestLogLayer`) are newer than
+  `v0.4.0`, the latest tag, so a `tag = "v0.4.0"` scaffold does not compile.
+  Pin the commit until a release includes them, then move to that tag.
 
   ```toml
   [dependencies]
-  stridelabs-config = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.4.0" }
-  # ... same git =/tag = for the other four crates, feature flags as below
+  stridelabs-config = { git = "https://github.com/charliek/stridelabs-rust.git", rev = "<full commit sha>" }
+  # ... the same git =/rev = for the other four crates, feature flags as below
   ```
 
 A service that starts in path-dependency mode (local co-dev) and later
@@ -291,7 +296,14 @@ async fn main() {
         return;
     }
 
-    stridelabs_observability::init_logging(stridelabs_observability::LogFormat::Text, "info");
+    // Readable text in development, Google Cloud Logging lines (severity,
+    // httpRequest, request/trace correlation) everywhere else. ENVIRONMENT
+    // is read once, here, and nowhere else.
+    let environment = stridelabs_config::env_or("ENVIRONMENT", "development");
+    stridelabs_observability::init_logging(
+        stridelabs_observability::LogFormat::from_environment(&environment),
+        "info",
+    );
 
     let state = state::AppState {};
 
@@ -316,7 +328,11 @@ async fn main() {
         )
         .merge(api_v1)
         .with_state(state)
-        .layer(stridelabs_http::security_headers());
+        .layer(stridelabs_http::security_headers())
+        // LAST, so it is the OUTERMOST layer — see "Request logging" below.
+        .layer(stridelabs_observability::RequestLogLayer::new(
+            stridelabs_observability::RequestLogConfig::from_env().with_skip_paths(["/health"]),
+        ));
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
     axum::serve(listener, app)
@@ -332,6 +348,34 @@ pub mod openapi;
 pub mod ping;
 pub mod state;
 ```
+
+### Request logging
+
+`RequestLogLayer` is on from the first commit, and it is the **outermost**
+layer: in axum the last `.layer(..)` call wraps everything before it. Only
+outermost does it log the status the client actually got — including
+requests an inner layer (CORS, security headers, auth) answers without
+reaching a handler — and open the request span (`requestId`, plus the Cloud
+Trace id) that lines logged from the handler's future inherit. Add a layer
+*after* it and that layer's responses go unlogged; that is the mistake to
+avoid.
+
+- It logs one `stridelabs.request` entry per request and **never** a
+  request header other than `User-Agent` (no `Authorization`, no cookies)
+  or a body; sensitive query values are redacted.
+- It writes no response header. Want `x-request-id` echoed? Add
+  `stridelabs_observability::RequestIdLayer` *before* it (so, inside it);
+  it reuses the logged id.
+- `with_skip_paths(["/health"])` keeps health probes out of the log — the
+  platform's own request log already has them. Exact paths only.
+- Trace correlation needs the GCP project: set `GOOGLE_CLOUD_PROJECT` or
+  `GOOGLE_PROJECT_ID` in the deployed environment (on Cloud Run, a plain
+  env entry in the service YAML). Without it everything else still works.
+- Only code inside the response future inherits the span. A streamed body
+  (SSE) and `tokio::spawn`ed work don't: capture `tracing::Span::current()`
+  in the handler and `.instrument(span)` that work (see the observability
+  README's "What inherits the span"). The entry's `latency` stops when the
+  response head is ready, not when a stream ends.
 
 ## Step 4 — the OpenAPI document: `src/openapi.rs` and the first annotated route
 
@@ -555,6 +599,10 @@ re-checkout the file after adding it.
   pattern for anything this service reads from the environment in a way its
   own tests need to vary: inject the lookup, don't mutate the process.
 - **`OpenApiRouter::nest` for versioning, never `merge`** — Gotcha 2.
+- **Logging is `LogFormat::from_environment` + an outermost
+  `RequestLogLayer`** (Step 3). No hard-coded `LogFormat::Text`, which
+  Cloud Logging shows as severity-less text, and no layer added after the
+  request-log layer.
 - **The route-pinning test is not optional** — a service with routes but no
   `documented_pairs` assertion has structural exclusion with no guard on
   the escape hatch (Gotcha 1).

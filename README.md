@@ -15,7 +15,7 @@ full API and feature topology.
 | Crate | Status | Contents | Seeded from |
 |---|---|---|---|
 | `stridelabs-config` | Implemented | Env-var config helpers + layered file loading with field-pathed errors | Two existing services' config loaders |
-| `stridelabs-observability` | Implemented | tracing init (json/pretty), request-ID tower layer, Prometheus wiring | A production reverse proxy's `observability` module |
+| `stridelabs-observability` | Implemented | tracing init (text/JSON/Cloud Logging), request-ID and request-logging tower layers, Prometheus wiring | A production reverse proxy's `observability` module; Python `stridelabs-logging`'s Cloud Logging format and request middleware |
 | `stridelabs-http` | Implemented | `AppError`→`IntoResponse` convention, security-headers + CORS layers, graceful shutdown, reverse-proxy primitives (feature `proxy`), OpenAPI spec mechanics (feature `openapi`) | An existing service's `error.rs`, a reverse proxy's HTTP layer, and the `http/openapi.rs` of slauth, the StrideLabs auth service |
 | `stridelabs-auth` | Implemented | slauth resource-server client: rate-limited JWKS cache, RS256 verification, bearer extraction, PAT hashing, offline test-key minting | An existing service's `auth/` module |
 | `stridelabs-testing` | Implemented | Fail-loud real-Postgres pool, `oneshot` axum router-test helpers, a one-line wiremock JSON stub | Existing integration-test idioms, hardened |
@@ -114,6 +114,7 @@ on what.
 |---|---|---|---|
 | `stridelabs-config` | *(none — everything is unconditional)* | — | — |
 | `stridelabs-observability` | `prometheus` | off | `metrics` + `metrics-exporter-prometheus`: recorder install, `status_class`, `DURATION_BUCKETS` |
+| `stridelabs-observability` | `axum` | off | `RequestLogLayer`'s peer-address fallback for `remoteIp`, read from axum's `ConnectInfo<SocketAddr>` |
 | `stridelabs-http` | `cors` | off | `cors_layer`, via `tower-http/cors` |
 | `stridelabs-http` | `openapi` | off | spec canonicalization, `(method, path)` enumeration, committed-spec freshness check, via `utoipa` |
 | `stridelabs-http` | `proxy` | off | reverse-proxy primitives, via `reqwest`/`url`/`bytes`/`futures` |

@@ -14,6 +14,12 @@
 //! Built directly on `tower`/`http` (not `axum`) so it stays usable by any
 //! `http::Request`/`http::Response` based service — axum's `Router` is one
 //! such service, since axum re-exports the same `http` crate types.
+//!
+//! An id already in the request's extensions wins over the header: a
+//! [`RequestLogLayer`](crate::RequestLogLayer) outside this layer establishes
+//! the id first (so it can log requests inner layers answer on their own),
+//! and this layer then echoes that same id rather than resolving a second
+//! one.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -26,16 +32,19 @@ use tower::{Layer, Service};
 /// already sent one) and outbound (always echoed on the response).
 pub const REQUEST_ID_HEADER: &str = "x-request-id";
 
-/// The request id resolved by [`RequestIdLayer`], inserted into the
-/// request's extensions so downstream handlers/middleware can read it (e.g.
-/// to include in a log span, or to forward to an upstream call).
+/// The request id resolved by [`RequestIdLayer`] or
+/// [`RequestLogLayer`](crate::RequestLogLayer), inserted into the request's
+/// extensions so downstream handlers/middleware can read it (e.g. to forward
+/// to an upstream call). Either layer reuses one already present.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestId(pub String);
 
 /// A [`tower::Layer`] that resolves a request id for every request passing
-/// through — reusing a reasonable client-supplied `x-request-id` header, or
-/// generating a fresh one — inserts it into the request's extensions as
-/// [`RequestId`], and echoes it on the response's `x-request-id` header.
+/// through — reusing an existing [`RequestId`] extension (one an outer
+/// [`RequestLogLayer`](crate::RequestLogLayer) set), else a reasonable
+/// client-supplied `x-request-id` header, else generating a fresh one —
+/// inserts it into the request's extensions as [`RequestId`], and echoes it
+/// on the response's `x-request-id` header.
 ///
 /// The echo happens for every response the inner service produces,
 /// including error status responses (4xx/5xx): the layer wraps the entire
@@ -78,11 +87,12 @@ where
         // extensions, so the resolved id is threaded through as one
         // `String` instead of being cloned.
         //
-        // `id` is always either a client value that already passed
-        // `is_reasonable` (bounded, ascii-graphic — a valid header value by
-        // construction) or our own generated lowercase-hex string, so this
-        // can't actually fail; `expect` documents that invariant rather than
-        // threading an unreachable error case through the return type.
+        // `id` is always either an extension or client value that already
+        // passed `is_reasonable` (bounded, ascii-graphic — a valid header
+        // value by construction) or our own generated lowercase-hex string,
+        // so this can't actually fail; `expect` documents that invariant
+        // rather than threading an unreachable error case through the return
+        // type.
         let header_value =
             HeaderValue::from_str(&id).expect("resolved request id is always a valid header value");
         req.extensions_mut().insert(RequestId(id));
@@ -96,12 +106,31 @@ where
     }
 }
 
-/// The incoming `x-request-id` if present and reasonable, else a fresh id.
-fn resolve<ReqBody>(req: &Request<ReqBody>) -> String {
-    req.headers()
+/// The request's id: an existing [`RequestId`] extension, else the incoming
+/// `x-request-id`, else a fresh id — the first candidate that
+/// [`is_reasonable`].
+///
+/// The one rule both [`RequestIdLayer`] and
+/// [`RequestLogLayer`](crate::RequestLogLayer) apply. The extension comes
+/// first so that whichever of them runs outermost establishes the id and the
+/// other reuses it: the id a service logs is the id it echoes. An extension
+/// is held to the same rule as a header (anything can insert one, and
+/// [`RequestIdLayer`] puts the id in a response header), and a rejected one
+/// is overwritten by the caller with what this returns, so the extension and
+/// the echo never disagree.
+pub(crate) fn resolve<ReqBody>(req: &Request<ReqBody>) -> String {
+    let existing = req
+        .extensions()
+        .get::<RequestId>()
+        .map(|RequestId(id)| id.as_str());
+    let incoming = req
+        .headers()
         .get(REQUEST_ID_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .filter(|s| is_reasonable(s))
+        .and_then(|v| v.to_str().ok());
+    existing
+        .into_iter()
+        .chain(incoming)
+        .find(|s| is_reasonable(s))
         .map(str::to_string)
         .unwrap_or_else(generate)
 }
@@ -258,6 +287,52 @@ mod tests {
         assert_eq!(
             captured.lock().unwrap().as_ref(),
             Some(&RequestId("seen-by-inner".to_string()))
+        );
+    }
+
+    /// A request carrying both a header and an extension, the extension set
+    /// as an outer layer would have set it.
+    fn request_with_extension(extension: &str) -> Request<()> {
+        let mut req = request_with_id("from-header");
+        req.extensions_mut()
+            .insert(RequestId(extension.to_string()));
+        req
+    }
+
+    #[tokio::test]
+    async fn an_existing_extension_wins_over_the_header() {
+        let res = ok_service()
+            .oneshot(request_with_extension("from-outer-layer"))
+            .await
+            .unwrap();
+
+        assert_eq!(response_id(&res), "from-outer-layer");
+    }
+
+    #[tokio::test]
+    async fn an_unreasonable_extension_falls_back_and_is_overwritten() {
+        let captured: Arc<Mutex<Option<RequestId>>> = Arc::new(Mutex::new(None));
+        let captured_in_service = captured.clone();
+        let svc = layered(move |req: Request<()>| {
+            let captured = captured_in_service.clone();
+            async move {
+                *captured.lock().unwrap() = req.extensions().get::<RequestId>().cloned();
+                Ok(Response::new(()))
+            }
+        });
+
+        // A newline is no valid header value: echoing it would be the
+        // `expect` panic, so the extension must be held to the header rule.
+        let res = svc
+            .oneshot(request_with_extension("bad\nid"))
+            .await
+            .unwrap();
+
+        assert_eq!(response_id(&res), "from-header");
+        assert_eq!(
+            captured.lock().unwrap().as_ref(),
+            Some(&RequestId("from-header".to_string())),
+            "the inner service sees the id that was echoed"
         );
     }
 

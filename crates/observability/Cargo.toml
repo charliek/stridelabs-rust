@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "tracing init (json/pretty), a request-id tower layer, and optional Prometheus wiring, for StrideLabs services"
+description = "tracing init (text, JSON, or Google Cloud Logging lines), request-id and request-logging tower layers, and optional Prometheus wiring, for StrideLabs services"
 publish = false
 
 [features]
@@ -15,6 +15,13 @@ default = []
 # Prometheus exporter + `metrics` facade unconditionally would be dead weight
 # for the ones that don't.
 prometheus = ["dep:metrics", "dep:metrics-exporter-prometheus", "dep:thiserror"]
+# Lets `RequestLogLayer` fall back to the connection's peer address for
+# `remoteIp`. axum's `ConnectInfo<SocketAddr>` extension is the only place a
+# peer address appears on an `http::Request`, and reading a typed extension
+# means naming its type — so this is the one place the crate needs axum
+# itself. Off by default: behind Cloud Run's front end `X-Forwarded-For`
+# always carries the client, and every other layer stays plain tower/http.
+axum = ["dep:axum"]
 
 [lints]
 workspace = true
@@ -25,11 +32,22 @@ tracing-subscriber = { workspace = true }
 tower = { workspace = true }
 http = { workspace = true }
 rand = { workspace = true }
+# The Cloud Logging formatter writes its lines with it. Already in every
+# consumer's graph through tracing-subscriber's `json` feature.
+serde_json = { workspace = true }
 metrics = { workspace = true, optional = true }
 metrics-exporter-prometheus = { workspace = true, optional = true }
 # Only the prometheus feature has a fallible surface (recorder installation).
 thiserror = { workspace = true, optional = true }
+# Only for the `axum` feature's `ConnectInfo` read (see the feature).
+axum = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 axum = { workspace = true }
+# Parses the Cloud formatter's timestamps back as RFC 3339 in tests; the
+# formatter itself stamps lines with tracing-subscriber's own clock.
+time = { workspace = true, features = ["parsing"] }
+# Test-only strict JSON reading that rejects duplicate keys, which
+# `serde_json::Value` silently collapses.
+serde = { workspace = true }
