@@ -103,6 +103,21 @@ consumers pin a commit (`rev = "…"`), not a tag.
   Likewise `set_enable_unit_suffix(true)` (deprecated in 0.18; `install` does
   not set it) now suffixes `# HELP`/`# TYPE` like the samples and no longer
   repeats a unit already in the name (`x_seconds_seconds_bucket`).
+- `tower-http` 0.6 → 0.7 (0.7.1). **BREAKING** for a consumer that names
+  tower-http types: `cors_layer` returns `tower_http::cors::CorsLayer`, and
+  `SecurityHeadersLayer`'s `Service` is a `tower_http::set_header` stack, so
+  code that writes either type down must depend on tower-http 0.7 too (applying
+  the layers with `.layer()` is unaffected).
+- `cors_layer`'s `Vary` is unchanged, and now explicit: it sets `Vary: origin,
+  access-control-request-method, access-control-request-headers` itself. That
+  is the header tower-http 0.6 always sent; 0.7 derives the list from the policy and would send
+  `origin` alone for `cors_layer`'s origin list with constant method/header
+  lists, so the bump by itself would have changed the wire. The header is
+  pinned by a test on ordinary, disallowed-origin, no-`Origin` and preflight
+  responses. Nothing else tower-http 0.7 emits for `cors_layer` or
+  `security_headers` differs from 0.6 (status, headers, values and header
+  order compared over 15 request shapes), so `Vary` is the only change
+  guarded.
 
 ### Fixed
 

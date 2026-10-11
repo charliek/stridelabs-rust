@@ -270,6 +270,10 @@ if !origins.is_empty() {
   parameters; nothing about one service's front-end is baked in here.
 - Credentials are always allowed — every StrideLabs browser client
   authenticates with a cookie or an `Authorization` header.
+- Every response the layer touches carries one `vary: origin,
+  access-control-request-method, access-control-request-headers` header —
+  set explicitly (a test pins it), so a tower-http upgrade can't change what a
+  shared cache keys on.
 - An origin string that isn't a valid header value is skipped with a
   `tracing::warn!` naming it. That's a deployment-config typo: the useful
   behavior is a service that boots, serves its other origins, and says so
