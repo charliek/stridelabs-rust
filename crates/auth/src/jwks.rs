@@ -151,18 +151,22 @@ impl State {
         (cached.fetched.elapsed() < ttl && cached.set.find(kid).is_some()).then_some(&cached.set)
     }
 
-    /// The cached set, if its last successful fetch is younger than `bound`.
-    /// Deliberately blind to `last_fetch`: attempts open intervals, and an
-    /// interval must never extend the bound.
-    fn within_bound(&self, bound: Duration) -> Option<&CachedJwks> {
+    /// The cached set, if at `now` its last successful fetch is younger than
+    /// `bound`. Deliberately blind to `last_fetch`: attempts open intervals,
+    /// and an interval must never extend the bound.
+    ///
+    /// `now` is a parameter so that the suppression arm's two checks read one
+    /// instant, and so that the bound's test can pin it to the second without
+    /// racing the clock.
+    fn within_bound(&self, bound: Duration, now: Instant) -> Option<&CachedJwks> {
         self.cached
             .as_ref()
-            .filter(|cached| cached.fetched.elapsed() < bound)
+            .filter(|cached| now.saturating_duration_since(cached.fetched) < bound)
     }
 
-    /// The cached set, if it has the key and is within `bound`.
-    fn any_with_kid(&self, kid: &str, bound: Duration) -> Option<&Arc<JwkSet>> {
-        self.within_bound(bound)
+    /// The cached set, if it has the key and is within `bound` at `now`.
+    fn any_with_kid(&self, kid: &str, bound: Duration, now: Instant) -> Option<&Arc<JwkSet>> {
+        self.within_bound(bound, now)
             .filter(|cached| cached.set.find(kid).is_some())
             .map(|cached| &cached.set)
     }
@@ -246,12 +250,13 @@ impl JwksCache {
             // failed attempts opens interval after interval, and none of them
             // may keep a retired key verifying (module docs, rule 3).
             let bound = self.tuning.stale_bound();
-            if let Some(set) = state.any_with_kid(kid, bound) {
+            let now = Instant::now();
+            if let Some(set) = state.any_with_kid(kid, bound, now) {
                 tracing::debug!("serving a stale JWKS: refetch is within the minimum interval");
                 return Ok(Arc::clone(set));
             }
             tracing::debug!("suppressing JWKS refetch");
-            return Err(match state.within_bound(bound) {
+            return Err(match state.within_bound(bound, now) {
                 Some(_) => AuthError::UnknownKid,
                 // Nothing cached, or a set past the bound — which inside the
                 // interval only a failed or cancelled attempt leaves behind
@@ -336,9 +341,15 @@ mod tests {
         min_refetch_interval: Duration::ZERO,
     };
 
-    /// Small on purpose. The stale-bound tests fabricate instants up to two
+    /// Small on purpose. The stale-bound tests fabricate instants under three
     /// minutes old, and an age near the 3600 s default could exceed the
     /// monotonic clock of a freshly booted CI VM (`earlier`'s `checked_sub`).
+    ///
+    /// Every test that reads the real clock keeps its fabricated ages at
+    /// least 15 s from each edge it asserts (TTL, interval, bound), so a
+    /// scheduler or VM pause between seeding and the lookup cannot flip the
+    /// answer. Only the pure `State` test, which passes its own `now`, checks
+    /// the bound to the second.
     const TTL: Duration = Duration::from_secs(60);
     const WINDOW: Duration = Duration::from_secs(30);
     /// Stale bound: 90 s.
@@ -346,6 +357,10 @@ mod tests {
         ttl: TTL,
         min_refetch_interval: WINDOW,
     };
+    /// Under [`BOUNDED`]: 15 s past the TTL and 15 s inside the bound.
+    const INSIDE_THE_BOUND: Duration = Duration::from_secs(75);
+    /// Under [`BOUNDED`]: 15 s past the bound.
+    const PAST_THE_BOUND: Duration = Duration::from_secs(105);
 
     fn secs(n: u64) -> Duration {
         Duration::from_secs(n)
@@ -362,20 +377,20 @@ mod tests {
         earlier(Instant::now(), age)
     }
 
-    /// A state holding the primary key set, last fetched successfully `age`
-    /// ago, whose most recent attempt was at `last_fetch`.
-    fn fetched_ago(age: Duration, last_fetch: Option<Instant>) -> State {
+    /// A state holding the primary key set, last fetched successfully at
+    /// `fetched`, whose most recent attempt was at `last_fetch`.
+    fn fetched_at(fetched: Instant, last_fetch: Option<Instant>) -> State {
         State {
             cached: Some(CachedJwks {
                 set: Arc::new(TestKey::primary().jwks()),
-                fetched: ago(age),
+                fetched,
             }),
             last_fetch,
         }
     }
 
     async fn seed(cache: &JwksCache, age: Duration, last_fetch: Option<Instant>) {
-        *cache.state.write().await = fetched_ago(age, last_fetch);
+        *cache.state.write().await = fetched_at(ago(age), last_fetch);
     }
 
     /// Time passing, without sleeping: every instant the cache holds becomes
@@ -513,9 +528,9 @@ mod tests {
     async fn an_unknown_kid_outside_the_interval_refetches_and_picks_up_a_rotated_key() {
         let server = issuer(jwks_body(TestKey::secondary().jwks_json()), 1).await;
         let cache = cache(&server, BOUNDED);
-        // Fetched 40 s ago — fresh under the 60 s TTL — by an attempt then,
-        // outside the 30 s interval.
-        seed(&cache, secs(40), Some(ago(secs(40)))).await;
+        // Fetched 45 s ago by the attempt then: 15 s inside the 60 s TTL, and
+        // 15 s outside the 30 s interval.
+        seed(&cache, secs(45), Some(ago(secs(45)))).await;
 
         let after = cache
             .jwks_for_kid(SECONDARY_KID)
@@ -551,7 +566,7 @@ mod tests {
         // Past the TTL but within the stale bound, the set is still the
         // issuer's word on which keys exist: unknown, not an outage.
         let attempt = cache.state.read().await.last_fetch;
-        seed(&cache, secs(89), attempt).await;
+        seed(&cache, INSIDE_THE_BOUND, attempt).await;
         let err = cache
             .jwks_for_kid("attacker-supplied-kid")
             .await
@@ -579,10 +594,10 @@ mod tests {
             .expect("stale but usable");
 
         // ...but only within the stale bound (ttl 0 + the interval). The same
-        // set a second past it, with the interval still open — which only a
+        // set 15 s past it, with the interval still open — which only a
         // failed attempt leaves behind — is an outage, not a key.
         let attempt = cache.state.read().await.last_fetch;
-        seed(&cache, MIN_REFETCH_INTERVAL + secs(1), attempt).await;
+        seed(&cache, MIN_REFETCH_INTERVAL + secs(15), attempt).await;
         assert_suppressed_outage(cache.jwks_for_kid(PRIMARY_KID).await, "past the bound");
     }
 
@@ -601,7 +616,7 @@ mod tests {
         // Nor with a set that has the kid but is past the stale bound: inside
         // the interval the failure opened, it is no usable set at all.
         let attempt = cache.state.read().await.last_fetch;
-        seed(&cache, secs(91), attempt).await;
+        seed(&cache, PAST_THE_BOUND, attempt).await;
         assert_suppressed_outage(
             cache.jwks_for_kid(PRIMARY_KID).await,
             "a set past the bound",
@@ -609,16 +624,18 @@ mod tests {
     }
 
     /// The bound is `ttl + interval`, read off the last SUCCESS whatever
-    /// `last_fetch` says: every state here has an attempt stamped just now,
-    /// i.e. sits inside an interval a failure opened.
+    /// `last_fetch` says: every state here has an attempt stamped at `now`,
+    /// i.e. sits inside an interval a failure opened. One fixed `now`, so the
+    /// edges are checked to the second with no clock to race.
     #[test]
     fn the_stale_bound_is_ttl_plus_one_window_past_the_last_success() {
-        let just_failed = |age| fetched_ago(age, Some(Instant::now()));
+        let now = Instant::now();
+        let just_failed = |age| fetched_at(earlier(now, age), Some(now));
         let served = |state: &State, tuning: Tuning| {
             let bound = tuning.stale_bound();
-            let served = state.within_bound(bound).is_some();
+            let served = state.within_bound(bound, now).is_some();
             assert_eq!(
-                state.any_with_kid(PRIMARY_KID, bound).is_some(),
+                state.any_with_kid(PRIMARY_KID, bound, now).is_some(),
                 served,
                 "the kid lookup obeys the same bound"
             );
@@ -626,6 +643,10 @@ mod tests {
         };
 
         assert!(served(&just_failed(secs(89)), BOUNDED), "inside the bound");
+        assert!(
+            !served(&just_failed(secs(90)), BOUNDED),
+            "the bound itself is past it"
+        );
         assert!(
             !served(&just_failed(secs(91)), BOUNDED),
             "fetched 91 s ago: a fresh attempt stamp must not stretch the bound"
@@ -661,14 +682,14 @@ mod tests {
         let attempt = Some(Instant::now());
 
         // Past the bound: an outage whether or not the set has the kid.
-        seed(&cache, secs(91), attempt).await;
+        seed(&cache, PAST_THE_BOUND, attempt).await;
         for kid in [PRIMARY_KID, "attacker-supplied-kid"] {
             assert_suppressed_outage(cache.jwks_for_kid(kid).await, kid);
         }
         assert_eq!(cache.state.read().await.last_fetch, attempt, "not dialed");
 
         // Past the TTL but within the bound: still the issuer's word.
-        seed(&cache, secs(89), attempt).await;
+        seed(&cache, INSIDE_THE_BOUND, attempt).await;
         cache
             .jwks_for_kid(PRIMARY_KID)
             .await
@@ -695,7 +716,7 @@ mod tests {
         );
         let cache = cache_at(url, BOUNDED);
         // Past the TTL, so the lookup dials; no attempt yet, so it may.
-        seed(&cache, secs(91), None).await;
+        seed(&cache, PAST_THE_BOUND, None).await;
         let last_success = cache.state.read().await.cached.as_ref().map(|c| c.fetched);
 
         let cancelled =
@@ -722,16 +743,26 @@ mod tests {
     }
 
     /// The outage timeline the bound exists for, compressed with `advance`
-    /// (TTL 60 s, interval 30 s, bound 90 s; t counts from the last success).
-    /// Two attempts reach the issuer and both fail; no run of them revives
-    /// the set.
+    /// (t counts from the last success). Two attempts reach the issuer and
+    /// both fail; no run of them revives the set.
+    ///
+    /// The interval here is 60 s (TTL 60 s, bound 120 s), not 30 s: one
+    /// interval must hold a lookup inside the bound and one past it, each
+    /// 15 s from the bound and from the interval's own end, which takes an
+    /// interval of at least 45 s.
     #[tokio::test]
     async fn failed_attempts_never_extend_the_stale_bound() {
         let server = issuer(ResponseTemplate::new(503), 2).await;
-        let cache = cache(&server, BOUNDED);
-        // t = 85: past the TTL, and the last attempt (t = 54) is outside the
-        // interval.
-        seed(&cache, secs(85), Some(ago(secs(31)))).await;
+        let cache = cache(
+            &server,
+            Tuning {
+                ttl: TTL,
+                min_refetch_interval: secs(60),
+            },
+        );
+        // t = 90: 30 s past the TTL, and the last attempt — the success
+        // itself — 30 s outside the interval.
+        seed(&cache, secs(90), Some(ago(secs(90)))).await;
         let last_success = cache.state.read().await.cached.as_ref().map(|c| c.fetched);
 
         let err = cache.jwks_for_kid(PRIMARY_KID).await.unwrap_err();
@@ -744,17 +775,20 @@ mod tests {
             last_success,
             "a failed attempt is not a success"
         );
+        // Inside attempt 1's interval, and 30 s inside the bound.
         cache
             .jwks_for_kid(PRIMARY_KID)
             .await
             .expect("inside attempt 1's interval and the bound: stale but served");
 
-        // t = 95: the same interval, now past the bound.
-        advance(&cache, secs(10)).await;
-        assert_suppressed_outage(cache.jwks_for_kid(PRIMARY_KID).await, "t = 95");
+        // t = 135: the same interval (15 s before it ends), now 15 s past the
+        // bound.
+        advance(&cache, secs(45)).await;
+        assert_suppressed_outage(cache.jwks_for_kid(PRIMARY_KID).await, "t = 135");
 
-        // t = 116: the interval has closed, so attempt 2 dials — and fails.
-        advance(&cache, secs(21)).await;
+        // t = 165: the interval closed 15 s ago, so attempt 2 dials — and
+        // fails.
+        advance(&cache, secs(30)).await;
         let err = cache.jwks_for_kid(PRIMARY_KID).await.unwrap_err();
         assert!(
             matches!(&err, AuthError::Jwks(detail) if detail.contains("503")),
