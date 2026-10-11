@@ -3,18 +3,23 @@
 version: 2
 updates:
   # CI workflow actions (actions/checkout, setup-rust-toolchain, …). Bumps the
-  # pinned ref whether it's a version tag or a commit SHA.
+  # pinned ref whether it's a version tag or a commit SHA. Grouped into one PR
+  # per week: some actions (taiki-e/install-action) release near-daily, so
+  # separate PRs kept being auto-closed as superseded before anyone merged them.
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
 
   # The Cargo workspace at the repo root.
   - package-ecosystem: cargo
     directory: /
     schedule:
       interval: weekly
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 10
     groups:
       cargo-minor-patch:
         update-types: ["minor", "patch"]
