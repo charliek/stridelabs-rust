@@ -62,8 +62,15 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
+      # v2 enforces warning-free builds with CARGO_BUILD_WARNINGS=deny (cargo's
+      # `build.warnings`, needs cargo >= 1.97; the pinned 1.97.1 qualifies),
+      # replacing v1's implicit RUSTFLAGS="-D warnings". Stated here rather
+      # than left to the action's default. Unlike RUSTFLAGS it also fails on
+      # rustdoc warnings, so the Doc lane below is gated too.
       - name: Install Rust toolchain (from rust-toolchain.toml)
-        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          build-warnings: deny
 
       - name: Format
         run: cargo fmt --all -- --check
@@ -206,7 +213,7 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust toolchain (from rust-toolchain.toml)
-        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
 
       - name: Install cargo-audit
         uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2
@@ -295,7 +302,11 @@ jobs:
           title="Scheduled cargo audit is failing"
           labels="$(gh label list --search security --json name --jq '.[].name')"
           if ! grep -qx security <<<"$labels"; then
-            gh label create security --color D93F0B --description "Security advisories and hardening"
+            # Tolerate losing a race to create it (no --force: that would
+            # overwrite an existing label's colour/description). If the label
+            # genuinely isn't there, `gh issue create --label` below fails loudly.
+            gh label create security --color D93F0B --description "Security advisories and hardening" \
+              || echo "::notice::label 'security' already exists (created concurrently)"
           fi
           number="$(gh issue list --label security --state open --limit 100 --json number,title \
             --jq "map(select(.title == \"$title\")) | first | .number // empty")"
