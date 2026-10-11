@@ -40,7 +40,11 @@ against.
   so the dependency graph resolves against the pinned compiler instead of
   grabbing a transitive crate that needs a newer rustc.
 - Local infra: `docker compose up -d` (Postgres 16 on host port 5438 rather than
-  5432, so it doesn't collide with other local Postgres stacks).
+  5432, so it doesn't collide with other local Postgres stacks). If something
+  else already holds 5438 (cadence does), pick a free port and give it to both
+  sides: `STRIDELABS_PG_PORT=5439 make up` for compose, and
+  `DATABASE_URL=postgres://postgres:localdev@localhost:5439/stridelabs_test` for
+  the tests (`require_postgres` reads `DATABASE_URL` before its default URL).
 
 ## Quality gate (run before every commit)
 
