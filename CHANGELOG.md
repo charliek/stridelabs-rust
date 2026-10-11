@@ -79,6 +79,11 @@ consumers pin a commit (`rev = "…"`), not a tag.
   set has the kid: inside the interval only a failed or cancelled attempt
   leaves a set that old, which is an outage rather than a verdict on the
   token, and a 401 would sign users out during it. Both fail closed.
+- Internal dependency bumps, no API change: `rand` 0.9 → 0.10
+  (`stridelabs-auth`, `stridelabs-observability`) and `sha2` 0.10 → 0.11
+  (`stridelabs-auth`). Neither crate's types appear in a public signature,
+  and `pat::hash` output is unchanged: lowercase SHA-256 hex, pinned by a
+  known-vector test, so stored token hashes stay valid.
 
 ### Not done
 
