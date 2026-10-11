@@ -85,7 +85,16 @@ sqlx = { version = "0.9", default-features = false, features = [
 # `use_pem` (pem + simple_asn1 + ~11 transitive crates) from production graphs:
 # verification decodes keys from the JWKS, never PEM. Only offline test-token
 # minting needs PEM, and stridelabs-auth's `test-support` feature re-enables it.
-jsonwebtoken = { version = "9", default-features = false }
+#
+# Exactly ONE crypto backend must be on across the whole unified graph: with
+# none, or with both `aws_lc_rs` and `rust_crypto` (a consumer's own
+# jsonwebtoken features unify with these), jsonwebtoken 10+ compiles cleanly and
+# then panics at its first sign or verify. `aws_lc_rs`, because aws-lc-rs is
+# already the house rustls provider (reqwest 0.13's `rustls`), and
+# `rust_crypto` would bring back the `rsa` crate (RUSTSEC-2023-0071, no fix
+# upstream). Consumers must never enable `rust_crypto`. stridelabs-auth's
+# `signing_and_verifying_work_on_the_one_crypto_backend` panics if this breaks.
+jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_rs"] }
 sha2 = "0.11"
 
 # Misc

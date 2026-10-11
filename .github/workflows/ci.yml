@@ -219,6 +219,41 @@ jobs:
           fi
           echo "ok: no rsa in Cargo.lock"
 
+      # aws-lc-rs is the only crypto provider anything here compiles: rustls's
+      # under reqwest 0.13's `rustls`, and jsonwebtoken 11's `aws_lc_rs`
+      # backend. ring compiled next to it is the second provider that makes
+      # `rustls::ClientConfig::builder()` panic in a consumer's process. ring
+      # left the compiled graph with jsonwebtoken 9, but it stays in Cargo.lock
+      # through optional edges nothing compiles: quinn-proto's wasm32-only ring
+      # dependency, reached through reqwest's optional quinn (its `http3` is
+      # off), and rustls-webpki's `ring` feature, which is off. So a lock grep
+      # (the rsa guard's shape, right for cargo-audit, which reads the lock)
+      # would fail on a ring that is never built. The check is a listing of
+      # what the workspace compiles: every member, every feature, every target,
+      # normal, build and dev edges, with aws-lc-rs as the positive control.
+      - name: "Guard: the workspace compiles no ring"
+        run: |
+          set -euo pipefail
+          pkgs="$(mktemp)"
+          trap 'rm -f "$pkgs"' EXIT
+          cargo tree --locked --workspace --all-features --target all -e normal,build,dev \
+            --prefix none --format '{p}' | awk '{print $1}' | sort -u > "$pkgs"
+          echo "$(wc -l < "$pkgs") packages in the workspace's compiled graph"
+          if [ ! -s "$pkgs" ]; then
+            echo "::error::the workspace package listing is empty; the guard proved nothing"
+            exit 1
+          fi
+          if ! grep -qx aws-lc-rs "$pkgs"; then
+            echo "::error::positive control failed: aws-lc-rs is not in the workspace's compiled graph, so this listing is not the one the guard means to inspect"
+            exit 1
+          fi
+          if grep -qx ring "$pkgs"; then
+            echo "::error::ring is in the workspace's compiled graph; next to aws-lc-rs it is a second crypto provider, and rustls::ClientConfig::builder() panics"
+            cargo tree --locked --workspace --all-features --target all -e normal,build,dev -i ring || true
+            exit 1
+          fi
+          echo "ok: ring absent, aws-lc-rs present"
+
       # deny.toml's license/bans/sources gates (verified clean locally:
       # `cargo deny check licenses bans sources`). Deliberately does NOT
       # include `advisories` in this list — that would duplicate the

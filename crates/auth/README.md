@@ -43,6 +43,31 @@ in your graph: rustls `ring` from something else (redis-rs `tls-rustls`, sqlx
 panic. CI's "Guard: stridelabs-auth pulls no rustls" keeps rustls out of this
 crate's graph.
 
+**One JWT crypto backend: aws-lc-rs.** The crate's `jsonwebtoken` (11) uses
+its `aws_lc_rs` backend, and that binds your whole graph, not just this crate:
+jsonwebtoken picks its backend from crate features at runtime, Cargo unifies
+those features across your graph, and with both `aws_lc_rs` and `rust_crypto`
+on (or neither) it compiles cleanly and then panics at the first sign or
+verify, in `verify_bearer`, `verify_with_jwks` and `TestKey::mint` alike. The
+rule: **never enable jsonwebtoken `rust_crypto`**, on your own `jsonwebtoken`
+or through any other dependency, **and use aws-lc-rs as the only rustls
+provider** (install it at startup with
+`rustls::crypto::aws_lc_rs::default_provider().install_default()` if your
+service builds rustls configs itself). `rust_crypto` is rejected here because
+it brings back the `rsa` crate (RUSTSEC-2023-0071, no fix). aws-lc-sys, a C
+build like ring before it, comes along into production graphs.
+`signing_and_verifying_work_on_the_one_crypto_backend` (in `verify.rs`) is the
+test that panics when the backend set is wrong; a consumer's own mint-and-verify
+test does the same for its graph.
+
+`Verifier::verify_with_jwks`, `JwksCache::jwks_for_kid`, `TestKey::jwks` and
+`test_support::test_jwks` take or return jsonwebtoken 11's `JwkSet`. To name
+it, depend on the same major with the same backend:
+
+```toml
+jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_rs"] }
+```
+
 ## Adding the dependency
 
 ```toml

@@ -63,8 +63,12 @@ allow = [
     # Permissive.
     "Unicode-3.0",
     # The crypto underneath TLS and JWT: aws-lc-rs/aws-lc-sys (rustls's
-    # provider under reqwest 0.13's `rustls`), ring (jsonwebtoken), and
-    # rustls-webpki, untrusted, simple_asn1. Permissive.
+    # provider under reqwest 0.13's `rustls`, and jsonwebtoken 11's
+    # `aws_lc_rs` backend), rustls-webpki, untrusted, and simple_asn1
+    # (jsonwebtoken's PEM support). Permissive. ring left this graph with
+    # jsonwebtoken 9; its remaining Cargo.lock entry is lock-only (edges from
+    # quinn-proto, behind reqwest's optional quinn, and from rustls-webpki's
+    # off `ring` feature), so nothing compiles it and cargo-deny never sees it.
     "ISC",
     # webpki-root-certs (Mozilla's root CA bundle). reqwest 0.13 bundles no
     # roots any more (0.12's webpki-roots is gone from the lock); this one is

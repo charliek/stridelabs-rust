@@ -168,6 +168,7 @@ impl Verifier {
 
 #[cfg(test)]
 mod tests {
+    use jsonwebtoken::errors::ErrorKind;
     use jsonwebtoken::{encode, EncodingKey, Header};
     use wiremock::{MockServer, ResponseTemplate};
 
@@ -444,5 +445,45 @@ mod tests {
         let err = verifier.verify_bearer(&token).await.unwrap_err();
 
         assert!(matches!(err, AuthError::Jwks(_)), "{err}");
+    }
+
+    // --- the crypto backend -------------------------------------------------
+
+    /// jsonwebtoken 10+ takes its crypto from crate features, unified across
+    /// the whole graph this test is built in (the workspace's, and in a
+    /// consumer, the consumer's). With exactly one of `aws_lc_rs` and
+    /// `rust_crypto` on it works; with neither, or both, it still compiles
+    /// cleanly and then panics at the first sign or verify. That is how the
+    /// bare 9 → 11 bump passed clippy and failed only at test time. So this
+    /// signs with the test-support key and verifies the token the way a
+    /// service does (JWKS over HTTP into `verify_bearer`) and with a direct
+    /// `jsonwebtoken::decode`. The wrong-key decode proves the backend really
+    /// checks a signature rather than accepting whatever it is handed.
+    #[tokio::test]
+    async fn signing_and_verifying_work_on_the_one_crypto_backend() {
+        let server = primary_issuer(1).await;
+        let token = TestKey::primary().mint(&claims().subject("backend-check").build());
+
+        let identity = verifier_against(&server)
+            .verify_bearer(&token)
+            .await
+            .expect("a minted token verifies through the JWKS path");
+        assert_eq!(identity.sub, "backend-check");
+
+        let decoding_key = |key: TestKey| {
+            let jwks = key.jwks();
+            DecodingKey::from_jwk(jwks.find(key.kid()).expect("the key's own kid"))
+                .expect("committed test JWK is a usable RSA key")
+        };
+        let mut validation = Validation::new(Algorithm::RS256);
+        validation.set_audience(&[AUDIENCE]);
+
+        let data = decode::<Claims>(&token, &decoding_key(TestKey::primary()), &validation)
+            .expect("a minted token decodes directly");
+        assert_eq!(data.claims.sub, "backend-check");
+
+        let err = decode::<Claims>(&token, &decoding_key(TestKey::secondary()), &validation)
+            .expect_err("a token must not verify under a key that did not sign it");
+        assert_eq!(err.kind(), &ErrorKind::InvalidSignature);
     }
 }

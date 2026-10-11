@@ -147,3 +147,27 @@ the Postgres driver is worth gating.
 TLS. `stridelabs-auth` has none — it takes the consumer's `reqwest::Client`,
 so the TLS stack and the process's rustls provider stay the consumer's choice —
 and `stridelabs-testing`'s Postgres pool talks to its database in the clear.
+
+### One crypto provider: aws-lc-rs
+
+`stridelabs-auth` signs and verifies JWTs with jsonwebtoken 11's `aws_lc_rs`
+backend, and `proxy`'s TLS uses rustls's aws-lc-rs provider. jsonwebtoken
+(10+) and rustls both choose their crypto from crate features at runtime, and
+Cargo unifies features across a consumer's whole graph, so a second backend
+anywhere in that graph does not fail the build: the process panics at its
+first JWT sign or verify, or its first `rustls::ClientConfig::builder()`. The
+consumer rule:
+
+- **Never enable jsonwebtoken `rust_crypto`**, on your own jsonwebtoken or
+  anywhere else in your graph. Next to this workspace's `aws_lc_rs` it makes
+  jsonwebtoken panic, `stridelabs-auth`'s verification and test-token minting
+  included, and it brings back the `rsa` crate (RUSTSEC-2023-0071, no fix).
+- **Use aws-lc-rs as the only rustls provider**: no rustls `ring` feature
+  (redis-rs `tls-rustls`, sqlx `tls-rustls-ring`, …). If your service builds
+  rustls configs itself, install the provider at startup with
+  `rustls::crypto::aws_lc_rs::default_provider().install_default()`.
+
+Nothing checks either rule at compile time. For the jsonwebtoken half, a test
+that mints and verifies a token (`stridelabs_auth::test_support`, feature
+`test-support`) panics in your own CI when the rule is broken; this
+workspace's own tests do exactly that.

@@ -270,6 +270,43 @@ see the README's "MSRV policy").
   URL's userinfo, query or fragment: the JWKS URL (and `pat_validate_url`)
   renders as `scheme://host[:port]/path`, and a string that does not parse as
   a URL with a host as `<unparseable URL>`.
+- `jsonwebtoken` 9 → 11 (11.1.0, `stridelabs-auth`) with the `aws_lc_rs`
+  crypto backend. **BREAKING** for a consumer that names jsonwebtoken types
+  from this crate: `Verifier::verify_with_jwks` takes a
+  `&jsonwebtoken::jwk::JwkSet`, `JwksCache::jwks_for_kid` returns an
+  `Arc<JwkSet>`, and `test_support::TestKey::jwks` and `test_support::test_jwks`
+  return a `JwkSet`, so code that passes or receives one must be on
+  jsonwebtoken 11 too. Nothing else exposes a jsonwebtoken type: `Claims` and
+  `VerifiedIdentity` are plain structs, `AuthError` holds no jsonwebtoken
+  error as a source (`InvalidToken` carries a fixed classification phrase),
+  and `TestKey::{pem, jwks_json, mint, mint_with_kid}` deal in strings and
+  `Serialize` claims. `AuthError::InvalidToken`'s classification is
+  unchanged; jsonwebtoken 11's new error kinds (`InvalidClaimFormat`,
+  `UnsupportedAlgorithm`, `InvalidEddsaKey`, `Signing`, `Provider`) fall into
+  its existing "token is malformed" arm. `InvalidClaimFormat` (a malformed
+  `exp`/`nbf`) cannot reach it from `Verifier`: `exp` is a required claim, so
+  a malformed one is still "a required claim is missing", and `nbf` is not
+  validated.
+- **BREAKING (behaviour): one jsonwebtoken backend per graph.** jsonwebtoken
+  10+ chooses its crypto from crate features, which Cargo unifies across a
+  consumer's whole graph, and with none or both of `aws_lc_rs` and
+  `rust_crypto` on it compiles cleanly and then panics at the first sign or
+  verify. This crate turns on `aws_lc_rs`, so a consumer whose graph also
+  enables `rust_crypto` (on its own jsonwebtoken 10+, or through another
+  dependency) panics in `Verifier::verify_bearer`,
+  `Verifier::verify_with_jwks` and `TestKey::mint`. The consumer rule:
+  **never enable jsonwebtoken `rust_crypto`; use aws-lc-rs as the only rustls
+  provider** (install `rustls::crypto::aws_lc_rs::default_provider()` at
+  startup if your service builds rustls configs itself). `rust_crypto` is
+  rejected because it brings back `rsa` (RUSTSEC-2023-0071). aws-lc-sys, a C
+  build, replaces ring in every `stridelabs-auth` consumer's graph,
+  production included. A test signs a token with the test-support key and
+  verifies it through the JWKS path and `jsonwebtoken::decode` in both CI
+  lanes; with no backend, or both, it panics. ring is no longer compiled
+  anywhere in the workspace, and CI's "Guard: the workspace compiles no ring"
+  step (a listing of every member's compiled graph, all features and targets)
+  fails if it is again. `Cargo.lock` still lists ring, through optional edges
+  nothing compiles, which is why the guard does not grep the lock.
 
 ### Fixed
 
