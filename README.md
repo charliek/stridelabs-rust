@@ -57,7 +57,7 @@ Once a version is tagged, pin the tag:
 
 ```toml
 [dependencies]
-stridelabs-config = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.4.0" }
+stridelabs-config = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.5.0" }
 ```
 
 Before the first tag exists — or when depending on a reviewed-but-unreleased
@@ -87,8 +87,12 @@ line, with X the new version:
 
 > Minimum supported Rust version raised to X. Consumers must be on Rust X or newer. Earlier tags are unaffected.
 
-A tag is immutable, so a consumer pinned to an earlier tag keeps resolving
-and building with the compiler that tag declares.
+A tag is immutable, so a consumer pinned to an earlier tag keeps that tag's
+manifest and the MSRV it declares. That fixes this workspace's source, not the
+consumer's dependency graph: transitive versions come from the consumer's own
+`Cargo.lock` (keep it committed), not from this repository's, so a fresh
+resolve can pick up a registry release that needs a newer compiler than the
+tag declares.
 
 ### Local co-development
 

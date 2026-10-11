@@ -96,16 +96,27 @@ an ancestor path. A service scaffolded inside an existing monorepo, at
   skill uses; otherwise pin the exact commit `rev`. See the root README's
   "Consuming these crates" section for the exact `tag =` / `rev =` forms.
 
-  **Today that means `rev`:** Step 3's logging defaults
-  (`LogFormat::from_environment`, `RequestLogLayer`) are newer than
-  `v0.4.0`, the latest tag, so a `tag = "v0.4.0"` scaffold does not compile.
-  Pin the commit until a release includes them, then move to that tag.
+  **Today that means `tag = "v0.5.0"`**, the latest tag: it contains Step 3's
+  logging defaults (`LogFormat::from_environment`, `RequestLogLayer`), which
+  `v0.4.0` lacks, so a `v0.4.0` scaffold does not compile. Pin one tag for all
+  five crates (they are versioned in lockstep).
 
   ```toml
   [dependencies]
-  stridelabs-config = { git = "https://github.com/charliek/stridelabs-rust.git", rev = "<full commit sha>" }
-  # ... the same git =/rev = for the other four crates, feature flags as below
+  stridelabs-config = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.5.0" }
+  # ... the same git =/tag = for the other four crates, feature flags as below
   ```
+
+  The tag brings its dependency majors with it. Wherever the service names a
+  type from one of these crates' public signatures it must be on the same
+  major, or the compiler sees two unrelated types: `utoipa` 6 (with
+  `utoipa-axum` 0.3, as Step 2 pins), `reqwest` 0.13 (the client handed to
+  `Verifier::new`), `jsonwebtoken` 11, `sqlx` 0.9 (a test that names
+  `PgPool`), `tower-http` 0.7 and `metrics-exporter-prometheus` 0.18. Keep
+  aws-lc-rs the only rustls provider, and never enable `jsonwebtoken`'s
+  `rust_crypto` feature (v0.5.0's CHANGELOG explains why). A `reqwest` that
+  fetches an `https://` JWKS needs its own TLS feature (`rustls`) turned on:
+  `stridelabs-auth` enables none.
 
 A service that starts in path-dependency mode — sibling or ancestor-relative,
 and whether it later moves to a real repo or already sits inside one — should

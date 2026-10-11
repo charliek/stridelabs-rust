@@ -38,7 +38,7 @@ methods on the value) must depend on the same `sqlx` major, currently 0.9.
 
 ```toml
 [dev-dependencies]
-stridelabs-testing = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.4.0", features = ["postgres"] }
+stridelabs-testing = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.5.0", features = ["postgres"] }
 ```
 
 (During development against an unreleased commit, pin `rev = "<sha>"` instead

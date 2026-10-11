@@ -5,11 +5,6 @@ Google Cloud Logging structured lines), real `tower` request-logging and
 request-id layers, and (behind a feature) Prometheus recorder wiring, for
 StrideLabs services.
 
-> **Unreleased.** `LogFormat::Cloud`, `LogFormat::from_environment`,
-> `CloudLayer`, `RequestLogLayer` and the `axum` feature are not in `v0.4.0`;
-> they ship first in the next release. Until then, pin a commit that has them
-> (`rev = "<commit>"`, see [Adding the dependency](#adding-the-dependency)).
-
 A new service's default is two lines — Cloud Logging lines everywhere but
 development, and the request-logging layer outermost:
 
@@ -45,32 +40,22 @@ default features.
 
 ## Adding the dependency
 
-For the released API (`v0.4.0`: `init_logging` with `Text`/`Json`,
-`RequestIdLayer`, the `prometheus` feature), pin the tag:
+Pin the tag:
 
 ```toml
 [dependencies]
-stridelabs-observability = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.4.0" }
+stridelabs-observability = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.5.0" }
 
 # with Prometheus wiring:
-stridelabs-observability = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.4.0", features = ["prometheus"] }
-```
-
-The Cloud Logging format, `from_environment`, `RequestLogLayer` and the
-`axum` feature are unreleased: until a release contains them, pin the exact
-commit (the workspace's rule for a reviewed-but-unreleased change; move back
-to a `tag` once one includes them):
-
-```toml
-[dependencies]
-stridelabs-observability = { git = "https://github.com/charliek/stridelabs-rust.git", rev = "<full commit sha>" }
+stridelabs-observability = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.5.0", features = ["prometheus"] }
 
 # with the peer-address fallback for request logs (and Prometheus wiring):
-stridelabs-observability = { git = "https://github.com/charliek/stridelabs-rust.git", rev = "<full commit sha>", features = ["axum", "prometheus"] }
+stridelabs-observability = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.5.0", features = ["axum", "prometheus"] }
 ```
 
-See the workspace root README for the local `[patch]` co-development
-snippet.
+(During development against an unreleased commit, pin `rev = "<sha>"` instead
+of `tag`.) See the workspace root README for the local `[patch]`
+co-development snippet.
 
 ## `logging` — tracing subscriber setup
 

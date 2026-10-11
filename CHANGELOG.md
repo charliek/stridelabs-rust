@@ -11,11 +11,30 @@ for a consumer's pin.
 
 ## [Unreleased]
 
-`stridelabs-observability` writes Google Cloud Logging lines and request
-logs, bringing Rust services to parity with Python `stridelabs-logging`. The
-next release must be a minor bump (0.x): `LogFormat` became
-`#[non_exhaustive]`. None of this is in `v0.4.0`: until it is released,
-consumers pin a commit (`rev = "…"`), not a tag.
+## [0.5.0] - 2026-10-11
+
+Every pending dependency major in one release, and the guards and CI that
+keep what they changed true. This is a minor bump (0.x) with a long list of
+breaking changes, set out first under Changed. A consumer moves its own
+`reqwest`, `jsonwebtoken`, `sqlx`, `utoipa`, `tower-http` and
+`metrics-exporter-prometheus` to the same majors when it moves to this tag,
+because their types appear in these crates' public signatures.
+
+- `stridelabs-auth` bounds how long a cached JWKS key outlives its last
+  successful fetch (`JWKS_TTL + MIN_REFETCH_INTERVAL`, 3630 s), so a retired
+  key no longer keeps verifying for as long as an issuer outage lasts, and it
+  verifies only with a key fit for RS256 signatures.
+- The workspace has one crypto provider, aws-lc-rs: ring is compiled nowhere,
+  and `jsonwebtoken` runs on its `aws_lc_rs` backend. CI guards that, and the
+  other properties a consumer's graph inherits (`stridelabs-testing` pulls no
+  ring, `stridelabs-auth` no rustls, and the lock has no `rsa`), instead of
+  trusting them.
+- CI tells the truth: `cargo audit` gates main, manual runs and the weekly
+  schedule (a scheduled failure opens an issue), `cargo-semver-checks` checks
+  all five crates against the previous tag and is a real gate, and a
+  downstream job builds limen against the candidate.
+- `stridelabs-observability` writes Google Cloud Logging lines and request
+  logs, bringing Rust services to parity with Python `stridelabs-logging`.
 
 The minimum supported Rust version is unchanged at 1.97 (raised in v0.2.0;
 see the README's "MSRV policy").
@@ -71,11 +90,6 @@ see the README's "MSRV policy").
   without every future format being a breaking change). A `match` on
   `LogFormat` outside the crate without a wildcard arm (`_ => ...`) no
   longer compiles.
-- `RequestIdLayer` reuses an existing `RequestId` request extension (held
-  to the same validity rule as the header) before the `x-request-id` header,
-  so behind an outer `RequestLogLayer` it echoes the id that was logged.
-- `LogFormat::Json`'s documentation now lists the `span`/`spans` keys its
-  lines have always carried inside a span; the format itself is unchanged.
 - **BREAKING (behaviour, for `Verifier` and `JwksCache` users):** the JWKS
   stale bound. Inside the refetch interval the cache serves only a set whose
   last *successful* fetch is younger than `JWKS_TTL + MIN_REFETCH_INTERVAL`.
@@ -89,17 +103,6 @@ see the README's "MSRV policy").
   set has the kid: inside the interval only a failed or cancelled attempt
   leaves a set that old, which is an outage rather than a verdict on the
   token, and a 401 would sign users out during it. Both fail closed.
-- Internal dependency bumps, no API change: `rand` 0.9 → 0.10
-  (`stridelabs-auth`, `stridelabs-observability`) and `sha2` 0.10 → 0.11
-  (`stridelabs-auth`). Neither crate's types appear in a public signature,
-  and `pat::hash` output is unchanged: lowercase SHA-256 hex, pinned by a
-  known-vector test, so stored token hashes stay valid.
-- Internal dependency swap, no API change: `serde_yaml` 0.9 (archived) →
-  `yaml_serde` 0.10, the YAML organization's maintained fork
-  (`stridelabs-config`; the parser underneath moves from `unsafe-libyaml` to
-  its fork `libyaml-rs`). `FileError::Parse` messages are unchanged —
-  field path, line/column and parser context render identically — and are now
-  pinned by two exact-message tests.
 - `metrics-exporter-prometheus` 0.17 → 0.18 (0.18.3; 0.18.2 is yanked).
   **BREAKING** for a consumer that names `PrometheusHandle`, which
   `prometheus::install` returns: it must depend on `metrics-exporter-prometheus`
@@ -160,16 +163,6 @@ see the README's "MSRV policy").
   `SecurityHeadersLayer`'s `Service` is a `tower_http::set_header` stack, so
   code that writes either type down must depend on tower-http 0.7 too (applying
   the layers with `.layer()` is unaffected).
-- `cors_layer`'s `Vary` is unchanged, and now explicit: it sets `Vary: origin,
-  access-control-request-method, access-control-request-headers` itself. That
-  is the header tower-http 0.6 always sent; 0.7 derives the list from the policy and would send
-  `origin` alone for `cors_layer`'s origin list with constant method/header
-  lists, so the bump by itself would have changed the wire. The header is
-  pinned by a test on ordinary, disallowed-origin, no-`Origin` and preflight
-  responses. Nothing else tower-http 0.7 emits for `cors_layer` or
-  `security_headers` differs from 0.6 (status, headers, values and header
-  order compared over 15 request shapes), so `Vary` is the only change
-  guarded.
 - `utoipa` 5 → 6 (6.0.0 with utoipa-gen 6.0.1, both from 2026-09-22/23;
   `stridelabs-http`'s `openapi` feature). **BREAKING** for every consumer of
   the module: `documented_pairs`, `find_operation`, `expect_operation`,
@@ -210,21 +203,6 @@ see the README's "MSRV policy").
   `PgPool` types). The one query this crate runs is a `&'static str`, so
   sqlx 0.9's `SqlSafeStr` bound (dynamic SQL needs `AssertSqlSafe`) changes
   nothing here; it does apply to a consumer's own `format!`-built queries.
-- `stridelabs-testing` has no TLS. The `postgres` feature's sqlx is built with
-  no `tls-*` feature (it used to enable `tls-rustls-ring`) because the pool
-  talks to a local or CI Postgres in the clear, and a TLS feature there
-  unifies into every consumer's test graph, where `ring` next to the aws-lc-rs
-  provider of reqwest 0.13's `rustls` makes `rustls::ClientConfig::builder()`
-  panic. Behaviour change for a consumer whose test URL demands TLS:
-  `sslmode=require` (or `verify-ca`/`verify-full`) now panics with sqlx's
-  "built without TLS support" error, pinned by a test; the default `prefer`
-  connects in the clear. CI's "Guard: stridelabs-testing pulls no ring" step
-  fails if a TLS feature comes back.
-- The RUSTSEC-2023-0071 (`rsa`, Marvin timing side-channel; no upstream fix)
-  ignore is gone from CI's `cargo audit` step and `deny.toml`: sqlx 0.9 no
-  longer compiles `rsa` (MySQL's RSA auth is behind its opt-in `mysql-rsa`
-  feature), so `Cargo.lock` has no `rsa` entry and `cargo audit` runs with no
-  ignores. A "Guard: no rsa in Cargo.lock" CI step keeps it that way.
 - `reqwest` 0.12 → 0.13 (0.13.5). **BREAKING** for a consumer that hands
   these crates a reqwest type or names one they return: it must be on reqwest
   0.13 too (two majors are two unrelated `Client` types). `stridelabs-auth`:
@@ -261,22 +239,6 @@ see the README's "MSRV policy").
   `tls-rustls`, sqlx's `tls-rustls-ring`), rustls has two providers and every
   `rustls::ClientConfig::builder()` relying on the crate-feature default
   panics: keep aws-lc-rs the only one.
-- reqwest errors are now rendered without URLs. `AuthError::Jwks` renders the
-  `reqwest::Error` from a failed JWKS fetch or JSON decode with
-  `without_url()`; before, it ended `for url (…)` with the JWKS URL's query
-  string, which reached logs (the `http` feature's 500 logs it in full).
-  Userinfo never reached it: reqwest moves it into an `Authorization` header.
-  A canary test, a JWKS URL carrying both, pins the error's `Display` and
-  `Debug` and the `http` feature's log line. In `proxy` nothing changes:
-  `UpstreamFailure` and `bad_gateway_upstream` never render the error. But
-  reqwest 0.13 now attaches the URL to a `Response::bytes()`/`json()` failure
-  too, so a consumer that logs `%err` or `?err` from a body read now leaks the
-  URL and its query string where 0.12 did not: call `.without_url()` first, or
-  log `UpstreamFailure` instead.
-- `Debug` for `SlauthConfig`, `JwksCache` and `Verifier` no longer prints a
-  URL's userinfo, query or fragment: the JWKS URL (and `pat_validate_url`)
-  renders as `scheme://host[:port]/path`, and a string that does not parse as
-  a URL with a host as `<unparseable URL>`.
 - `jsonwebtoken` 9 → 11 (11.1.0, `stridelabs-auth`) with the `aws_lc_rs`
   crypto backend. **BREAKING** for a consumer that names jsonwebtoken types
   from this crate: `Verifier::verify_with_jwks` takes a
@@ -341,6 +303,63 @@ see the README's "MSRV policy").
 
   A correctly labelled signing key, or one with no labels, verifies as
   before. Rejections not listed here are classified as before.
+- **BREAKING (behaviour, `stridelabs-testing`):** no TLS. The `postgres`
+  feature's sqlx is built with no `tls-*` feature (it used to enable `tls-rustls-ring`) because the pool
+  talks to a local or CI Postgres in the clear, and a TLS feature there
+  unifies into every consumer's test graph, where `ring` next to the aws-lc-rs
+  provider of reqwest 0.13's `rustls` makes `rustls::ClientConfig::builder()`
+  panic. Behaviour change for a consumer whose test URL demands TLS:
+  `sslmode=require` (or `verify-ca`/`verify-full`) now panics with sqlx's
+  "built without TLS support" error, pinned by a test; the default `prefer`
+  connects in the clear. CI's "Guard: stridelabs-testing pulls no ring" step
+  fails if a TLS feature comes back.
+- `RequestIdLayer` reuses an existing `RequestId` request extension (held
+  to the same validity rule as the header) before the `x-request-id` header,
+  so behind an outer `RequestLogLayer` it echoes the id that was logged.
+- `LogFormat::Json`'s documentation now lists the `span`/`spans` keys its
+  lines have always carried inside a span; the format itself is unchanged.
+- Internal dependency bumps, no API change: `rand` 0.9 → 0.10
+  (`stridelabs-auth`, `stridelabs-observability`) and `sha2` 0.10 → 0.11
+  (`stridelabs-auth`). Neither crate's types appear in a public signature,
+  and `pat::hash` output is unchanged: lowercase SHA-256 hex, pinned by a
+  known-vector test, so stored token hashes stay valid.
+- Internal dependency swap, no API change: `serde_yaml` 0.9 (archived) →
+  `yaml_serde` 0.10, the YAML organization's maintained fork
+  (`stridelabs-config`; the parser underneath moves from `unsafe-libyaml` to
+  its fork `libyaml-rs`). `FileError::Parse` messages are unchanged —
+  field path, line/column and parser context render identically — and are now
+  pinned by two exact-message tests.
+- `cors_layer`'s `Vary` is unchanged, and now explicit: it sets `Vary: origin,
+  access-control-request-method, access-control-request-headers` itself. That
+  is the header tower-http 0.6 always sent; 0.7 derives the list from the policy and would send
+  `origin` alone for `cors_layer`'s origin list with constant method/header
+  lists, so the bump by itself would have changed the wire. The header is
+  pinned by a test on ordinary, disallowed-origin, no-`Origin` and preflight
+  responses. Nothing else tower-http 0.7 emits for `cors_layer` or
+  `security_headers` differs from 0.6 (status, headers, values and header
+  order compared over 15 request shapes), so `Vary` is the only change
+  guarded.
+- The RUSTSEC-2023-0071 (`rsa`, Marvin timing side-channel; no upstream fix)
+  ignore is gone from CI's `cargo audit` step and `deny.toml`: sqlx 0.9 no
+  longer compiles `rsa` (MySQL's RSA auth is behind its opt-in `mysql-rsa`
+  feature), so `Cargo.lock` has no `rsa` entry and `cargo audit` runs with no
+  ignores. A "Guard: no rsa in Cargo.lock" CI step keeps it that way.
+- reqwest errors are now rendered without URLs. `AuthError::Jwks` renders the
+  `reqwest::Error` from a failed JWKS fetch or JSON decode with
+  `without_url()`; before, it ended `for url (…)` with the JWKS URL's query
+  string, which reached logs (the `http` feature's 500 logs it in full).
+  Userinfo never reached it: reqwest moves it into an `Authorization` header.
+  A canary test, a JWKS URL carrying both, pins the error's `Display` and
+  `Debug` and the `http` feature's log line. In `proxy` nothing changes:
+  `UpstreamFailure` and `bad_gateway_upstream` never render the error. But
+  reqwest 0.13 now attaches the URL to a `Response::bytes()`/`json()` failure
+  too, so a consumer that logs `%err` or `?err` from a body read now leaks the
+  URL and its query string where 0.12 did not: call `.without_url()` first, or
+  log `UpstreamFailure` instead.
+- `Debug` for `SlauthConfig`, `JwksCache` and `Verifier` no longer prints a
+  URL's userinfo, query or fragment: the JWKS URL (and `pat_validate_url`)
+  renders as `scheme://host[:port]/path`, and a string that does not parse as
+  a URL with a host as `<unparseable URL>`.
 
 ### Fixed
 

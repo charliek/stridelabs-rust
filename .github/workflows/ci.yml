@@ -286,15 +286,15 @@ jobs:
         with:
           tool: cargo-semver-checks@0.51.0
 
-      # The baseline above is the latest reachable `v*` tag. `continue-on-error`
-      # stays only until the commit that bumps `[workspace.package].version`
-      # to 0.5.0, which removes it: until then the workspace is still 0.4.0,
-      # equal to the baseline, while stridelabs-observability's `LogFormat`
-      # became `#[non_exhaustive]` (a real break, see CHANGELOG
-      # `[Unreleased]`), so this step is expected to be red and must not
-      # block. After the bump, a 0.x minor bump covers that break and this
-      # step is a real gate; each later breaking PR must bump the version
-      # itself. Don't carry the tolerance forward past that commit.
+      # A real gate: the baseline above is the latest reachable `v*` tag, and
+      # a crate whose public API breaks against it fails this step. Under 0.x
+      # a breaking change is legal only with a minor bump, so every breaking
+      # PR must bump `[workspace.package].version` itself. That is why this
+      # passes at 0.5.0 against the v0.4.0 baseline (the breaks since v0.4.0,
+      # e.g. `LogFormat` becoming `#[non_exhaustive]`, are covered by the
+      # bump), and why, once v0.5.0 is tagged and becomes the baseline, the
+      # next break needs 0.6.0. The version bump is the fix; never put
+      # `continue-on-error` back.
       #
       # Every crate here has `publish = false` (crates/*/Cargo.toml) — a
       # `--workspace` cargo-semver-checks invocation silently NO-OPS against
@@ -321,7 +321,6 @@ jobs:
       # regardless of cargo-semver-checks's own exit code — a vacuously
       # "passing" check is worse than a loudly failing one.
       - name: cargo-semver-checks (all five crates)
-        continue-on-error: true
         run: |
           set +e -uo pipefail
           baseline="${{ steps.semver-baseline.outputs.tag }}"
