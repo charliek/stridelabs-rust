@@ -97,21 +97,47 @@ see the README's "MSRV policy").
   **BREAKING** for a consumer that names `PrometheusHandle`, which
   `prometheus::install` returns: it must depend on `metrics-exporter-prometheus`
   0.18 too (`metrics` stays 0.24). The scrape text `install` produces is
-  unchanged for counters, gauges, `*duration_seconds` histograms (the only
-  ones `install` gives buckets) and ordinary default-summary histograms: their
-  `# HELP`, `# TYPE` and sample lines are pinned by tests. One exception, a
-  renamed series: a histogram that falls back to the default summary (any
-  histogram not ending `duration_seconds`) whose name ENDS IN `count` or `sum`
-  loses that suffix on the matching series. 0.18's suffix helper skips a suffix
-  the name already ends with, comparing `ends_with("count")` without the `_`
-  (upstream `formatting.rs`, `add_suffix_if_missing`), so after `install()`
-  `metrics::histogram!("discount")` renders `discount{…} 2` where 0.17.2
-  rendered `discount_count{…} 2`, and `checksum{…} 4` where it rendered
-  `checksum_sum{…} 4`; the other series of the summary (`discount_sum`,
-  `checksum_count`, the quantiles) are unchanged. A consumer with such a metric
-  must rename it or update the queries and alerts that read its `_count`/`_sum`
-  series. A test pins this as observed on 0.18.3, so an exporter release that
-  fixes it shows up as a deliberate change. 0.18's fix that puts
+  unchanged, series for series, for counters, gauges, `*duration_seconds`
+  histograms (the only ones `install` gives buckets) and ordinary
+  default-summary histograms, except in the two cases below: their `# HELP`,
+  `# TYPE` and sample lines are pinned by tests. (The order of the families,
+  and of the series within one, was never fixed and still is not.)
+  Exception 1, a renamed series: a histogram that falls back to the default
+  summary (any histogram not ending `duration_seconds`) whose name ENDS IN
+  `count` or `sum` loses that suffix on the matching series. 0.18's suffix
+  helper skips a suffix the name already ends with, comparing
+  `ends_with("count")` without the `_` (upstream `formatting.rs`,
+  `add_suffix_if_missing`), so after `install()` `metrics::histogram!("discount")`
+  renders `discount{…} 2` where 0.17.2 rendered `discount_count{…} 2`, and
+  `checksum{…} 4` where it rendered `checksum_sum{…} 4`; the other series of
+  the summary (`discount_sum`, `checksum_count`, the quantiles) are unchanged.
+  A consumer with such a metric must rename it or update the queries and
+  alerts that read its `_count`/`_sum` series. A test pins this as observed on
+  0.18.3, so an exporter release that fixes it shows up as a deliberate
+  change. Exception 2, series that used to merge and no longer do, for ALL
+  four kinds above (counters, gauges, `*duration_seconds` histograms and
+  default-summary histograms): one metric recorded with two label keys that
+  differ only in characters Prometheus replaces with `_` when it renders a
+  label name (anything outside `[A-Za-z0-9_]`, and a digit in first position)
+  and carry the same value. `"route-path" => "/a"` and `"route_path" => "/a"`
+  both render as `route_path="/a"`. 0.17.2 sanitized the labels before
+  grouping and rendered ONE series: a histogram pooled both spellings'
+  observations (observations 1 and 3 gave `x_sum{route_path="/a"} 4` and
+  `x_count{route_path="/a"} 2`), and a counter or gauge printed one line
+  holding whichever of the two values the exporter visited last, not their sum
+  and not the same one on every run. 0.18.3 groups on the raw labels and
+  sanitizes only when it writes, so each spelling is its own series, and the
+  two print with an identical name and labels: a counter or gauge prints two
+  `x{route_path="/a"}` lines (here `1` and `3`), and a histogram prints two
+  complete bucket or quantile sets, each with its own sum and count
+  (`x_sum{route_path="/a"} 1` and `x_sum{route_path="/a"} 3`, each beside an
+  `x_count{route_path="/a"} 1`), in no fixed order. Two samples with one name
+  and label set cannot be two series in Prometheus, so a scraper keeps at most
+  one of them. Use ONE spelling per label key (letters, digits and `_`, the
+  same at every call site). Different label values, or keys that differ in
+  case, were never merged and are unchanged. Four tests, one per kind, pin the
+  0.18.3 rendering as observed, so an exporter release that merges them again
+  shows up as a deliberate change. 0.18's fix that puts
   the `_total` suffix on a counter's `# HELP` and `# TYPE` lines applies only
   with the new `with_recommended_naming(true)`, which `install` does not set; a
   consumer building its own exporter with it gets `# HELP x_total`,

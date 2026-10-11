@@ -288,6 +288,151 @@ mod tests {
         );
     }
 
+    // Label KEYS that differ only in a character Prometheus replaces: the
+    // exporter renders `"route-path"` and `"route_path"` both as `route_path`.
+    //
+    // metrics-exporter-prometheus 0.18.3 keeps a series' labels as the RAW
+    // key/value pairs and sanitizes them only when it renders, so these are two
+    // series that print with the same name and labels. 0.17.2 sanitized first,
+    // so it merged them: a histogram's observations were pooled (`_sum 4`,
+    // `_count 2`) and a counter or gauge printed ONE line holding whichever of
+    // the two values it visited last (not their sum, and not the same one from
+    // run to run). The four tests below pin the 0.18.3 output as OBSERVED, one
+    // per metric kind, so that an exporter release that merges them again shows
+    // up as a deliberate edit to these tests (and to the CHANGELOG entry that
+    // documents it) rather than as a dashboard that quietly changed. The fix on
+    // the caller's side is one spelling per label key.
+
+    /// What `record` observes, rendered through `builder()`'s configuration on a
+    /// local recorder.
+    fn render_recording(record: impl FnOnce()) -> String {
+        let recorder = builder().expect("bucket config is valid").build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, record);
+        handle.render()
+    }
+
+    /// Every rendered line that starts with `prefix`, sorted. The exporter
+    /// holds a family's series in a hash map, so the order of the series within
+    /// a family differs from process to process; a test that cares about WHICH
+    /// lines are rendered, not their order, compares the sorted lines.
+    fn sorted_lines_starting<'a>(scrape: &'a str, prefix: &str) -> Vec<&'a str> {
+        let mut lines: Vec<&str> = scrape.lines().filter(|l| l.starts_with(prefix)).collect();
+        lines.sort_unstable();
+        lines
+    }
+
+    #[test]
+    fn sanitized_alike_label_keys_render_a_counter_as_two_lines() {
+        let scrape = render_recording(|| {
+            metrics::counter!("pin_dup_requests", "route-path" => "/a").increment(1);
+            metrics::counter!("pin_dup_requests", "route_path" => "/a").increment(3);
+        });
+
+        assert_eq!(
+            sorted_lines_starting(&scrape, "pin_dup_requests{"),
+            [
+                "pin_dup_requests{route_path=\"/a\"} 1",
+                "pin_dup_requests{route_path=\"/a\"} 3",
+            ],
+            "counter lines in:\n{scrape}"
+        );
+    }
+
+    #[test]
+    fn sanitized_alike_label_keys_render_a_gauge_as_two_lines() {
+        let scrape = render_recording(|| {
+            metrics::gauge!("pin_dup_in_flight", "route-path" => "/a").set(1.0);
+            metrics::gauge!("pin_dup_in_flight", "route_path" => "/a").set(3.0);
+        });
+
+        assert_eq!(
+            sorted_lines_starting(&scrape, "pin_dup_in_flight{"),
+            [
+                "pin_dup_in_flight{route_path=\"/a\"} 1",
+                "pin_dup_in_flight{route_path=\"/a\"} 3",
+            ],
+            "gauge lines in:\n{scrape}"
+        );
+    }
+
+    #[test]
+    fn sanitized_alike_label_keys_render_a_summary_as_two_series() {
+        // A default-summary histogram (its name does not end `duration_seconds`):
+        // two summaries, each with the observations of one spelling. Their
+        // quantile VALUES are sketch estimates, so only the number of series is
+        // pinned there.
+        let scrape = render_recording(|| {
+            metrics::histogram!("pin_dup_payload_size", "route-path" => "/a").record(1.0);
+            metrics::histogram!("pin_dup_payload_size", "route_path" => "/a").record(3.0);
+        });
+
+        assert_eq!(
+            sorted_lines_starting(&scrape, "pin_dup_payload_size_sum{"),
+            [
+                "pin_dup_payload_size_sum{route_path=\"/a\"} 1",
+                "pin_dup_payload_size_sum{route_path=\"/a\"} 3",
+            ],
+            "summary sums in:\n{scrape}"
+        );
+        assert_eq!(
+            sorted_lines_starting(&scrape, "pin_dup_payload_size_count{"),
+            [
+                "pin_dup_payload_size_count{route_path=\"/a\"} 1",
+                "pin_dup_payload_size_count{route_path=\"/a\"} 1",
+            ],
+            "summary counts in:\n{scrape}"
+        );
+        assert_eq!(
+            sorted_lines_starting(&scrape, "pin_dup_payload_size{")
+                .into_iter()
+                .filter(|l| l.contains("quantile=\"0.5\""))
+                .count(),
+            2,
+            "median lines in:\n{scrape}"
+        );
+    }
+
+    #[test]
+    fn sanitized_alike_label_keys_render_a_bucketed_histogram_as_two_series() {
+        // A `*duration_seconds` histogram, the only kind `install()` gives
+        // buckets: two full bucket sets, one per spelling.
+        let scrape = render_recording(|| {
+            metrics::histogram!("pin_dup_handler_duration_seconds", "route-path" => "/a")
+                .record(0.03);
+            metrics::histogram!("pin_dup_handler_duration_seconds", "route_path" => "/a")
+                .record(0.3);
+        });
+
+        assert_eq!(
+            sorted_lines_starting(&scrape, "pin_dup_handler_duration_seconds_sum{"),
+            [
+                "pin_dup_handler_duration_seconds_sum{route_path=\"/a\"} 0.03",
+                "pin_dup_handler_duration_seconds_sum{route_path=\"/a\"} 0.3",
+            ],
+            "bucketed sums in:\n{scrape}"
+        );
+        assert_eq!(
+            sorted_lines_starting(&scrape, "pin_dup_handler_duration_seconds_count{"),
+            [
+                "pin_dup_handler_duration_seconds_count{route_path=\"/a\"} 1",
+                "pin_dup_handler_duration_seconds_count{route_path=\"/a\"} 1",
+            ],
+            "bucketed counts in:\n{scrape}"
+        );
+        assert_eq!(
+            sorted_lines_starting(
+                &scrape,
+                "pin_dup_handler_duration_seconds_bucket{route_path=\"/a\",le=\"+Inf\"}"
+            ),
+            [
+                "pin_dup_handler_duration_seconds_bucket{route_path=\"/a\",le=\"+Inf\"} 1",
+                "pin_dup_handler_duration_seconds_bucket{route_path=\"/a\",le=\"+Inf\"} 1",
+            ],
+            "bucketed +Inf lines in:\n{scrape}"
+        );
+    }
+
     #[test]
     fn status_class_boundaries() {
         assert_eq!(status_class(0), "other");
