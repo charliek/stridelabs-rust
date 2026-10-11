@@ -57,6 +57,13 @@ see the README's "MSRV policy").
   cache's two durations (defaults `JWKS_TTL` and `MIN_REFETCH_INTERVAL`), so
   a consumer's tests can watch a set expire or the interval close without
   sleeping. `Verifier::new` still builds its cache with the defaults.
+- CI and tooling, not part of the crates: `scripts/downstream-check.sh
+  <consumer> <ref>` builds and tests tapper, slauth, limen or spendwise-rs
+  against this checkout through `[patch]` path overrides (a development
+  check, not `--locked`; it refuses a dirty tree and prints the tree id), and
+  a `downstream-limen` CI job does the same for limen at a pinned commit.
+  `ci-success` requires that job on every event, the weekly schedule
+  included.
 
 ### Changed
 

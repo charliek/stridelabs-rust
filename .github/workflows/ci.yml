@@ -10,8 +10,8 @@ on:
   # when nobody opens a PR for a while — a new advisory can land against a
   # dependency with no code change here. `build-test` is skipped on this
   # trigger (see its own `if:` below) since there's nothing to rebuild;
-  # `ci-success` still runs and requires `audit`, so the run's conclusion
-  # reflects the advisory result, and a failing `audit` also opens or
+  # `ci-success` still runs and requires `audit` and `downstream-limen`, so
+  # the run's conclusion reflects both, and a failing `audit` also opens or
   # updates a `security` issue (`audit-issue` below) so it isn't missed.
   schedule:
     - cron: "0 6 * * 1"
@@ -385,6 +385,119 @@ jobs:
         run: |
           cargo audit
 
+  # Does the candidate still build and pass for a real consumer? limen is the
+  # one consumer checked here: it is public, so this log is public too, and it
+  # needs no services and no secrets. tapper, slauth and spendwise-rs are
+  # private, and a public Actions log would publish their failing test output,
+  # so scripts/downstream-check.sh checks them locally, before a tag.
+  #
+  # limen is checked out at a pinned commit SHA, never at a branch: a branch
+  # moves under a PR, and this check must say the same thing on a re-run.
+  # `[patch]` points all five stridelabs-* crates at this checkout (the same
+  # --config the script uses). The run is deliberately NOT `--locked`: limen's
+  # lock names the pinned git crates, and the patched path packages (and what
+  # they newly pull in) have to be resolved into it. So this is a drift
+  # detector as well: it also notices a transitive release that breaks the
+  # candidate. The "Prove the patch took effect" step fails the job if limen
+  # names the library under a URL the patch does not key, which would
+  # otherwise "pass" by testing the pinned crates.
+  #
+  # It runs on `schedule` too (it is required there, see `ci-success`), unlike
+  # `build-test`: that job is --locked, so a week with no commit changes
+  # nothing for it, but this one re-resolves, so a week can change its result.
+  # The failure shows as a red weekly run; unlike `audit` it opens no issue.
+  downstream-limen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # set by the orchestrator: the head SHA of limen's migration branch for
+      # this release (limen `main` cannot build against these majors until
+      # that branch merges, so checking `main` would deadlock this PR). A
+      # follow-up PR advances it to a limen `main` commit once limen merges.
+      # Always a full 40-hex commit SHA (the first step enforces it).
+      LIMEN_REF: "0000000000000000000000000000000000000000"
+    steps:
+      - name: Require an immutable limen ref
+        run: |
+          if [ "$LIMEN_REF" = "0000000000000000000000000000000000000000" ]; then
+            echo "::error::LIMEN_REF is still the placeholder; set it to the head commit SHA of limen's migration branch"
+            exit 1
+          fi
+          if ! [[ "$LIMEN_REF" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::LIMEN_REF='$LIMEN_REF' is not a full 40-hex commit SHA; a branch or tag name moves under this job"
+            exit 1
+          fi
+          echo "ok: limen at $LIMEN_REF"
+
+      # Side by side, not nested: limen is a plain package, and cargo would take
+      # this repo's workspace root for its own if it sat inside this checkout.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          path: stridelabs-rust
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: charliek/limen
+          ref: ${{ env.LIMEN_REF }}
+          path: limen
+          persist-credentials: false
+
+      # limen's own toolchain (its rust-toolchain.toml), found through
+      # rust-src-dir, which is also the directory the cache keys on.
+      - name: Install Rust toolchain (from limen/rust-toolchain.toml)
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          rust-src-dir: limen
+          build-warnings: deny
+
+      # One definition of the override, passed to every cargo call as
+      # `--config <file>`: the same [patch] scripts/downstream-check.sh gives
+      # cargo inline, with explicit absolute paths into this checkout. All
+      # five crates are listed whether or not limen uses them (an unused entry
+      # only draws a cargo warning).
+      - name: Point limen's stridelabs-rust dependency at this checkout
+        run: |
+          set -euo pipefail
+          patch="$RUNNER_TEMP/stridelabs-patch.toml"
+          echo '[patch."https://github.com/charliek/stridelabs-rust.git"]' > "$patch"
+          for c in config observability http auth testing; do
+            echo "stridelabs-$c = { path = \"$GITHUB_WORKSPACE/stridelabs-rust/crates/$c\" }" >> "$patch"
+          done
+          cat "$patch"
+          echo "STRIDELABS_PATCH=$patch" >> "$GITHUB_ENV"
+
+      # `cargo metadata` resolves the patched graph (writing limen's lock) and
+      # lists every stridelabs-* package in it. Each must be a path package
+      # (no `source`), and there must be at least one.
+      - name: Prove the patch took effect
+        working-directory: limen
+        run: |
+          set -euo pipefail
+          pkgs="$RUNNER_TEMP/stridelabs-packages.txt"
+          cargo metadata --format-version 1 --config "$STRIDELABS_PATCH" |
+            jq -r '.packages[] | select(.name | startswith("stridelabs-")) | "\(.name) \(.version) \(.source // "path")"' |
+            sort > "$pkgs"
+          cat "$pkgs"
+          if [ ! -s "$pkgs" ]; then
+            echo "::error::limen's graph has no stridelabs-* package; the check proved nothing"
+            exit 1
+          fi
+          if grep -v ' path$' "$pkgs"; then
+            echo "::error::a stridelabs-* package above still comes from a git source: the [patch] did not apply to it"
+            exit 1
+          fi
+          echo "ok: every stridelabs-* package in limen's graph is this checkout"
+
+      # Format is not run: this repo cannot change limen's formatting.
+      - name: Clippy (limen, all targets)
+        working-directory: limen
+        run: cargo clippy --config "$STRIDELABS_PATCH" --all-targets -- -D warnings
+
+      - name: Test (limen)
+        working-directory: limen
+        run: cargo test --config "$STRIDELABS_PATCH" --all
+
   # Single required status check the branch ruleset gates on. Keeping it a
   # separate aggregator job means the required check name stays stable even as
   # the matrix of jobs grows.
@@ -394,13 +507,17 @@ jobs:
   #     `if:` skips it, so `skipped` (or `success`) is accepted there.
   #   - audit: must be `success` on every event except `pull_request`; on a
   #     PR its result is printed but does not decide the outcome.
+  #   - downstream-limen: must be `success` on every event, `schedule`
+  #     included, because the job runs there too (its own comment says why).
+  #     It is NOT advisory on a PR: a PR that breaks a real consumer is the
+  #     case this job exists to catch.
   # A `skipped` or `cancelled` result never counts as success otherwise.
   #
   # `always()` so this still reports on a failed/cancelled needed job (that's
   # the whole point of the aggregator). It also runs on `schedule` so the
-  # weekly run's conclusion reflects the audit result.
+  # weekly run's conclusion reflects the audit and downstream-limen results.
   ci-success:
-    needs: [build-test, audit]
+    needs: [build-test, audit, downstream-limen]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -409,8 +526,9 @@ jobs:
           EVENT: ${{ github.event_name }}
           BUILD_TEST: ${{ needs.build-test.result }}
           AUDIT: ${{ needs.audit.result }}
+          DOWNSTREAM_LIMEN: ${{ needs.downstream-limen.result }}
         run: |
-          echo "event=$EVENT build-test=$BUILD_TEST audit=$AUDIT"
+          echo "event=$EVENT build-test=$BUILD_TEST audit=$AUDIT downstream-limen=$DOWNSTREAM_LIMEN"
           status=0
           if [ "$EVENT" = "schedule" ]; then
             if [ "$BUILD_TEST" != "skipped" ] && [ "$BUILD_TEST" != "success" ]; then
@@ -425,6 +543,10 @@ jobs:
             echo "audit='$AUDIT' is advisory on pull_request (not required)"
           elif [ "$AUDIT" != "success" ]; then
             echo "::error::audit='$AUDIT' (required on $EVENT)"
+            status=1
+          fi
+          if [ "$DOWNSTREAM_LIMEN" != "success" ]; then
+            echo "::error::downstream-limen='$DOWNSTREAM_LIMEN' (required on $EVENT)"
             status=1
           fi
           exit "$status"
