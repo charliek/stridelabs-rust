@@ -17,17 +17,30 @@
 //!   and response-echo (including on error responses) just by adding the
 //!   layer, rather than every consumer wiring the plumbing itself.
 //!
+//! `cloud` is new here rather than extracted: [`cloud::CloudLayer`] writes
+//! Google Cloud Logging structured lines (`severity`, a top-level
+//! `message`, `httpRequest`, request/trace correlation) in the shape Python's
+//! `stridelabs-logging` writes, selected by [`LogFormat::Cloud`] and, for
+//! any non-development environment, by [`LogFormat::from_environment`].
+//! [`REQUEST_SPAN_NAME`], [`REQUEST_ID_FIELD`] and [`TRACE_FIELD`] are the
+//! contract a request span uses to put its ids on every line inside it.
+//!
 //! `prometheus` is off by default (`default = []`) — most consumers don't
 //! render `/metrics`, and pulling in the exporter + `metrics` facade
 //! unconditionally would be dead weight for the ones that don't. See this
 //! crate's README for the full feature topology.
 
+pub mod cloud;
 pub mod logging;
 pub mod request_id;
 
 #[cfg(feature = "prometheus")]
 pub mod prometheus;
 
+#[cfg(test)]
+mod test_support;
+
+pub use cloud::{CloudLayer, REQUEST_ID_FIELD, REQUEST_SPAN_NAME, TRACE_FIELD};
 pub use logging::{init_logging, LogFormat};
 pub use request_id::{RequestId, RequestIdLayer, RequestIdService, REQUEST_ID_HEADER};
 

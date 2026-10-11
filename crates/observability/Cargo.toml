@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "tracing init (json/pretty), a request-id tower layer, and optional Prometheus wiring, for StrideLabs services"
+description = "tracing init (text, JSON, or Google Cloud Logging lines), a request-id tower layer, and optional Prometheus wiring, for StrideLabs services"
 publish = false
 
 [features]
@@ -25,6 +25,9 @@ tracing-subscriber = { workspace = true }
 tower = { workspace = true }
 http = { workspace = true }
 rand = { workspace = true }
+# The Cloud Logging formatter writes its lines with it. Already in every
+# consumer's graph through tracing-subscriber's `json` feature.
+serde_json = { workspace = true }
 metrics = { workspace = true, optional = true }
 metrics-exporter-prometheus = { workspace = true, optional = true }
 # Only the prometheus feature has a fallible surface (recorder installation).
@@ -33,3 +36,9 @@ thiserror = { workspace = true, optional = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 axum = { workspace = true }
+# Parses the Cloud formatter's timestamps back as RFC 3339 in tests; the
+# formatter itself stamps lines with tracing-subscriber's own clock.
+time = { workspace = true, features = ["parsing"] }
+# Test-only strict JSON reading that rejects duplicate keys, which
+# `serde_json::Value` silently collapses.
+serde = { workspace = true }
