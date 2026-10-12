@@ -29,8 +29,10 @@ against.
   commit rev (PR-accepted, pending release) — see each crate's README for the
   exact `[dependencies]` snippet and the `[patch]` snippet for local
   co-development.
-- `Cargo.lock` is committed; CI runs every command with `--locked` so a
-  consumer's build is never surprised by a dependency it didn't review.
+- `Cargo.lock` is committed; CI runs every command that builds this workspace
+  with `--locked` (`downstream-limen` alone re-resolves limen's lock, on
+  purpose) so a consumer's build is never surprised by a dependency it didn't
+  review.
 
 ## Toolchain
 

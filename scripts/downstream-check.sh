@@ -28,7 +28,15 @@
 #     (a [patch] at another version than the locked one is silently unused).
 #     That makes this a DEVELOPMENT check. The binding proof builds each
 #     consumer from its own committed rev pin and Cargo.lock with --locked.
+#   - The table's `patch` column is the first step: every locked stridelabs-*
+#     package moved onto the patch (`cargo update -p`), then `cargo metadata`
+#     (with the feature flags clippy and test use) proving each one is this
+#     checkout's own crate. clippy and test run only when it passed.
 #   - Every build uses CARGO_TARGET_DIR=$SCRATCH/target-<consumer>.
+#   - The scratch root, the library and each consumer repo are resolved ONCE
+#     to their physical paths, and only those paths are used from then on
+#     (archive, extraction, logs, lock, target dirs), so a symlink retargeted
+#     after the checks cannot redirect a removal.
 #   - Nothing is removed unless it resolves, symlinks and all, to
 #     $SCRATCH/downstream/<consumer>, or is this script's own lock
 #     ($SCRATCH/downstream/.lock). A consumer repo or the library that is,
@@ -39,7 +47,8 @@
 #     log sees it: URL userinfo and the values of token/password/secret/key
 #     parameters are masked (a failing test can print the URL it could not
 #     authenticate with). The script's own messages name a host and a port,
-#     never a URL.
+#     never a URL. No raw cargo output is kept: `cargo metadata`'s JSON exists
+#     only while jq reads it, and its stderr is kept in memory and logged masked.
 #   - Once the lock is held the library's HEAD, tree id and (untracked files
 #     included) state are read again; they are checked once more at the end, and
 #     the run fails if the library moved while the consumers were tested.
@@ -79,10 +88,6 @@ set -uo pipefail
 
 LIB=${DOWNSTREAM_LIB:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
 SCRATCH=${DOWNSTREAM_SCRATCH:-/Volumes/miniext/scratch-011}
-WORK=$SCRATCH/downstream
-LOGS=$WORK/logs
-LOCK=$WORK/.lock
-TAKEOVER=$LOCK.takeover
 LIB_URL='https://github.com/charliek/stridelabs-rust.git'
 CRATES='config observability http auth testing'
 KNOWN_CONSUMERS='tapper slauth limen spendwise'
@@ -99,6 +104,24 @@ EOF
 die() {
   printf 'downstream-check: %s\n' "$*" >&2
   exit 2
+}
+
+# The physical (symlink-free) absolute form of a path. A tail that does not
+# exist yet is kept as written, under its deepest existing parent.
+canon() {
+  local p=$1 tail='' base
+  case $p in /*) ;; *) p=$PWD/$p ;; esac
+  while [ "${p%/}" != "$p" ] && [ "$p" != / ]; do p=${p%/}; done
+  while [ ! -d "$p" ]; do
+    tail=/${p##*/}$tail
+    p=${p%/*}
+    while [ "${p%/}" != "$p" ] && [ "$p" != / ]; do p=${p%/}; done
+    [ -n "$p" ] || p=/
+  done
+  case $tail/ in */./* | */../*) return 1 ;; esac
+  base=$(cd "$p" && pwd -P) || return 1
+  p=${base%/}$tail
+  printf '%s' "${p:-/}"
 }
 
 # ---------------------------------------------------------------- arguments
@@ -145,15 +168,66 @@ for c in "${CONSUMERS[@]}"; do
   esac
 done
 
+# --------------------------------------------------- paths, resolved once
+
+# The scratch root and the library are resolved to their physical paths HERE,
+# once, and every later use (archive, extraction, logs, lock, target dirs, the
+# [patch] paths, git -C) goes through the resolved paths, never the ones given.
+# A symlink retargeted after the safety checks below therefore changes nothing.
+SCRATCH_ARG=$SCRATCH
+SCRATCH=$(canon "$SCRATCH_ARG") || die "cannot resolve the scratch directory $SCRATCH_ARG"
+LIB_ARG=$LIB
+LIB=$(canon "$LIB_ARG") || die "cannot resolve the library path $LIB_ARG"
+WORK=$SCRATCH/downstream
+LOGS=$WORK/logs
+LOCK=$WORK/.lock
+TAKEOVER=$LOCK.takeover
+
 # ------------------------------------------------------------ consumer table
+
+# The part of the cargo flags that selects features. `cargo metadata` must see
+# the graph the clippy and test steps build, or an optional stridelabs-*
+# dependency that --features / --all-features switches on (and that a consumer
+# could vendor) would not be in what the proof looks at. Sets C_FEATURE_FLAGS
+# from the flags it is given.
+feature_flags() { # flags...
+  local a pend='' seen=' '
+  C_FEATURE_FLAGS=()
+  for a in "$@"; do
+    if [ -n "$pend" ]; then
+      case $seen in
+        *" $pend $a "*) ;;
+        *)
+          seen="$seen$pend $a "
+          C_FEATURE_FLAGS+=("$pend" "$a")
+          ;;
+      esac
+      pend=''
+      continue
+    fi
+    case $a in
+      --features | -F) pend=$a ;;
+      --features=* | -F?* | --all-features | --no-default-features)
+        case $seen in
+          *" $a "*) ;;
+          *)
+            seen="$seen$a "
+            C_FEATURE_FLAGS+=("$a")
+            ;;
+        esac
+        ;;
+    esac
+  done
+}
 
 # Sets C_* for one consumer. The clippy and test flags are the ones that
 # consumer's own CI uses, minus --locked (see the header): tapper-rs runs
 # clippy with --all-features (its CI job tapper-rs-check), limen and spendwise
 # test with --all, slauth with plain `cargo test`. The command line's extra
-# flags are appended to both.
+# flags are appended to both. The repo path is resolved here, once per call, so
+# no later step goes through a symlink.
 load_consumer() {
-  local var
+  local var real
   C_NAME=$1
   C_UPPER=$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')
   C_TEST_FLAGS=()
@@ -187,8 +261,10 @@ load_consumer() {
   esac
   C_CLIPPY_FLAGS+=(${EXTRA[@]+"${EXTRA[@]}"})
   C_TEST_FLAGS+=(${EXTRA[@]+"${EXTRA[@]}"})
+  feature_flags "${C_CLIPPY_FLAGS[@]}" ${C_TEST_FLAGS[@]+"${C_TEST_FLAGS[@]}"}
   var=DOWNSTREAM_${C_UPPER}_REPO
   C_REPO=${!var:-$C_REPO}
+  real=$(canon "$C_REPO") && C_REPO=$real
   var=DOWNSTREAM_${C_UPPER}_REF
   C_REF=${!var:-$REF_ARG}
   var=DOWNSTREAM_${C_UPPER}_DATABASE_URL
@@ -206,24 +282,6 @@ problem() { PROBLEMS+=("$*"); }
 
 need_cmd() {
   command -v "$1" >/dev/null 2>&1 || problem "'$1' is not on PATH"
-}
-
-# The physical (symlink-free) absolute form of a path. A tail that does not
-# exist yet is kept as written, under its deepest existing parent.
-canon() {
-  local p=$1 tail='' base
-  case $p in /*) ;; *) p=$PWD/$p ;; esac
-  while [ "${p%/}" != "$p" ] && [ "$p" != / ]; do p=${p%/}; done
-  while [ ! -d "$p" ]; do
-    tail=/${p##*/}$tail
-    p=${p%/*}
-    while [ "${p%/}" != "$p" ] && [ "$p" != / ]; do p=${p%/}; done
-    [ -n "$p" ] || p=/
-  done
-  case $tail/ in */./* | */../*) return 1 ;; esac
-  base=$(cd "$p" && pwd -P) || return 1
-  p=${base%/}$tail
-  printf '%s' "${p:-/}"
 }
 
 # True when the physical paths $1 and $2 are the same, or one holds the other.
@@ -251,15 +309,16 @@ redact() {
 
 # The database number a redis:// URL selects, read the way redis-rs reads it:
 # the path with its slashes trimmed, an optional `+`, then digits (so `00` and
-# `+0` are database 0). Prints the number, 0 when the URL names none, or
-# `invalid` when the path is not a number.
+# `+0` are database 0). The query and fragment go first, so a `/` inside them
+# is not a path. Prints the number, 0 when the URL names none, or `invalid`
+# when the path is not a number.
 redis_db() {
   local u=${1#*://}
+  u=${u%%[?#]*}
   case $u in
     */*) u=${u#*/} ;;
     *) u='' ;;
   esac
-  u=${u%%[?#]*}
   while [ "${u#/}" != "$u" ]; do u=${u#/}; done
   while [ "${u%/}" != "$u" ]; do u=${u%/}; done
   u=${u#+}
@@ -439,43 +498,64 @@ run_cargo() { # label cargo-args...
 # release bump: the lock says 0.4.0, the candidate is 0.5.0) is silently left
 # unused, so first move every locked stridelabs-* package onto the patch.
 # CI's downstream-limen does the same in its "Move limen's locked stridelabs
-# packages onto the patch" step; keep the two in step.
+# packages onto the patch" step; keep the two in step. A lock that names no
+# stridelabs-* package fails here, as it does there: a consumer that does not
+# use the library cannot pass the proof below either, so say so first.
 adopt_patch() {
   local lock=$C_CRATE_DIR/Cargo.lock n
   local names=()
-  [ -f "$lock" ] || return 0
+  if [ ! -f "$lock" ]; then
+    echo "!! $C_NAME has no Cargo.lock in $C_CRATE_DIR"
+    return 1
+  fi
   while IFS= read -r n; do
     names+=(-p "$n")
   done < <(sed -n 's/^name = "\(stridelabs-[a-z-]*\)"$/\1/p' "$lock" | sort -u)
-  [ "${#names[@]}" -gt 0 ] || return 0
+  if [ "${#names[@]}" -eq 0 ]; then
+    echo "!! $C_NAME's Cargo.lock names no stridelabs-* package"
+    return 1
+  fi
   run_cargo adopt update "${PATCH[@]}" "${names[@]}"
 }
 
-# After the resolve step: every stridelabs-* package in the consumer's resolved
-# graph must be THIS checkout's crate of that name, a path package whose
-# manifest is $LIB_REAL/crates/<name>/Cargo.toml. A git source means the
-# [patch] did not take (the consumer names the library under another URL, or
-# the key is misspelled); a path package from anywhere else is a vendored copy
-# that also has no `source`. Either way the "pass" would have tested other code.
+# After adopt_patch: every stridelabs-* package in the consumer's resolved graph
+# (the one its clippy and test steps build: same feature flags) must be THIS
+# checkout's crate of that name, a path package whose manifest is
+# $LIB/crates/<name>/Cargo.toml. A git source means the [patch] did not take
+# (the consumer names the library under another URL, or the key is
+# misspelled); a path package from anywhere else is a vendored copy that also
+# has no `source`. Either way the "pass" would have tested other code.
 # CI's "Prove the patch took effect" step is the same check.
 check_patched_graph() {
-  local meta=$LOGS/$C_NAME-metadata.json err=$LOGS/$C_NAME-metadata.err
+  local meta=$LOGS/$C_NAME-metadata.json err rc
   local pkgs name version source manifest dir seen=0 bad=0
-  if ! cargo_in_crate metadata --format-version 1 "${PATCH[@]}" >"$meta" 2>"$err"; then
+  # The raw JSON exists only while jq reads it, and stderr never touches the
+  # disk raw: what lands in a log is masked.
+  err=$( (
+    umask 077
+    cargo_in_crate metadata --format-version 1 ${C_FEATURE_FLAGS[@]+"${C_FEATURE_FLAGS[@]}"} "${PATCH[@]}" 2>&1 >"$meta"
+  ))
+  rc=$?
+  printf '%s\n' "$err" | redact >"$LOGS/$C_NAME-metadata.log"
+  if [ "$rc" -ne 0 ]; then
+    rm -f -- "$meta"
     echo "!! cargo metadata failed:"
-    redact <"$err"
+    printf '%s\n' "$err" | redact
     return 1
   fi
   pkgs=$(jq -r '.packages[] | select(.name | startswith("stridelabs-"))
-    | [.name, .version, (.source // "path"), .manifest_path] | @tsv' "$meta" | sort) || {
-    echo "!! cannot read $meta"
+    | [.name, .version, (.source // "path"), .manifest_path] | @tsv' "$meta" | sort)
+  rc=$?
+  rm -f -- "$meta"
+  if [ "$rc" -ne 0 ]; then
+    echo "!! cannot read cargo metadata's output"
     return 1
-  }
+  fi
   while IFS=$'\t' read -r name version source manifest; do
     [ -n "$name" ] || continue
     seen=1
     dir=$(canon "$(dirname "$manifest")")
-    if [ "$source" = path ] && [ "$dir" = "$LIB_REAL/crates/${name#stridelabs-}" ]; then
+    if [ "$source" = path ] && [ "$dir" = "$LIB/crates/${name#stridelabs-}" ]; then
       echo "   $name $version path (patched)"
     else
       [ "$source" = path ] && source="a path package outside this checkout: $dir"
@@ -492,10 +572,10 @@ check_patched_graph() {
 
 prepare_archive() {
   # The one rm -rf of a consumer archive (the others remove only the lock).
-  # It only ever removes what resolves to $ARCHIVE_ROOT/<consumer>, checked
-  # here and not only up front.
-  [ "$(canon "$C_DIR")" = "$ARCHIVE_ROOT/$C_NAME" ] || {
-    echo "!! refusing to remove $C_DIR: it does not resolve to $ARCHIVE_ROOT/$C_NAME"
+  # It only ever removes what resolves to $WORK/<consumer>, checked here and
+  # not only up front; $WORK is under the scratch root resolved at the start.
+  [ "$(canon "$C_DIR")" = "$WORK/$C_NAME" ] || {
+    echo "!! refusing to remove $C_DIR: it does not resolve to $WORK/$C_NAME"
     return 1
   }
   rm -rf -- "${C_DIR:?}"
@@ -553,31 +633,27 @@ if [ "${#PROBLEMS[@]}" -gt 0 ]; then
 fi
 
 # Path safety, before anything is created or removed (a dry run refuses too).
-# Each run recreates $ARCHIVE_ROOT/<consumer> with rm -rf, so nothing the run
-# reads from may be that directory, sit inside the archive root, or hold it;
-# and the archive root and each archive directory must be where they say once
-# symlinks are resolved. Paths are compared in their physical form.
-SCRATCH_REAL=$(canon "$SCRATCH") || die "cannot resolve the scratch directory $SCRATCH"
-ARCHIVE_ROOT=${SCRATCH_REAL%/}/downstream
-LIB_REAL=$(canon "$LIB") || die "cannot resolve the library path $LIB"
+# Each run recreates $WORK/<consumer> with rm -rf, so nothing the run reads
+# from may be that directory, sit inside $WORK, or hold it; and $WORK and each
+# archive directory must be where they say once symlinks are resolved. The
+# scratch root, the library and the repos are already physical paths.
 PATH_BAD=0
 path_problem() {
   printf 'downstream-check: %s\n' "$*" >&2
   PATH_BAD=1
 }
-[ "$(canon "$WORK")" = "$ARCHIVE_ROOT" ] ||
-  path_problem "$WORK does not resolve to $ARCHIVE_ROOT (a symlink?); nothing under it would be safe to remove"
-if nested "$LIB_REAL" "$ARCHIVE_ROOT"; then
-  path_problem "the library ($LIB_REAL) overlaps the archive root $ARCHIVE_ROOT; point DOWNSTREAM_LIB or DOWNSTREAM_SCRATCH elsewhere"
+[ "$(canon "$WORK")" = "$WORK" ] ||
+  path_problem "$WORK does not resolve to itself (a symlink?); nothing under it would be safe to remove"
+if nested "$LIB" "$WORK"; then
+  path_problem "the library ($LIB) overlaps the archive root $WORK; point DOWNSTREAM_LIB or DOWNSTREAM_SCRATCH elsewhere"
 fi
 for c in "${CONSUMERS[@]}"; do
   load_consumer "$c"
-  real=$(canon "$C_REPO") || real=$C_REPO
-  if nested "$real" "$ARCHIVE_ROOT"; then
-    path_problem "$c's repo ($real) overlaps the archive root $ARCHIVE_ROOT; point DOWNSTREAM_${C_UPPER}_REPO or DOWNSTREAM_SCRATCH elsewhere"
+  if nested "$C_REPO" "$WORK"; then
+    path_problem "$c's repo ($C_REPO) overlaps the archive root $WORK; point DOWNSTREAM_${C_UPPER}_REPO or DOWNSTREAM_SCRATCH elsewhere"
   fi
-  [ "$(canon "$C_DIR")" = "$ARCHIVE_ROOT/$c" ] ||
-    path_problem "$C_DIR does not resolve to $ARCHIVE_ROOT/$c (a symlink?); it would not be safe to remove"
+  [ "$(canon "$C_DIR")" = "$WORK/$c" ] ||
+    path_problem "$C_DIR does not resolve to $WORK/$c (a symlink?); it would not be safe to remove"
 done
 [ "$PATH_BAD" = 0 ] || exit 2
 
@@ -616,7 +692,7 @@ if [ "$DRY_RUN" = 1 ]; then
     printf '\n%s (%s) ref %s -> %s\n' "$c" "$C_KIND" "$C_REF" "$C_SHA"
     printf '  repo     %s\n  archive  %s (fresh each run)\n  crate    %s\n' "$C_REPO" "$C_DIR" "$C_CRATE_DIR"
     show_cmd adopt update '<patch flags>' '-p <each stridelabs-* package in its lock>'
-    show_cmd resolve tree --depth 0 '<patch flags>'
+    show_cmd proof metadata --format-version 1 '<patch flags>' ${C_FEATURE_FLAGS[@]+"${C_FEATURE_FLAGS[@]}"}
     show_cmd clippy clippy '<patch flags>' "${C_CLIPPY_FLAGS[@]}" -- -D warnings
     show_cmd test test '<patch flags>' ${C_TEST_FLAGS[@]+"${C_TEST_FLAGS[@]}"}
   done
@@ -702,7 +778,7 @@ for c in "${CONSUMERS[@]}"; do
   res=FAIL clip=- tst=-
   if ! prepare_archive; then
     echo "!! could not archive $C_REF of $C_REPO into $C_DIR"
-  elif adopt_patch && run_cargo resolve tree --depth 0 "${PATCH[@]}" && check_patched_graph; then
+  elif adopt_patch && check_patched_graph; then
     res=PASS
     if run_cargo clippy clippy "${PATCH[@]}" "${C_CLIPPY_FLAGS[@]}" -- -D warnings; then
       clip=PASS
@@ -730,7 +806,7 @@ done
 printf '\n'
 printf 'library %s (tree %s)\n' "$LIB_SHA" "$LIB_TREE"
 printf 'PATCHED development check, not --locked: see the header of this script.\n\n'
-row consumer req ref-sha lib-sha resolve clippy test
+row consumer req ref-sha lib-sha patch clippy test
 printf '%s\n' "${ROWS[@]}"
 
 # The check must not write into the library (its target dir lives elsewhere),

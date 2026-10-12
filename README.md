@@ -120,6 +120,22 @@ listing all five up front, as above, is the simplest thing that stays correct
 as a consumer's dependency set grows. The `[patch]` key must match the
 `https://…` source URL the consumer's `[dependencies]` actually used.
 
+A patch only takes effect if the consumer's `Cargo.lock` can use it. A consumer
+locked to another version of this library (say `0.4.0` while the workspace is
+at `0.5.0`) leaves the patch **silently unused** and keeps building the old git
+dependency, so after adding the block:
+
+1. Move the locked crates onto it: `cargo update -p stridelabs-config -p
+   stridelabs-http …`, one `-p` for each `stridelabs-*` package the consumer's
+   `Cargo.lock` names.
+2. Check it took: `cargo tree -i stridelabs-config` (or `cargo metadata`) shows
+   the local path rather than the git URL. Cargo prints "patch … was not used in
+   the crate graph" when it did not.
+
+`scripts/downstream-check.sh` is the automated form: it does both against this
+checkout for tapper, slauth, limen or spendwise-rs, then proves with `cargo
+metadata` that every `stridelabs-*` package is this checkout's own crate.
+
 ### Feature topology (all five crates)
 
 Every crate that defines optional features defaults to `default = []` — a
