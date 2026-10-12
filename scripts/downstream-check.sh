@@ -34,12 +34,15 @@
 #     checkout's own crate. clippy and test run only when it passed.
 #   - Every build uses CARGO_TARGET_DIR=$SCRATCH/target-<consumer>.
 #   - The scratch root, the library and each consumer repo are resolved ONCE
-#     to their physical paths, and only those paths are used from then on
-#     (archive, extraction, logs, lock, target dirs), so a symlink retargeted
-#     after the checks cannot redirect a removal.
+#     to their physical paths (a repo at the up-front check, then pinned), and
+#     only those paths are used from then on (archive, extraction, logs, lock,
+#     target dirs), so a symlink retargeted after the checks cannot redirect a
+#     removal or change what is archived.
 #   - Nothing is removed unless it resolves, symlinks and all, to
 #     $SCRATCH/downstream/<consumer>, or is this script's own lock
-#     ($SCRATCH/downstream/.lock). A consumer repo or the library that is,
+#     ($SCRATCH/downstream/.lock) or its logs directory, which is recreated
+#     empty (mode 700) once the lock is held, so no log is ever written
+#     through a symlink somebody left there. A consumer repo or the library that is,
 #     holds or sits inside $SCRATCH/downstream is refused before anything
 #     happens (a dry run refuses too), so a mistaken DOWNSTREAM_<NAME>_REPO
 #     cannot be the directory that is recreated.
@@ -47,8 +50,10 @@
 #     log sees it: URL userinfo and the values of token/password/secret/key
 #     parameters are masked (a failing test can print the URL it could not
 #     authenticate with). The script's own messages name a host and a port,
-#     never a URL. No raw cargo output is kept: `cargo metadata`'s JSON exists
-#     only while jq reads it, and its stderr is kept in memory and logged masked.
+#     never a URL. No raw cargo output is kept: `cargo metadata`'s JSON is a
+#     mktemp file in the logs directory that exists only while jq reads it
+#     (removed on any exit, a signal included), and its stderr is kept in
+#     memory and logged masked.
 #   - Once the lock is held the library's HEAD, tree id and (untracked files
 #     included) state are read again; they are checked once more at the end, and
 #     the run fails if the library moved while the consumers were tested.
@@ -224,10 +229,10 @@ feature_flags() { # flags...
 # consumer's own CI uses, minus --locked (see the header): tapper-rs runs
 # clippy with --all-features (its CI job tapper-rs-check), limen and spendwise
 # test with --all, slauth with plain `cargo test`. The command line's extra
-# flags are appended to both. The repo path is resolved here, once per call, so
-# no later step goes through a symlink.
+# flags are appended to both. The repo path is the pinned physical one once the
+# path-safety check has run.
 load_consumer() {
-  local var real
+  local var
   C_NAME=$1
   C_UPPER=$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')
   C_TEST_FLAGS=()
@@ -264,7 +269,10 @@ load_consumer() {
   feature_flags "${C_CLIPPY_FLAGS[@]}" ${C_TEST_FLAGS[@]+"${C_TEST_FLAGS[@]}"}
   var=DOWNSTREAM_${C_UPPER}_REPO
   C_REPO=${!var:-$C_REPO}
-  real=$(canon "$C_REPO") && C_REPO=$real
+  # Once the path-safety check below has pinned the physical path, only that
+  # one is used: the given path (a symlink, say) is never looked at again.
+  var=pinned_repo_$C_NAME
+  C_REPO=${!var:-$C_REPO}
   var=DOWNSTREAM_${C_UPPER}_REF
   C_REF=${!var:-$REF_ARG}
   var=DOWNSTREAM_${C_UPPER}_DATABASE_URL
@@ -527,26 +535,31 @@ adopt_patch() {
 # has no `source`. Either way the "pass" would have tested other code.
 # CI's "Prove the patch took effect" step is the same check.
 check_patched_graph() {
-  local meta=$LOGS/$C_NAME-metadata.json err rc
+  local err rc
   local pkgs name version source manifest dir seen=0 bad=0
-  # The raw JSON exists only while jq reads it, and stderr never touches the
-  # disk raw: what lands in a log is masked.
-  err=$( (
-    umask 077
-    cargo_in_crate metadata --format-version 1 ${C_FEATURE_FLAGS[@]+"${C_FEATURE_FLAGS[@]}"} "${PATCH[@]}" 2>&1 >"$meta"
-  ))
+  # The raw JSON exists only while jq reads it, in a mktemp file (mode 600, a
+  # name nobody can have planted a symlink at) that `cleanup` also removes if a
+  # signal ends the run first. stderr never touches the disk raw: what lands in
+  # a log is masked.
+  META_TMP=$(mktemp "$LOGS/$C_NAME-metadata.XXXXXX") || {
+    echo "!! cannot create a temporary file in $LOGS"
+    return 1
+  }
+  err=$(cargo_in_crate metadata --format-version 1 ${C_FEATURE_FLAGS[@]+"${C_FEATURE_FLAGS[@]}"} "${PATCH[@]}" 2>&1 >"$META_TMP")
   rc=$?
   printf '%s\n' "$err" | redact >"$LOGS/$C_NAME-metadata.log"
   if [ "$rc" -ne 0 ]; then
-    rm -f -- "$meta"
+    rm -f -- "$META_TMP"
+    META_TMP=''
     echo "!! cargo metadata failed:"
     printf '%s\n' "$err" | redact
     return 1
   fi
   pkgs=$(jq -r '.packages[] | select(.name | startswith("stridelabs-"))
-    | [.name, .version, (.source // "path"), .manifest_path] | @tsv' "$meta" | sort)
+    | [.name, .version, (.source // "path"), .manifest_path] | @tsv' "$META_TMP" | sort)
   rc=$?
-  rm -f -- "$meta"
+  rm -f -- "$META_TMP"
+  META_TMP=''
   if [ "$rc" -ne 0 ]; then
     echo "!! cannot read cargo metadata's output"
     return 1
@@ -578,8 +591,15 @@ prepare_archive() {
     echo "!! refusing to remove $C_DIR: it does not resolve to $WORK/$C_NAME"
     return 1
   }
+  # The repo is only ever read from its pinned physical path; if that path now
+  # leads somewhere else (swapped for a symlink, say) or into $WORK, the
+  # removal below could delete the thing about to be archived.
+  if [ "$(canon "$C_REPO")" != "$C_REPO" ] || nested "$C_REPO" "$WORK"; then
+    echo "!! refusing to archive $C_REPO: it no longer resolves to itself outside $WORK"
+    return 1
+  fi
   rm -rf -- "${C_DIR:?}"
-  mkdir -p -- "$C_DIR" "$LOGS" || return 1
+  mkdir -p -- "$C_DIR" || return 1
   git -C "$C_REPO" archive --format=tar "$C_SHA" | tar -x -C "$C_DIR" || return 1
   # mise refuses config files it has not been told to trust. These are byte
   # copies of the consumer's own committed files, so trusting them is safe.
@@ -638,6 +658,9 @@ fi
 # archive directory must be where they say once symlinks are resolved. The
 # scratch root, the library and the repos are already physical paths.
 PATH_BAD=0
+for c in $KNOWN_CONSUMERS; do
+  printf -v "pinned_repo_$c" '%s' '' # nothing inherited from the environment
+done
 path_problem() {
   printf 'downstream-check: %s\n' "$*" >&2
   PATH_BAD=1
@@ -649,6 +672,13 @@ if nested "$LIB" "$WORK"; then
 fi
 for c in "${CONSUMERS[@]}"; do
   load_consumer "$c"
+  # Pin the repo's physical path: every later load_consumer reads it back.
+  if real=$(canon "$C_REPO"); then
+    printf -v "pinned_repo_$c" '%s' "$real"
+    C_REPO=$real
+  else
+    path_problem "cannot resolve $c's repo path $C_REPO"
+  fi
   if nested "$C_REPO" "$WORK"; then
     path_problem "$c's repo ($C_REPO) overlaps the archive root $WORK; point DOWNSTREAM_${C_UPPER}_REPO or DOWNSTREAM_SCRATCH elsewhere"
   fi
@@ -722,7 +752,7 @@ reap_stale_lock() { # pid-seen-dead
 
 # One run at a time: the scratch archives are reused, and the consumers'
 # test databases are shared with whoever else is running a gate.
-mkdir -p -- "$WORK" "$LOGS" || die "cannot create $WORK"
+mkdir -p -- "$WORK" || die "cannot create $WORK"
 LOCK_WAITED=0
 LOCK_TIMEOUT=${DOWNSTREAM_LOCK_TIMEOUT:-3600}
 while ! mkdir "$LOCK" 2>/dev/null; do
@@ -743,9 +773,22 @@ while ! mkdir "$LOCK" 2>/dev/null; do
   LOCK_WAITED=$((LOCK_WAITED + 5))
 done
 printf '%s\n' "$$" >"$LOCK/pid"
-trap 'rm -rf -- "$LOCK"' EXIT
+# On any exit, INT and TERM included (they exit through this trap): release the
+# lock and drop the metadata temp file if a signal arrived while it was on disk.
+META_TMP=''
+cleanup() {
+  [ -z "$META_TMP" ] || rm -f -- "$META_TMP"
+  rm -rf -- "$LOCK"
+}
+trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
+# Fresh logs, under the lock: whatever a previous run or anyone else left in the
+# directory (a symlink at a log's name, or at the directory's) is removed, not
+# written through. rm -rf on a symlink removes the link, not what it points at.
+rm -rf -- "${LOGS:?}"
+mkdir -m 700 -- "$LOGS" || die "cannot create $LOGS"
 
 # The library can change while this run waited for the lock (or sat in
 # preflight above). What is tested is what is there now, so read it again, and
