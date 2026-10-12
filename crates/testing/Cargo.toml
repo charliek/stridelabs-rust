@@ -11,9 +11,13 @@ publish = false
 
 [features]
 default = []
-# Off by default: `sqlx` pulls in a real Postgres driver and TLS stack, which
-# only consumers whose *own* tests touch a database need. `oneshot` and
-# `wiremock` have nothing to do with Postgres and are always available.
+# Off by default: `sqlx` pulls in a real Postgres driver, which only consumers
+# whose *own* tests touch a database need. `oneshot` and `wiremock` have
+# nothing to do with Postgres and are always available. The driver is built
+# with NO sqlx TLS feature (see `workspace.dependencies.sqlx`): the pool talks
+# to a local Postgres without TLS, and a TLS feature here would unify into the
+# consumer's graph. CI's "Guard: stridelabs-testing pulls no ring" fails if a
+# TLS feature brings `ring` back.
 postgres = ["dep:sqlx", "dep:url"]
 
 [lints]

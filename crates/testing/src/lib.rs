@@ -26,8 +26,13 @@
 //! | `postgres` | off | `postgres::require_postgres`, via `sqlx`/`url` |
 //!
 //! `postgres` is gated because `sqlx`'s Postgres driver drags in a real
-//! network/TLS stack; a consumer whose tests never touch a database
-//! shouldn't compile it just to get the `oneshot` helpers.
+//! network stack; a consumer whose tests never touch a database shouldn't
+//! compile it just to get the `oneshot` helpers. The driver is built **without
+//! TLS**: `require_postgres` connects to a local or CI Postgres in the clear,
+//! and a `sslmode=require` URL is refused rather than silently downgraded.
+//! (A TLS feature on this crate's `sqlx` would also unify into the consumer's
+//! graph, where `ring` next to another rustls provider makes
+//! `rustls::ClientConfig::builder()` panic.)
 //!
 //! # Fail loud, never skip
 //!

@@ -6,11 +6,11 @@ name: CI
 #
 # This assumes the service depends on the stridelabs-* crates as a real git
 # dependency (`git = "https://github.com/charliek/stridelabs-rust.git", tag
-# = "..."`), NOT as a `[patch]` path override — a CI runner has no sibling
-# checkout of stridelabs-rust on disk. If the service's Cargo.toml still has
-# a `[patch]` path override left over from local/offline scaffolding (see
-# the skill's "Choosing how to consume the crates" step), switch it to the
-# git form before this workflow can pass.
+# = "..."`), NOT as a `path =` dependency (or a `[patch]` path override) — a
+# CI runner has no checkout of stridelabs-rust at any relative path. If the
+# service's Cargo.toml still has a path left over from local/offline
+# scaffolding (see the skill's "Choosing how to consume the crates" step),
+# switch it to the git form before this workflow can pass.
 
 on:
   push:

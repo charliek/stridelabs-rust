@@ -15,12 +15,24 @@ add friction.
 |---|---|---|
 | `cors` | off | `cors_layer`, via `tower-http/cors` |
 | `openapi` | off | the `openapi` module — spec canonicalization, `(method, path)` enumeration, committed-spec freshness check — via `utoipa` |
-| `proxy` | off | the `proxy` module — and `AppError::bad_gateway_upstream`, which takes a `reqwest::Error` — via `reqwest`/`url`/`bytes`/`futures` (and `tokio/time`) |
+| `proxy` | off | the `proxy` module — and `AppError::bad_gateway_upstream`, which takes a `reqwest::Error` — via `reqwest` 0.13 (with its `rustls` TLS feature)/`url`/`bytes`/`futures` (and `tokio/time`) |
 
 `proxy` is the gate that matters: it pulls in an HTTP *client* and a TLS
 stack. A service that only answers requests should never compile that, which
 is why the proxy primitives live behind a feature instead of in a crate
 everyone already depends on.
+
+It is also the **only** TLS feature in this workspace. reqwest 0.13's `rustls`
+means rustls's aws-lc-rs provider (unless the process installed a default
+provider first; aws-lc-sys is a C build) and `rustls-platform-verifier`: the
+OS trust store plus `UpstreamClient::build`'s `ca_bundle_pem`, and **no
+bundled roots** — 0.12's webpki roots are gone. On Linux that store is the
+system CA bundle (`SSL_CERT_FILE`/`SSL_CERT_DIR` respected), so an image
+without `ca-certificates` fails `UpstreamClient::build(true, None)` with
+`ClientBuildError::Build`. Keep aws-lc-rs the only rustls provider in the
+consumer's graph: rustls `ring` from anywhere else (redis-rs `tls-rustls`,
+sqlx `tls-rustls-ring`) next to it makes `rustls::ClientConfig::builder()`
+panic.
 
 `tokio` is a **non-optional** dependency (`signal`, `sync`, `macros`) because
 `shutdown` is signal/watch machinery. A service with no tokio in its graph
@@ -31,16 +43,16 @@ build.
 
 ```toml
 [dependencies]
-stridelabs-http = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.4.0" }
+stridelabs-http = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.5.0" }
 
 # with the CORS layer builder:
-stridelabs-http = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.4.0", features = ["cors"] }
+stridelabs-http = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.5.0", features = ["cors"] }
 
 # for a service that proxies to an upstream:
-stridelabs-http = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.4.0", features = ["proxy"] }
+stridelabs-http = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.5.0", features = ["proxy"] }
 
 # for a service that publishes an OpenAPI document:
-stridelabs-http = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.4.0", features = ["openapi"] }
+stridelabs-http = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.5.0", features = ["openapi"] }
 ```
 
 (During development against an unreleased commit, pin `rev = "<sha>"`
@@ -270,6 +282,10 @@ if !origins.is_empty() {
   parameters; nothing about one service's front-end is baked in here.
 - Credentials are always allowed — every StrideLabs browser client
   authenticates with a cookie or an `Authorization` header.
+- Every response the layer touches carries one `vary: origin,
+  access-control-request-method, access-control-request-headers` header —
+  set explicitly (a test pins it), so a tower-http upgrade can't change what a
+  shared cache keys on.
 - An origin string that isn't a valid header value is skipped with a
   `tracing::warn!` naming it. That's a deployment-config typo: the useful
   behavior is a service that boots, serves its other origins, and says so
@@ -485,7 +501,28 @@ repositories before review caught it (#11). One copy, next to the
 **On the exhaustive match** and **on `utoipa`'s features** (this crate enables
 no schema features because it derives no schemas; a consumer declares its own
 `utoipa` with whatever its types need and Cargo unifies them) — likewise the
-module docs, which carry the reasoning and the utoipa-5.x details.
+module docs, which carry the reasoning and the utoipa 5.x/6.x details.
+
+### Version pairing: utoipa 6 and utoipa-axum 0.3
+
+This crate builds against `utoipa` 6, and every function above takes a
+`utoipa::openapi::OpenApi` (`find_operation` and `expect_operation` also return
+a `utoipa::openapi::path::Operation`), so a consumer must be on utoipa 6 too:
+two `utoipa` majors in one graph are two unrelated `OpenApi` types. A service
+that registers routes through `utoipa_axum::router::OpenApiRouter` pairs it
+with **utoipa-axum 0.3**, the release that requires utoipa 6; 0.2 only supports
+utoipa 5. The `nest`/`merge`/`route` behaviour described in the module docs is
+unchanged by the move: utoipa-axum's `router.rs` is byte-identical in 0.2.0 and
+0.3.0. Moving from utoipa 5 to 6 also changes what utoipa-gen derives, so diff
+a regenerated `openapi.json` and run your OpenAPI validator rather than
+expecting a one-line diff. Known differences: a derived `Option<T>` field's
+`oneOf` lists the `$ref` first and `null` second; a non-nullable `$ref` field
+with `title` or `default` loses its `oneOf` wrapper; an empty response
+description serializes as `{}`, which OpenAPI 3.1 rejects (always give a
+description); and an `inline` unit-enum field that also carries a title, a
+description (a doc comment counts), a default, `read_only` or `write_only`
+derives an unsatisfiable `allOf` (reference the enum instead of inlining it).
+See the CHANGELOG's 0.5.0 entry.
 
 ## `proxy` feature — reverse-proxy primitives
 
@@ -597,7 +634,10 @@ re-introduces every time this layer gets rewritten:
   `AppError::BadGateway(format!("upstream: {e}"))` hands the caller the
   upstream's address (exactly the class of leak this module exists to close
   — an internal provider base URL configured via environment is a realistic
-  example), and `tracing::error!(error = ?e, …)` puts it in the logs.
+  example), and `tracing::error!(error = ?e, …)` puts it in the logs. Since
+  reqwest 0.13 that includes a body-read failure from `Response::bytes()` or
+  `json()`, which 0.12 rendered without one; `e.without_url()` strips it when
+  rendering the error is really what you want.
   `UpstreamFailure::classify` is the alternative: four `reqwest` predicates,
   the `Option<StatusCode>` that only `error_for_status` ever produces, and a
   **total** `category` — because all four predicates can be false at once

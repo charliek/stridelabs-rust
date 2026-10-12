@@ -2,7 +2,9 @@
 
 use std::sync::Arc;
 
-use jsonwebtoken::jwk::JwkSet;
+use jsonwebtoken::jwk::{
+    AlgorithmParameters, Jwk, JwkSet, KeyAlgorithm, KeyOperations, PublicKeyUse,
+};
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use serde::Deserialize;
 
@@ -54,6 +56,10 @@ pub struct Verifier {
     inner: Arc<Inner>,
 }
 
+// `Debug` stays derived here and on `Verifier`: the only URL either holds is
+// inside `SlauthConfig` and `JwksCache`, whose own `Debug` impls redact it.
+// `jwks::tests::debug_never_renders_url_material` renders a `Verifier` to
+// hold the composition to that.
 #[derive(Debug)]
 struct Inner {
     config: SlauthConfig,
@@ -105,9 +111,11 @@ impl Verifier {
     /// against a key set it obtained some other way — without a
     /// [`Verifier`] or an HTTP client.
     ///
-    /// Checks, in order: `kid` is in the set; the key is usable; RS256
-    /// signature; `exp`; `iss` equals `issuer`; `aud` contains `audience`; a
-    /// non-empty `email` claim; a non-empty `sub` claim.
+    /// Checks, in order: the set holds a key under `kid` that is fit for RS256
+    /// signatures (an RSA key whose `alg`, `use` and `key_ops`, where present,
+    /// allow it); the key is usable; RS256 signature; `exp`; `iss` equals
+    /// `issuer`; `aud` contains `audience`; a non-empty `email` claim; a
+    /// non-empty `sub` claim.
     pub fn verify_with_jwks(
         token: &str,
         jwks: &JwkSet,
@@ -115,7 +123,24 @@ impl Verifier {
         issuer: &str,
         audience: &str,
     ) -> Result<VerifiedIdentity, AuthError> {
-        let jwk = jwks.find(kid).ok_or(AuthError::UnknownKid)?;
+        // Only a key the issuer published for RS256 signatures may verify one.
+        // `DecodingKey::from_jwk` ignores the JWK's `alg`, `use` and `key_ops`,
+        // so without this an RSA key labelled for encryption (`use: enc`,
+        // `alg: RSA-OAEP`, or a label jsonwebtoken 11 parses as
+        // `UNKNOWN_ALGORITHM` where 9 rejected the whole set) would verify a
+        // token naming its kid. A kid with no fit key is `UnknownKid` (401),
+        // not `Jwks` (500): there is no signature-verification key by that
+        // name, the same verdict as a kid missing from the set; and the kid is
+        // the caller's choice, so a 500 would let anyone raise this service's
+        // error rate against an issuer that publishes encryption keys
+        // alongside its signing keys. Keys sharing a kid are all considered,
+        // so an encryption key listed first does not hide the signing key.
+        let jwk = jwks
+            .keys
+            .iter()
+            .filter(|jwk| jwk.common.key_id.as_deref() == Some(kid))
+            .find(|jwk| verifies_rs256(jwk))
+            .ok_or(AuthError::UnknownKid)?;
         // A key the issuer published but we can't build a verifier from is the
         // issuer's problem, not the caller's — hence `Jwks`, which maps to a
         // 5xx, and not a 401 blaming a token that never got to be checked.
@@ -162,13 +187,35 @@ impl Verifier {
     }
 }
 
+/// Whether `jwk` is an RSA key its issuer allows for RS256 signature
+/// verification. An absent `alg`, `use` or `key_ops` allows it (RFC 7517 makes
+/// all three optional); a present one must say RS256, say `sig`, or include
+/// `verify`. Anything else, an unrecognised label included, rules the key out.
+fn verifies_rs256(jwk: &Jwk) -> bool {
+    let common = &jwk.common;
+    matches!(jwk.algorithm, AlgorithmParameters::RSA(_))
+        && common
+            .key_algorithm
+            .is_none_or(|alg| alg == KeyAlgorithm::RS256)
+        && common
+            .public_key_use
+            .as_ref()
+            .is_none_or(|key_use| *key_use == PublicKeyUse::Signature)
+        && common
+            .key_operations
+            .as_ref()
+            .is_none_or(|ops| ops.contains(&KeyOperations::Verify))
+}
+
 #[cfg(test)]
 mod tests {
+    use jsonwebtoken::errors::ErrorKind;
     use jsonwebtoken::{encode, EncodingKey, Header};
+    use serde_json::{json, Value};
     use wiremock::{MockServer, ResponseTemplate};
 
     use super::*;
-    use crate::mock_issuer::{issuer, jwks_url_of, primary_issuer};
+    use crate::mock_issuer::{issuer, jwks_body, jwks_url_of, primary_issuer};
     use crate::test_support::{TestClaims, TestKey, AUDIENCE, ISSUER, PRIMARY_KID};
 
     fn verify(token: &str) -> Result<VerifiedIdentity, AuthError> {
@@ -440,5 +487,187 @@ mod tests {
         let err = verifier.verify_bearer(&token).await.unwrap_err();
 
         assert!(matches!(err, AuthError::Jwks(_)), "{err}");
+    }
+
+    // --- the crypto backend -------------------------------------------------
+
+    /// jsonwebtoken 10+ takes its crypto from crate features, unified across
+    /// the whole graph this test is built in (the workspace's, and in a
+    /// consumer, the consumer's). With exactly one of `aws_lc_rs` and
+    /// `rust_crypto` on it works; with neither, or both, it still compiles
+    /// cleanly and then panics at the first sign or verify. That is how the
+    /// bare 9 → 11 bump passed clippy and failed only at test time. So this
+    /// signs with the test-support key and verifies the token the way a
+    /// service does (JWKS over HTTP into `verify_bearer`) and with a direct
+    /// `jsonwebtoken::decode`. The wrong-key decode proves the backend really
+    /// checks a signature rather than accepting whatever it is handed.
+    #[tokio::test]
+    async fn signing_and_verifying_work_on_the_one_crypto_backend() {
+        let server = primary_issuer(1).await;
+        let token = TestKey::primary().mint(&claims().subject("backend-check").build());
+
+        let identity = verifier_against(&server)
+            .verify_bearer(&token)
+            .await
+            .expect("a minted token verifies through the JWKS path");
+        assert_eq!(identity.sub, "backend-check");
+
+        let decoding_key = |key: TestKey| {
+            let jwks = key.jwks();
+            DecodingKey::from_jwk(jwks.find(key.kid()).expect("the key's own kid"))
+                .expect("committed test JWK is a usable RSA key")
+        };
+        let mut validation = Validation::new(Algorithm::RS256);
+        validation.set_audience(&[AUDIENCE]);
+
+        let data = decode::<Claims>(&token, &decoding_key(TestKey::primary()), &validation)
+            .expect("a minted token decodes directly");
+        assert_eq!(data.claims.sub, "backend-check");
+
+        let err = decode::<Claims>(&token, &decoding_key(TestKey::secondary()), &validation)
+            .expect_err("a token must not verify under a key that did not sign it");
+        assert_eq!(err.kind(), &ErrorKind::InvalidSignature);
+    }
+
+    // --- which key may verify -----------------------------------------------
+
+    /// One key of a committed test JWKS, as JSON, to relabel.
+    fn key_json(key: TestKey) -> Value {
+        let set: Value = serde_json::from_str(key.jwks_json()).expect("committed JWKS");
+        set["keys"][0].clone()
+    }
+
+    /// The primary key's JWK with `changes` applied (a `null` removes the
+    /// member), as JWKS text, the form the cache fetches.
+    fn primary_jwks_json_with(changes: Value) -> String {
+        let mut key = key_json(TestKey::primary());
+        let members = key.as_object_mut().expect("a JWK is an object");
+        for (name, value) in changes.as_object().expect("changes are an object") {
+            if value.is_null() {
+                members.remove(name);
+            } else {
+                members.insert(name.clone(), value.clone());
+            }
+        }
+        json!({ "keys": [key] }).to_string()
+    }
+
+    fn parse(jwks_json: &str) -> JwkSet {
+        serde_json::from_str(jwks_json).expect("parses as a JWKS")
+    }
+
+    /// A good token from the primary key, checked against `jwks`.
+    fn verify_against(jwks: &JwkSet) -> Result<VerifiedIdentity, AuthError> {
+        let token = TestKey::primary().mint(&claims().build());
+        Verifier::verify_with_jwks(&token, jwks, PRIMARY_KID, ISSUER, AUDIENCE)
+    }
+
+    #[test]
+    fn a_key_labelled_for_another_algorithm_does_not_verify() {
+        // The key really did sign the token; only its `alg` label is wrong.
+        // `RSA-OAEP-512` is a name jsonwebtoken does not know: 9 refused the
+        // whole set over it, 11 parses it as `UNKNOWN_ALGORITHM`, and
+        // `DecodingKey::from_jwk` never looks at it.
+        for alg in [
+            "RSA-OAEP-512",
+            "RSA-OAEP",
+            "RSA-OAEP-256",
+            "RSA1_5",
+            "RS512",
+            "PS256",
+        ] {
+            let jwks = parse(&primary_jwks_json_with(json!({ "alg": alg })));
+
+            let err = verify_against(&jwks).unwrap_err();
+
+            assert!(matches!(err, AuthError::UnknownKid), "alg {alg}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_key_for_encryption_does_not_verify() {
+        let jwks = parse(&primary_jwks_json_with(json!({ "use": "enc" })));
+
+        let err = verify_against(&jwks).unwrap_err();
+
+        assert!(matches!(err, AuthError::UnknownKid), "{err}");
+    }
+
+    #[test]
+    fn a_key_whose_operations_exclude_verify_does_not_verify() {
+        for ops in [json!(["encrypt", "wrapKey"]), json!(["sign"]), json!([])] {
+            let jwks = parse(&primary_jwks_json_with(json!({ "key_ops": ops })));
+
+            let err = verify_against(&jwks).unwrap_err();
+
+            assert!(matches!(err, AuthError::UnknownKid), "key_ops {ops}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_non_rsa_key_under_the_kid_does_not_verify() {
+        // Unlabelled, so the key type is the only thing ruling each one out:
+        // an EC P-256 public key (RFC 7517 appendix A.1) and a symmetric key.
+        let foreign = [
+            json!({
+                "kty": "EC",
+                "crv": "P-256",
+                "x": "MKBCTNIcKUSDii11ySs3526iDZ8AiTo7Tu6KPAqv7D4",
+                "y": "4Etl6SRW2YiLUrN5vfvVHuhp7x8PxltmWWlbbM4IFyM",
+                "kid": PRIMARY_KID,
+            }),
+            json!({ "kty": "oct", "k": "cHVibGljIGtleSBtYXRlcmlhbA", "kid": PRIMARY_KID }),
+        ];
+        for key in foreign {
+            let jwks = parse(&json!({ "keys": [key] }).to_string());
+
+            let err = verify_against(&jwks).unwrap_err();
+
+            assert!(matches!(err, AuthError::UnknownKid), "{key}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_signing_key_verifies_with_or_without_its_labels() {
+        for changes in [
+            json!({}),
+            json!({ "use": null, "alg": null }),
+            json!({ "use": null, "alg": null, "key_ops": ["verify"] }),
+            json!({ "key_ops": ["sign", "verify"] }),
+        ] {
+            let jwks = parse(&primary_jwks_json_with(changes.clone()));
+
+            verify_against(&jwks).unwrap_or_else(|err| panic!("{changes}: {err}"));
+        }
+    }
+
+    #[test]
+    fn an_encryption_key_sharing_the_kid_does_not_hide_the_signing_key() {
+        // A different keypair's public half, published as an encryption key
+        // under the same kid and listed first.
+        let mut encryption = key_json(TestKey::secondary());
+        encryption["kid"] = json!(PRIMARY_KID);
+        encryption["use"] = json!("enc");
+        encryption["alg"] = json!("RSA-OAEP");
+        let jwks =
+            parse(&json!({ "keys": [encryption, key_json(TestKey::primary())] }).to_string());
+
+        verify_against(&jwks).expect("the signing key under the kid verifies");
+    }
+
+    #[tokio::test]
+    async fn verify_bearer_refuses_a_fetched_key_labelled_for_encryption() {
+        // Through the fetch: jsonwebtoken 11 parses the set (9 refused it, a
+        // `Jwks` outage for every token), and the key still may not verify.
+        let jwks_json = primary_jwks_json_with(json!({ "alg": "RSA-OAEP-512", "use": "enc" }));
+        let server = issuer(jwks_body(&jwks_json), 1).await;
+        let token = TestKey::primary().mint(&claims().build());
+
+        let err = verifier_against(&server)
+            .verify_bearer(&token)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, AuthError::UnknownKid), "{err}");
     }
 }

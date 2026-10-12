@@ -31,33 +31,20 @@ db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
 # Deliberately NOT run in CI (see .github/workflows/ci.yml: the build-test
 # job's cargo-deny step is scoped to `check licenses bans sources` only). A
-# separate, non-required `audit` job runs `cargo-audit` instead —
-# advisories are time-varying (a new RUSTSEC ID can land between commits
-# with no code change), so gating a *required* check on them would brick
-# unrelated PRs.
+# separate `audit` job runs `cargo-audit` instead — advisories are
+# time-varying (a new RUSTSEC ID can land between commits with no code
+# change), so it gates main, manual runs and the weekly schedule but is
+# advisory on pull requests, where it would otherwise brick unrelated PRs.
 # Splitting the concerns this way means exactly one tool (cargo-audit) owns
 # "is there a live advisory," and cargo-deny here owns licenses/bans/sources
 # only. This section is kept accurate anyway for whoever runs the full
 # `cargo deny check` locally, so it doesn't disagree with the audit job's
 # published assessment.
-ignore = [
-    # rsa 0.9.10, Marvin Attack timing side-channel. Reachable only through
-    # sqlx-mysql's caching_sha2_password/sha256_password auth exchange;
-    # sqlx-mysql is compiled in only because sqlx-macros-core depends on all
-    # three backend crates unconditionally for its proc-macro query
-    # checking. This workspace's actual sqlx feature selection
-    # (workspace.dependencies.sqlx in Cargo.toml) is Postgres-only — no
-    # `mysql` feature, no MySQL connection ever opened. Assessed unreachable
-    # in c7-disclosure-and-advisory.md §B1; no fix is available upstream.
-    "RUSTSEC-2023-0071",
-    # event-listener 5.4.1, unsound `!Send` crossing a thread boundary via
-    # StackSlot. Transitive via sqlx-core/sqlx-postgres (the path this
-    # workspace actually uses); cargo-audit's own default policy already
-    # treats this as an informational "allowed warning," not a
-    # severity-scored vulnerability. Assessed unreachable in
-    # c7-disclosure-and-advisory.md §B1.
-    "RUSTSEC-2026-0221",
-]
+#
+# No `ignore` entries, and none on CI's `cargo audit` step either (keep the two
+# in sync if one is ever added). The last one, RUSTSEC-2023-0071 (rsa, Marvin
+# timing side-channel, no upstream fix), was dropped once sqlx 0.9 took `rsa`
+# out of Cargo.lock; CI's "Guard: no rsa in Cargo.lock" step keeps it out.
 
 [licenses]
 # Licenses allowed for any crate in the dependency graph. Base set is the
@@ -75,12 +62,19 @@ allow = [
     # under the Unicode data-and-software license's 2024 successor term.
     # Permissive.
     "Unicode-3.0",
-    # ring (TLS crypto primitives, transitively via rustls/reqwest).
-    # Permissive.
+    # The crypto underneath TLS and JWT: aws-lc-rs/aws-lc-sys (rustls's
+    # provider under reqwest 0.13's `rustls`, and jsonwebtoken 11's
+    # `aws_lc_rs` backend), rustls-webpki, untrusted, and simple_asn1
+    # (jsonwebtoken's PEM support). Permissive. ring left this graph with
+    # jsonwebtoken 9; its remaining Cargo.lock entry is lock-only (edges from
+    # quinn-proto, behind reqwest's optional quinn, and from rustls-webpki's
+    # off `ring` feature), so nothing compiles it and cargo-deny never sees it.
     "ISC",
-    # webpki-roots (Mozilla's root CA bundle, pulled in transitively by
-    # reqwest's rustls-tls-native-roots feature). A data license covering the
-    # cert bundle, not code — permissive in substance.
+    # webpki-root-certs (Mozilla's root CA bundle). reqwest 0.13 bundles no
+    # roots any more (0.12's webpki-roots is gone from the lock); this one is
+    # rustls-platform-verifier's wasm32-only fallback, so nothing built for a
+    # real target compiles it, but this file's graph spans every target. A data
+    # license covering the cert bundle, not code — permissive in substance.
     "CDLA-Permissive-2.0",
     # ryu (float-to-string formatting, transitive via serde_json). Permissive
     # (Boost Software License).
@@ -109,8 +103,9 @@ confidence-threshold = 0.8
 
 [bans]
 # Default posture kept: multiple versions of the same crate in the graph
-# (e.g. r-efi 5.3.0 AND 6.0.0, syn 1.x AND 2.x) are normal in a 315-crate
-# resolved graph and not, by themselves, a problem worth failing CI over.
+# (e.g. r-efi 5.3.0 AND 6.0.0, syn 2.x AND 3.x) are normal in a resolved
+# graph of 300-odd crates and not, by themselves, a problem worth failing CI
+# over.
 multiple-versions = "allow"
 
 [sources]

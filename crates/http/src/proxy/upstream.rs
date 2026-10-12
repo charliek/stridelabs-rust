@@ -75,7 +75,7 @@ pub struct UpstreamFailure {
     /// A request- or response-body error.
     ///
     /// Narrower than it looks: a *truncated response body* read through
-    /// `Response::bytes()` is a **decode** error in reqwest 0.12, not a body
+    /// `Response::bytes()` is a **decode** error in reqwest, not a body
     /// error, so this stays false and [`UpstreamFailure::category`] reports
     /// [`UpstreamCategory::Decode`]. Existing consumers log
     /// `is_body` at their body-read sites today and get `false` for exactly
@@ -592,7 +592,7 @@ mod tests {
                 ("connect", UpstreamCategory::Connect),
                 ("timeout", UpstreamCategory::Timeout),
                 ("status", UpstreamCategory::Status),
-                // Not `Body`: reqwest 0.12 maps a `Response::bytes()` failure
+                // Not `Body`: reqwest maps a `Response::bytes()` failure
                 // to its *decode* kind, so `is_body()` is false for the very
                 // failure both consumers log `is_body` at. See the field docs.
                 ("body", UpstreamCategory::Decode),
@@ -673,27 +673,46 @@ mod tests {
     async fn the_errors_display_really_does_carry_the_url() {
         // The control for every assertion above and below: if reqwest stopped
         // attaching the URL, the leak tests would be vacuous and nobody would
-        // notice. One of the five classes carries no URL, which is a property
-        // of where reqwest builds that error rather than a promise — hence the
-        // split rather than one blanket assertion.
+        // notice. Under reqwest 0.12 the body-read class carried none; since
+        // 0.13 `Response::bytes()` attaches the response's URL as well, so
+        // every class renders it and the leak tests bite on all five.
         for (name, err) in every_failure_class().await {
             let rendered = format!("{err} / {err:?}");
-            let carries = CANARY_MARKERS.iter().any(|m| rendered.contains(m));
-            match name {
-                // `Response::bytes()` maps its failure through
-                // `reqwest::error::decode`, which attaches no URL — unlike
-                // `error_for_status`, which attaches the response's.
-                "body" => assert!(
-                    !carries,
-                    "body-read errors are not expected to carry a URL: {rendered}"
-                ),
-                _ => assert!(
-                    carries,
-                    "{name}: reqwest no longer renders the URL — the leak tests are now vacuous \
-                     and this module's premise needs re-checking: {rendered}"
-                ),
-            }
+            assert!(
+                CANARY_MARKERS.iter().any(|m| rendered.contains(m)),
+                "{name}: reqwest no longer renders the URL — the leak tests are now vacuous \
+                 and this module's premise needs re-checking: {rendered}"
+            );
         }
+    }
+
+    /// The one place an upstream request's `reqwest::Error` leaves this crate
+    /// unclassified: a relayed body (`relay_response`, and the remainder
+    /// `buffer_or_stream` streams on) carries `bytes_stream()`'s errors into
+    /// the client response, where the consumer's server can log them. Those
+    /// carry no URL — reqwest 0.13 builds them with `error::decode` and never
+    /// attaches one — and this pins it, so a reqwest that starts to (as 0.13
+    /// did for `bytes()`) fails here instead of leaking quietly.
+    #[tokio::test]
+    async fn a_relayed_body_error_carries_no_url() {
+        let addr = spawn(Behavior::TruncatedBody).await;
+        let upstream = reqwest::Client::new()
+            .get(canary_url(addr))
+            .send()
+            .await
+            .expect("headers arrive");
+
+        let relayed = crate::proxy::relay_response(upstream).into_body();
+        let err = axum::body::to_bytes(relayed, usize::MAX)
+            .await
+            .expect_err("a body short of its content-length must fail mid-relay");
+
+        let rendered = format!("{err} / {err:?}");
+        assert!(
+            rendered.contains("error decoding response body"),
+            "the relayed failure must be reqwest's own body error: {rendered}"
+        );
+        assert_no_canary(&rendered, "a relayed body error");
     }
 
     #[tokio::test]

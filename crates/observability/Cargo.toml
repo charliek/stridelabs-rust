@@ -23,6 +23,12 @@ prometheus = ["dep:metrics", "dep:metrics-exporter-prometheus", "dep:thiserror"]
 # always carries the client, and every other layer stays plain tower/http.
 axum = ["dep:axum"]
 
+# The `prometheus` module's own tests cannot see this one: it needs a process
+# where nothing has called `install()` yet (see the file's header).
+[[test]]
+name = "prometheus_concurrent_install"
+required-features = ["prometheus"]
+
 [lints]
 workspace = true
 

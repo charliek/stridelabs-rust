@@ -25,8 +25,10 @@
 //! is a single indexed lookup on every proxied request — a bcrypt-per-request
 //! design would be a self-inflicted denial of service.
 
+use std::fmt::Write as _;
+
 use rand::distr::Alphanumeric;
-use rand::Rng;
+use rand::RngExt;
 use sha2::{Digest, Sha256};
 
 /// Length of the random body appended to the prefix.
@@ -156,9 +158,17 @@ impl PatFormat {
 pub fn hash(raw: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(raw.as_bytes());
-    // `{:x}` on the digest is byte-identical to `hex::encode` and saves the
-    // crate a dependency for its single use.
-    format!("{:x}", hasher.finalize())
+    // sha2 0.11's digest is a `hybrid_array::Array`, which (unlike 0.10's
+    // `GenericArray`) has no `LowerHex` impl. Two hex digits per byte is
+    // byte-identical to `hex::encode` and saves the crate a dependency for
+    // its single use.
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest.iter() {
+        // Writing to a `String` cannot fail.
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
 }
 
 #[cfg(test)]
@@ -254,6 +264,8 @@ mod tests {
         assert_ne!(hash("sw_abc"), hash("sw_abd"));
         // A known vector, so a future "optimisation" of the hash function is a
         // failing test rather than every stored token silently invalidated.
+        // This digest holds bytes below 0x10 (`2a01ba…`), so a hex encoder
+        // that drops the zero pad fails here too.
         assert_eq!(
             hash("sw_abc"),
             "47b92df3e0bab4ab2a01ba562471014c1017b394e0b1858d97a504474103183d"

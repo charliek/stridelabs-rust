@@ -17,7 +17,7 @@
 //! panicking combination through this function — it is ruled out by
 //! construction rather than by a warning in a doc comment.
 
-use http::{HeaderName, HeaderValue, Method};
+use http::{header, HeaderName, HeaderValue, Method};
 use tower_http::cors::CorsLayer;
 
 /// Build a credentialed CORS layer from an explicit policy.
@@ -31,6 +31,10 @@ use tower_http::cors::CorsLayer;
 /// Credentials are always allowed (`access-control-allow-credentials: true`),
 /// since every StrideLabs browser client authenticates with either a cookie
 /// or an `Authorization` header.
+///
+/// Every response the layer touches carries one
+/// `vary: origin, access-control-request-method, access-control-request-headers`
+/// header, set explicitly rather than left to tower-http's default.
 ///
 /// An origin string that isn't a valid header value is **skipped with a
 /// `tracing::warn!`** rather than aborting: that is a typo in deployment
@@ -73,6 +77,15 @@ pub fn cors_layer(origins: &[String], methods: &[Method], headers: &[HeaderName]
         .allow_methods(methods.to_vec())
         .allow_headers(headers.to_vec())
         .allow_credentials(true)
+        // Explicit, so the wire does not depend on tower-http's default: 0.6
+        // always sent these three names; 0.7 derives the list from the
+        // policy and, for an origin list with constant method/header lists,
+        // would send `origin` alone (tower-rs/tower-http#674).
+        .vary([
+            header::ORIGIN,
+            header::ACCESS_CONTROL_REQUEST_METHOD,
+            header::ACCESS_CONTROL_REQUEST_HEADERS,
+        ])
 }
 
 #[cfg(test)]
@@ -193,6 +206,54 @@ mod tests {
             header_value(&res, header::ACCESS_CONTROL_ALLOW_ORIGIN).as_deref(),
             Some(ALLOWED)
         );
+    }
+
+    /// Every `Vary` header on a response, one string per header line.
+    fn vary_lines(res: &Response<Body>) -> Vec<String> {
+        res.headers()
+            .get_all(header::VARY)
+            .iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// Pins `Vary` on every kind of response the layer touches. The allow-origin
+    /// header differs per request origin, so a shared cache needs `Vary: origin`;
+    /// the two `access-control-request-*` names are what the preflight answer
+    /// depends on. tower-http 0.6 always sent all three, in one header line, and
+    /// that is the wire these services have always had.
+    #[tokio::test]
+    async fn vary_is_the_same_three_names_on_ordinary_and_preflight_responses() {
+        const VARY: &str = "origin, access-control-request-method, access-control-request-headers";
+        let hostile = "https://evil.example.com";
+        let no_origin = Request::builder().uri("/").body(Body::empty()).unwrap();
+
+        let cases = [
+            (
+                "ordinary GET, allowed origin",
+                get_from(allowed_origin_app(), ALLOWED).await,
+            ),
+            (
+                "ordinary GET, disallowed origin",
+                get_from(allowed_origin_app(), hostile).await,
+            ),
+            (
+                "ordinary GET, no Origin header",
+                allowed_origin_app().oneshot(no_origin).await.unwrap(),
+            ),
+            (
+                "preflight, allowed origin",
+                preflight(allowed_origin_app(), ALLOWED).await,
+            ),
+            (
+                "preflight, disallowed origin",
+                preflight(allowed_origin_app(), hostile).await,
+            ),
+        ];
+
+        for (what, res) in cases {
+            assert_eq!(vary_lines(&res), [VARY], "Vary on: {what}");
+        }
     }
 
     #[tokio::test]

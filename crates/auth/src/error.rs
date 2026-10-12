@@ -39,7 +39,9 @@ pub enum AuthError {
     #[error("token is missing a key id")]
     MissingKid,
     /// The token's `kid` is not in the issuer's JWKS — after a refetch, or
-    /// after a refetch was suppressed by [`crate::MIN_REFETCH_INTERVAL`].
+    /// after a refetch was suppressed by [`crate::MIN_REFETCH_INTERVAL`] — or
+    /// names only keys unfit for RS256 signatures: not RSA, or an `alg`,
+    /// `use` or `key_ops` that says otherwise (an encryption key, say).
     #[error("token signed by an unknown key")]
     UnknownKid,
     /// Signature, `iss`, `aud`, `exp` or claim-shape check failed. The
@@ -55,7 +57,9 @@ pub enum AuthError {
     MissingSubject,
     /// The issuer's JWKS could not be fetched or parsed. This is the one
     /// failure here that is the *server's* fault, and the only one that maps
-    /// to a 5xx.
+    /// to a 5xx. The payload names the failure but never the JWKS URL, whose
+    /// query string or userinfo may hold a credential: a `reqwest::Error` is
+    /// rendered `without_url()`.
     #[error("JWKS unavailable: {0}")]
     Jwks(String),
 }

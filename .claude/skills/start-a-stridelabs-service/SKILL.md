@@ -23,9 +23,9 @@ exist*, not what every parameter does:
 - `crates/http/README.md` — `AppError`, security headers, `methods`, `openapi`, `proxy`
 - `crates/auth/README.md` — JWKS verification, PAT hashing
 - `crates/testing/README.md` — fail-loud Postgres pool, oneshot router tests, wiremock stub
-- root `README.md` — consuming these crates (git dep forms, `[patch]` local co-dev, feature topology table)
+- root `README.md` — consuming these crates (git dep forms, `[patch]` local co-dev, MSRV policy, feature topology table, the one-crypto-provider rule)
 
-All five paths above are relative to the `stridelabs-rust` checkout this
+All six paths above are relative to the `stridelabs-rust` checkout this
 skill lives in.
 
 ## Before you start
@@ -64,15 +64,20 @@ errors.
 
 ### 1. Choosing how to consume the crates
 
-Check whether a local checkout of `stridelabs-rust` exists as a **sibling
-directory** of the new service — i.e. `../stridelabs-rust/crates` exists
-relative to the new service's root:
+Check whether a local checkout of `stridelabs-rust` exists **relative to the
+new service's root** — a sibling (`../stridelabs-rust/crates`), or anywhere up
+an ancestor path. A service scaffolded inside an existing monorepo, at
+`repo/service/`, reaches a checkout beside the monorepo at
+`../../stridelabs-rust/crates`; each further level of nesting adds one `../`:
 
 - **If it exists** (local co-development, or a sandboxed/offline
   environment with no guaranteed GitHub auth — including a cold-run of this
-  very skill): use **path dependencies** straight into that checkout. No
-  network fetch, no auth needed, and it always resolves to exactly the code
-  on disk. This is the mechanism this skill's own cold-run tests use.
+  very skill): use **path dependencies** straight into that checkout, with
+  whatever `../` prefix reaches it from the service's root. No network
+  fetch, no auth needed, and it always resolves to exactly the code on disk.
+  This is the mechanism this skill's own cold-run tests use. The snippets
+  here and in Step 2 show the sibling form; a nested service lengthens the
+  prefix (`../../stridelabs-rust/crates/config`) and nothing else.
 
   ```toml
   [dependencies]
@@ -91,21 +96,34 @@ relative to the new service's root:
   skill uses; otherwise pin the exact commit `rev`. See the root README's
   "Consuming these crates" section for the exact `tag =` / `rev =` forms.
 
-  **Today that means `rev`:** Step 3's logging defaults
-  (`LogFormat::from_environment`, `RequestLogLayer`) are newer than
-  `v0.4.0`, the latest tag, so a `tag = "v0.4.0"` scaffold does not compile.
-  Pin the commit until a release includes them, then move to that tag.
+  **Today that means `tag = "v0.5.0"`**, the latest tag: it contains Step 3's
+  logging defaults (`LogFormat::from_environment`, `RequestLogLayer`), which
+  `v0.4.0` lacks, so a `v0.4.0` scaffold does not compile. Pin one tag for all
+  five crates (they are versioned in lockstep).
 
   ```toml
   [dependencies]
-  stridelabs-config = { git = "https://github.com/charliek/stridelabs-rust.git", rev = "<full commit sha>" }
-  # ... the same git =/rev = for the other four crates, feature flags as below
+  stridelabs-config = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.5.0" }
+  # ... the same git =/tag = for the other four crates, feature flags as below
   ```
 
-A service that starts in path-dependency mode (local co-dev) and later
-moves to a real repo should switch every `stridelabs-*` line to the git
-form before its first CI run — CI has no sibling checkout on disk. The
-`templates/ci.yml` skeleton below assumes the git form and says so.
+  The tag brings its dependency majors with it. Wherever the service names a
+  type from one of these crates' public signatures it must be on the same
+  major, or the compiler sees two unrelated types: `utoipa` 6 (with
+  `utoipa-axum` 0.3, as Step 2 pins), `reqwest` 0.13 (the client handed to
+  `Verifier::new`), `jsonwebtoken` 11, `sqlx` 0.9 (a test that names
+  `PgPool`), `tower-http` 0.7 and `metrics-exporter-prometheus` 0.18. Keep
+  aws-lc-rs the only rustls provider, and never enable `jsonwebtoken`'s
+  `rust_crypto` feature (the root README's "One crypto provider: aws-lc-rs"
+  explains why). A `reqwest` that fetches an `https://` JWKS needs its own
+  TLS feature (`rustls`) turned on: `stridelabs-auth` enables none.
+
+A service that starts in path-dependency mode — sibling or ancestor-relative,
+and whether it later moves to a real repo or already sits inside one — should
+switch every `stridelabs-*` line to the git form before its first CI run: CI
+has no checkout of `stridelabs-rust` at that relative path (or anywhere) on
+disk. Leave a loud comment beside the path lines saying so while they stand.
+The `templates/ci.yml` skeleton below assumes the git form and says so.
 
 Don't try to detect this automatically inside `Cargo.toml` itself (Cargo has
 no conditional dependency sources) — decide once, at scaffold time, and
@@ -159,6 +177,15 @@ the `<service>` name and toolchain version in the CI file's comments/
 `toolchain:` line). Append `templates/gitattributes.fragment`'s content to
 `.gitattributes` (create the file if the service has none yet).
 
+**A service nested in a monorepo (`repo/service/`) gets an inert
+`.github/workflows/ci.yml`:** workflows run only from the repository root's
+`.github/workflows/`, so the copy inside the service directory never fires.
+Fold its lanes into the root workflow as a job for this service (steps under
+`working-directory: service`) and drop the nested file. To run it only when
+the service changes, put a `paths:` filter on the workflow's trigger
+(`on.push.paths` / `on.pull_request.paths`) — GitHub rejects `paths:` on a
+job — or gate the job with an `if:` on a changed-files step.
+
 `.spectral.yaml` is a dotfile — a bare `ls` in the new service's root won't
 show it, so a copy that silently failed (wrong destination, typo'd filename)
 is easy to miss. Confirm it's actually there with `ls -a` (or `ls -la`)
@@ -200,12 +227,13 @@ tracing = "0.1"
 
 # utoipa: default features on, so the derive macros come along. Pin the
 # same MAJOR this workspace's stridelabs-http/openapi feature builds
-# against (utoipa = "5") — verify against stridelabs-rust/Cargo.toml if in
+# against (utoipa = "6") — verify against stridelabs-rust/Cargo.toml if in
 # doubt, since a mismatched major here vs. what utoipa-axum expects fails
 # to compile with a confusing trait-not-satisfied error, not a version
-# error.
-utoipa = { version = "5" }
-utoipa-axum = "0.2"
+# error. utoipa-axum 0.3 is the release that requires utoipa 6 (0.2 only
+# supports utoipa 5).
+utoipa = { version = "6" }
+utoipa-axum = "0.3"
 
 # The five stridelabs-* crates — see "Choosing how to consume the crates"
 # above for path vs. git dependency form. `stridelabs-http` needs its
@@ -498,11 +526,13 @@ into a failing assertion instead of a quiet gap.
 
 ### Gotcha 2 — `OpenApiRouter::nest`, never `merge`, never `axum::Router::nest`
 
-**Verified against this workspace's own vendored `utoipa-axum` 0.2.0
-source** (`~/.cargo/registry/src/.../utoipa-axum-0.2.0/src/router.rs`,
+**Verified against the vendored `utoipa-axum` 0.3.0 source**
+(`~/.cargo/registry/src/.../utoipa-axum-0.3.0/src/router.rs`,
 `nest`/`merge` — this claim has been stated wrong in this fleet's docs
 twice before, so it is stated here only after reading the actual
-implementation, not carried forward from memory):
+implementation, not carried forward from memory; `router.rs` is
+byte-identical in 0.2.0, which an earlier version of this section was
+verified against, so nothing below changed with the move to utoipa 6):
 
 - `OpenApiRouter::nest(prefix, router)` prefixes **both halves**: it calls
   `self.0.nest(path, router.0)` on the underlying `axum::Router` AND

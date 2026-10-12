@@ -32,14 +32,50 @@ machinery (~13 transitive crates), which only offline minting needs.
 Verification decodes keys from the JWKS, never from PEM, so put the feature in
 `dev-dependencies` and release graphs never see it.
 
+**No TLS, in any feature.** The crate's `reqwest` (0.13) has `json` and
+nothing else: it never builds a client outside its own tests —
+`Verifier::new` and `JwksCache::new` take yours — so the TLS stack, and with
+it the process's rustls crypto provider, is your choice. To fetch an
+`https://` JWKS, enable a TLS feature on your own `reqwest` 0.13 (`rustls`:
+the aws-lc-rs provider plus the OS trust store), and keep one rustls provider
+in your graph: rustls `ring` from something else (redis-rs `tls-rustls`, sqlx
+`tls-rustls-ring`) next to aws-lc-rs makes `rustls::ClientConfig::builder()`
+panic. CI's "Guard: stridelabs-auth pulls no rustls" keeps rustls out of this
+crate's graph.
+
+**One JWT crypto backend: aws-lc-rs.** The crate's `jsonwebtoken` (11) uses
+its `aws_lc_rs` backend, and that binds your whole graph, not just this crate:
+jsonwebtoken picks its backend from crate features at runtime, Cargo unifies
+those features across your graph, and with both `aws_lc_rs` and `rust_crypto`
+on (or neither) it compiles cleanly and then panics at the first sign or
+verify, in `verify_bearer`, `verify_with_jwks` and `TestKey::mint` alike. The
+rule: **never enable jsonwebtoken `rust_crypto`**, on your own `jsonwebtoken`
+or through any other dependency, **and use aws-lc-rs as the only rustls
+provider** (install it at startup with
+`rustls::crypto::aws_lc_rs::default_provider().install_default()` if your
+service builds rustls configs itself). `rust_crypto` is rejected here because
+it brings back the `rsa` crate (RUSTSEC-2023-0071, no fix). aws-lc-sys, a C
+build like ring before it, comes along into production graphs.
+`signing_and_verifying_work_on_the_one_crypto_backend` (in `verify.rs`) is the
+test that panics when the backend set is wrong; a consumer's own mint-and-verify
+test does the same for its graph.
+
+`Verifier::verify_with_jwks`, `JwksCache::jwks_for_kid`, `TestKey::jwks` and
+`test_support::test_jwks` take or return jsonwebtoken 11's `JwkSet`. To name
+it, depend on the same major with the same backend:
+
+```toml
+jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_rs"] }
+```
+
 ## Adding the dependency
 
 ```toml
 [dependencies]
-stridelabs-auth = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.4.0", features = ["axum", "http"] }
+stridelabs-auth = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.5.0", features = ["axum", "http"] }
 
 [dev-dependencies]
-stridelabs-auth = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.4.0", features = ["test-support"] }
+stridelabs-auth = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.5.0", features = ["test-support"] }
 ```
 
 (During development against an unreleased commit, pin `rev = "<sha>"` instead
@@ -78,10 +114,20 @@ can test its own wiring without an HTTP client.
 
 ### What is checked
 
-In order: the token's `kid` is present in the issuer's key set; the key is
-usable; the **RS256** signature; `exp`; `iss` equals the configured issuer;
-`aud` contains the configured audience; a **non-empty `email`** claim; a
-**non-empty `sub`**.
+In order: the issuer's key set has a key under the token's `kid` that is
+**fit for RS256 signatures**; the key is usable; the **RS256** signature;
+`exp`; `iss` equals the configured issuer; `aud` contains the configured
+audience; a **non-empty `email`** claim; a **non-empty `sub`**.
+
+"Fit" means an RSA key whose `alg`, `use` and `key_ops`, where present, say
+RS256, `sig` and `verify`. jsonwebtoken builds a verifier from a JWK without
+reading any of them, so without this an RSA key the issuer published for
+encryption (`use: enc`, `alg: RSA-OAEP`) would verify a token that names its
+kid. A kid with only unfit keys is `UnknownKid` (401), not `Jwks` (500): there
+is no verification key by that name, and the kid is the caller's to choose, so
+a 500 would hand anyone a way to raise the error rate whenever the issuer
+publishes encryption keys next to its signing keys. Keys sharing a kid are all
+considered, so a listed-first encryption key cannot hide the signing key.
 
 Pinning the algorithm to RS256 is what rules out the two classic forgeries
 (`alg: none`, and HS256 signed with the issuer's public key as an HMAC
@@ -115,18 +161,32 @@ error.
   anyone can mint a syntactically valid token carrying a random `kid` and turn
   every request into an outbound HTTPS call — a request amplifier pointed at
   the one service every other service depends on. Inside the interval the
-  answer comes from memory: the cached set if it happens to contain the kid (a
-  stale key beats a spurious 401 — the interval protects the issuer, it does
-  not expire keys), otherwise `AuthError::UnknownKid` — unless nothing has ever
-  been cached, in which case the last *fetch* failed and the error is
-  `Jwks`, not a verdict on the caller's token.
+  answer comes from memory, and only from a set within the *stale bound*
+  (next bullet): that set if it contains the kid (a stale key beats a spurious
+  401 — the interval protects the issuer), otherwise `AuthError::UnknownKid`.
+  With no set within the bound — nothing ever cached, or a set past it — the
+  last *fetch* failed and the error is `Jwks` (a 500 under the `http`
+  feature), not a verdict on the caller's token.
+- **The stale bound is `JWKS_TTL + MIN_REFETCH_INTERVAL` (3630 s), measured
+  from the last *successful* fetch.** Every failed attempt opens a new
+  interval, so without the bound a set would outlive any issuer outage: a key
+  the issuer retired (say, because it leaked) would keep verifying for as long
+  as the outage lasted. With it, a retired key stops verifying at most 3630 s
+  after the last successful fetch, however many attempts fail after that.
 - A fetch *attempt* starts the interval, successful or not. A failing issuer
-  is exactly when hammering it helps least.
+  is exactly when hammering it helps least. The attempt that fails answers
+  `Jwks` itself; it never falls back to the cached set.
 
 The cost is bounded and worth naming: **a key rotation landing within 30
 seconds of the last fetch is invisible for the rest of that interval**, so
 tokens signed by the brand-new key are rejected for up to 30 seconds. Issuers
 roll keys on the order of days.
+
+`JwksCache::with_ttl` and `JwksCache::with_min_refetch_interval` replace the
+two durations (the stale bound follows them), for tests that need to watch a
+set expire or an interval close without sleeping. The defaults are the
+contract: a zero interval turns the floor off, and `Verifier::new` always
+builds its cache with the defaults.
 
 Concurrency: the fetch happens under the write lock and the hit-check is
 repeated after acquiring it (double-checked locking), so a thundering herd of
@@ -148,6 +208,17 @@ mapped to one of a fixed set of phrases, never rendered with `Display`. That
 is a departure from the original implementation this crate replaced, whose
 `format!("token rejected: {e}")` could quote the claim value that failed to
 parse.
+
+Nor do they echo the JWKS URL, and neither does any type's `Debug`.
+`AuthError::Jwks` renders a failed fetch's `reqwest::Error` with
+`without_url()`: a `reqwest::Error` otherwise ends `for url (…)` with the
+query string, and a JWKS URL is configuration that can carry a credential.
+`SlauthConfig`, `JwksCache` and `Verifier` print it in `Debug` as
+`scheme://host[:port]/path` (userinfo, query and fragment dropped; so is
+`pat_validate_url`'s), so `tracing::info!(?config)` is safe. A canary test
+pins both: a URL with a token in the query and userinfo in the authority,
+checked in the error's `Display`/`Debug`, in the line the `http` feature logs
+for the 500, and in each type's `Debug`.
 
 With the `http` feature:
 

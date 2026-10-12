@@ -37,7 +37,7 @@ each crate turns on by default versus behind a feature flag.
   pattern it exists to replace (nine of eleven test files in one service had
   their own copy). A green test suite must mean the behavior it claims to
   cover actually ran.
-- OpenAPI default for services: utoipa 5 + utoipa-axum, Swagger UI dev-gated,
+- OpenAPI default for services: utoipa 6 + utoipa-axum 0.3, Swagger UI dev-gated,
   spec exported and linted in CI.
 - Issuer-side JWT helpers stay app-local until a second issuer exists (same
   "defer until a second consumer" rule as stridelabs-python).
@@ -57,7 +57,7 @@ Once a version is tagged, pin the tag:
 
 ```toml
 [dependencies]
-stridelabs-config = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.4.0" }
+stridelabs-config = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.5.0" }
 ```
 
 Before the first tag exists — or when depending on a reviewed-but-unreleased
@@ -73,6 +73,26 @@ released and tagged, bump the consumer back to `tag = "vX.Y.Z"` so its
 manifest reads the same way for everyone, forever. Every crate is versioned
 in lockstep (one `[workspace.package].version` for the whole workspace), so a
 consumer pins **one** tag/rev for however many of the five crates it uses.
+
+### MSRV policy
+
+The minimum supported Rust version is `rust-version` in the workspace
+`Cargo.toml` (currently 1.97, in force since v0.2.0). It tracks the minor
+version of the pinned toolchain (`rust-toolchain.toml`, currently 1.97.1):
+a patch bump of the toolchain leaves it alone, and moving the pin to a new
+minor moves it too. Cargo rejects a consumer on an older compiler from the
+declared `rust-version` alone, even where the source would still build, so an
+MSRV bump is a minor release (0.x), and its CHANGELOG section carries this
+line, with X the new version:
+
+> Minimum supported Rust version raised to X. Consumers must be on Rust X or newer. Earlier tags are unaffected.
+
+A tag is immutable, so a consumer pinned to an earlier tag keeps that tag's
+manifest and the MSRV it declares. That fixes this workspace's source, not the
+consumer's dependency graph: transitive versions come from the consumer's own
+`Cargo.lock` (keep it committed), not from this repository's, so a fresh
+resolve can pick up a registry release that needs a newer compiler than the
+tag declares.
 
 ### Local co-development
 
@@ -100,6 +120,22 @@ listing all five up front, as above, is the simplest thing that stays correct
 as a consumer's dependency set grows. The `[patch]` key must match the
 `https://…` source URL the consumer's `[dependencies]` actually used.
 
+A patch only takes effect if the consumer's `Cargo.lock` can use it. A consumer
+locked to another version of this library (say `0.4.0` while the workspace is
+at `0.5.0`) leaves the patch **silently unused** and keeps building the old git
+dependency, so after adding the block:
+
+1. Move the locked crates onto it: `cargo update -p stridelabs-config -p
+   stridelabs-http …`, one `-p` for each `stridelabs-*` package the consumer's
+   `Cargo.lock` names.
+2. Check it took: `cargo tree -i stridelabs-config` (or `cargo metadata`) shows
+   the local path rather than the git URL. Cargo prints "patch … was not used in
+   the crate graph" when it did not.
+
+`scripts/downstream-check.sh` is the automated form: it does both against this
+checkout for tapper, slauth, limen or spendwise-rs, then proves with `cargo
+metadata` that every `stridelabs-*` package is this checkout's own crate.
+
 ### Feature topology (all five crates)
 
 Every crate that defines optional features defaults to `default = []` — a
@@ -117,7 +153,7 @@ on what.
 | `stridelabs-observability` | `axum` | off | `RequestLogLayer`'s peer-address fallback for `remoteIp`, read from axum's `ConnectInfo<SocketAddr>` |
 | `stridelabs-http` | `cors` | off | `cors_layer`, via `tower-http/cors` |
 | `stridelabs-http` | `openapi` | off | spec canonicalization, `(method, path)` enumeration, committed-spec freshness check, via `utoipa` |
-| `stridelabs-http` | `proxy` | off | reverse-proxy primitives, via `reqwest`/`url`/`bytes`/`futures` |
+| `stridelabs-http` | `proxy` | off | reverse-proxy primitives, via `reqwest` (with `rustls`: the aws-lc-rs provider and the OS trust store)/`url`/`bytes`/`futures` |
 | `stridelabs-auth` | `axum` | off | `bearer_token(&Parts)`, via the `http` types crate |
 | `stridelabs-auth` | `http` | off | `From<AuthError> for stridelabs_http::AppError` |
 | `stridelabs-auth` | `test-support` | off | offline JWT minting against two committed throwaway keypairs |
@@ -126,3 +162,32 @@ on what.
 `stridelabs-testing`'s `oneshot` and `wiremock` modules have no feature gate
 of their own — both are cheap and every consumer of the crate wants them; only
 the Postgres driver is worth gating.
+
+`stridelabs-http`'s `proxy` is the only feature anywhere here that turns on
+TLS. `stridelabs-auth` has none — it takes the consumer's `reqwest::Client`,
+so the TLS stack and the process's rustls provider stay the consumer's choice —
+and `stridelabs-testing`'s Postgres pool talks to its database in the clear.
+
+### One crypto provider: aws-lc-rs
+
+`stridelabs-auth` signs and verifies JWTs with jsonwebtoken 11's `aws_lc_rs`
+backend, and `proxy`'s TLS uses rustls's aws-lc-rs provider. jsonwebtoken
+(10+) and rustls both choose their crypto from crate features at runtime, and
+Cargo unifies features across a consumer's whole graph, so a second backend
+anywhere in that graph does not fail the build: the process panics at its
+first JWT sign or verify, or its first `rustls::ClientConfig::builder()`. The
+consumer rule:
+
+- **Never enable jsonwebtoken `rust_crypto`**, on your own jsonwebtoken or
+  anywhere else in your graph. Next to this workspace's `aws_lc_rs` it makes
+  jsonwebtoken panic, `stridelabs-auth`'s verification and test-token minting
+  included, and it brings back the `rsa` crate (RUSTSEC-2023-0071, no fix).
+- **Use aws-lc-rs as the only rustls provider**: no rustls `ring` feature
+  (redis-rs `tls-rustls`, sqlx `tls-rustls-ring`, …). If your service builds
+  rustls configs itself, install the provider at startup with
+  `rustls::crypto::aws_lc_rs::default_provider().install_default()`.
+
+Nothing checks either rule at compile time. For the jsonwebtoken half, a test
+that mints and verifies a token (`stridelabs_auth::test_support`, feature
+`test-support`) panics in your own CI when the rule is broken; this
+workspace's own tests do exactly that.

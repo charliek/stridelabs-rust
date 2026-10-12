@@ -17,15 +17,28 @@ the database helper:
 |---|---|---|
 | `postgres` | off | [`require_postgres`], via `sqlx`'s Postgres driver + `url` |
 
-`postgres` is gated because `sqlx`'s driver pulls in a real network/TLS
-stack — a consumer whose tests never touch a database shouldn't compile it
-just to get the `oneshot` helpers.
+`postgres` is gated because `sqlx`'s driver pulls in a real network stack — a
+consumer whose tests never touch a database shouldn't compile it just to get
+the `oneshot` helpers.
+
+The driver is built **without TLS**: `require_postgres` connects to a local or
+CI Postgres in the clear, and a `sslmode=require` URL is refused rather than
+silently downgraded. This is deliberate. A consumer's test build unifies
+features across its whole graph, so a TLS feature here (sqlx's
+`tls-rustls-ring`, which this crate used to enable) would put `ring` into it —
+and `ring` next to the aws-lc-rs provider of reqwest 0.13's `rustls` makes
+`rustls::ClientConfig::builder()` panic. CI's "Guard: stridelabs-testing pulls
+no ring" step fails if a TLS feature brings `ring` back.
+
+`require_postgres` returns an `sqlx::PgPool` — the one `sqlx` type in this
+crate's public API — so a consumer that names it (rather than just calling
+methods on the value) must depend on the same `sqlx` major, currently 0.9.
 
 ## Adding the dependency
 
 ```toml
 [dev-dependencies]
-stridelabs-testing = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.4.0", features = ["postgres"] }
+stridelabs-testing = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.5.0", features = ["postgres"] }
 ```
 
 (During development against an unreleased commit, pin `rev = "<sha>"` instead

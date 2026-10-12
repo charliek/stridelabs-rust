@@ -56,7 +56,15 @@ tracing = { workspace = true }
 # on it: `Response::bytes_stream` is what lets a body be relayed without ever
 # being held in memory, and what lets `buffer_or_stream` bail out to streaming
 # mid-body once it crosses the cap.
-reqwest = { workspace = true, features = ["stream"], optional = true }
+#
+# `rustls` (reqwest 0.13's rename of 0.12's `rustls-tls`) is the only TLS
+# feature anywhere in this workspace (see the workspace manifest). It brings
+# rustls's aws-lc-rs provider — used unless the process installed a default
+# provider first — and the OS trust store with no bundled roots; the README's
+# "Feature topology" says what that means for a consumer's image. Still no
+# openssl. Not `rustls-no-provider`: that panics at `Client` build unless the
+# consumer installed a provider first.
+reqwest = { workspace = true, features = ["stream", "rustls"], optional = true }
 url = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }

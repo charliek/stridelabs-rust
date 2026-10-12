@@ -9,7 +9,7 @@ resolver = "2"
 # Lockstep versioning: every crate in this workspace ships at the same
 # version, bumped together at release time regardless of which crate(s)
 # changed. Consumers pin a single git rev/tag for the whole set.
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 rust-version = "1.97"
 license = "MIT"
@@ -23,7 +23,7 @@ tokio = { version = "1", features = ["full"] }
 # HTTP server / middleware
 axum = "0.8"
 tower = { version = "0.5", features = ["util"] }
-tower-http = "0.6"
+tower-http = "0.7"
 # Request/response types for tower layers that stay axum-compatible without
 # depending on axum itself (axum re-exports this same `http` crate).
 http = "1"
@@ -32,24 +32,30 @@ http = "1"
 # every other dependency, and moving a crate is a one-line edit.
 stridelabs-http = { path = "crates/http" }
 
-# HTTP client (proxy primitives, JWKS fetch). rustls with BOTH webpki and
-# OS-native roots — matching the reverse proxy these primitives were extracted
-# from: without native roots, upstreams trusted via the system store (mkcert
-# local CAs, corporate roots) verify there but fail here. Still no openssl.
-reqwest = { version = "0.12", default-features = false, features = [
-    "rustls-tls",
-    "rustls-tls-native-roots",
-] }
+# HTTP client (proxy primitives, JWKS fetch). Deliberately NO TLS feature
+# here: whatever is listed at workspace level reaches every member's graph, and
+# so every consumer's. reqwest 0.13's `rustls` switches on rustls's aws-lc-rs
+# provider, and next to a consumer's rustls `ring` (redis-rs, sqlx
+# `tls-rustls-ring`) every `rustls::ClientConfig::builder()` that relies on the
+# crate-feature default panics. Only stridelabs-http's `proxy` builds a client
+# of its own, so only it turns TLS on (crates/http/Cargo.toml).
+# stridelabs-auth is handed the consumer's client and must not pick a TLS
+# stack for it; CI's "Guard: stridelabs-auth pulls no rustls" keeps rustls out
+# of its graph.
+reqwest = { version = "0.13", default-features = false }
 
 # OpenAPI. No schema features (`uuid`, `time`, …) here: the shared crate
 # derives no schemas of its own, and a consumer that does declares its own
-# `utoipa` with whatever its types need — Cargo unifies the two.
-utoipa = "5"
+# `utoipa` with whatever its types need — Cargo unifies the two. A consumer
+# that routes through `utoipa_axum::OpenApiRouter` pairs this major with
+# utoipa-axum 0.3 (0.2 supports only utoipa 5); this workspace does not
+# depend on utoipa-axum itself.
+utoipa = "6"
 
 # Serialization / config parsing
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-serde_yaml = "0.9"
+yaml_serde = "0.10"
 serde_path_to_error = "0.1"
 
 # Errors
@@ -60,12 +66,15 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 metrics = "0.24"
-metrics-exporter-prometheus = { version = "0.17", default-features = false }
+metrics-exporter-prometheus = { version = "0.18", default-features = false }
 
-# Database
-sqlx = { version = "0.8", default-features = false, features = [
+# Database. Deliberately NO `tls-*` feature: stridelabs-testing's pool talks to
+# a local/CI Postgres without TLS, and any TLS feature here would unify into a
+# consumer's test graph (`ring` next to reqwest 0.13's aws-lc-rs makes
+# `rustls::ClientConfig::builder()` panic). CI's "Guard: stridelabs-testing
+# pulls no ring" step fails if a TLS feature brings `ring` back.
+sqlx = { version = "0.9", default-features = false, features = [
     "runtime-tokio",
-    "tls-rustls-ring",
     "postgres",
     "uuid",
     "time",
@@ -77,11 +86,20 @@ sqlx = { version = "0.8", default-features = false, features = [
 # `use_pem` (pem + simple_asn1 + ~11 transitive crates) from production graphs:
 # verification decodes keys from the JWKS, never PEM. Only offline test-token
 # minting needs PEM, and stridelabs-auth's `test-support` feature re-enables it.
-jsonwebtoken = { version = "9", default-features = false }
-sha2 = "0.10"
+#
+# Exactly ONE crypto backend must be on across the whole unified graph: with
+# none, or with both `aws_lc_rs` and `rust_crypto` (a consumer's own
+# jsonwebtoken features unify with these), jsonwebtoken 10+ compiles cleanly and
+# then panics at its first sign or verify. `aws_lc_rs`, because aws-lc-rs is
+# already the house rustls provider (reqwest 0.13's `rustls`), and
+# `rust_crypto` would bring back the `rsa` crate (RUSTSEC-2023-0071, no fix
+# upstream). Consumers must never enable `rust_crypto`. stridelabs-auth's
+# `signing_and_verifying_work_on_the_one_crypto_backend` panics if this breaks.
+jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_rs"] }
+sha2 = "0.11"
 
 # Misc
-rand = "0.9"
+rand = "0.10"
 uuid = { version = "1", features = ["v4", "serde"] }
 time = { version = "0.3", features = ["serde"] }
 bytes = "1"

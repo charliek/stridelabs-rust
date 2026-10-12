@@ -29,8 +29,10 @@ against.
   commit rev (PR-accepted, pending release) — see each crate's README for the
   exact `[dependencies]` snippet and the `[patch]` snippet for local
   co-development.
-- `Cargo.lock` is committed; CI runs every command with `--locked` so a
-  consumer's build is never surprised by a dependency it didn't review.
+- `Cargo.lock` is committed; CI runs every command that builds this workspace
+  with `--locked` (`downstream-limen` alone re-resolves limen's lock, on
+  purpose) so a consumer's build is never surprised by a dependency it didn't
+  review.
 
 ## Toolchain
 
@@ -40,7 +42,11 @@ against.
   so the dependency graph resolves against the pinned compiler instead of
   grabbing a transitive crate that needs a newer rustc.
 - Local infra: `docker compose up -d` (Postgres 16 on host port 5438 rather than
-  5432, so it doesn't collide with other local Postgres stacks).
+  5432, so it doesn't collide with other local Postgres stacks). If something
+  else already holds 5438 (cadence does), pick a free port and give it to both
+  sides: `STRIDELABS_PG_PORT=5439 make up` for compose, and
+  `DATABASE_URL=postgres://postgres:localdev@localhost:5439/stridelabs_test` for
+  the tests (`require_postgres` reads `DATABASE_URL` before its default URL).
 
 ## Quality gate (run before every commit)
 

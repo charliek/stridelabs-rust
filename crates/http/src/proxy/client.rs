@@ -45,10 +45,17 @@ impl UpstreamClient {
     ///   accepted. That is a development affordance for self-signed upstreams;
     ///   it disables the guarantee TLS exists to provide, so it should be
     ///   reachable only from a config value an operator had to set on purpose.
-    /// - `ca_bundle_pem` — an extra root certificate to trust, as PEM bytes,
-    ///   *in addition* to the built-in roots. This is the right answer for a
-    ///   private CA, and the reason `verify_certificates: false` should be
-    ///   rare.
+    /// - `ca_bundle_pem` — extra root certificates to trust, as PEM bytes,
+    ///   *in addition* to the operating system's trust store (reqwest 0.13
+    ///   verifies through `rustls-platform-verifier` and bundles no roots of
+    ///   its own). This is the right answer for a private CA, and the reason
+    ///   `verify_certificates: false` should be rare.
+    ///
+    /// On Linux the trust store is the system CA bundle (`SSL_CERT_FILE` /
+    /// `SSL_CERT_DIR` override where it is read from). With no bundle there
+    /// and no `ca_bundle_pem`, verification has no roots at all and this
+    /// fails with [`ClientBuildError::Build`] — an image that calls it needs
+    /// `ca-certificates`.
     ///
     /// The client **never follows redirects** (`redirect::Policy::none()`).
     /// A proxy relays a 3xx to the client and lets the client decide; chasing
@@ -68,7 +75,7 @@ impl UpstreamClient {
             .tcp_nodelay(true);
 
         if !verify_certificates {
-            builder = builder.danger_accept_invalid_certs(true);
+            builder = builder.tls_danger_accept_invalid_certs(true);
         }
         if let Some(pem) = ca_bundle_pem {
             // `Certificate::from_pem` would be the obvious call, but under
@@ -81,9 +88,9 @@ impl UpstreamClient {
             // attributable.
             let certs = reqwest::Certificate::from_pem_bundle(pem)
                 .map_err(|source| ClientBuildError::CaParse { source })?;
-            for cert in certs {
-                builder = builder.add_root_certificate(cert);
-            }
+            // Merged with the platform's roots, not instead of them
+            // (`tls_certs_only` would be the replacing form).
+            builder = builder.tls_certs_merge(certs);
         }
 
         Ok(Self {

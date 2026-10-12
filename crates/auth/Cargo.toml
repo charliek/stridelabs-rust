@@ -32,8 +32,11 @@ workspace = true
 
 [dependencies]
 jsonwebtoken = { workspace = true }
-# `json` so a JWKS response deserializes straight into `JwkSet`; the rest of
-# reqwest's default feature set stays off (see the workspace manifest).
+# `json` so a JWKS response deserializes straight into `JwkSet`. Nothing
+# else, TLS above all: this crate never builds a client outside its tests
+# (`Verifier::new`/`JwksCache::new` take the consumer's), so the TLS stack —
+# and through it the process's rustls provider — is the consumer's choice
+# (see the workspace manifest). Its tests talk plain HTTP to wiremock.
 reqwest = { workspace = true, features = ["json"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -63,3 +66,11 @@ http = { workspace = true }
 # which needs PEM decoding regardless of whether test-support is enabled.
 # Dev-only: consumers' production graphs are unaffected.
 jsonwebtoken = { workspace = true, features = ["use_pem"] }
+# The JWKS URL canary renders a failure the way the `http` feature does
+# (`AppError`'s `IntoResponse`, hence axum's trait) under a capturing
+# subscriber, and asserts on the line it logs. Only that `http`-gated half
+# uses them; ungated for the same reason as `http` above. Neither adds a
+# Cargo.lock entry: stridelabs-http depends on axum and tests with
+# tracing-subscriber.
+axum = { workspace = true }
+tracing-subscriber = { workspace = true }
