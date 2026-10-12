@@ -410,12 +410,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      # set by the orchestrator: the head SHA of limen's migration branch for
-      # this release (limen `main` cannot build against these majors until
-      # that branch merges, so checking `main` would deadlock this PR). A
+      # limen's migration commit for this release (its branch
+      # feature/plan-011-stridelabs-v0.5.0): limen `main` cannot build against
+      # these majors until that branch merges, so checking `main` would
+      # deadlock this PR. A
       # follow-up PR advances it to a limen `main` commit once limen merges.
       # Always a full 40-hex commit SHA (the first step enforces it).
-      LIMEN_REF: "0000000000000000000000000000000000000000"
+      LIMEN_REF: "10ee5a9330111a7b8a2a868699f139cfb934b5a3"
     steps:
       - name: Require an immutable limen ref
         run: |
