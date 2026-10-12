@@ -431,6 +431,20 @@ run_cargo() { # label cargo-args...
   return "$rc"
 }
 
+# A [patch] whose version differs from the one the consumer's lock holds (a
+# release bump: the lock says 0.4.0, the candidate is 0.5.0) is silently left
+# unused, so first move every locked stridelabs-* package onto the patch.
+adopt_patch() {
+  local lock=$C_CRATE_DIR/Cargo.lock n
+  local names=()
+  [ -f "$lock" ] || return 0
+  while IFS= read -r n; do
+    names+=(-p "$n")
+  done < <(sed -n 's/^name = "\(stridelabs-[a-z-]*\)"$/\1/p' "$lock" | sort -u)
+  [ "${#names[@]}" -gt 0 ] || return 0
+  run_cargo adopt update "${PATCH[@]}" "${names[@]}"
+}
+
 # After the resolve step: every stridelabs-* package in the consumer's resolved
 # graph must be THIS checkout's crate of that name, a path package whose
 # manifest is $LIB_REAL/crates/<name>/Cargo.toml. A git source means the
@@ -593,6 +607,7 @@ if [ "$DRY_RUN" = 1 ]; then
     build_env
     printf '\n%s (%s) ref %s -> %s\n' "$c" "$C_KIND" "$C_REF" "$C_SHA"
     printf '  repo     %s\n  archive  %s (fresh each run)\n  crate    %s\n' "$C_REPO" "$C_DIR" "$C_CRATE_DIR"
+    show_cmd adopt update '<patch flags>' '-p <each stridelabs-* package in its lock>'
     show_cmd resolve tree --depth 0 '<patch flags>'
     show_cmd clippy clippy '<patch flags>' "${C_CLIPPY_FLAGS[@]}" -- -D warnings
     show_cmd test test '<patch flags>' ${C_TEST_FLAGS[@]+"${C_TEST_FLAGS[@]}"}
@@ -679,7 +694,7 @@ for c in "${CONSUMERS[@]}"; do
   res=FAIL clip=- tst=-
   if ! prepare_archive; then
     echo "!! could not archive $C_REF of $C_REPO into $C_DIR"
-  elif run_cargo resolve tree --depth 0 "${PATCH[@]}" && check_patched_graph; then
+  elif adopt_patch && run_cargo resolve tree --depth 0 "${PATCH[@]}" && check_patched_graph; then
     res=PASS
     if run_cargo clippy clippy "${PATCH[@]}" "${C_CLIPPY_FLAGS[@]}" -- -D warnings; then
       clip=PASS

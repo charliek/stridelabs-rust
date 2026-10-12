@@ -468,6 +468,22 @@ jobs:
           cat "$patch"
           echo "STRIDELABS_PATCH=$patch" >> "$GITHUB_ENV"
 
+      # A [patch] whose version differs from limen's locked one (this release
+      # bumped 0.4.0 -> 0.5.0) is silently unused, so move every locked
+      # stridelabs-* package onto it before proving it took effect.
+      - name: Move limen's locked stridelabs packages onto the patch
+        working-directory: limen
+        run: |
+          set -euo pipefail
+          pkgs=$(sed -n 's/^name = "\(stridelabs-[a-z-]*\)"$/\1/p' Cargo.lock | sort -u)
+          if [ -z "$pkgs" ]; then
+            echo "::error::limen's Cargo.lock names no stridelabs-* package"
+            exit 1
+          fi
+          args=()
+          for p in $pkgs; do args+=(-p "$p"); done
+          cargo update --config "$STRIDELABS_PATCH" "${args[@]}"
+
       # `cargo metadata` resolves the patched graph (writing limen's lock) and
       # lists every stridelabs-* package in it. There must be at least one, and
       # each must be this checkout's crate of that name: a path package (no
