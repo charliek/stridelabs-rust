@@ -411,20 +411,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      # limen's migration commit for this release (its branch
-      # feature/plan-011-stridelabs-v0.5.0): limen `main` cannot build against
-      # these majors until that branch merges, so checking `main` would
-      # deadlock this PR. A follow-up PR advances it to a limen `main` commit
-      # once limen merges. Always a full 40-hex commit SHA (the first step
-      # enforces it).
-      LIMEN_REF: "10ee5a9330111a7b8a2a868699f139cfb934b5a3"
+      # A limen `main` commit: the merge of limen#43, limen's migration to
+      # v0.5.0. Pinned, not `main`, so a re-run checks the same code; advance
+      # it deliberately when limen moves. Always a full 40-hex commit SHA (the
+      # first step enforces it).
+      LIMEN_REF: "66c53aa558c217e0546e38486199c319b52ab9c2"
     steps:
       - name: Require an immutable limen ref
         run: |
-          if [ "$LIMEN_REF" = "0000000000000000000000000000000000000000" ]; then
-            echo "::error::LIMEN_REF is still the placeholder; set it to the head commit SHA of limen's migration branch"
-            exit 1
-          fi
           if ! [[ "$LIMEN_REF" =~ ^[0-9a-f]{40}$ ]]; then
             echo "::error::LIMEN_REF='$LIMEN_REF' is not a full 40-hex commit SHA; a branch or tag name moves under this job"
             exit 1

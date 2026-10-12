@@ -511,10 +511,26 @@ run_cargo() { # label cargo-args...
 # stridelabs-* package fails here, as it does there: a consumer that does not
 # use the library cannot pass the proof below either, so say so first.
 adopt_patch() {
-  local lock=$C_CRATE_DIR/Cargo.lock n
+  local root lock n
   local names=()
+  # The lock cargo resolves this crate against is its workspace root's
+  # (spendwise keeps backend/ as a member of a root workspace), so ask cargo
+  # rather than taking the nearest Cargo.lock: one that merely sits in a
+  # parent directory belongs to some other workspace.
+  if ! root=$(cargo_in_crate locate-project --workspace --message-format plain 2>/dev/null); then
+    echo "!! cargo cannot locate $C_NAME's workspace from $C_CRATE_DIR"
+    return 1
+  fi
+  lock=$(dirname "$root")/Cargo.lock
+  case $lock in
+    "$C_DIR"/*) ;;
+    *)
+      echo "!! $C_NAME's workspace root is outside its archive"
+      return 1
+      ;;
+  esac
   if [ ! -f "$lock" ]; then
-    echo "!! $C_NAME has no Cargo.lock in $C_CRATE_DIR"
+    echo "!! $C_NAME has no Cargo.lock at its workspace root"
     return 1
   fi
   while IFS= read -r n; do
