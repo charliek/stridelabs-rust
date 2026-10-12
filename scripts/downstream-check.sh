@@ -312,7 +312,8 @@ REDACT_KEYS='[Tt][Oo][Kk][Ee][Nn]|[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]|[Pp][Aa][Ss][
 redact() {
   sed -u -E \
     -e "s#([A-Za-z][A-Za-z0-9+.-]*://)[^[:space:]/\"']*@#\1***@#g" \
-    -e "s#(^|[?&;,[:space:]\"'(])([A-Za-z0-9_.-]*($REDACT_KEYS)[A-Za-z0-9_.-]*)=[^&;,[:space:]\"')]*#\1\2=***#g"
+    -e "s#(^|[?&;,[:space:]\"'(])([A-Za-z0-9_.-]*($REDACT_KEYS)[A-Za-z0-9_.-]*)=[^&;,[:space:]\"')]*#\1\2=***#g" \
+    -e "s#(\"?[A-Za-z0-9_.-]*($REDACT_KEYS)[A-Za-z0-9_.-]*\"?[[:space:]]*:[[:space:]]*(Some\\()?)\"([^\"\\\\]|\\\\.)*\"#\1\"***\"#g"
 }
 
 # The database number a redis:// URL selects, read the way redis-rs reads it:

@@ -181,8 +181,10 @@ the `<service>` name and toolchain version in the CI file's comments/
 `.github/workflows/ci.yml`:** workflows run only from the repository root's
 `.github/workflows/`, so the copy inside the service directory never fires.
 Fold its lanes into the root workflow as a job for this service (steps under
-`working-directory: service`, plus a `paths:` filter if the monorepo uses
-them) and drop the nested file.
+`working-directory: service`) and drop the nested file. To run it only when
+the service changes, put a `paths:` filter on the workflow's trigger
+(`on.push.paths` / `on.pull_request.paths`) — GitHub rejects `paths:` on a
+job — or gate the job with an `if:` on a changed-files step.
 
 `.spectral.yaml` is a dotfile — a bare `ls` in the new service's root won't
 show it, so a copy that silently failed (wrong destination, typo'd filename)
