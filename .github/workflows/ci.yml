@@ -398,8 +398,9 @@ jobs:
   # they newly pull in) have to be resolved into it. So this is a drift
   # detector as well: it also notices a transitive release that breaks the
   # candidate. The "Prove the patch took effect" step fails the job if limen
-  # names the library under a URL the patch does not key, which would
-  # otherwise "pass" by testing the pinned crates.
+  # names the library under a URL the patch does not key, or resolves a
+  # stridelabs-* crate from anywhere but this checkout (a vendored copy has no
+  # `source` either), which would otherwise "pass" by testing other code.
   #
   # It runs on `schedule` too (it is required there, see `ci-success`), unlike
   # `build-test`: that job is --locked, so a week with no commit changes
@@ -467,26 +468,34 @@ jobs:
           echo "STRIDELABS_PATCH=$patch" >> "$GITHUB_ENV"
 
       # `cargo metadata` resolves the patched graph (writing limen's lock) and
-      # lists every stridelabs-* package in it. Each must be a path package
-      # (no `source`), and there must be at least one.
+      # lists every stridelabs-* package in it. There must be at least one, and
+      # each must be this checkout's crate of that name: a path package (no
+      # `source`) whose manifest is crates/<name>/Cargo.toml here. `source` alone
+      # is not enough, since a vendored copy of the library has none either.
       - name: Prove the patch took effect
         working-directory: limen
         run: |
           set -euo pipefail
+          crates=$(realpath "$GITHUB_WORKSPACE/stridelabs-rust/crates")
           pkgs="$RUNNER_TEMP/stridelabs-packages.txt"
           cargo metadata --format-version 1 --config "$STRIDELABS_PATCH" |
-            jq -r '.packages[] | select(.name | startswith("stridelabs-")) | "\(.name) \(.version) \(.source // "path")"' |
+            jq -r '.packages[] | select(.name | startswith("stridelabs-")) | [.name, .version, (.source // "path"), .manifest_path] | @tsv' |
             sort > "$pkgs"
           cat "$pkgs"
           if [ ! -s "$pkgs" ]; then
             echo "::error::limen's graph has no stridelabs-* package; the check proved nothing"
             exit 1
           fi
-          if grep -v ' path$' "$pkgs"; then
-            echo "::error::a stridelabs-* package above still comes from a git source: the [patch] did not apply to it"
-            exit 1
-          fi
-          echo "ok: every stridelabs-* package in limen's graph is this checkout"
+          bad=0
+          while IFS=$'\t' read -r name version source manifest; do
+            dir=$(realpath "$(dirname "$manifest")")
+            if [ "$source" != path ] || [ "$dir" != "$crates/${name#stridelabs-}" ]; then
+              echo "::error::$name $version (source: $source, manifest: $manifest) is not this checkout's crates/${name#stridelabs-}: the [patch] did not apply to it"
+              bad=1
+            fi
+          done < "$pkgs"
+          [ "$bad" = 0 ] || exit 1
+          echo "ok: every stridelabs-* package in limen's graph is this checkout's"
 
       # Format is not run: this repo cannot change limen's formatting.
       - name: Clippy (limen, all targets)

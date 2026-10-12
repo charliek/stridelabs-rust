@@ -27,10 +27,23 @@
 #     makes this a DEVELOPMENT check. The binding proof builds each consumer
 #     from its own committed rev pin and Cargo.lock with --locked.
 #   - Every build uses CARGO_TARGET_DIR=$SCRATCH/target-<consumer>.
+#   - Nothing is removed unless it resolves, symlinks and all, to
+#     $SCRATCH/downstream/<consumer>. A consumer repo or the library that is,
+#     holds or sits inside $SCRATCH/downstream is refused before anything
+#     happens (a dry run refuses too), so a mistaken DOWNSTREAM_<NAME>_REPO
+#     cannot be the directory that is recreated.
+#   - Everything cargo prints passes through `redact` before the terminal or a
+#     log sees it: URL userinfo and the values of token/password/secret/key
+#     parameters are masked (a failing test can print the URL it could not
+#     authenticate with). The script's own messages name a host and a port, never a URL.
+#   - Once the lock is held the library's HEAD, tree id and (untracked files
+#     included) state are read again; they are checked once more at the end, and
+#     the run fails if the library moved while the consumers were tested.
 #
 # Exit status: 0 when every REQUIRED consumer (tapper, slauth, limen) passed;
-# 1 when one failed, or when the run changed the library tree; 2 when it
-# refused to start (usage, dirty library tree, missing env or service).
+# 1 when one failed, or when the run changed or moved the library; 2 when it
+# refused to start (usage, dirty library tree, paths that overlap, missing env
+# or service).
 # spendwise is INFORMATIONAL: its result is printed but never decides the exit.
 #
 # Environment (names only; this script never prints a value):
@@ -55,6 +68,7 @@
 #   DOWNSTREAM_SCRATCH the scratch root, DOWNSTREAM_LOCK_TIMEOUT the seconds
 #   to wait for the lock (default 3600).
 #
+# Needs git, tar, mise and jq (cargo metadata proves the patch applied).
 # Written for bash 3.2 (macOS /bin/bash) as well as current bash.
 
 set -uo pipefail
@@ -64,6 +78,7 @@ SCRATCH=${DOWNSTREAM_SCRATCH:-/Volumes/miniext/scratch-011}
 WORK=$SCRATCH/downstream
 LOGS=$WORK/logs
 LOCK=$WORK/.lock
+TAKEOVER=$LOCK.takeover
 LIB_URL='https://github.com/charliek/stridelabs-rust.git'
 CRATES='config observability http auth testing'
 KNOWN_CONSUMERS='tapper slauth limen spendwise'
@@ -189,16 +204,67 @@ need_cmd() {
   command -v "$1" >/dev/null 2>&1 || problem "'$1' is not on PATH"
 }
 
-# The database number a redis:// URL selects; 0 when it names none.
+# The physical (symlink-free) absolute form of a path. A tail that does not
+# exist yet is kept as written, under its deepest existing parent.
+canon() {
+  local p=$1 tail='' base
+  case $p in /*) ;; *) p=$PWD/$p ;; esac
+  while [ "${p%/}" != "$p" ] && [ "$p" != / ]; do p=${p%/}; done
+  while [ ! -d "$p" ]; do
+    tail=/${p##*/}$tail
+    p=${p%/*}
+    while [ "${p%/}" != "$p" ] && [ "$p" != / ]; do p=${p%/}; done
+    [ -n "$p" ] || p=/
+  done
+  case $tail/ in */./* | */../*) return 1 ;; esac
+  base=$(cd "$p" && pwd -P) || return 1
+  p=${base%/}$tail
+  printf '%s' "${p:-/}"
+}
+
+# True when the physical paths $1 and $2 are the same, or one holds the other.
+nested() {
+  local a=${1%/}/ b=${2%/}/
+  case $a in "$b"*) return 0 ;; esac
+  case $b in "$a"*) return 0 ;; esac
+  return 1
+}
+
+# A consumer's output can carry credentials: a panic that prints the URL it
+# failed to authenticate with, a readiness failure that prints DATABASE_URL.
+# This filter keeps them off the terminal and out of the logs:
+#   scheme://user:pass@host  ->  scheme://***@host
+#   name=value, for a name containing token, password, passwd, secret or key
+#   (any case), in a query string or on its own  ->  name=***
+# Deliberately blunt: an over-masked line costs a look at the raw run, a leak
+# costs a rotation. It is line-buffered so a long build still streams.
+REDACT_KEYS='[Tt][Oo][Kk][Ee][Nn]|[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]|[Pp][Aa][Ss][Ss][Ww][Dd]|[Ss][Ee][Cc][Rr][Ee][Tt]|[Kk][Ee][Yy]'
+redact() {
+  sed -u -E \
+    -e "s#([A-Za-z][A-Za-z0-9+.-]*://)[^[:space:]/\"']*@#\1***@#g" \
+    -e "s#(^|[?&;,[:space:]\"'(])([A-Za-z0-9_.-]*($REDACT_KEYS)[A-Za-z0-9_.-]*)=[^&;,[:space:]\"')]*#\1\2=***#g"
+}
+
+# The database number a redis:// URL selects, read the way redis-rs reads it:
+# the path with its slashes trimmed, an optional `+`, then digits (so `00` and
+# `+0` are database 0). Prints the number, 0 when the URL names none, or
+# `invalid` when the path is not a number.
 redis_db() {
   local u=${1#*://}
   case $u in
-    */*)
-      u=${u#*/}
-      u=${u%%\?*}
+    */*) u=${u#*/} ;;
+    *) u='' ;;
+  esac
+  u=${u%%[?#]*}
+  while [ "${u#/}" != "$u" ]; do u=${u#/}; done
+  while [ "${u%/}" != "$u" ]; do u=${u%/}; done
+  u=${u#+}
+  case $u in
+    *[!0-9]*) printf invalid ;;
+    *)
+      while [ "${u#0}" != "$u" ]; do u=${u#0}; done
       printf '%s' "${u:-0}"
       ;;
-    *) printf 0 ;;
   esac
 }
 
@@ -214,16 +280,34 @@ need_tcp() { # label host port hint
   tcp_open "$2" "$3" || problem "$1 is not reachable at $2:$3 ($4)"
 }
 
-# need_tcp on the host and port a URL names, without its credentials: the value
-# is never echoed.
+# need_tcp on the host and port a URL names. Only what is plainly a hostname
+# and a port is ever echoed: a URL that does not parse the way a URL should
+# could otherwise carry its credentials into the message.
 need_url_tcp() { # label url default-port hint
-  local a=${2#*://}
+  local a=${2#*://} host port
   a=${a%%[/?]*}
   a=${a##*@}
   case $a in
-    *:*) need_tcp "$1" "${a%%:*}" "${a##*:}" "$4" ;;
-    *) need_tcp "$1" "$a" "$3" "$4" ;;
+    *:*)
+      host=${a%%:*}
+      port=${a##*:}
+      ;;
+    *)
+      host=$a
+      port=$3
+      ;;
   esac
+  case $host in '' | *[!A-Za-z0-9._-]*)
+    problem "$1: no host can be read from its URL"
+    return
+    ;;
+  esac
+  case $port in '' | *[!0-9]*)
+    problem "$1: no port can be read from its URL"
+    return
+    ;;
+  esac
+  need_tcp "$1" "$host" "$port" "$4"
 }
 
 need_env() { # variable description
@@ -253,8 +337,10 @@ preflight() {
         need_url_tcp "TAPPER_RS_TEST_DATABASE_URL's Postgres" "$TAPPER_RS_TEST_DATABASE_URL" 5432 "docker compose up -d postgres in tapper"
       fi
       if [ -n "${TAPPER_RS_TEST_REDIS_URL:-}" ]; then
-        [ "$(redis_db "$TAPPER_RS_TEST_REDIS_URL")" != 0 ] ||
-          problem "TAPPER_RS_TEST_REDIS_URL selects Redis DB 0, which is the dev stack's; use another number, e.g. .../1"
+        case $(redis_db "$TAPPER_RS_TEST_REDIS_URL") in
+          invalid) problem "TAPPER_RS_TEST_REDIS_URL's database is not a number; use another number than 0, e.g. .../1" ;;
+          0) problem "TAPPER_RS_TEST_REDIS_URL selects Redis DB 0, which is the dev stack's; use another number, e.g. .../1" ;;
+        esac
         need_url_tcp "TAPPER_RS_TEST_REDIS_URL's Redis" "$TAPPER_RS_TEST_REDIS_URL" 6379 "docker compose up -d redis in tapper"
       fi
       need_tcp "fake-gcs-server" localhost 4443 "docker compose up -d fake-gcs-server in tapper"
@@ -326,61 +412,70 @@ show_cmd() { # label cargo-args...
   printf ')\n'
 }
 
-# Run `cargo <args>` in the consumer's crate dir through mise, streaming to the
-# terminal and to $LOGS/<consumer>-<label>.log, and return cargo's own status.
+# `cargo <args>` in the consumer's crate dir, through mise, in its environment.
+cargo_in_crate() { # cargo-args...
+  (cd "$C_CRATE_DIR" && env ${RUN_UNSET[@]+"${RUN_UNSET[@]}"} "${RUN_ENV[@]}" mise exec -- cargo "$@")
+}
+
+# Run `cargo <args>`, streaming to the terminal and to $LOGS/<consumer>-<label>.log
+# (both only ever see `redact`ed text), and return cargo's own status.
 run_cargo() { # label cargo-args...
   local label=$1 log
   shift
   log=$LOGS/$C_NAME-$label.log
   printf '\n==> %s: %s\n' "$C_NAME" "$label"
   SECONDS=0
-  (cd "$C_CRATE_DIR" && env ${RUN_UNSET[@]+"${RUN_UNSET[@]}"} "${RUN_ENV[@]}" mise exec -- cargo "$@") 2>&1 | tee "$log"
+  cargo_in_crate "$@" 2>&1 | redact | tee "$log"
   local rc=${PIPESTATUS[0]}
   printf '==> %s: %s exited %s after %ss (log: %s)\n' "$C_NAME" "$label" "$rc" "$SECONDS" "$log"
   return "$rc"
 }
 
-# After the resolve step: every stridelabs-* package in the consumer's lock
-# must be a PATH package (no `source =` line). A git one means the [patch] did
-# not take (the consumer names the library under another URL, or the key is
-# misspelled), and the "pass" would have tested the pinned crates instead.
-check_patched_lock() {
-  local lock='' d
-  for d in "$C_CRATE_DIR" "$C_DIR"; do
-    if [ -f "$d/Cargo.lock" ]; then
-      lock=$d/Cargo.lock
-      break
-    fi
-  done
-  if [ -z "$lock" ]; then
-    echo "!! no Cargo.lock in $C_CRATE_DIR or $C_DIR after resolving"
+# After the resolve step: every stridelabs-* package in the consumer's resolved
+# graph must be THIS checkout's crate of that name, a path package whose
+# manifest is $LIB_REAL/crates/<name>/Cargo.toml. A git source means the
+# [patch] did not take (the consumer names the library under another URL, or
+# the key is misspelled); a path package from anywhere else is a vendored copy
+# that also has no `source`. Either way the "pass" would have tested other code.
+check_patched_graph() {
+  local meta=$LOGS/$C_NAME-metadata.json err=$LOGS/$C_NAME-metadata.err
+  local pkgs name version source manifest dir seen=0 bad=0
+  if ! cargo_in_crate metadata --format-version 1 "${PATCH[@]}" >"$meta" 2>"$err"; then
+    echo "!! cargo metadata failed:"
+    redact <"$err"
     return 1
   fi
-  # Only [[package]] entries count: a lock also lists [[patch.unused]] patches
-  # (ones the consumer does not depend on, e.g. four of the five for limen),
-  # which carry no `source` either and would read as patched.
-  awk '
-    function flush() {
-      if (n != "") {
-        print "   " n " " v " " s
-        if (s ~ /NOT PATCHED/) bad = 1
-        seen = 1
-      }
-      n = ""
-    }
-    /^\[/ { flush(); inpkg = ($0 == "[[package]]") }
-    inpkg && /^name = "stridelabs-/ { n = $3; gsub(/"/, "", n); v = ""; s = "path (patched)" }
-    inpkg && /^version = / && n != "" { v = $3; gsub(/"/, "", v) }
-    inpkg && /^source = / && n != "" { s = "NOT PATCHED: " $3 }
-    END {
-      flush()
-      if (!seen) { print "   no stridelabs-* package in the lock: this ref does not use the library"; exit 1 }
-      exit bad
-    }
-  ' "$lock"
+  pkgs=$(jq -r '.packages[] | select(.name | startswith("stridelabs-"))
+    | [.name, .version, (.source // "path"), .manifest_path] | @tsv' "$meta" | sort) || {
+    echo "!! cannot read $meta"
+    return 1
+  }
+  while IFS=$'\t' read -r name version source manifest; do
+    [ -n "$name" ] || continue
+    seen=1
+    dir=$(canon "$(dirname "$manifest")")
+    if [ "$source" = path ] && [ "$dir" = "$LIB_REAL/crates/${name#stridelabs-}" ]; then
+      echo "   $name $version path (patched)"
+    else
+      [ "$source" = path ] && source="a path package outside this checkout: $dir"
+      echo "   $name $version NOT PATCHED: $source" | redact
+      bad=1
+    fi
+  done <<<"$pkgs"
+  if [ "$seen" = 0 ]; then
+    echo "   no stridelabs-* package in the resolved graph: this ref does not use the library"
+    return 1
+  fi
+  return "$bad"
 }
 
 prepare_archive() {
+  # The one rm -rf in this script. It only ever removes what resolves to
+  # $ARCHIVE_ROOT/<consumer>, checked here and not only up front.
+  [ "$(canon "$C_DIR")" = "$ARCHIVE_ROOT/$C_NAME" ] || {
+    echo "!! refusing to remove $C_DIR: it does not resolve to $ARCHIVE_ROOT/$C_NAME"
+    return 1
+  }
   rm -rf -- "${C_DIR:?}"
   mkdir -p -- "$C_DIR" "$LOGS" || return 1
   git -C "$C_REPO" archive --format=tar "$C_SHA" | tar -x -C "$C_DIR" || return 1
@@ -395,9 +490,15 @@ prepare_archive() {
 
 # ------------------------------------------------------------- the run
 
-LIB_SHA=$(git -C "$LIB" rev-parse HEAD 2>/dev/null) || die "$LIB is not a git checkout"
-LIB_TREE=$(git -C "$LIB" rev-parse 'HEAD^{tree}')
-LIB_STATE=$(git -C "$LIB" status --porcelain)
+# What the library is right now: HEAD, its tree id, and whether the working
+# tree differs from it. Untracked files count whatever status.showUntrackedFiles
+# says (an untracked module is still compiled), and so does a changed submodule.
+read_library() {
+  LIB_SHA=$(git -C "$LIB" rev-parse HEAD 2>/dev/null) || return 1
+  LIB_TREE=$(git -C "$LIB" rev-parse 'HEAD^{tree}') || return 1
+  LIB_STATE=$(git -C "$LIB" status --porcelain --untracked-files=all --ignore-submodules=none)
+}
+read_library || die "$LIB is not a git checkout"
 WOULD_REFUSE=0
 
 printf 'library : %s\n' "$LIB"
@@ -423,10 +524,40 @@ EOF
 need_cmd git
 need_cmd tar
 need_cmd mise
+need_cmd jq
 if [ "${#PROBLEMS[@]}" -gt 0 ]; then
   printf 'downstream-check: %s\n' "${PROBLEMS[@]}" >&2
   exit 2
 fi
+
+# Path safety, before anything is created or removed (a dry run refuses too).
+# Each run recreates $ARCHIVE_ROOT/<consumer> with rm -rf, so nothing the run
+# reads from may be that directory, sit inside the archive root, or hold it;
+# and the archive root and each archive directory must be where they say once
+# symlinks are resolved. Paths are compared in their physical form.
+SCRATCH_REAL=$(canon "$SCRATCH") || die "cannot resolve the scratch directory $SCRATCH"
+ARCHIVE_ROOT=${SCRATCH_REAL%/}/downstream
+LIB_REAL=$(canon "$LIB") || die "cannot resolve the library path $LIB"
+PATH_BAD=0
+path_problem() {
+  printf 'downstream-check: %s\n' "$*" >&2
+  PATH_BAD=1
+}
+[ "$(canon "$WORK")" = "$ARCHIVE_ROOT" ] ||
+  path_problem "$WORK does not resolve to $ARCHIVE_ROOT (a symlink?); nothing under it would be safe to remove"
+if nested "$LIB_REAL" "$ARCHIVE_ROOT"; then
+  path_problem "the library ($LIB_REAL) overlaps the archive root $ARCHIVE_ROOT; point DOWNSTREAM_LIB or DOWNSTREAM_SCRATCH elsewhere"
+fi
+for c in "${CONSUMERS[@]}"; do
+  load_consumer "$c"
+  real=$(canon "$C_REPO") || real=$C_REPO
+  if nested "$real" "$ARCHIVE_ROOT"; then
+    path_problem "$c's repo ($real) overlaps the archive root $ARCHIVE_ROOT; point DOWNSTREAM_${C_UPPER}_REPO or DOWNSTREAM_SCRATCH elsewhere"
+  fi
+  [ "$(canon "$C_DIR")" = "$ARCHIVE_ROOT/$c" ] ||
+    path_problem "$C_DIR does not resolve to $ARCHIVE_ROOT/$c (a symlink?); it would not be safe to remove"
+done
+[ "$PATH_BAD" = 0 ] || exit 2
 
 PATCH=()
 for c in $CRATES; do
@@ -473,6 +604,23 @@ if [ "$DRY_RUN" = 1 ]; then
   exit 0
 fi
 
+# Take over the lock of a holder that has died, without ever removing a live
+# one. Contenders that saw the same dead holder race to remove it, and the one
+# that loses must not remove the lock the winner then took. So a removal
+# happens only inside $TAKEOVER (one contender at a time), after re-reading who
+# holds the lock, and by renaming it away first. Returns 0 when it removed it.
+reap_stale_lock() { # pid-seen-dead
+  local now rc=1
+  mkdir "$TAKEOVER" 2>/dev/null || return 1
+  now=$(cat "$LOCK/pid" 2>/dev/null || true)
+  if [ "$now" = "$1" ] && ! kill -0 "$1" 2>/dev/null; then
+    printf 'removing stale lock left by pid %s\n' "$1"
+    mv "$LOCK" "$LOCK.stale.$$" && rm -rf -- "$LOCK.stale.$$" && rc=0
+  fi
+  rmdir "$TAKEOVER"
+  return "$rc"
+}
+
 # One run at a time: the scratch archives are reused, and the consumers'
 # test databases are shared with whoever else is running a gate.
 mkdir -p -- "$WORK" "$LOGS" || die "cannot create $WORK"
@@ -481,12 +629,16 @@ LOCK_TIMEOUT=${DOWNSTREAM_LOCK_TIMEOUT:-3600}
 while ! mkdir "$LOCK" 2>/dev/null; do
   holder=$(cat "$LOCK/pid" 2>/dev/null || true)
   if [ -n "$holder" ] && ! kill -0 "$holder" 2>/dev/null; then
-    printf 'removing stale lock left by pid %s\n' "$holder"
-    rm -rf -- "$LOCK"
-    continue
+    if reap_stale_lock "$holder"; then
+      continue
+    fi
+    holder=$(cat "$LOCK/pid" 2>/dev/null || true) # not the one seen dead: someone took it
   fi
-  [ "$LOCK_WAITED" -lt "$LOCK_TIMEOUT" ] ||
-    die "gave up after ${LOCK_TIMEOUT}s waiting for $LOCK (held by pid ${holder:-unknown}; remove it if that run is gone)"
+  [ "$LOCK_WAITED" -lt "$LOCK_TIMEOUT" ] || {
+    stuck=it
+    [ ! -d "$TAKEOVER" ] || stuck="$LOCK and $TAKEOVER"
+    die "gave up after ${LOCK_TIMEOUT}s waiting for $LOCK (held by pid ${holder:-unknown}; remove $stuck if that run is gone)"
+  }
   [ $((LOCK_WAITED % 30)) -ne 0 ] || printf 'waiting for %s (held by pid %s)\n' "$LOCK" "${holder:-unknown}"
   sleep 5
   LOCK_WAITED=$((LOCK_WAITED + 5))
@@ -496,8 +648,19 @@ trap 'rm -rf -- "$LOCK"' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+# The library can change while this run waited for the lock (or sat in
+# preflight above). What is tested is what is there now, so read it again, and
+# say so when it is not what was printed at the start.
+SEEN_SHA=$LIB_SHA SEEN_TREE=$LIB_TREE
+read_library || die "$LIB is not a git checkout"
+[ -z "$LIB_STATE" ] || die "the library tree became dirty while waiting for the lock; commit or stash first so the SHA and tree id name what is tested"
+if [ "$LIB_SHA" != "$SEEN_SHA" ] || [ "$LIB_TREE" != "$SEEN_TREE" ]; then
+  printf 'the library moved while waiting for the lock; testing the new one:\nlib HEAD: %s\nlib tree: %s\n' "$LIB_SHA" "$LIB_TREE"
+fi
+
 # One table row per consumer, formatted where it is recorded.
 row() { printf '%-10s %-4s %-13s %-13s %-8s %-8s %-8s\n' "$@"; }
+START_SHA=$LIB_SHA START_TREE=$LIB_TREE
 LIB_SHORT=${LIB_SHA:0:12}
 ROWS=()
 ANY_REQUIRED_FAILED=0
@@ -516,7 +679,7 @@ for c in "${CONSUMERS[@]}"; do
   res=FAIL clip=- tst=-
   if ! prepare_archive; then
     echo "!! could not archive $C_REF of $C_REPO into $C_DIR"
-  elif run_cargo resolve tree --depth 0 "${PATCH[@]}" && check_patched_lock; then
+  elif run_cargo resolve tree --depth 0 "${PATCH[@]}" && check_patched_graph; then
     res=PASS
     if run_cargo clippy clippy "${PATCH[@]}" "${C_CLIPPY_FLAGS[@]}" -- -D warnings; then
       clip=PASS
@@ -547,10 +710,16 @@ printf 'PATCHED development check, not --locked: see the header of this script.\
 row consumer req ref-sha lib-sha resolve clippy test
 printf '%s\n' "${ROWS[@]}"
 
-# The check must not write into the library (its target dir lives elsewhere).
-after=$(git -C "$LIB" status --porcelain)
-if [ -n "$after" ]; then
-  printf '\n!! the run changed the library tree:\n%s\n' "$after" >&2
+# The check must not write into the library (its target dir lives elsewhere),
+# and the library must still be the commit and tree the rows above name.
+read_library || die "$LIB is not a git checkout"
+if [ -n "$LIB_STATE" ]; then
+  printf '\n!! the run changed the library tree:\n%s\n' "$LIB_STATE" >&2
+  exit 1
+fi
+if [ "$LIB_SHA" != "$START_SHA" ] || [ "$LIB_TREE" != "$START_TREE" ]; then
+  printf '\n!! the library moved during the run: HEAD %s -> %s, tree %s -> %s\n' \
+    "$START_SHA" "$LIB_SHA" "$START_TREE" "$LIB_TREE" >&2
   exit 1
 fi
 
