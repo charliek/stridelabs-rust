@@ -109,7 +109,7 @@ see the README's "MSRV policy").
   0.18 too (`metrics` stays 0.24). The scrape text `install` produces is
   unchanged, series for series, for counters, gauges, `*duration_seconds`
   histograms (the only ones `install` gives buckets) and ordinary
-  default-summary histograms, except in the two cases below: their `# HELP`,
+  default-summary histograms, except in the three cases below: their `# HELP`,
   `# TYPE` and sample lines are pinned by tests. (The order of the families,
   and of the series within one, was never fixed and still is not.)
   Exception 1, a renamed series: a histogram that falls back to the default
@@ -151,6 +151,12 @@ see the README's "MSRV policy").
   identically (e.g. differing only in backslash runs) split the same way.
   Four tests, one per kind, pin the 0.18.3 rendering as observed, so an
   exporter release that merges them again shows up as a deliberate change.
+  Exception 3, a duplicate description: when one metric is described twice
+  (`describe_counter!` and friends) before its first scrape, 0.18.3 keeps the
+  LAST description in `# HELP` where 0.17.2 kept the first (the exporter
+  queues descriptions in an evmap whose read view does not yet see the first
+  one). A scrape between the two calls keeps the first. Describe each metric
+  once.
   0.18's fix that puts the `_total` suffix on a counter's `# HELP` and
   `# TYPE` lines applies only with the new `with_recommended_naming(true)`,
   which `install` does not set; a consumer building its own exporter with it

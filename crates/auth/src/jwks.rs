@@ -101,7 +101,9 @@ impl fmt::Debug for JwksCache {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("JwksCache")
             .field("jwks_url", &redact_url(&self.jwks_url))
-            .field("http", &self.http)
+            // Never the client itself: reqwest::Client's Debug prints its
+            // default headers, and an injected client may carry credentials.
+            .field("http", &format_args!("reqwest::Client {{ .. }}"))
             .field("tuning", &self.tuning)
             .field("state", &self.state)
             .finish()
@@ -939,8 +941,21 @@ mod tests {
             audience: "svc".into(),
             pat_validate_url: Some(url.clone()),
         };
-        let cache = JwksCache::new(url, reqwest::Client::new());
-        let verifier = crate::Verifier::new(config.clone(), reqwest::Client::new());
+        // An injected client with a default credential header that nobody
+        // marked sensitive: reqwest::Client's own Debug would print it.
+        let client = || {
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(
+                reqwest::header::AUTHORIZATION,
+                reqwest::header::HeaderValue::from_static("Bearer CANARY-header"),
+            );
+            reqwest::Client::builder()
+                .default_headers(headers)
+                .build()
+                .expect("a plain client builds")
+        };
+        let cache = JwksCache::new(url, client());
+        let verifier = crate::Verifier::new(config.clone(), client());
 
         for (name, debug) in [
             ("SlauthConfig", format!("{config:?}")),
@@ -949,7 +964,7 @@ mod tests {
         ] {
             assert!(
                 !debug.contains("CANARY"),
-                "{name}'s Debug leaked JWKS URL material: {debug}"
+                "{name}'s Debug leaked URL or client-header material: {debug}"
             );
             assert!(
                 debug.contains(r#""http://jwks.example:8443/jwks""#),
