@@ -28,7 +28,7 @@ features across its whole graph, so a TLS feature here (sqlx's
 `tls-rustls-ring`, which this crate used to enable) would put `ring` into it —
 and `ring` next to the aws-lc-rs provider of reqwest 0.13's `rustls` makes
 `rustls::ClientConfig::builder()` panic. CI's "Guard: stridelabs-testing pulls
-no ring" step fails if a TLS feature comes back.
+no ring" step fails if a TLS feature brings `ring` back.
 
 `require_postgres` returns an `sqlx::PgPool` — the one `sqlx` type in this
 crate's public API — so a consumer that names it (rather than just calling

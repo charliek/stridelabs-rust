@@ -503,25 +503,26 @@ no schema features because it derives no schemas; a consumer declares its own
 `utoipa` with whatever its types need and Cargo unifies them) — likewise the
 module docs, which carry the reasoning and the utoipa 5.x/6.x details.
 
-**Version pairing.** This crate builds against `utoipa` 6, and every function
-above takes a `utoipa::openapi::OpenApi` (`find_operation` and
-`expect_operation` also return a `utoipa::openapi::path::Operation`), so a
-consumer must be on utoipa 6 too: two `utoipa` majors in one graph are two
-unrelated `OpenApi` types. A service that registers routes through
-`utoipa_axum::router::OpenApiRouter` pairs it with **utoipa-axum 0.3**, the
-release that requires utoipa 6; 0.2 only supports utoipa 5. The
-`nest`/`merge`/`route` behaviour described in the module docs is unchanged by
-the move: utoipa-axum's `router.rs` is byte-identical in 0.2.0 and 0.3.0.
-Moving from utoipa 5 to 6 also changes what utoipa-gen derives, so diff a
-regenerated `openapi.json` and run your OpenAPI validator rather than expecting
-a one-line diff. Known differences: a derived `Option<T>` field's `oneOf` lists
-the `$ref` first and `null` second; a non-nullable `$ref` field with `title` or
-`default` loses its `oneOf` wrapper; an empty response description serializes
-as `{}`, which OpenAPI 3.1 rejects (always give a description); and an
-`inline` unit-enum field that also carries a title, a description (a doc
-comment counts), a default, `read_only` or `write_only` derives an
-unsatisfiable `allOf` (reference the enum instead of inlining it). See the
-CHANGELOG's 0.5.0 entry.
+### Version pairing: utoipa 6 and utoipa-axum 0.3
+
+This crate builds against `utoipa` 6, and every function above takes a
+`utoipa::openapi::OpenApi` (`find_operation` and `expect_operation` also return
+a `utoipa::openapi::path::Operation`), so a consumer must be on utoipa 6 too:
+two `utoipa` majors in one graph are two unrelated `OpenApi` types. A service
+that registers routes through `utoipa_axum::router::OpenApiRouter` pairs it
+with **utoipa-axum 0.3**, the release that requires utoipa 6; 0.2 only supports
+utoipa 5. The `nest`/`merge`/`route` behaviour described in the module docs is
+unchanged by the move: utoipa-axum's `router.rs` is byte-identical in 0.2.0 and
+0.3.0. Moving from utoipa 5 to 6 also changes what utoipa-gen derives, so diff
+a regenerated `openapi.json` and run your OpenAPI validator rather than
+expecting a one-line diff. Known differences: a derived `Option<T>` field's
+`oneOf` lists the `$ref` first and `null` second; a non-nullable `$ref` field
+with `title` or `default` loses its `oneOf` wrapper; an empty response
+description serializes as `{}`, which OpenAPI 3.1 rejects (always give a
+description); and an `inline` unit-enum field that also carries a title, a
+description (a doc comment counts), a default, `read_only` or `write_only`
+derives an unsatisfiable `allOf` (reference the enum instead of inlining it).
+See the CHANGELOG's 0.5.0 entry.
 
 ## `proxy` feature — reverse-proxy primitives
 

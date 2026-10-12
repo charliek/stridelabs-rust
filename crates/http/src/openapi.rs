@@ -1114,10 +1114,10 @@ mod tests {
         // macro's, not ours: `canonicalize` sorts object keys and never
         // reorders an array, and the uncanonicalized `serde_json::to_value`
         // already has this order. utoipa 5 emitted `null` first and utoipa 6
-        // emits the `$ref` first, so a committed spec with an `Option<T>`
-        // field gains exactly this one diff on the bump. It is pinned apart
-        // from the test above, which passed unchanged across the bump, so a
-        // future change of this kind shows up as this test alone.
+        // emits the `$ref` first: one of several derive changes on that bump
+        // (see the CHANGELOG). It is pinned apart from the test above, which
+        // passed unchanged across the bump, so a future change of this kind
+        // shows up as this test alone.
         #[derive(utoipa::ToSchema)]
         #[allow(dead_code)]
         struct Hours {

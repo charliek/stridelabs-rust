@@ -125,6 +125,15 @@ mod tests {
         }
     }
 
+    /// What `record` observes, rendered through `builder()`'s configuration on a
+    /// local recorder, which keeps the tests off the process-global one.
+    fn render_recording(record: impl FnOnce()) -> String {
+        let recorder = builder().expect("bucket config is valid").build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, record);
+        handle.render()
+    }
+
     /// Every rendered line that names `metric`, in render order: its `# HELP`
     /// and `# TYPE` lines and every sample.
     fn lines_naming<'a>(scrape: &'a str, metric: &str) -> Vec<&'a str> {
@@ -138,12 +147,8 @@ mod tests {
         // up here as a failing test rather than as a surprise on a dashboard.
         // `builder()` is the configuration `install()` uses: it applies
         // DURATION_BUCKETS to `*duration_seconds`, which is what makes that
-        // one a real histogram. A local recorder keeps the test off the
-        // process-global one.
-        let recorder = builder().expect("bucket config is valid").build_recorder();
-        let handle = recorder.handle();
-
-        metrics::with_local_recorder(&recorder, || {
+        // one a real histogram.
+        let scrape = render_recording(|| {
             metrics::describe_counter!("pin_requests", "Requests handled.");
             metrics::counter!("pin_requests", "route" => "/a").increment(3);
             metrics::describe_gauge!("pin_in_flight", "Requests in flight.");
@@ -151,8 +156,6 @@ mod tests {
             metrics::describe_histogram!("pin_handler_duration_seconds", "Handler latency.");
             metrics::histogram!("pin_handler_duration_seconds").record(0.03);
         });
-
-        let scrape = handle.render();
 
         assert_eq!(
             lines_naming(&scrape, "pin_requests"),
@@ -206,16 +209,11 @@ mod tests {
     /// VALUES are left out on purpose: they are sketch estimates (the 0.5
     /// quantile of {1, 3} renders as 0.9998999999999999), not wire shape.
     fn summary_render(metric: &'static str, help: &'static str) -> (Vec<String>, Vec<String>) {
-        let recorder = builder().expect("bucket config is valid").build_recorder();
-        let handle = recorder.handle();
-
-        metrics::with_local_recorder(&recorder, || {
+        let scrape = render_recording(|| {
             metrics::describe_histogram!(metric, help);
             metrics::histogram!(metric).record(1.0);
             metrics::histogram!(metric).record(3.0);
         });
-
-        let scrape = handle.render();
         let lines = lines_naming(&scrape, metric);
         let quantiles = lines
             .iter()
@@ -302,15 +300,6 @@ mod tests {
     // up as a deliberate edit to these tests (and to the CHANGELOG entry that
     // documents it) rather than as a dashboard that quietly changed. The fix on
     // the caller's side is one spelling per label key.
-
-    /// What `record` observes, rendered through `builder()`'s configuration on a
-    /// local recorder.
-    fn render_recording(record: impl FnOnce()) -> String {
-        let recorder = builder().expect("bucket config is valid").build_recorder();
-        let handle = recorder.handle();
-        metrics::with_local_recorder(&recorder, record);
-        handle.render()
-    }
 
     /// Every rendered line that starts with `prefix`, sorted. The exporter
     /// holds a family's series in a hash map, so the order of the series within

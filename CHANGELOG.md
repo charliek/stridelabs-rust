@@ -117,10 +117,11 @@ see the README's "MSRV policy").
   `count` or `sum` loses that suffix on the matching series. 0.18's suffix
   helper skips a suffix the name already ends with, comparing
   `ends_with("count")` without the `_` (upstream `formatting.rs`,
-  `add_suffix_if_missing`), so after `install()` `metrics::histogram!("discount")`
-  renders `discount{…} 2` where 0.17.2 rendered `discount_count{…} 2`, and
-  `checksum{…} 4` where it rendered `checksum_sum{…} 4`; the other series of
-  the summary (`discount_sum`, `checksum_count`, the quantiles) are unchanged.
+  `add_suffix_if_missing`), so after `install()`
+  `metrics::histogram!("discount")` renders `discount{…} 2` where 0.17.2
+  rendered `discount_count{…} 2`, and `checksum{…} 4` where it rendered
+  `checksum_sum{…} 4`; the other series of the summary (`discount_sum`,
+  `checksum_count`, the quantiles) are unchanged.
   A consumer with such a metric must rename it or update the queries and
   alerts that read its `_count`/`_sum` series. A test pins this as observed on
   0.18.3, so an exporter release that fixes it shows up as a deliberate
@@ -148,13 +149,13 @@ see the README's "MSRV policy").
   values that render differently, and keys that differ only in case, were
   never merged and are unchanged; two values the exporter's escaping renders
   identically (e.g. differing only in backslash runs) split the same way.
-  Four tests, one per kind, pin the
-  0.18.3 rendering as observed, so an exporter release that merges them again
-  shows up as a deliberate change. 0.18's fix that puts
-  the `_total` suffix on a counter's `# HELP` and `# TYPE` lines applies only
-  with the new `with_recommended_naming(true)`, which `install` does not set; a
-  consumer building its own exporter with it gets `# HELP x_total`,
-  `# TYPE x_total counter` and `x_total{…} N` for a counter registered as `x`.
+  Four tests, one per kind, pin the 0.18.3 rendering as observed, so an
+  exporter release that merges them again shows up as a deliberate change.
+  0.18's fix that puts the `_total` suffix on a counter's `# HELP` and
+  `# TYPE` lines applies only with the new `with_recommended_naming(true)`,
+  which `install` does not set; a consumer building its own exporter with it
+  gets `# HELP x_total`, `# TYPE x_total counter` and `x_total{…} N` for a
+  counter registered as `x`.
   Likewise `set_enable_unit_suffix(true)` (deprecated in 0.18; `install` does
   not set it) now suffixes `# HELP`/`# TYPE` like the samples and no longer
   repeats a unit already in the name (`x_seconds_seconds_bucket`).
@@ -190,11 +191,10 @@ see the README's "MSRV policy").
   description (a doc comment counts), a `default`, `read_only` or
   `write_only` derives an `allOf` of the string enum and `{"type":"object"}`,
   a schema no value satisfies, so do not inline such a field (reference the
-  enum instead). `documented_pairs` does not
-  list the two path-item slots utoipa 6 added for OpenAPI 3.2 (`query` and
-  `additional_operations`): they have no `HttpMethod` variant, so the
-  exhaustive match cannot see them, and neither the derive macro nor
-  utoipa-axum can fill them; a test pins this.
+  enum instead). `documented_pairs` does not list the two path-item slots
+  utoipa 6 added for OpenAPI 3.2 (`query` and `additional_operations`): they
+  have no `HttpMethod` variant, so the exhaustive match cannot see them, and
+  neither the derive macro nor utoipa-axum can fill them; a test pins this.
 - `sqlx` 0.8 → 0.9 (0.9.0, `stridelabs-testing`'s `postgres` feature).
   **BREAKING** for a consumer that names sqlx types from this crate:
   `require_postgres` returns an `sqlx::PgPool`, the only sqlx type in any
@@ -250,15 +250,15 @@ see the README's "MSRV policy").
   error as a source (`InvalidToken` carries a fixed classification phrase),
   and `TestKey::{pem, jwks_json, mint, mint_with_kid}` deal in strings and
   `Serialize` claims. How rejections are classified changes only as "only a
-  key fit for RS256 signatures verifies" below says. jsonwebtoken 11's new error
-  kinds (`InvalidClaimFormat`, `UnsupportedAlgorithm`, `InvalidEddsaKey`,
-  `Signing`, `Provider`) fall into `InvalidToken`'s existing "token is
-  malformed" arm, and none of them arises on `Verifier`'s RS256 path:
-  `InvalidClaimFormat` (a malformed `exp`/`nbf`) because `exp` is a required
-  claim, so a malformed one is still "a required claim is missing", and `nbf`
-  is not validated; `UnsupportedAlgorithm` (a JWK of unknown key type) because
-  only RSA keys reach `DecodingKey::from_jwk`; the other three belong to
-  signing, EdDSA keys and custom providers.
+  key fit for RS256 signatures verifies" below says. jsonwebtoken 11's new
+  error kinds (`InvalidClaimFormat`, `UnsupportedAlgorithm`,
+  `InvalidEddsaKey`, `Signing`, `Provider`) fall into `InvalidToken`'s
+  existing "token is malformed" arm, and none of them arises on `Verifier`'s
+  RS256 path: `InvalidClaimFormat` (a malformed `exp`/`nbf`) because `exp` is
+  a required claim, so a malformed one is still "a required claim is
+  missing", and `nbf` is not validated; `UnsupportedAlgorithm` (a JWK of
+  unknown key type) because only RSA keys reach `DecodingKey::from_jwk`; the
+  other three belong to signing, EdDSA keys and custom providers.
 - **BREAKING (behaviour): one jsonwebtoken backend per graph.** jsonwebtoken
   10+ chooses its crypto from crate features, which Cargo unifies across a
   consumer's whole graph, and with none or both of `aws_lc_rs` and
@@ -268,8 +268,9 @@ see the README's "MSRV policy").
   dependency) panics in `Verifier::verify_bearer`,
   `Verifier::verify_with_jwks` and `TestKey::mint`. The consumer rule:
   **never enable jsonwebtoken `rust_crypto`; use aws-lc-rs as the only rustls
-  provider** (install `rustls::crypto::aws_lc_rs::default_provider()` at
-  startup if your service builds rustls configs itself). `rust_crypto` is
+  provider** (install it at startup with
+  `rustls::crypto::aws_lc_rs::default_provider().install_default()` if your
+  service builds rustls configs itself). `rust_crypto` is
   rejected because it brings back `rsa` (RUSTSEC-2023-0071). aws-lc-sys, a C
   build, replaces ring in every `stridelabs-auth` consumer's graph,
   production included. A test signs a token with the test-support key and
@@ -304,15 +305,16 @@ see the README's "MSRV policy").
   A correctly labelled signing key, or one with no labels, verifies as
   before. Rejections not listed here are classified as before.
 - **BREAKING (behaviour, `stridelabs-testing`):** no TLS. The `postgres`
-  feature's sqlx is built with no `tls-*` feature (it used to enable `tls-rustls-ring`) because the pool
-  talks to a local or CI Postgres in the clear, and a TLS feature there
-  unifies into every consumer's test graph, where `ring` next to the aws-lc-rs
-  provider of reqwest 0.13's `rustls` makes `rustls::ClientConfig::builder()`
-  panic. Behaviour change for a consumer whose test URL demands TLS:
-  `sslmode=require` (or `verify-ca`/`verify-full`) now panics with sqlx's
-  "built without TLS support" error, pinned by a test; the default `prefer`
-  connects in the clear. CI's "Guard: stridelabs-testing pulls no ring" step
-  fails if a TLS feature comes back.
+  feature's sqlx is built with no `tls-*` feature (it used to enable
+  `tls-rustls-ring`) because the pool talks to a local or CI Postgres in the
+  clear, and a TLS feature there unifies into every consumer's test graph,
+  where `ring` next to the aws-lc-rs provider of reqwest 0.13's `rustls`
+  makes `rustls::ClientConfig::builder()` panic. Behaviour change for a
+  consumer whose test URL demands TLS: `sslmode=require` (or
+  `verify-ca`/`verify-full`) now panics with sqlx's "built without TLS
+  support" error, pinned by a test; the default `prefer` connects in the
+  clear. CI's "Guard: stridelabs-testing pulls no ring" step fails if a TLS
+  feature brings `ring` back.
 - `RequestIdLayer` reuses an existing `RequestId` request extension (held
   to the same validity rule as the header) before the `x-request-id` header,
   so behind an outer `RequestLogLayer` it echoes the id that was logged.
@@ -331,14 +333,14 @@ see the README's "MSRV policy").
   pinned by two exact-message tests.
 - `cors_layer`'s `Vary` is unchanged, and now explicit: it sets `Vary: origin,
   access-control-request-method, access-control-request-headers` itself. That
-  is the header tower-http 0.6 always sent; 0.7 derives the list from the policy and would send
-  `origin` alone for `cors_layer`'s origin list with constant method/header
-  lists, so the bump by itself would have changed the wire. The header is
-  pinned by a test on ordinary, disallowed-origin, no-`Origin` and preflight
-  responses. Nothing else tower-http 0.7 emits for `cors_layer` or
-  `security_headers` differs from 0.6 (status, headers, values and header
-  order compared over 15 request shapes), so `Vary` is the only change
-  guarded.
+  is the header tower-http 0.6 always sent; 0.7 derives the list from the
+  policy and would send `origin` alone for `cors_layer`'s origin list with
+  constant method/header lists, so the bump by itself would have changed the
+  wire. The header is pinned by a test on ordinary, disallowed-origin,
+  no-`Origin` and preflight responses. Nothing else tower-http 0.7 emits for
+  `cors_layer` or `security_headers` differs from 0.6 (status, headers,
+  values and header order compared over 15 request shapes), so `Vary` is the
+  only change guarded.
 - The RUSTSEC-2023-0071 (`rsa`, Marvin timing side-channel; no upstream fix)
   ignore is gone from CI's `cargo audit` step and `deny.toml`: sqlx 0.9 no
   longer compiles `rsa` (MySQL's RSA auth is behind its opt-in `mysql-rsa`
@@ -428,10 +430,9 @@ serializer, exhaustive `(method, path)` enumeration, committed-spec
 freshness check), and the pinned Rust toolchain moved to 1.97.1.
 
 Amended later: the toolchain bump also raised the workspace `rust-version`
-(the MSRV) from 1.96 to 1.97, and this entry did not say so. `v0.1.0`
-declares 1.96; `v0.2.0` and every later tag declare 1.97. Minimum supported
-Rust version raised to 1.97. Consumers must be on Rust 1.97 or newer.
-Earlier tags are unaffected.
+(the MSRV) from 1.96 (`v0.1.0`) to 1.97 (`v0.2.0` and every later tag), and
+this entry did not say so. Minimum supported Rust version raised to 1.97.
+Consumers must be on Rust 1.97 or newer. Earlier tags are unaffected.
 
 ## [0.1.0] - 2026-07-25
 

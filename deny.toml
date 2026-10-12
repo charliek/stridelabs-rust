@@ -103,8 +103,9 @@ confidence-threshold = 0.8
 
 [bans]
 # Default posture kept: multiple versions of the same crate in the graph
-# (e.g. r-efi 5.3.0 AND 6.0.0, syn 1.x AND 2.x) are normal in a 315-crate
-# resolved graph and not, by themselves, a problem worth failing CI over.
+# (e.g. r-efi 5.3.0 AND 6.0.0, syn 2.x AND 3.x) are normal in a resolved
+# graph of 300-odd crates and not, by themselves, a problem worth failing CI
+# over.
 multiple-versions = "allow"
 
 [sources]

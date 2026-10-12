@@ -16,7 +16,8 @@ default = []
 # nothing to do with Postgres and are always available. The driver is built
 # with NO sqlx TLS feature (see `workspace.dependencies.sqlx`): the pool talks
 # to a local Postgres without TLS, and a TLS feature here would unify into the
-# consumer's graph. CI's "Guard: stridelabs-testing pulls no ring" enforces it.
+# consumer's graph. CI's "Guard: stridelabs-testing pulls no ring" fails if a
+# TLS feature brings `ring` back.
 postgres = ["dep:sqlx", "dep:url"]
 
 [lints]

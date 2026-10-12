@@ -23,9 +23,9 @@ exist*, not what every parameter does:
 - `crates/http/README.md` — `AppError`, security headers, `methods`, `openapi`, `proxy`
 - `crates/auth/README.md` — JWKS verification, PAT hashing
 - `crates/testing/README.md` — fail-loud Postgres pool, oneshot router tests, wiremock stub
-- root `README.md` — consuming these crates (git dep forms, `[patch]` local co-dev, feature topology table)
+- root `README.md` — consuming these crates (git dep forms, `[patch]` local co-dev, MSRV policy, feature topology table, the one-crypto-provider rule)
 
-All five paths above are relative to the `stridelabs-rust` checkout this
+All six paths above are relative to the `stridelabs-rust` checkout this
 skill lives in.
 
 ## Before you start
@@ -114,9 +114,9 @@ an ancestor path. A service scaffolded inside an existing monorepo, at
   `Verifier::new`), `jsonwebtoken` 11, `sqlx` 0.9 (a test that names
   `PgPool`), `tower-http` 0.7 and `metrics-exporter-prometheus` 0.18. Keep
   aws-lc-rs the only rustls provider, and never enable `jsonwebtoken`'s
-  `rust_crypto` feature (v0.5.0's CHANGELOG explains why). A `reqwest` that
-  fetches an `https://` JWKS needs its own TLS feature (`rustls`) turned on:
-  `stridelabs-auth` enables none.
+  `rust_crypto` feature (the root README's "One crypto provider: aws-lc-rs"
+  explains why). A `reqwest` that fetches an `https://` JWKS needs its own
+  TLS feature (`rustls`) turned on: `stridelabs-auth` enables none.
 
 A service that starts in path-dependency mode — sibling or ancestor-relative,
 and whether it later moves to a real repo or already sits inside one — should

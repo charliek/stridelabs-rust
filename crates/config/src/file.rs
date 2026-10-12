@@ -167,27 +167,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn nested_field_parse_failure_reports_field_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("bad.yaml");
-        // `nested.port` should be a number; giving it a string trips a parse
-        // error whose message must carry the `nested.port` path.
-        std::fs::write(&path, "name: svc\nnested:\n  port: \"not-a-number\"\n").unwrap();
-
-        let err = load_yaml::<Sample>(&path).unwrap_err();
-        match err {
-            FileError::Parse { message, .. } => {
-                assert!(
-                    message.contains("nested") && message.contains("port"),
-                    "message did not contain field path: {message}"
-                );
-            }
-            other => panic!("expected Parse error, got {other:?}"),
-        }
-    }
-
-    /// The parse message of a YAML file, for the exact-rendering pins below.
+    /// The parse message of a YAML file, for the parse-failure tests below.
     fn yaml_parse_message(contents: &str) -> String {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bad.yaml");
@@ -197,6 +177,18 @@ mod tests {
             FileError::Parse { message, .. } => message,
             other => panic!("expected Parse error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn nested_field_parse_failure_reports_field_path() {
+        // `nested.port` should be a number; giving it a string trips a parse
+        // error whose message must carry the `nested.port` path.
+        let message = yaml_parse_message("name: svc\nnested:\n  port: \"not-a-number\"\n");
+
+        assert!(
+            message.contains("nested") && message.contains("port"),
+            "message did not contain field path: {message}"
+        );
     }
 
     #[test]

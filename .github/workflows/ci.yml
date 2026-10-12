@@ -25,10 +25,10 @@ concurrency:
 
 jobs:
   build-test:
-    # Scheduled (weekly) runs exist only to re-check `audit`'s time-varying
-    # advisories, not to rebuild the workspace — skip this job on that
-    # trigger so a cron run doesn't burn a full build-test matrix for
-    # nothing.
+    # Scheduled (weekly) runs exist to re-check what can change with no
+    # commit here (`audit`'s advisories, `downstream-limen`'s re-resolve), not
+    # to rebuild the workspace — skip this job on that trigger so a cron run
+    # doesn't burn a full build-test matrix for nothing.
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
 
@@ -105,7 +105,8 @@ jobs:
       # whole graph, so what a crate here enables is what the consumer compiles;
       # these steps fail the moment a forbidden crate re-enters.
       #
-      # Each asserts on a package LISTING (`cargo tree ... --prefix none
+      # Each, except the rsa guard (which reads the lock; its own comment says
+      # why), asserts on a package LISTING (`cargo tree ... --prefix none
       # --format '{p}'`, first word of each line, de-duplicated), never on
       # `cargo tree -i`: `-i` exits 101 when the crate is absent, which is
       # indistinguishable from cargo breaking, so a guard built on it either
@@ -115,7 +116,8 @@ jobs:
       # `--features`, a wrong `-p`) would pass for the wrong reason. An empty
       # listing or a cargo error fails the step (`set -euo pipefail`).
       # `--target all` so a platform-gated edge cannot hide the crate; `-e
-      # normal` because that is what reaches a consumer's build.
+      # normal` because that is what reaches a consumer's build (the ring
+      # guard adds build and dev edges: it asks what the workspace compiles).
       #
       # `ring` enabled on rustls next to the aws-lc-rs provider that reqwest
       # 0.13's `rustls` feature brings leaves rustls with no unambiguous
@@ -353,10 +355,10 @@ jobs:
   # dispatch and the weekly schedule must be advisory-clean, so a red audit
   # can't sit unnoticed on main — while on a PR it is advisory, so a newly
   # published advisory can't brick an unrelated PR. A red run on a PR is a
-  # signal for manual triage. The job carries no `--ignore` entries, and
-  # deny.toml's `[advisories]` section none either (keep the two in sync if one
-  # is ever added); the section exists for anyone running the full
-  # `cargo deny check` locally, but does not run in CI itself.
+  # signal for manual triage. deny.toml's `[advisories]` section mirrors this
+  # job (the `cargo audit` step below says how an ignore is kept in sync) for
+  # anyone running the full `cargo deny check` locally, but does not run in CI
+  # itself.
   audit:
     runs-on: ubuntu-latest
     steps:
@@ -381,8 +383,7 @@ jobs:
       # RUSTSEC-2023-0071 (rsa), was removed that way when sqlx 0.9 dropped
       # rsa from the lock; the "no rsa" guard in build-test keeps it out.
       - name: cargo audit
-        run: |
-          cargo audit
+        run: cargo audit
 
   # Does the candidate still build and pass for a real consumer? limen is the
   # one consumer checked here: it is public, so this log is public too, and it
@@ -413,9 +414,9 @@ jobs:
       # limen's migration commit for this release (its branch
       # feature/plan-011-stridelabs-v0.5.0): limen `main` cannot build against
       # these majors until that branch merges, so checking `main` would
-      # deadlock this PR. A
-      # follow-up PR advances it to a limen `main` commit once limen merges.
-      # Always a full 40-hex commit SHA (the first step enforces it).
+      # deadlock this PR. A follow-up PR advances it to a limen `main` commit
+      # once limen merges. Always a full 40-hex commit SHA (the first step
+      # enforces it).
       LIMEN_REF: "10ee5a9330111a7b8a2a868699f139cfb934b5a3"
     steps:
       - name: Require an immutable limen ref
@@ -468,9 +469,10 @@ jobs:
           cat "$patch"
           echo "STRIDELABS_PATCH=$patch" >> "$GITHUB_ENV"
 
-      # A [patch] whose version differs from limen's locked one (this release
-      # bumped 0.4.0 -> 0.5.0) is silently unused, so move every locked
-      # stridelabs-* package onto it before proving it took effect.
+      # A [patch] whose version differs from limen's locked one (a release
+      # bump: the lock says 0.4.0, the candidate is 0.5.0) is silently unused,
+      # so move every locked stridelabs-* package onto it before proving it
+      # took effect (the script's `adopt_patch`; keep the two in step).
       - name: Move limen's locked stridelabs packages onto the patch
         working-directory: limen
         run: |
@@ -484,11 +486,12 @@ jobs:
           for p in $pkgs; do args+=(-p "$p"); done
           cargo update --config "$STRIDELABS_PATCH" "${args[@]}"
 
-      # `cargo metadata` resolves the patched graph (writing limen's lock) and
+      # `cargo metadata` reads the patched graph the step above resolved and
       # lists every stridelabs-* package in it. There must be at least one, and
       # each must be this checkout's crate of that name: a path package (no
       # `source`) whose manifest is crates/<name>/Cargo.toml here. `source` alone
       # is not enough, since a vendored copy of the library has none either.
+      # The script's `check_patched_graph` is the same check.
       - name: Prove the patch took effect
         working-directory: limen
         run: |

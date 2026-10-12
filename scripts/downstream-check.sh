@@ -23,19 +23,23 @@
 #     is keyed by the source URL, so it applies to a consumer that pins by
 #     `tag` and to one that pins by `rev` alike.
 #   - The run is NOT --locked: the scratch copy's lock is re-resolved so the
-#     patched path packages (and anything new they pull in) can enter it. That
-#     makes this a DEVELOPMENT check. The binding proof builds each consumer
-#     from its own committed rev pin and Cargo.lock with --locked.
+#     patched path packages (and anything new they pull in) can enter it,
+#     starting with `cargo update -p` for every stridelabs-* package it holds
+#     (a [patch] at another version than the locked one is silently unused).
+#     That makes this a DEVELOPMENT check. The binding proof builds each
+#     consumer from its own committed rev pin and Cargo.lock with --locked.
 #   - Every build uses CARGO_TARGET_DIR=$SCRATCH/target-<consumer>.
 #   - Nothing is removed unless it resolves, symlinks and all, to
-#     $SCRATCH/downstream/<consumer>. A consumer repo or the library that is,
+#     $SCRATCH/downstream/<consumer>, or is this script's own lock
+#     ($SCRATCH/downstream/.lock). A consumer repo or the library that is,
 #     holds or sits inside $SCRATCH/downstream is refused before anything
 #     happens (a dry run refuses too), so a mistaken DOWNSTREAM_<NAME>_REPO
 #     cannot be the directory that is recreated.
 #   - Everything cargo prints passes through `redact` before the terminal or a
 #     log sees it: URL userinfo and the values of token/password/secret/key
 #     parameters are masked (a failing test can print the URL it could not
-#     authenticate with). The script's own messages name a host and a port, never a URL.
+#     authenticate with). The script's own messages name a host and a port,
+#     never a URL.
 #   - Once the lock is held the library's HEAD, tree id and (untracked files
 #     included) state are read again; they are checked once more at the end, and
 #     the run fails if the library moved while the consumers were tested.
@@ -434,6 +438,8 @@ run_cargo() { # label cargo-args...
 # A [patch] whose version differs from the one the consumer's lock holds (a
 # release bump: the lock says 0.4.0, the candidate is 0.5.0) is silently left
 # unused, so first move every locked stridelabs-* package onto the patch.
+# CI's downstream-limen does the same in its "Move limen's locked stridelabs
+# packages onto the patch" step; keep the two in step.
 adopt_patch() {
   local lock=$C_CRATE_DIR/Cargo.lock n
   local names=()
@@ -451,6 +457,7 @@ adopt_patch() {
 # [patch] did not take (the consumer names the library under another URL, or
 # the key is misspelled); a path package from anywhere else is a vendored copy
 # that also has no `source`. Either way the "pass" would have tested other code.
+# CI's "Prove the patch took effect" step is the same check.
 check_patched_graph() {
   local meta=$LOGS/$C_NAME-metadata.json err=$LOGS/$C_NAME-metadata.err
   local pkgs name version source manifest dir seen=0 bad=0
@@ -484,8 +491,9 @@ check_patched_graph() {
 }
 
 prepare_archive() {
-  # The one rm -rf in this script. It only ever removes what resolves to
-  # $ARCHIVE_ROOT/<consumer>, checked here and not only up front.
+  # The one rm -rf of a consumer archive (the others remove only the lock).
+  # It only ever removes what resolves to $ARCHIVE_ROOT/<consumer>, checked
+  # here and not only up front.
   [ "$(canon "$C_DIR")" = "$ARCHIVE_ROOT/$C_NAME" ] || {
     echo "!! refusing to remove $C_DIR: it does not resolve to $ARCHIVE_ROOT/$C_NAME"
     return 1

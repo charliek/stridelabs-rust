@@ -40,7 +40,8 @@ stridelabs-http = { path = "crates/http" }
 # crate-feature default panics. Only stridelabs-http's `proxy` builds a client
 # of its own, so only it turns TLS on (crates/http/Cargo.toml).
 # stridelabs-auth is handed the consumer's client and must not pick a TLS
-# stack for it; CI's "Guard: stridelabs-auth pulls no rustls" holds it to that.
+# stack for it; CI's "Guard: stridelabs-auth pulls no rustls" keeps rustls out
+# of its graph.
 reqwest = { version = "0.13", default-features = false }
 
 # OpenAPI. No schema features (`uuid`, `time`, …) here: the shared crate
@@ -71,7 +72,7 @@ metrics-exporter-prometheus = { version = "0.18", default-features = false }
 # a local/CI Postgres without TLS, and any TLS feature here would unify into a
 # consumer's test graph (`ring` next to reqwest 0.13's aws-lc-rs makes
 # `rustls::ClientConfig::builder()` panic). CI's "Guard: stridelabs-testing
-# pulls no ring" step fails if one is re-enabled.
+# pulls no ring" step fails if a TLS feature brings `ring` back.
 sqlx = { version = "0.9", default-features = false, features = [
     "runtime-tokio",
     "postgres",
