@@ -511,12 +511,20 @@ run_cargo() { # label cargo-args...
 # stridelabs-* package fails here, as it does there: a consumer that does not
 # use the library cannot pass the proof below either, so say so first.
 adopt_patch() {
-  local lock=$C_CRATE_DIR/Cargo.lock n
+  local lock dir=$C_CRATE_DIR n
   local names=()
-  if [ ! -f "$lock" ]; then
-    echo "!! $C_NAME has no Cargo.lock in $C_CRATE_DIR"
-    return 1
-  fi
+  # The lock sits in the crate dir, or in a workspace root above it (spendwise
+  # keeps backend/ as a member of a root workspace); look no higher than the
+  # archive itself.
+  while :; do
+    lock=$dir/Cargo.lock
+    [ -f "$lock" ] && break
+    if [ "$dir" = "$C_DIR" ] || [ "$dir" = / ]; then
+      echo "!! $C_NAME has no Cargo.lock in $C_CRATE_DIR or above it in the archive"
+      return 1
+    fi
+    dir=$(dirname "$dir")
+  done
   while IFS= read -r n; do
     names+=(-p "$n")
   done < <(sed -n 's/^name = "\(stridelabs-[a-z-]*\)"$/\1/p' "$lock" | sort -u)
