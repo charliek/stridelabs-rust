@@ -330,8 +330,13 @@ struct Captured {
     fields: BTreeMap<String, String>,
 }
 
+/// `take_audit` forgets the lines it hands out; `everything` still covers
+/// them, so a secrecy check after a take sees every line ever written.
 #[derive(Clone, Default)]
-struct Capture(Arc<Mutex<Vec<Captured>>>);
+struct Capture {
+    pending: Arc<Mutex<Vec<Captured>>>,
+    all: Arc<Mutex<Vec<Captured>>>,
+}
 
 impl Capture {
     /// Install for this thread; keep the guard alive for the test.
@@ -343,7 +348,7 @@ impl Capture {
 
     /// The audit lines written since the last call, and forget them.
     fn take_audit(&self) -> Vec<Captured> {
-        let mut events = self.0.lock().expect("capture lock");
+        let mut events = self.pending.lock().expect("capture lock");
         let audit = events
             .iter()
             .filter(|event| event.target == AUDIT_TARGET)
@@ -354,7 +359,7 @@ impl Capture {
     }
 
     fn everything(&self) -> String {
-        format!("{:?}", self.0.lock().expect("capture lock"))
+        format!("{:?}", self.all.lock().expect("capture lock"))
     }
 
     /// The one audit line a call must have written.
@@ -381,11 +386,16 @@ impl<S: tracing::Subscriber> Layer<S> for Capture {
     fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
         let mut fields = BTreeMap::new();
         event.record(&mut Fields(&mut fields));
-        self.0.lock().expect("capture lock").push(Captured {
+        let captured = Captured {
             target: event.metadata().target().to_owned(),
             level: *event.metadata().level(),
             fields,
-        });
+        };
+        self.all
+            .lock()
+            .expect("capture lock")
+            .push(captured.clone());
+        self.pending.lock().expect("capture lock").push(captured);
     }
 }
 

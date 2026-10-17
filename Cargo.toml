@@ -32,8 +32,12 @@ http = "1"
 # every other dependency, and moving a crate is a one-line edit.
 stridelabs-http = { path = "crates/http" }
 stridelabs-auth = { path = "crates/auth" }
-# Only stridelabs-redis's real-Redis tests use it: a dev-dependency whose
-# `redis` feature that crate's `live-tests` feature switches on.
+# stridelabs-mcp's `redis` feature (the Redis-backed rate limiter and PAT
+# cache) is built on it.
+stridelabs-redis = { path = "crates/redis" }
+# Only the real-Redis tests use it (stridelabs-redis's and stridelabs-mcp's):
+# a dev-dependency whose `redis` feature each crate's `live-tests` feature
+# switches on.
 stridelabs-testing = { path = "crates/testing" }
 
 # HTTP client (proxy primitives, JWKS fetch). Deliberately NO TLS feature

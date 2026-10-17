@@ -20,9 +20,22 @@
 //! - [`server_config`] / [`router`] — rmcp's Streamable HTTP service,
 //!   stateless with JSON responses, `Host`-checked against the resource, at
 //!   exactly the resource's path, behind the auth layer.
-//! - [`ToolCall`] — the tool boundary: principal, per-tool scopes, timeout,
-//!   safe errors ([`ToolError`]), one audit line per run; plus
-//!   [`clamp_limit`] / [`clamp_offset`] / [`Page`] for list tools.
+//! - [`ToolCall`] — the tool boundary: principal, per-tool scopes, an
+//!   optional rate limit, timeout, safe errors ([`ToolError`]), one audit
+//!   line per run; plus [`clamp_limit`] / [`clamp_offset`] / [`Page`] for
+//!   list tools.
+//! - [`RateLimiter`] — the rate-limit seam [`ToolCall::rate_limit`] calls
+//!   after the scope check, with [`MemoryLimiter`] (Python's fixed
+//!   one-minute window, in memory) and [`NoLimit`].
+//! - [`SlauthPatCredential`] — slauth `slp_live_` PATs as a
+//!   [`CredentialVerifier`]: slauth's verdict, the app's ceiling scopes, and
+//!   an optional fail-through [`PatCache`].
+//! - [`canonical_tools_json`] — the committed `tools/list` contract
+//!   (`mcp-tools.json`), byte-stable.
+//!
+//! And behind features: Redis-backed `RedisRateLimiter` and `RedisPatCache`
+//! (`redis`), the SSRF-hardened `ImageFetcher` (`image-fetch`), the
+//! app-wide `cors_layer` (`cors`).
 //!
 //! # Wiring
 //!
@@ -77,9 +90,10 @@
 //!
 //! # What stays in the app
 //!
-//! The scope taxonomy, which credentials besides slauth JWTs it accepts (and
-//! how it validates them), mapping a [`Principal`] to its own user row, quotas
-//! and rate limits, its database sessions, and the tools themselves.
+//! The scope taxonomy and the rate classes, which credentials besides slauth
+//! JWTs it accepts (and how it validates them), its limits and PAT ceiling,
+//! mapping a [`Principal`] to its own user row, quotas, its database
+//! sessions, and the tools themselves.
 //!
 //! # rmcp
 //!
@@ -96,18 +110,32 @@
 //!
 //! | Feature | Default | Adds |
 //! |---|---|---|
-//! | `test-support` | off | `test_support` — MCP access tokens for a `ProtectedResource`, signed with stridelabs-auth's committed throwaway keys, for consumers' end-to-end tests |
+//! | `test-support` | off | `test_support` — MCP access tokens for a `ProtectedResource`, signed with stridelabs-auth's committed throwaway keys, and the committed `tools/list` freshness check, for consumers' tests. With `image-fetch`, also stridelabs-http's `ssrf-test-support` |
+//! | `cors` | off | `cors_layer()`, the app-wide CORS preset (any origin, no credentials, `Mcp-Session-Id` and `WWW-Authenticate` exposed), via tower-http |
+//! | `redis` | off | `RedisRateLimiter` (fails open) and `RedisPatCache`, on stridelabs-redis — which brings rustls for `rediss://`, with no crypto provider of its own (the app installs aws-lc-rs) |
+//! | `image-fetch` | off | `ImageFetcher`, Python `fetch.py`'s twin, on stridelabs-http's `ssrf` — an HTTP client and a TLS stack (rustls, aws-lc-rs) |
+//! | `live-tests` | off | **Not for consumers**: compiles this crate's real-Redis suite |
 //!
-//! As in stridelabs-auth, the feature-gated module is named in plain code,
-//! not linked: it does not exist in a default build's docs.
+//! As in stridelabs-auth, the feature-gated items are named in plain code,
+//! not linked: they do not exist in a default build's docs.
 
 pub mod auth;
+pub mod limits;
 pub mod metadata;
+pub mod pat;
 pub mod principal;
 pub mod resource;
 pub mod server;
 pub mod tool;
+pub mod tools_json;
 pub mod verifier;
+
+#[cfg(feature = "cors")]
+pub mod cors;
+#[cfg(feature = "image-fetch")]
+pub mod image_fetch;
+#[cfg(feature = "redis")]
+pub mod redis;
 
 // Compiled for this crate's own tests whether or not the feature is on, so
 // both test lanes run its tests; the feature only makes it public.
@@ -119,7 +147,14 @@ mod test_support;
 pub use rmcp;
 
 pub use auth::{McpAuthLayer, McpAuthService, AUTH_LOG_TARGET};
+pub use limits::{
+    LimitFuture, MemoryLimiter, NoLimit, RateClass, RateLimited, RateLimiter, RATE_LIMIT_LOG_TARGET,
+};
 pub use metadata::metadata_router;
+pub use pat::{
+    pat_cache_key, PatCache, PatCacheError, PatCacheFuture, SlauthPatCredential, PAT_CACHE_MAX_TTL,
+    PAT_CACHE_TIMEOUT, PAT_CACHE_TTL,
+};
 pub use principal::{AuthMethod, Principal, ScopeError};
 pub use resource::{ProtectedResource, ResourceError, ResourceMetadata, METADATA_PATH};
 pub use server::{principal, router, server_config, MAX_REQUEST_BODY_BYTES};
@@ -127,4 +162,12 @@ pub use tool::{
     clamp_limit, clamp_offset, Outcome, Page, ToolCall, ToolError, AUDIT_TARGET, DEFAULT_LIMIT,
     DEFAULT_TOOL_TIMEOUT, MAX_LIMIT,
 };
+pub use tools_json::canonical_tools_json;
 pub use verifier::{CredentialVerifier, McpVerifier, VerifyError, VerifyFuture};
+
+#[cfg(feature = "cors")]
+pub use crate::cors::cors_layer;
+#[cfg(feature = "image-fetch")]
+pub use crate::image_fetch::{ImageFetchError, ImageFetcher, IMAGE_FETCH_TIMEOUT};
+#[cfg(feature = "redis")]
+pub use crate::redis::{RedisPatCache, RedisRateLimiter, DEFAULT_RATE_LIMIT_PREFIX};

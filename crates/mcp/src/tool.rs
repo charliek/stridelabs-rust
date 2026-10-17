@@ -1,8 +1,8 @@
 //! The tool boundary: one wrapper around every tool body.
 //!
 //! The Rust twin of stridelabs-python's `make_tool_decorator`, minus what is
-//! app policy there too (database sessions, rate limits, user provisioning):
-//! a tool calls [`ToolCall::run`] and gets, around its body,
+//! app policy there too (database sessions, user provisioning): a tool calls
+//! [`ToolCall::run`] and gets, around its body,
 //!
 //! 1. the authenticated [`Principal`] (missing → a safe "Not authenticated."
 //!    error, outcome `denied`);
@@ -10,12 +10,17 @@
 //!    a [`ScopeError`](crate::ScopeError)'s actionable message is the
 //!    result, outcome `denied`) — authorization, where the HTTP boundary did
 //!    authentication;
-//! 3. a timeout (outcome `timeout`, a safe "try again" message), and the
-//!    request's cancellation (outcome `cancelled`);
-//! 4. error translation: [`ToolError::user`] and [`ToolError::denied`]
+//! 3. optionally, its rate limit ([`ToolCall::rate_limit`]): checked after
+//!    the scopes, so a refused call consumes nothing, and before the body; a
+//!    refusal's [`RateLimited`] text is the result, outcome `ratelimited`;
+//! 4. a timeout (outcome `timeout`, a safe "try again" message), and the
+//!    request's cancellation (outcome `cancelled`) — both covering the rate
+//!    limit check as well as the body;
+//! 5. error translation: [`ToolError::user`] and [`ToolError::denied`]
 //!    messages are shown to the model, while anything internal — a
-//!    [`ToolError::internal`], or a panic — becomes "Internal server error.";
-//! 5. exactly **one** structured audit line per run (see [`AUDIT_TARGET`]).
+//!    [`ToolError::internal`], or a panic (in the body or the limiter) —
+//!    becomes "Internal server error.";
+//! 6. exactly **one** structured audit line per run (see [`AUDIT_TARGET`]).
 //!
 //! "Per run" is per call that reaches the tool's code: rmcp answers some
 //! `tools/call` requests before any tool runs — arguments that do not
@@ -40,8 +45,10 @@
 //! service that cares installs its own hook.)
 
 use std::borrow::Cow;
+use std::fmt;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::FutureExt;
@@ -50,16 +57,17 @@ use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer};
 use serde::Serialize;
 
+use crate::limits::{RateClass, RateLimited, RateLimiter};
 use crate::principal::Principal;
 use crate::server::principal;
 
 /// The `tracing` target of the one audit line per [`ToolCall::run`].
 ///
-/// Fields: `tool`, `outcome` (`ok`, `error`, `denied`, `timeout`,
-/// `internal`, `cancelled`), `duration_ms`, `required_scopes`, and when the
-/// caller is known `sub`, `auth_method`, `scopes` and `client_id`; plus
-/// `error_class` for anything but `ok`. Never a token, an email or a name.
-/// `INFO`, except `timeout` and `cancelled` (`WARN`) and `internal`
+/// Fields: `tool`, `outcome` (`ok`, `error`, `denied`, `ratelimited`,
+/// `timeout`, `internal`, `cancelled`), `duration_ms`, `required_scopes`, and
+/// when the caller is known `sub`, `auth_method`, `scopes` and `client_id`;
+/// plus `error_class` for anything but `ok`. Never a token, an email or a
+/// name. `INFO`, except `timeout` and `cancelled` (`WARN`) and `internal`
 /// (`ERROR`), so an alert can key on severity.
 pub const AUDIT_TARGET: &str = "stridelabs.mcp.tool";
 
@@ -81,13 +89,16 @@ pub enum Outcome {
     Error,
     /// Not authenticated, a missing scope, or a [`ToolError::denied`].
     Denied,
-    /// The body outran its timeout.
+    /// The body (or its rate limit check) outran the call's timeout.
     Timeout,
     /// A [`ToolError::internal`] or a panic.
     Internal,
     /// The request was cancelled, or the call was dropped, before the body
     /// finished.
     Cancelled,
+    /// The call's [rate limiter](ToolCall::rate_limit) refused it. (Last, so
+    /// the variants v0.6.0 had keep their discriminants.)
+    RateLimited,
 }
 
 impl Outcome {
@@ -100,6 +111,7 @@ impl Outcome {
             Outcome::Timeout => "timeout",
             Outcome::Internal => "internal",
             Outcome::Cancelled => "cancelled",
+            Outcome::RateLimited => "ratelimited",
         }
     }
 }
@@ -181,7 +193,7 @@ impl std::fmt::Display for ToolError {
 impl std::error::Error for ToolError {}
 
 /// One tool call, configured: its name (for the audit line), its required
-/// scopes and its timeout.
+/// scopes, its rate limit and its timeout.
 ///
 /// ```no_run
 /// use rmcp::model::{CallToolResult, ContentBlock};
@@ -201,11 +213,15 @@ impl std::error::Error for ToolError {}
 ///         .await
 /// }
 /// ```
-#[derive(Debug, Clone)]
+///
+/// `Clone`, `Send`, `Sync`, `UnwindSafe` and `RefUnwindSafe`; its `Debug`
+/// names the rate class, never the limiter.
+#[derive(Clone)]
 pub struct ToolCall {
     name: Cow<'static, str>,
     scopes: Vec<String>,
     timeout: Duration,
+    rate_limit: Option<(Arc<dyn RateLimiter>, RateClass)>,
 }
 
 impl ToolCall {
@@ -216,6 +232,7 @@ impl ToolCall {
             name: name.into(),
             scopes: Vec::new(),
             timeout: DEFAULT_TOOL_TIMEOUT,
+            rate_limit: None,
         }
     }
 
@@ -232,6 +249,19 @@ impl ToolCall {
     /// Replace the timeout.
     pub fn timeout(mut self, timeout: Duration) -> ToolCall {
         self.timeout = timeout;
+        self
+    }
+
+    /// Count each run against `limiter` in `class`, keyed by the caller's
+    /// subject; a refusal is the call's result (outcome `ratelimited`).
+    ///
+    /// The check runs after the scope check — a call refused for its scopes
+    /// consumes nothing — and inside the call's timeout, cancellation and
+    /// panic capture, together with the body: a limiter that hangs ends the
+    /// call as `timeout`, one that panics as `internal`. Share one limiter
+    /// across the service's handler instances (they are built per request).
+    pub fn rate_limit(mut self, limiter: Arc<dyn RateLimiter>, class: RateClass) -> ToolCall {
+        self.rate_limit = Some((limiter, class));
         self
     }
 
@@ -261,9 +291,18 @@ impl ToolCall {
             return Ok(audit.refuse(Outcome::Denied, "ScopeError", &missing.to_string()));
         }
 
-        // Called inside the guarded future, so a panic while *building* the
-        // body's future is caught too, not only one while polling it.
-        let guarded = AssertUnwindSafe(async move { body(principal).await }).catch_unwind();
+        // The rate limit check and the body run as one guarded future, so the
+        // timeout, the cancellation and the panic capture cover both. Called
+        // inside it, so a panic while *building* either future is caught
+        // too, not only one while polling it.
+        let rate_limit = self.rate_limit;
+        let guarded = AssertUnwindSafe(async move {
+            if let Some((limiter, class)) = &rate_limit {
+                limiter.check(&principal.subject, *class).await?;
+            }
+            Ok::<_, RateLimited>(body(principal).await)
+        })
+        .catch_unwind();
         let finished = tokio::select! {
             // Cancellation first: a cancelled request's result is unwanted.
             biased;
@@ -275,7 +314,10 @@ impl ToolCall {
             None => audit.refuse(Outcome::Cancelled, "Cancelled", CANCELLED),
             Some(Err(_elapsed)) => audit.refuse(Outcome::Timeout, "Timeout", TIMED_OUT),
             Some(Ok(Err(_panic))) => audit.refuse(Outcome::Internal, "panic", INTERNAL),
-            Some(Ok(Ok(Ok(result)))) => {
+            Some(Ok(Ok(Err(limited)))) => {
+                audit.refuse(Outcome::RateLimited, "RateLimited", &limited.to_string())
+            }
+            Some(Ok(Ok(Ok(Ok(result))))) => {
                 if result.is_error == Some(true) {
                     audit.finish(Outcome::Error, Some("CallToolResult"));
                 } else {
@@ -283,7 +325,7 @@ impl ToolCall {
                 }
                 result
             }
-            Some(Ok(Ok(Err(error)))) => {
+            Some(Ok(Ok(Ok(Err(error))))) => {
                 let (outcome, class) = match &error {
                     ToolError::User(_) => (Outcome::Error, "ToolError::User"),
                     ToolError::Denied(_) => (Outcome::Denied, "ToolError::Denied"),
@@ -292,6 +334,20 @@ impl ToolCall {
                 audit.refuse(outcome, class, &error.to_string())
             }
         })
+    }
+}
+
+impl fmt::Debug for ToolCall {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ToolCall")
+            .field("name", &self.name)
+            .field("scopes", &self.scopes)
+            .field("timeout", &self.timeout)
+            .field(
+                "rate_class",
+                &self.rate_limit.as_ref().map(|(_, class)| *class),
+            )
+            .finish_non_exhaustive()
     }
 }
 
@@ -583,11 +639,61 @@ mod tests {
             Outcome::Timeout,
             Outcome::Internal,
             Outcome::Cancelled,
+            Outcome::RateLimited,
         ];
         let names: Vec<&str> = all.iter().map(|outcome| outcome.as_str()).collect();
         assert_eq!(
             names,
-            ["ok", "error", "denied", "timeout", "internal", "cancelled"]
+            [
+                "ok",
+                "error",
+                "denied",
+                "timeout",
+                "internal",
+                "cancelled",
+                "ratelimited"
+            ]
         );
+    }
+
+    #[test]
+    fn a_tool_call_keeps_its_auto_traits() {
+        // Compile-time: adding the limiter must not cost `ToolCall` any of
+        // the auto traits v0.6.0 gave it (they are part of its API).
+        fn assert_traits<
+            T: Clone
+                + Send
+                + Sync
+                + Unpin
+                + std::panic::UnwindSafe
+                + std::panic::RefUnwindSafe
+                + fmt::Debug
+                + 'static,
+        >() {
+        }
+        assert_traits::<ToolCall>();
+    }
+
+    #[test]
+    fn debug_names_the_rate_class_never_the_limiter() {
+        struct Secretive;
+        impl RateLimiter for Secretive {
+            fn check<'a>(&'a self, _: &'a str, _: RateClass) -> crate::LimitFuture<'a> {
+                Box::pin(std::future::ready(Ok(())))
+            }
+        }
+
+        let call = ToolCall::new("generate")
+            .scopes(["image:generate"])
+            .rate_limit(Arc::new(Secretive), RateClass("generate"));
+        let debug = format!("{call:?}");
+
+        assert!(
+            debug.contains("rate_class: Some(RateClass(\"generate\"))"),
+            "{debug}"
+        );
+        assert!(!debug.contains("Secretive"), "{debug}");
+        let plain = format!("{:?}", ToolCall::new("ping"));
+        assert!(plain.contains("rate_class: None"), "{plain}");
     }
 }

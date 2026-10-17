@@ -34,8 +34,9 @@ jobs:
 
     # Postgres and Redis for the fail-loud integration tests the all-features
     # lane compiles in: stridelabs-testing's `require_postgres` and
-    # `require_redis`, and stridelabs-redis's live suite. Mapped to 5438 and
-    # 6390 to match docker-compose.yml / the local dev ports.
+    # `require_redis`, and stridelabs-redis's and stridelabs-mcp's live suites
+    # (each crate's `live-tests` feature). Mapped to 5438 and 6390 to match
+    # docker-compose.yml / the local dev ports.
     services:
       postgres:
         image: postgres:16-alpine
@@ -93,6 +94,10 @@ jobs:
       - name: Test (default features)
         run: cargo test --workspace --locked
 
+      # `--all-features` turns on every crate's `live-tests`, so this lane runs
+      # stridelabs-redis's and stridelabs-mcp's real-Redis suites against the
+      # `redis` service above (`REDIS_URL`); `require_redis` fails them loudly,
+      # never skips them, if it is not up.
       - name: Test (all features)
         run: cargo test --workspace --all-features --locked
 
@@ -109,6 +114,26 @@ jobs:
 
       - name: Build (no default features)
         run: cargo build --workspace --no-default-features --locked
+
+      # The workspace-wide lanes above unify every member's features, which
+      # hides a feature that compiles only because another one is on (a
+      # missing `dep:` edge, an item gated on the wrong feature). Built and
+      # linted one feature at a time, `-p` alone, so each is resolved on its
+      # own. The lone `""` is the core (no features); `live-tests` compiles
+      # the live suite without running it.
+      - name: stridelabs-mcp, feature by feature (build + clippy)
+        run: |
+          set -euo pipefail
+          for features in "" cors redis image-fetch test-support live-tests; do
+            echo "::group::stridelabs-mcp [${features:-core}]"
+            cargo build --locked -p stridelabs-mcp --no-default-features ${features:+--features "$features"}
+            cargo clippy --locked -p stridelabs-mcp --all-targets --no-default-features ${features:+--features "$features"} -- -D warnings
+            echo "::endgroup::"
+          done
+          echo "::group::stridelabs-mcp [all]"
+          cargo build --locked -p stridelabs-mcp --all-features
+          cargo clippy --locked -p stridelabs-mcp --all-targets --all-features -- -D warnings
+          echo "::endgroup::"
 
       - name: Doc
         run: cargo doc --workspace --all-features --no-deps --locked
@@ -218,38 +243,97 @@ jobs:
           fi
           echo "ok: rustls absent with every feature on, jsonwebtoken and stridelabs-http present"
 
-      # stridelabs-mcp sits in consumers' production graphs too, with the same
-      # reason to pick no TLS stack: its reqwest (no features) is only the
-      # `reqwest::Client` type `McpVerifier::new` takes from the consumer, and
-      # rmcp is built with default features off, so neither its HTTP client
-      # (`__reqwest`, with a TLS feature of its own) nor its OAuth client
-      # (`auth`) comes along. One listing with every feature on (features
-      # only add crates); rmcp and jsonwebtoken are the positive controls,
-      # proving the listing walked both the transport and the verifier.
-      - name: "Guard: stridelabs-mcp pulls no rustls"
+      # stridelabs-mcp sits in consumers' production graphs too, and its core
+      # has the same reason to pick no TLS stack: its reqwest (no features) is
+      # only the `reqwest::Client` type `McpVerifier::new` takes from the
+      # consumer, and rmcp is built with default features off, so neither its
+      # HTTP client (`__reqwest`, with a TLS feature of its own) nor its OAuth
+      # client (`auth`) comes along. The non-network features (`cors`, a
+      # header layer; `test-support`, token minting) keep that true. One
+      # listing with both on (features only add crates, so it covers the core
+      # and each alone); rmcp and jsonwebtoken are the positive controls for
+      # the transport and the verifier, and tower-http 0.7 for the `cors` edge
+      # (the 0.6 in the graph is reqwest's).
+      #
+      # `redis` and `image-fetch` are TLS by design (`rediss://`; https image
+      # fetches) and get the next guard instead.
+      - name: "Guard: stridelabs-mcp pulls no rustls (core, cors, test-support)"
         run: |
           set -euo pipefail
           pkgs="$(mktemp)"
           trap 'rm -f "$pkgs"' EXIT
-          cargo tree --locked --target all -e normal -p stridelabs-mcp --all-features \
-            --prefix none --format '{p}' | awk '{print $1}' | sort -u > "$pkgs"
-          echo "$(wc -l < "$pkgs") packages in stridelabs-mcp[all features]'s normal graph"
+          cargo tree --locked --target all -e normal -p stridelabs-mcp --no-default-features \
+            --features cors,test-support --prefix none --format '{p}' | awk '{print $1, $2}' | sort -u > "$pkgs"
+          echo "$(wc -l < "$pkgs") packages in stridelabs-mcp[cors,test-support]'s normal graph"
           if [ ! -s "$pkgs" ]; then
             echo "::error::the stridelabs-mcp package listing is empty; the guard proved nothing"
             exit 1
           fi
           for control in rmcp jsonwebtoken; do
-            if ! grep -qx "$control" "$pkgs"; then
-              echo "::error::positive control failed: $control is not in stridelabs-mcp[all features]'s graph, so this listing is not the one the guard means to inspect"
+            if ! grep -q "^$control " "$pkgs"; then
+              echo "::error::positive control failed: $control is not in stridelabs-mcp[cors,test-support]'s graph, so this listing is not the one the guard means to inspect"
               exit 1
             fi
           done
-          if grep -qx rustls "$pkgs"; then
-            echo "::error::rustls is in stridelabs-mcp[all features]'s graph; a TLS feature (on its reqwest, or an rmcp client feature) picks a rustls provider for every consumer"
-            cargo tree --locked --target all -e normal -p stridelabs-mcp --all-features -i rustls || true
+          if ! grep -q '^tower-http v0\.7\.' "$pkgs"; then
+            echo "::error::positive control failed: tower-http 0.7 (the cors feature's) is not in stridelabs-mcp[cors,test-support]'s graph, so the feature edge was not walked"
             exit 1
           fi
-          echo "ok: rustls absent with every feature on, rmcp and jsonwebtoken present"
+          if grep -q '^rustls ' "$pkgs"; then
+            echo "::error::rustls is in stridelabs-mcp[cors,test-support]'s graph; a TLS feature (on its reqwest, an rmcp client feature, or a non-network feature's dependency) picks a rustls provider for every consumer"
+            cargo tree --locked --target all -e normal -p stridelabs-mcp --no-default-features --features cors,test-support -i rustls || true
+            exit 1
+          fi
+          echo "ok: rustls absent from the core, cors and test-support; rmcp, jsonwebtoken and tower-http 0.7 present"
+
+      # `redis` (redis-rs `tokio-rustls-comp`, for Upstash's `rediss://`) and
+      # `image-fetch` (stridelabs-http's `ssrf`: reqwest 0.13's `rustls`) do
+      # bring rustls. What must hold is that its only provider is aws-lc-rs:
+      # rustls `ring` next to it makes `rustls::ClientConfig::builder()`
+      # panic. Each listing proves rustls is there (the positive control: the
+      # feature really is the TLS one), that no `ring` crate is, and that no
+      # provider feature but aws-lc-rs is on rustls. `redis` alone enables NO
+      # provider feature (redis-rs 1.x builds rustls with defaults off): the
+      # consumer installs aws-lc-rs at startup, per stridelabs-redis's README;
+      # `image-fetch` names aws-lc-rs through reqwest, and is checked for it.
+      - name: "Guard: stridelabs-mcp's redis and image-fetch put rustls on aws-lc-rs, never ring"
+        run: |
+          set -euo pipefail
+          listing="$(mktemp)"
+          trap 'rm -f "$listing"' EXIT
+          for features in redis image-fetch redis,image-fetch; do
+            cargo tree --locked --target all -e normal -p stridelabs-mcp --no-default-features \
+              --features "$features" --prefix none --format '{p} [{f}]' | sort -u > "$listing"
+            echo "$(wc -l < "$listing") lines in stridelabs-mcp[$features]'s normal graph"
+            if [ ! -s "$listing" ]; then
+              echo "::error::the stridelabs-mcp[$features] listing is empty; the guard proved nothing"
+              exit 1
+            fi
+            if ! grep -q '^rustls v' "$listing"; then
+              echo "::error::positive control failed: rustls is not in stridelabs-mcp[$features]'s graph, so this listing is not the one the guard means to inspect"
+              exit 1
+            fi
+            if awk '{print $1}' "$listing" | grep -qx ring; then
+              echo "::error::ring is in stridelabs-mcp[$features]'s graph; next to aws-lc-rs it is a second crypto provider, and rustls::ClientConfig::builder() panics"
+              cargo tree --locked --target all -e normal -p stridelabs-mcp --no-default-features --features "$features" -i ring || true
+              exit 1
+            fi
+            providers="$(awk '$1 == "rustls"' "$listing" | sed -n 's/^[^[]*\[\(.*\)\].*$/\1/p' | tr ',' '\n' \
+              | grep -E '^(ring|aws_lc_rs|aws-lc-rs|fips|custom-provider)$' | sort -u || true)"
+            # (`grep -v` into a variable, not `grep -qv`: macOS's BSD grep
+            # answered `-qv` from the first line alone when tried, so a local
+            # run of this step would miss a second provider.)
+            others="$(grep -vE '^(aws_lc_rs|aws-lc-rs)$' <<<"$providers" | grep . || true)"
+            if [ -n "$others" ]; then
+              echo "::error::rustls in stridelabs-mcp[$features]'s graph has a provider feature other than aws-lc-rs: $(echo $others)"
+              exit 1
+            fi
+            if [ "$features" != redis ] && ! grep -qx aws_lc_rs <<<"$providers"; then
+              echo "::error::rustls in stridelabs-mcp[$features]'s graph does not name aws-lc-rs, though reqwest's rustls feature should"
+              exit 1
+            fi
+            echo "ok: [$features] rustls present, ring absent, provider features: $(echo ${providers:-none, the consumer installs aws-lc-rs})"
+          done
 
       # rsa (RUSTSEC-2023-0071, no upstream fix) has to stay out of the lock
       # entirely: cargo-audit reads Cargo.lock, so even a crate that is never
