@@ -6,23 +6,74 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "Hardened MCP-server middle for StrideLabs services: RFC 9728 protected-resource metadata, slauth bearer verification at the MCP boundary, a stateless rmcp Streamable HTTP router, and a scoped, audited tool boundary"
+description = "Hardened MCP-server middle for StrideLabs services: RFC 9728 protected-resource metadata, slauth bearer verification at the MCP boundary, a stateless rmcp Streamable HTTP router, and a scoped, rate-limited, audited tool boundary"
 publish = false
 
 [features]
 default = []
 # Offline MCP access-token minting for a `ProtectedResource`, for consumers'
-# tests (their /mcp end to end). Nothing more than stridelabs-auth's own
-# `test-support` (the committed throwaway keypairs and jsonwebtoken's PEM
-# machinery) plus a claims builder, so it belongs in dev-dependencies.
-test-support = ["stridelabs-auth/test-support"]
+# tests (their /mcp end to end), and the committed `tools/list` freshness
+# check. Nothing more than stridelabs-auth's own `test-support` (the committed
+# throwaway keypairs and jsonwebtoken's PEM machinery) plus a claims builder,
+# so it belongs in dev-dependencies.
+#
+# With `image-fetch` also on, it turns on stridelabs-http's
+# `ssrf-test-support` (the `?` makes that conditional: without `image-fetch`
+# there is no stridelabs-http to turn it on in), so a consumer's image tests
+# can point an `ImageFetcher` at a local TLS server. One more reason this
+# feature must never reach a shipped binary: see stridelabs-http's README for
+# the `cargo tree` guard.
+test-support = ["stridelabs-auth/test-support", "stridelabs-http?/ssrf-test-support"]
+# `cors_layer()`, the app-wide CORS preset for an MCP service, via
+# tower-http's `cors`. A header layer: no client, no TLS.
+cors = ["dep:tower-http"]
+# `RedisRateLimiter` and `RedisPatCache`, on stridelabs-redis's lazy handle.
+# That crate builds redis-rs with `tokio-rustls-comp` (production Redis is
+# `rediss://`), so this feature brings rustls — on aws-lc-rs, never `ring`
+# (CI's guard). It installs no crypto provider; the consumer does, at startup
+# (stridelabs-redis's README).
+redis = ["dep:stridelabs-redis"]
+# `ImageFetcher`, the SSRF-hardened image fetch (https URLs and `data:` URIs),
+# on stridelabs-http's `ssrf`: an HTTP client and a TLS stack (reqwest's
+# `rustls`, aws-lc-rs). `base64` decodes `data:` payloads.
+image-fetch = ["dep:stridelabs-http", "dep:base64"]
+# NOT for consumers: it compiles this crate's own real-Redis suite
+# (`tests/redis_live.rs`), which needs the compose Redis (`docker compose up -d
+# redis`) or CI's Redis service, and panics without one rather than skipping.
+# A feature, not an always-on test target, so `cargo test --workspace` keeps
+# needing no services; `--all-features` (CI's all-features lane) turns it on.
+# Like stridelabs-redis's, it enables a DEV-dependency's feature
+# (`stridelabs-testing/redis`), so the default lane never builds that probe.
+live-tests = ["redis", "stridelabs-testing/redis"]
 
 [lints]
 workspace = true
 
+# Offline: a dead handle, no server needed.
+[[test]]
+name = "redis_backed"
+required-features = ["redis"]
+
+[[test]]
+name = "redis_live"
+required-features = ["live-tests"]
+
+[[test]]
+name = "image_fetch"
+required-features = ["image-fetch", "test-support"]
+
+[[test]]
+name = "cors"
+required-features = ["cors"]
+
+[[test]]
+name = "tools_freshness"
+required-features = ["test-support"]
+
 [dependencies]
 # `axum` for `bearer_token(&Parts)`. Not `http` (the stridelabs-http bridge):
 # the MCP boundary answers with its own RFC 6750 challenges, never `AppError`.
+# Also the source of `PatValidator`, which `SlauthPatCredential` wraps.
 stridelabs-auth = { workspace = true, features = ["axum"] }
 rmcp = { workspace = true }
 axum = { workspace = true }
@@ -38,6 +89,19 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["time"] }
 tracing = { workspace = true }
+# The PAT cache key: the first 32 hex characters of the token's SHA-256, never
+# the token. Already in the graph through stridelabs-auth; declared here
+# because the key's shape is this crate's contract, not a borrowed helper's.
+sha2 = { workspace = true }
+# The identity a slauth PAT resolves to, as a `PatCache` stores it. Already in
+# the graph through stridelabs-auth's `PatValidator`.
+uuid = { workspace = true }
+
+# --- feature-gated ---------------------------------------------------------
+tower-http = { workspace = true, optional = true, features = ["cors"] }
+stridelabs-redis = { workspace = true, optional = true }
+stridelabs-http = { workspace = true, optional = true, features = ["ssrf"] }
+base64 = { workspace = true, optional = true }
 
 [dev-dependencies]
 stridelabs-auth = { workspace = true, features = ["axum", "test-support"] }
@@ -46,3 +110,30 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 reqwest = { workspace = true, features = ["json"] }
 wiremock = { workspace = true }
 tracing-subscriber = { workspace = true }
+# `require_redis` for the live suite. Its `redis` feature is switched on by
+# `live-tests` above, never here: the default lane must need no Redis.
+stridelabs-testing = { workspace = true }
+# The live suite reads TTLs and plants raw values (`PTTL`, `SET`), which the
+# handle under test deliberately cannot. Already in the graph through
+# stridelabs-redis and stridelabs-testing.
+redis = { workspace = true }
+# The image-fetch suite names `LoopbackTestServer` and the resolver seam. Its
+# features come from `image-fetch` + `test-support` above, so this line adds
+# none (and dev-dependencies never reach a consumer's graph).
+stridelabs-http = { workspace = true }
+# The image-fetch suite's local TLS server, built as stridelabs-http's own
+# `ssrf_pinning` suite builds it: a throwaway CA and leaf certificates
+# (`aws_lc_rs`, never rcgen's default `ring`: CI's "compiles no ring" guard
+# lists dev edges too), served by tokio-rustls on the same provider. Both are
+# already in Cargo.lock through that suite.
+rcgen = { version = "0.14", default-features = false, features = [
+    "aws_lc_rs",
+    "pem",
+] }
+tokio-rustls = { version = "0.26", default-features = false, features = [
+    "aws_lc_rs",
+] }
+# Encodes the `data:` URIs the image-fetch suite decodes.
+base64 = { workspace = true }
+# The freshness tests write a committed file to compare against.
+tempfile = "3"

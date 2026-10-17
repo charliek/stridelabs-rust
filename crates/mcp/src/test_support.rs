@@ -1,4 +1,5 @@
-//! Offline MCP access tokens for consumers' tests (feature `test-support`).
+//! Offline MCP access tokens for consumers' tests, and the committed
+//! `tools/list` freshness check (feature `test-support`).
 //!
 //! Tokens are signed with stridelabs-auth's committed **throwaway** test
 //! keypair (see `stridelabs_auth::test_support`), shaped as slauth mints
@@ -45,6 +46,8 @@
 //! accept the test's `Host`: pass `"127.0.0.1"` (or `"localhost"`) as an
 //! extra host to [`crate::server_config`] when it listens on loopback. The
 //! resource URL itself stays `https`: it is an identifier, never dialled.
+
+use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 use stridelabs_auth::test_support::{TestClaims, TestKey};
@@ -149,6 +152,135 @@ impl AccessToken {
                 .or_insert_with(|| json!(scopes.join(" ")));
         }
         self.key.mint_with_kid(TestKey::primary().kid(), &claims)
+    }
+}
+
+/// Why a committed `tools/list` file failed its freshness check. `Display`
+/// is the whole report, ending with the command that regenerates the file.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum ToolsFreshnessError {
+    /// The committed file could not be read (missing, unreadable, not UTF-8).
+    #[error(
+        "could not read the committed MCP tool list at {}: {source}\nregenerate it with: {regenerate_command}",
+        .path.display()
+    )]
+    Read {
+        /// The file that was checked.
+        path: PathBuf,
+        /// The command that regenerates it.
+        regenerate_command: String,
+        /// Why it could not be read.
+        source: std::io::Error,
+    },
+    /// The committed file differs from the fresh export.
+    #[error(
+        "{} is stale: it does not match the tools this build serves.\n{detail}\nregenerate it with: {regenerate_command}",
+        .path.display()
+    )]
+    Stale {
+        /// The file that was checked.
+        path: PathBuf,
+        /// The command that regenerates it.
+        regenerate_command: String,
+        /// Where the two first differ, or which invisible difference it is
+        /// (CRLF line endings, a missing or doubled trailing newline).
+        detail: String,
+    },
+}
+
+/// Check that the committed file at `path` is byte-identical to `fresh_json`
+/// — the service's [`canonical_tools_json`](crate::canonical_tools_json) —
+/// the MCP counterpart of `stridelabs_http::openapi::check_committed_spec`.
+///
+/// Line endings are not normalized: a CRLF checkout is reported by name,
+/// with the `.gitattributes` line that fixes it (`mcp-tools.json text
+/// eol=lf`), rather than passing locally and failing for the next person.
+pub fn check_committed_tools(
+    path: impl AsRef<Path>,
+    fresh_json: &str,
+    regenerate_command: &str,
+) -> Result<(), ToolsFreshnessError> {
+    let path = path.as_ref();
+    let committed = std::fs::read_to_string(path).map_err(|source| ToolsFreshnessError::Read {
+        path: path.to_path_buf(),
+        regenerate_command: regenerate_command.to_owned(),
+        source,
+    })?;
+    if committed == fresh_json {
+        return Ok(());
+    }
+    Err(ToolsFreshnessError::Stale {
+        path: path.to_path_buf(),
+        regenerate_command: regenerate_command.to_owned(),
+        detail: describe_difference(path, &committed, fresh_json),
+    })
+}
+
+/// [`check_committed_tools`], panicking with the report: the one-line test.
+///
+/// ```no_run
+/// # fn tools() -> Vec<rmcp::model::Tool> { vec![] }
+/// #[test]
+/// fn the_committed_tool_list_is_fresh() {
+///     stridelabs_mcp::test_support::assert_committed_tools_are_fresh(
+///         concat!(env!("CARGO_MANIFEST_DIR"), "/mcp-tools.json"),
+///         &stridelabs_mcp::canonical_tools_json(&tools()),
+///         "cargo run -- tools > mcp-tools.json",
+///     );
+/// }
+/// ```
+#[track_caller]
+pub fn assert_committed_tools_are_fresh(
+    path: impl AsRef<Path>,
+    fresh_json: &str,
+    regenerate_command: &str,
+) {
+    if let Err(error) = check_committed_tools(path, fresh_json, regenerate_command) {
+        panic!("{error}");
+    }
+}
+
+fn describe_difference(path: &Path, committed: &str, fresh: &str) -> String {
+    if committed.contains('\r') {
+        let file = path.file_name().map_or_else(
+            || path.display().to_string(),
+            |name| name.to_string_lossy().into_owned(),
+        );
+        return format!(
+            "the committed file has CRLF line endings; the export always writes LF. \
+             Pin it to LF and re-check it out:\n    echo '{file} text eol=lf' >> .gitattributes"
+        );
+    }
+    if committed.trim_end_matches('\n') == fresh.trim_end_matches('\n') {
+        return if committed.ends_with('\n') {
+            "the content matches but the committed file has more than one trailing newline".into()
+        } else {
+            "the content matches but the committed file has no trailing newline".into()
+        };
+    }
+    let committed_lines: Vec<&str> = committed.lines().collect();
+    let fresh_lines: Vec<&str> = fresh.lines().collect();
+    for (number, (old, new)) in committed_lines.iter().zip(&fresh_lines).enumerate() {
+        if old != new {
+            return format!(
+                "first difference at line {}:\n  committed: {old}\n  exported:  {new}",
+                number + 1
+            );
+        }
+    }
+    if committed_lines.len() < fresh_lines.len() {
+        format!(
+            "the committed file ends at line {}; the export continues with: {}",
+            committed_lines.len(),
+            fresh_lines[committed_lines.len()]
+        )
+    } else {
+        format!(
+            "the export ends at line {}; the committed file continues with: {}",
+            fresh_lines.len(),
+            committed_lines[fresh_lines.len()]
+        )
     }
 }
 
@@ -267,5 +399,93 @@ mod tests {
                 Err(VerifyError::invalid(reason))
             );
         }
+    }
+
+    // --- the tools freshness check -----------------------------------------
+
+    const REGEN: &str = "cargo run -- tools > mcp-tools.json";
+    const FRESH: &str = "{\n  \"tools\": [\n    {\n      \"name\": \"ping\"\n    }\n  ]\n}\n";
+
+    fn committed(contents: &str) -> tempfile::NamedTempFile {
+        let file = tempfile::NamedTempFile::new().expect("a temp file");
+        std::fs::write(file.path(), contents).expect("written");
+        file
+    }
+
+    fn report(contents: &str) -> String {
+        let file = committed(contents);
+        check_committed_tools(file.path(), FRESH, REGEN)
+            .expect_err("stale")
+            .to_string()
+    }
+
+    #[test]
+    fn a_fresh_file_passes() {
+        let file = committed(FRESH);
+        check_committed_tools(file.path(), FRESH, REGEN).expect("fresh");
+        assert_committed_tools_are_fresh(file.path(), FRESH, REGEN);
+    }
+
+    #[test]
+    fn a_stale_file_names_the_first_difference_and_the_command() {
+        let report = report(&FRESH.replace("ping", "pong"));
+
+        assert!(report.contains("is stale"), "{report}");
+        assert!(report.contains("first difference at line 4"), "{report}");
+        assert!(
+            report.contains("committed:       \"name\": \"pong\""),
+            "{report}"
+        );
+        assert!(
+            report.ends_with(&format!("regenerate it with: {REGEN}")),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn a_shorter_or_longer_file_says_where_it_ends() {
+        let shorter = report("{\n  \"tools\": [\n");
+        assert!(
+            shorter.contains("the committed file ends at line 2"),
+            "{shorter}"
+        );
+        let longer = report(&format!("{FRESH}extra\n"));
+        assert!(longer.contains("the export ends at line 7"), "{longer}");
+    }
+
+    #[test]
+    fn invisible_differences_are_called_out_by_name() {
+        let crlf = report(&FRESH.replace('\n', "\r\n"));
+        assert!(crlf.contains("CRLF"), "{crlf}");
+        assert!(crlf.contains("text eol=lf"), "{crlf}");
+
+        let bare = report(FRESH.trim_end());
+        assert!(bare.contains("no trailing newline"), "{bare}");
+
+        let doubled = report(&format!("{FRESH}\n"));
+        assert!(
+            doubled.contains("more than one trailing newline"),
+            "{doubled}"
+        );
+    }
+
+    #[test]
+    fn a_missing_file_names_the_command() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let error = check_committed_tools(dir.path().join("mcp-tools.json"), FRESH, REGEN)
+            .expect_err("missing");
+
+        assert!(
+            matches!(error, ToolsFreshnessError::Read { .. }),
+            "{error:?}"
+        );
+        assert!(error.to_string().contains(REGEN), "{error}");
+    }
+
+    #[test]
+    #[should_panic(expected = "regenerate it with: cargo run -- tools > mcp-tools.json")]
+    fn the_assertion_panics_with_the_report() {
+        let file = committed("{}\n");
+        assert_committed_tools_are_fresh(file.path(), FRESH, REGEN);
     }
 }

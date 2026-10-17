@@ -18,7 +18,7 @@
 #   - The consumer ref is `git archive`d into $WORK/<consumer>, a fresh
 #     directory every run. No worktree metadata, and the consumer's real repo
 #     and Cargo.lock are never touched.
-#   - All six stridelabs-* crates are overridden with `--config
+#   - Every stridelabs-* crate is overridden with `--config
 #     'patch."<git url>".<crate>.path=...'` pointing at this checkout. [patch]
 #     is keyed by the source URL, so it applies to a consumer that pins by
 #     `tag` and to one that pins by `rev` alike.
@@ -94,7 +94,7 @@ set -uo pipefail
 LIB=${DOWNSTREAM_LIB:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
 SCRATCH=${DOWNSTREAM_SCRATCH:-/Volumes/miniext/scratch-011}
 LIB_URL='https://github.com/charliek/stridelabs-rust.git'
-CRATES='config observability http auth testing mcp'
+CRATES='config observability http auth testing mcp redis gcp'
 KNOWN_CONSUMERS='tapper slauth limen spendwise'
 
 usage() {
@@ -654,7 +654,7 @@ else
   printf 'lib state: clean\n'
 fi
 cat <<'EOF'
-mode    : PATCHED development check. The six stridelabs-* crates are [patch]ed to the
+mode    : PATCHED development check. Every stridelabs-* crate is [patch]ed to the
           path above and each consumer's lock is re-resolved in its scratch copy (never
           --locked). The binding proof is separate: the consumer's own committed rev pin
           and lock, built with --locked.

@@ -9,7 +9,7 @@ resolver = "2"
 # Lockstep versioning: every crate in this workspace ships at the same
 # version, bumped together at release time regardless of which crate(s)
 # changed. Consumers pin a single git rev/tag for the whole set.
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 rust-version = "1.97"
 license = "MIT"
@@ -32,17 +32,25 @@ http = "1"
 # every other dependency, and moving a crate is a one-line edit.
 stridelabs-http = { path = "crates/http" }
 stridelabs-auth = { path = "crates/auth" }
+# stridelabs-mcp's `redis` feature (the Redis-backed rate limiter and PAT
+# cache) is built on it.
+stridelabs-redis = { path = "crates/redis" }
+# Only the real-Redis tests use it (stridelabs-redis's and stridelabs-mcp's):
+# a dev-dependency whose `redis` feature each crate's `live-tests` feature
+# switches on.
+stridelabs-testing = { path = "crates/testing" }
 
-# HTTP client (proxy primitives, JWKS fetch). Deliberately NO TLS feature
-# here: whatever is listed at workspace level reaches every member's graph, and
-# so every consumer's. reqwest 0.13's `rustls` switches on rustls's aws-lc-rs
-# provider, and next to a consumer's rustls `ring` (redis-rs, sqlx
+# HTTP client (proxy primitives, the SSRF-guarded fetch, JWKS fetch, PAT
+# validation, GCP calls). Deliberately NO TLS feature here: whatever is listed
+# at workspace level reaches every member's graph, and so every consumer's.
+# reqwest 0.13's `rustls` switches on rustls's aws-lc-rs provider, and next to
+# a consumer's rustls `ring` (redis-rs 0.27's `tls-rustls`, sqlx
 # `tls-rustls-ring`) every `rustls::ClientConfig::builder()` that relies on the
-# crate-feature default panics. Only stridelabs-http's `proxy` builds a client
-# of its own, so only it turns TLS on (crates/http/Cargo.toml).
-# stridelabs-auth is handed the consumer's client and must not pick a TLS
-# stack for it; CI's "Guard: stridelabs-auth pulls no rustls" keeps rustls out
-# of its graph.
+# crate-feature default panics. Only stridelabs-http's `proxy` and `ssrf` build
+# a client of their own, so only they turn reqwest's TLS on
+# (crates/http/Cargo.toml). stridelabs-auth and stridelabs-gcp are handed the
+# consumer's client and must not pick a TLS stack for it; CI's "Guard:
+# stridelabs-auth pulls no rustls" keeps rustls out of stridelabs-auth's graph.
 reqwest = { version = "0.13", default-features = false }
 
 # OpenAPI. No schema features (`uuid`, `time`, …) here: the shared crate
@@ -99,6 +107,20 @@ sqlx = { version = "0.9", default-features = false, features = [
     "macros",
 ] }
 
+# Redis (stridelabs-redis's lazy handle, stridelabs-testing's `require_redis`).
+# `default-features = false` drops `acl`, `streams`, `geospatial`, `script` and
+# `num-bigint`, none of which either crate uses. `script` exists for `Script`'s
+# EVALSHA caching (and pulls in `sha1_smol`); the one script here, the fixed
+# window, goes out as a raw `EVAL` through `redis::cmd`, which needs nothing
+# from it. `tokio-comp` is the async runtime glue.
+#
+# Deliberately NO TLS feature at this level, for the reqwest reason above:
+# whatever is listed here reaches every member's graph, and so every
+# consumer's. stridelabs-redis turns `tokio-rustls-comp` on for itself
+# (crates/redis/Cargo.toml says why it must); stridelabs-testing's probe talks
+# to a local or CI Redis in the clear, as its Postgres pool does.
+redis = { version = "1", default-features = false, features = ["tokio-comp"] }
+
 # Auth (slauth JWT verification + PAT hashing). default-features = false drops
 # `use_pem` (pem + simple_asn1 + ~11 transitive crates) from production graphs:
 # verification decodes keys from the JWKS, never PEM. Only offline test-token
@@ -114,6 +136,10 @@ sqlx = { version = "0.9", default-features = false, features = [
 # `signing_and_verifying_work_on_the_one_crypto_backend` panics if this breaks.
 jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_rs"] }
 sha2 = "0.11"
+# stridelabs-gcp decodes a base64 service-account key (the GOOGLE_CREDENTIALS
+# convention) and Vertex `inlineData` image bytes. 0.22, the major
+# jsonwebtoken 11 and wiremock already lock, so no second copy.
+base64 = "0.22"
 
 # Misc
 rand = "0.10"
@@ -122,6 +148,9 @@ time = { version = "0.3", features = ["serde"] }
 bytes = "1"
 futures = "0.3"
 url = "2"
+# stridelabs-gcp: GCS object names are percent-encoded into a path segment or
+# query value, `/` included. Already in every graph through `url` and reqwest.
+percent-encoding = "2"
 
 # Test-only
 wiremock = "0.6"

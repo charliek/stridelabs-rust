@@ -3,13 +3,171 @@
 All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
-Versioning is lockstep across all six crates in this workspace (one
+Versioning is lockstep across all eight crates in this workspace (one
 `[workspace.package].version`, bumped together regardless of which crate(s)
 changed) rather than independent per-crate versioning —
 see the root README's "Consuming these crates" section for what that means
 for a consumer's pin.
 
 ## [Unreleased]
+
+## [0.7.0] - 2026-10-17
+
+Two new crates, `stridelabs-redis` and `stridelabs-gcp`, and the additive
+features the imgmcp port needs on `stridelabs-auth`, `stridelabs-http`,
+`stridelabs-testing` and `stridelabs-mcp`: slauth PAT validation, an
+SSRF-guarded public fetch, rate limiting in the MCP tool boundary, and the
+Redis and Google Cloud pieces under them. No breaking change:
+`cargo-semver-checks` (patch mode against v0.6.0, CI's pinned 0.51.0 and
+0.50.0) is clean for every crate, and the dependency majors are v0.6.0's
+plus `redis` 1 for the new crate. First consumer: imgmcp.
+
+### Added
+
+- `stridelabs-auth`: `PatValidator` / `is_slauth_pat`, the Rust twin of
+  Python's `PATValidator`, reading `SlauthConfig.pat_validate_url`. A
+  malformed token (prefix plus exactly 43 characters) is never sent; a
+  rejection is `PatValidationError::Rejected` (a 401) and an outage
+  `::Unavailable` (a 503), mapped as the Python client does. It takes the
+  consumer's `reqwest::Client`, which **must not follow redirects**
+  (`reqwest::redirect::Policy::none()`): then every 3xx is a service error,
+  as with Python's httpx. With a following client, an answer whose final URL
+  is not the validate URL is still refused, but that check is defence in
+  depth only: a redirect back to the validate URL itself (`POST` → `303` →
+  `GET` of the same URL) cannot be told from slauth answering, and a test
+  pins that limitation. Hardened beyond Python: the answer is read with a
+  16 KiB cap, only slauth's own reason codes pass through, and no error or
+  log line renders the token or the URL (`Debug` shows the endpoint
+  redacted: no userinfo, query or fragment). One 5 s deadline for the whole
+  exchange.
+- `stridelabs-http`, feature `tls`: `install_default_provider()` installs
+  the aws-lc-rs rustls provider as the process default
+  (`ProviderInstall`).
+- `stridelabs-http`, feature `ssrf`: `fetch_public(url, &FetchPolicy)`, a
+  port of Python `stridelabs-mcp`'s `ssrf.py` for fetching caller-supplied
+  URLs. https only by default; userinfo and metadata host names refused; a
+  hand-written address policy from the IANA IPv4 and IPv6 Special-Purpose
+  Address Registries (IPv6 only inside `2000::/3`; IPv4-mapped and NAT64
+  addresses unwrapped and rechecked). Every DNS answer must be public, and
+  each hop is sent through a client whose resolver answers only that name
+  with the validated address, with proxies off, no pooling across decisions
+  and redirects off by default (re-validated per hop when allowed). One
+  wall-clock budget across hops, a streamed byte cap, Python's error texts,
+  nothing internal in an error. Nothing is ever decompressed
+  (`Accept-Encoding: identity`; any other `Content-Encoding` is refused).
+- `stridelabs-http`, feature `ssrf-test-support`: a loopback TLS
+  test-server override, compiled out without the feature and inert until
+  `with_loopback_test_server` is called. Not for release builds.
+- `stridelabs-redis`, a new crate: `RedisHandle`, a lazy single-flight
+  Redis handle built from a URL with no I/O (a malformed URL, `#insecure`
+  or a zero timeout fails at construction; the first command dials, once
+  across concurrent callers; an I/O failure discards the connection under a
+  generation guard; 1 s dial and 500 ms response timeouts; `Debug` never
+  shows the URL). `fixed_window_hit` is Python `stridelabs-mcp`'s
+  `INCR` + `EXPIRE` Lua as a raw `EVAL`, never replayed after an
+  outcome-unknown failure; `get` / `set_ex` retry once on a fresh connection
+  after an I/O error on a cached one, and when that fresh connection cannot
+  be made the caller gets the first attempt's outcome-unknown `Io`, never
+  the dial's "never sent" `Connect`. Errors classify by where the round
+  trip failed. `rediss://` through redis-rs `tokio-rustls-comp` in this
+  crate only (native roots, no provider chosen: the consumer installs
+  aws-lc-rs). Feature `live-tests` compiles the crate's real-Redis suite.
+- `stridelabs-testing`, feature `redis`: `require_redis(default_url)`,
+  fail-loud, `REDIS_URL` first. The URL redaction shared with
+  `require_postgres` now renders a URL only when it has the expected
+  structure. Built with no redis-rs TLS feature. Compose and CI gain Redis
+  on 6390.
+- `stridelabs-gcp`, a new crate: policy-free Google Cloud building blocks
+  that take the consumer's `reqwest::Client` and enable no TLS feature.
+  `TokenProvider` resolves Application Default Credentials from an
+  enumerated subset (explicit base64 JSON, `GOOGLE_APPLICATION_CREDENTIALS`,
+  the gcloud well-known file, then the metadata server) for
+  `authorized_user` and `service_account` credentials; any other type is
+  refused, and a configured-but-broken source fails construction rather
+  than selecting another identity. Construction is local only; tokens are
+  cached with a 60 s refresh margin and one spawned refresh per attempt
+  that caller cancellation cannot cancel. `GcsClient` uploads
+  (`uploadType=media`), downloads (bounded, 32 MiB default) and deletes,
+  with bucket and object-name validation and `public_url`.
+  - Feature `service-account-key`: the RS256 JWT-bearer exchange for
+    `service_account` keys (jsonwebtoken with `use_pem`, on the workspace's
+    aws-lc-rs backend). Off, such a credential is
+    `GcpAuthError::Unsupported`, never a silent fallthrough.
+  - Feature `vertex`: typed `generateContent` request and response, the
+    endpoint builder (the `global` host as google-genai, with validated
+    location, project, model and version), a response cap (64 MiB default)
+    and `first_inline_image()` classifying `Image` / `Blocked` (`SAFETY`,
+    `PROHIBITED`, `BLOCKLIST`, `RECITATION`, `SPII`, `promptFeedback`) /
+    `Empty`.
+  - Google's `error.message` (which may echo a prompt or object name) is
+    only available through `sensitive_message()`; serde and reqwest errors
+    are reduced to fixed categories, never rendered.
+- `stridelabs-mcp`: rate limiting in the tool boundary. `RateClass`, an
+  async object-safe `RateLimiter`, `RateLimited` (Python `stridelabs-mcp`'s
+  text), `NoLimit` and `MemoryLimiter` (fixed 60 s windows). `ToolCall::
+  rate_limit` checks after the scope check, inside the existing
+  cancellation, timeout and panic region; a refusal is the new
+  `Outcome::RateLimited` (`"ratelimited"`, appended so earlier discriminants
+  are unchanged) with one audit line as before.
+- `stridelabs-mcp`: `SlauthPatCredential`, a `CredentialVerifier` for
+  `slp_live_` PATs on `PatValidator` (rejected is `Invalid`, unavailable is
+  `Unavailable`, the ceiling scopes applied on every call), with an
+  optional `PatCache` (key = the first 32 hex of sha256 of the token;
+  successes only, stored as a `CachedPat` of the identity UUID and an
+  absolute expiry, the validation's start plus a whole-second TTL of 1 s to
+  1 day, which the credential enforces on every read so that neither a hit
+  nor a write that lands late can extend it; every cache operation bounded
+  at 250 ms; fail-through on any cache error or malformed entry). The
+  validator's client must not follow redirects (above).
+- `stridelabs-mcp`, feature `redis`: `RedisRateLimiter` (fixed window on
+  `stridelabs-redis`, fails open on any backend error, never replayed) and
+  `RedisPatCache` (`{uuid}:{expires_at}` under a required prefix, `SET … EX`
+  as housekeeping only).
+- `stridelabs-mcp`, feature `image-fetch`: `ImageFetcher`, Python
+  `fetch.py`'s twin over the pinned public-only fetch (`data:` URIs,
+  Content-Type and magic-byte checks, Python's messages); its setters cannot
+  weaken the size cap, https-only, no-redirect or Accept rules.
+- `stridelabs-mcp`, feature `cors`: `cors_layer()` for bearer-only MCP
+  endpoints (any origin, no credentials, mirrored methods and headers,
+  `Mcp-Session-Id` and `WWW-Authenticate` exposed).
+- `stridelabs-mcp`: `canonical_tools_json` and, under `test-support`,
+  `assert_committed_tools_are_fresh`, the MCP counterpart of the OpenAPI
+  freshness test. Feature `live-tests` compiles the real-Redis tests.
+  `PARITY.md` maps Python `stridelabs-mcp` 0.4.0's tests to the Rust ones.
+
+### Security
+
+- The SSRF address policy in `stridelabs-http` is built from the IANA IPv4
+  and IPv6 Special-Purpose Address Registries as retrieved 2026-10-17; the
+  guard is the policy, not a deny-list of well-known hosts.
+- The workspace still has one crypto provider, aws-lc-rs. `stridelabs-gcp`
+  and `stridelabs-auth` pull no rustls; `stridelabs-redis` and
+  `stridelabs-mcp`'s `redis` and `image-fetch` features bring rustls, but
+  only on aws-lc-rs and never ring (a rustls `ring` next to it makes
+  `ClientConfig::builder()` panic). CI guards each.
+- Dependency majors: `redis` 1 (new workspace dependency, no default
+  features and no TLS feature at workspace level), `base64` 0.22 and
+  `percent-encoding` 2 (both already in the lock). A consumer that names
+  redis-rs types moves to the same major.
+- `stridelabs-gcp` keeps secrets out of its errors, `Debug` and logs: an
+  OAuth failure keeps only a validated `error` code, `TokenOptions` redacts
+  in `Debug`, and every URL component (a hostile `location` could otherwise
+  move the Vertex host) is validated before a token is fetched.
+
+### CI and tooling
+
+- New guards: "stridelabs-gcp pulls no rustls" and "stridelabs-mcp's redis
+  and image-fetch put rustls on aws-lc-rs, never ring"; the stridelabs-mcp
+  no-rustls guard now covers the core, `cors` and `test-support`.
+- Per-feature build and clippy lanes, one feature at a time with `-p`
+  alone, for `stridelabs-mcp`, `stridelabs-gcp`, `stridelabs-http`
+  (`tls`, `ssrf`, `ssrf-test-support`), `stridelabs-redis` and
+  `stridelabs-testing` (`redis`), so a feature that compiles only because
+  another is on is caught.
+- Redis 7 on 6390 beside Postgres, for the all-features lane's fail-loud
+  integration tests.
+- `cargo-semver-checks`, the `downstream-limen` `[patch]` loop and
+  `scripts/downstream-check.sh` list all eight crates.
 
 ## [0.6.0] - 2026-10-17
 

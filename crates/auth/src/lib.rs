@@ -56,6 +56,36 @@
 //!   ids can't turn this service into a load generator against the issuer.
 //!   See [`jwks`] for the full cache contract.
 //!
+//! # slauth PATs: [`slauth_pat`]
+//!
+//! [`PatValidator`] resolves a `slp_live_…` PAT to its slauth identity by
+//! asking slauth (`SlauthConfig::pat_validate_url`), with the outcomes and
+//! messages of stridelabs-python's `PATValidator`: a [`PatValidationError`]
+//! is `Rejected` (the token, a 401) or `Unavailable` (slauth, a 503).
+//! Caching the answer is the consumer's. The client it is given **must not
+//! follow redirects** ([`PatValidator`]'s docs say why).
+//!
+//! ```no_run
+//! # async fn example(config: stridelabs_auth::SlauthConfig)
+//! # -> Result<(), stridelabs_auth::PatValidationError> {
+//! use stridelabs_auth::{PatValidator, SLAUTH_PAT_PREFIX};
+//!
+//! let http = reqwest::Client::builder()
+//!     .redirect(reqwest::redirect::Policy::none())
+//!     .build()
+//!     .expect("a client builds");
+//! // `None` when the config names no validate URL.
+//! let pats = PatValidator::from_config(&config, http).expect("PATs are configured");
+//!
+//! let bearer = "slp_live_...";
+//! if bearer.starts_with(SLAUTH_PAT_PREFIX) {
+//!     let identity_id = pats.validate(bearer).await?; // a `uuid::Uuid`
+//!     println!("PAT for identity {identity_id}");
+//! }
+//! # Ok(())
+//! # }
+//! ```
+//!
 //! # Errors never echo the token
 //!
 //! [`AuthError`]'s messages are fixed strings or a classification of *why* a
@@ -65,8 +95,8 @@
 //!
 //! # Feature topology
 //!
-//! `default = []`. Verification, the JWKS cache and [`pat`] are unconditional:
-//! they are the crate.
+//! `default = []`. Verification, the JWKS cache, [`slauth_pat`] and [`pat`] are
+//! unconditional: they are the crate.
 //!
 //! Note that feature-gated items are named in plain code spans, never
 //! intra-doc links: they are off by default, so a link would be an
@@ -89,6 +119,7 @@ pub mod config;
 pub mod error;
 pub mod jwks;
 pub mod pat;
+pub mod slauth_pat;
 pub mod verify;
 
 #[cfg(feature = "axum")]
@@ -113,6 +144,9 @@ pub use jwks::{JwksCache, JWKS_TTL, MIN_REFETCH_INTERVAL};
 // `pat::hash` is deliberately not re-exported here: a bare `hash` at a crate
 // root says nothing about *what* it hashes.
 pub use pat::{GeneratedToken, PatFormat, PatFormatError, MAX_PREFIX_LEN};
+pub use slauth_pat::{
+    is_slauth_pat, PatValidationError, PatValidator, PAT_VALIDATION_TIMEOUT, SLAUTH_PAT_PREFIX,
+};
 pub use verify::{Claims, VerifiedIdentity, Verifier};
 
 #[cfg(feature = "axum")]

@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "Test-only helpers for StrideLabs services: a fail-loud Postgres pool, axum oneshot request helpers, and a one-line wiremock JSON stub"
+description = "Test-only helpers for StrideLabs services: fail-loud Postgres and Redis probes, axum oneshot request helpers, and a one-line wiremock JSON stub"
 publish = false
 
 [features]
@@ -19,6 +19,11 @@ default = []
 # consumer's graph. CI's "Guard: stridelabs-testing pulls no ring" fails if a
 # TLS feature brings `ring` back.
 postgres = ["dep:sqlx", "dep:url"]
+# Off by default for the same reason: a real Redis client, which only
+# consumers whose own tests talk to Redis need. Built with NO redis-rs TLS
+# feature (see `workspace.dependencies.redis`): the probe talks to a local or
+# CI Redis in the clear, and adds no rustls to a consumer's test graph.
+redis = ["dep:redis", "dep:url"]
 
 [lints]
 workspace = true
@@ -40,6 +45,11 @@ wiremock = { workspace = true }
 
 # --- `postgres` only -------------------------------------------------------
 sqlx = { workspace = true, optional = true }
+
+# --- `redis` only ----------------------------------------------------------
+redis = { workspace = true, optional = true }
+
+# --- `postgres` or `redis` -------------------------------------------------
 # Only used to redact the password out of a connection string before it can
 # reach a panic message.
 url = { workspace = true, optional = true }

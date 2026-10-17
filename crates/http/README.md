@@ -2,7 +2,8 @@
 
 The house `AppError` → HTTP convention, a security-headers layer, an
 explicit-origin CORS builder, graceful-shutdown primitives, the mechanical
-layer of a reverse proxy, and the mechanics of publishing an OpenAPI document,
+layer of a reverse proxy, the mechanics of publishing an OpenAPI document, an
+SSRF-hardened outbound fetch, and the process-wide rustls provider install,
 for StrideLabs axum services.
 
 ## Feature topology
@@ -16,23 +17,30 @@ add friction.
 | `cors` | off | `cors_layer`, via `tower-http/cors` |
 | `openapi` | off | the `openapi` module — spec canonicalization, `(method, path)` enumeration, committed-spec freshness check — via `utoipa` |
 | `proxy` | off | the `proxy` module — and `AppError::bad_gateway_upstream`, which takes a `reqwest::Error` — via `reqwest` 0.13 (with its `rustls` TLS feature)/`url`/`bytes`/`futures` (and `tokio/time`) |
+| `ssrf` | off | the `ssrf` module — `fetch_public`, an SSRF-hardened fetch of a URL somebody else chose (public-address policy, DNS pinning, capped body) — via the same `reqwest`/`url`/`bytes`/`futures` as `proxy` (and `tokio/time`, `tokio/net`) |
+| `ssrf-test-support` | off | `ssrf::LoopbackTestServer` and `FetchPolicy::with_loopback_test_server`: point a fetch at a local TLS test server. Implies `ssrf`. Enable from `[dev-dependencies]` and **check the shipped graph for it** (see "Testing against it" below) |
+| `tls` | off | the `tls` module — `install_default_provider`, which makes aws-lc-rs the process's rustls `CryptoProvider` — via `rustls` 0.23 (`aws_lc_rs` + `std`, no defaults) |
 
 `proxy` is the gate that matters: it pulls in an HTTP *client* and a TLS
 stack. A service that only answers requests should never compile that, which
 is why the proxy primitives live behind a feature instead of in a crate
 everyone already depends on.
 
-It is also the **only** TLS feature in this workspace. reqwest 0.13's `rustls`
-means rustls's aws-lc-rs provider (unless the process installed a default
-provider first; aws-lc-sys is a C build) and `rustls-platform-verifier`: the
-OS trust store plus `UpstreamClient::build`'s `ca_bundle_pem`, and **no
-bundled roots** — 0.12's webpki roots are gone. On Linux that store is the
+`ssrf` is the same gate for the same reason, and shares `proxy`'s one
+reqwest declaration, so a service with both compiles the client once. Between
+them they are the only features in this workspace that turn on reqwest's TLS
+(`tls` adds a direct `rustls` dependency, but only to install a provider, and
+stridelabs-redis turns on redis-rs's). reqwest 0.13's `rustls` means
+rustls's aws-lc-rs provider (unless the process installed a default provider
+first; aws-lc-sys is a C build) and `rustls-platform-verifier`: the OS trust
+store plus `UpstreamClient::build`'s `ca_bundle_pem`, and **no bundled
+roots** — 0.12's webpki roots are gone. On Linux that store is the
 system CA bundle (`SSL_CERT_FILE`/`SSL_CERT_DIR` respected), so an image
 without `ca-certificates` fails `UpstreamClient::build(true, None)` with
 `ClientBuildError::Build`. Keep aws-lc-rs the only rustls provider in the
-consumer's graph: rustls `ring` from anywhere else (redis-rs `tls-rustls`,
-sqlx `tls-rustls-ring`) next to it makes `rustls::ClientConfig::builder()`
-panic.
+consumer's graph: rustls `ring` from anywhere else (redis-rs 0.27's
+`tls-rustls`, sqlx `tls-rustls-ring`) next to it makes
+`rustls::ClientConfig::builder()` panic.
 
 `tokio` is a **non-optional** dependency (`signal`, `sync`, `macros`) because
 `shutdown` is signal/watch machinery. A service with no tokio in its graph
@@ -43,16 +51,23 @@ build.
 
 ```toml
 [dependencies]
-stridelabs-http = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.6.0" }
+stridelabs-http = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.7.0" }
 
 # with the CORS layer builder:
-stridelabs-http = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.6.0", features = ["cors"] }
+stridelabs-http = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.7.0", features = ["cors"] }
 
 # for a service that proxies to an upstream:
-stridelabs-http = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.6.0", features = ["proxy"] }
+stridelabs-http = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.7.0", features = ["proxy"] }
 
 # for a service that publishes an OpenAPI document:
-stridelabs-http = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.6.0", features = ["openapi"] }
+stridelabs-http = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.7.0", features = ["openapi"] }
+
+# for a service that fetches user-supplied URLs, and installs the rustls provider at startup:
+stridelabs-http = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.7.0", features = ["ssrf", "tls"] }
+
+[dev-dependencies]
+# its tests, to fetch from a local TLS server (never in [dependencies]):
+stridelabs-http = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.7.0", features = ["ssrf-test-support"] }
 ```
 
 (During development against an unreleased commit, pin `rev = "<sha>"`
@@ -663,3 +678,242 @@ are per-route policy and don't belong on a client shared by every route.
 **Not included: a proxy handler.** Routing, retries, timeouts, circuit
 breaking, shadowing, metrics — that's policy, it differs per service, and it
 stays in the service. This is the mechanical layer underneath it.
+
+## `tls` feature — the process's one rustls provider
+
+```rust,ignore
+fn main() {
+    // after logging is up, before anything connects
+    stridelabs_http::tls::install_default_provider();
+    // …
+}
+```
+
+rustls needs a process-level `CryptoProvider`. When none was installed,
+`rustls::ClientConfig::builder()` derives one from rustls's crate features and
+**panics** if the unified graph names zero providers or two (`ring` next to
+`aws_lc_rs`) — at the first TLS connect through such a builder, not at compile
+time. `install_default_provider()` installs aws-lc-rs once at startup so no
+later builder falls back on the feature-derived default; reqwest and sqlx name
+their provider themselves, so it is for everything else (`rediss://` through
+redis-rs, the next dependency).
+
+- Returns `ProviderInstall::Installed`, or `ProviderInstall::AlreadyInstalled`
+  when something got there first. That is accepted, not an error: rustls
+  allows one install per process and no replacement, and in a graph that
+  follows the [one-provider rule](../../README.md#one-crypto-provider-aws-lc-rs)
+  the earlier provider is aws-lc-rs too.
+- The compile-time half stays yours: keep `ring` out of the graph (the
+  workspace CI's `cargo tree` listing guard is the pattern to copy).
+- Lifted from slauth's `tls.rs`; tapper and limen carry the same function.
+  It lives here, not in `stridelabs-auth`, which is guarded to stay
+  rustls-free.
+
+`tests/tls_provider.rs` is one test in its own process (the provider is
+process-global): the first call installs aws-lc-rs, the second reports
+`AlreadyInstalled` and leaves it, and `ClientConfig::builder()` then uses it.
+
+## `ssrf` feature — SSRF-hardened outbound fetch
+
+Every server-side fetch of a URL a user, an LLM or an attacker chose goes
+through `fetch_public`. On Cloud Run the threat is reaching the metadata
+server (`169.254.169.254`, `metadata.google.internal`) or another internal
+service. Ported from Python `stridelabs.mcp.ssrf` (stridelabs-mcp 0.4.0): the
+same steps, in the same order, with the same client-safe messages.
+Image-specific policy (content type, magic bytes, `data:` URIs) is not here;
+it layers on top.
+
+```rust
+use std::time::Duration;
+use http::HeaderValue;
+use stridelabs_http::ssrf::{fetch_public, FetchPolicy, SsrfError};
+
+async fn fetch_image(url: &str) -> Result<bytes::Bytes, SsrfError> {
+    let policy = FetchPolicy::new("image", 10 * 1024 * 1024) // label, max_bytes
+        .with_scheme_error("Only https:// image URLs (or data: URIs) are allowed.")
+        .with_too_large_error("The image is too large (max 10 MB).")
+        .with_timeout(Duration::from_secs(10))
+        .with_accept(HeaderValue::from_static("image/*"));
+    let fetched = fetch_public(url, &policy).await?; // Fetched { body, content_type }
+    Ok(fetched.body)
+}
+```
+
+| Item | What it does |
+|---|---|
+| `fetch_public(&str, &FetchPolicy)` → `Result<Fetched, SsrfError>` | The whole guarded fetch |
+| `FetchPolicy::new(label, max_bytes)` | The strict policy: https only, no redirects, 10 s, system DNS, public addresses only |
+| `.with_allowed_schemes(AllowedSchemes)` | `HttpsOnly` (default) or `HttpAndHttps` (feeds) |
+| `.with_scheme_error` / `.with_too_large_error` | Replace those two messages |
+| `.with_timeout(Duration)` | The wall-clock budget for everything — DNS, connects, TLS, body, every hop |
+| `.with_max_redirects(u32)` | Follow up to this many (default 0), each hop validated and pinned afresh |
+| `.with_accept(HeaderValue)` | The `Accept` header to send |
+| `.with_resolver(impl HostResolver)` | The DNS seam: `SystemResolver` by default, or any `Fn(String, u16) -> impl Future<Output = io::Result<Vec<IpAddr>>>` |
+| `is_public_address(IpAddr)` | The address policy on its own |
+| `SsrfError` | Every failure; `Display` is the client-safe message |
+
+### The policy, in order, with Python's exact messages
+
+| Step | Message |
+|---|---|
+| Parse | `Invalid URL.` (also a `Location` that cannot be joined) |
+| Scheme allowlist | `Only https:// URLs are allowed.` / `Only http://, https:// URLs are allowed.` / your text. A string with no scheme at all gets this one too, as in Python |
+| Embedded credentials | `URLs with embedded credentials are not allowed.` |
+| Metadata names (`metadata.google.internal`, any subdomain, `metadata`) | `That host is not allowed.` |
+| IP-literal host outside the policy | `URL host is not a public address.` |
+| Resolver error, or no answers | `Could not resolve the URL host.` |
+| **Any** answer outside the policy | `URL host resolves to a non-public address.` |
+| A 3xx with redirects off (any 3xx, as Python's `is_redirect`) | `URL redirects are not allowed.` |
+| Chain longer than `max_redirects` | `Too many redirects.` |
+| Status other than 200 | `{Label} fetch failed with HTTP {code}.` |
+| Numeric `Content-Length` over the cap, or the stream passing it | `The fetched {label} is too large.` / your text |
+| The budget runs out | `{Label} fetch timed out.` |
+| A `Content-Encoding` other than `identity` (see below) | `Could not fetch the {label} URL.` |
+| Anything else (connect, TLS, a certificate for another name, a broken body, a 3xx with no `Location`) | `Could not fetch the {label} URL.` |
+
+`{Label}` is Python's `str.capitalize`. No message ever carries an address, a
+port or an underlying error; transport detail is logged at `debug` with
+`reqwest::Error::without_url` and goes nowhere else.
+
+That is this crate's own logging. reqwest, hyper and hyper-util log too, and
+their `DEBUG`/`TRACE` events name the destination host and the pinned address
+being connected to — outside this crate's control. Run production at `info`
+(or keep those crates at `info` in the filter).
+
+### Compressed responses: refused, never decoded
+
+Every request sends `Accept-Encoding: identity`, reqwest's decoders are
+switched off per client (`no_gzip()`, `no_brotli()`, `no_zstd()`,
+`no_deflate()` — this crate enables none of those features, but a consumer's
+graph may, and Cargo would unify them in), and a `200` whose
+`Content-Encoding` is anything but `identity` (case-insensitive, every header
+and every comma-separated coding; an empty value included) is refused as
+`Could not fetch the {label} URL.`
+
+A deliberate difference from Python, whose httpx decodes gzip and deflate
+(brotli and zstd when installed): decoding would return bytes the server did
+not send, under the type it claimed, and with no decoder there is no
+decompression bomb to bound. The cost is a server that compresses even when
+asked for `identity` — it cannot be fetched.
+
+### The address policy
+
+Hand-written, because `IpAddr::is_global` is unstable. Source: the **IANA IPv4
+and IPv6 Special-Purpose Address Registries** (both "Last Updated
+2025-10-09"), **retrieved 2026-10-17**. Every row whose "Globally Reachable"
+is False is denied; rows marked N/A or blank, and globally reachable rows
+nested inside a non-reachable block, are decided toward denial.
+
+- **IPv4 denied:** `0.0.0.0/8`, `10.0.0.0/8`, `100.64.0.0/10` (CGNAT),
+  `127.0.0.0/8`, `169.254.0.0/16` and `169.254.169.254` by name,
+  `172.16.0.0/12`, `192.0.0.0/24` (whole, including its anycast `.9`/`.10`),
+  `192.0.2.0/24`, `192.88.99.0/24` (whole: deprecated 6to4 relay + 6a44),
+  `192.168.0.0/16`, `198.18.0.0/15`, `198.51.100.0/24`, `203.0.113.0/24`,
+  multicast `224.0.0.0/4`, and `240.0.0.0/4` including `255.255.255.255`.
+- **IPv6:** IPv4-mapped `::ffff:0:0/96` and the NAT64 well-known prefix
+  `64:ff9b::/96` are unwrapped and the embedded IPv4 judged by the IPv4
+  policy. Everything outside Global Unicast `2000::/3` is denied (`::`,
+  `::1`, IPv4-compatible, `64:ff9b:1::/48`, `100::/64`, `100:0:0:1::/64`,
+  `5f00::/16`, `fc00::/7`, `fe80::/10`, site-local `fec0::/10`, `ff00::/8`,
+  every reserved block). Inside it: `2001::/23` (whole — Teredo, benchmarking,
+  ORCHID and the reachable anycast/AMT/AS112 more-specifics alike),
+  `2001:db8::/32`, `3fff::/20`, and 6to4 `2002::/16` (denied, not unwrapped:
+  its IPv4 names a relay, not the host).
+
+Against Python's `ipaddress`-flag policy this denies everything Python denies
+except a NAT64 `64:ff9b::/96` address wrapping a *public* IPv4 (Python calls
+the whole prefix reserved; unwrapping keeps DNS64 networks working and still
+refuses `64:ff9b::169.254.169.254`), and additionally denies `192.0.0.9`,
+`192.0.0.10`, `192.88.99.0/24`, the reachable `2001::/23` more-specifics and
+`fec0::/10`, which Python lets through. The full table is in the
+`is_public_address` docs; the tests check every row at its first and last
+address and at both neighbours.
+
+### Pinning and the hostname invariant
+
+Pinning is only as good as the agreement between the name the policy checked,
+the name the connection was pinned under, and the name actually requested.
+Here that is structural:
+
+- The URL is parsed with `url` (WHATWG: IDNA, lower-casing), trailing dots are
+  stripped, and the request URL is **rebuilt around that normalized host**:
+  the deny-list, the resolver, the pin, SNI, certificate verification and the
+  `Host` header all see one string.
+- Each hop builds a **fresh `reqwest::Client`** (no pooled connection carries
+  an earlier decision) whose DNS resolver answers **only** that name, with the
+  validated address, and errors for every other name — no fallback to system
+  DNS. If the request and the pin ever disagreed, the request would fail
+  rather than resolve the stranger.
+- `no_proxy()`, so neither a configured nor an environment proxy
+  (`HTTPS_PROXY`, `ALL_PROXY`) makes the connection; redirects are followed
+  here, never by reqwest.
+- All answers must be public; IPv4 is preferred for the pin. IP-literal hosts
+  skip DNS and are judged directly. The port is the URL's.
+
+### Testing against it
+
+`with_resolver` fakes DNS, so every rejection can be tested with no network.
+Proving the *connection* needs a real TLS server — a loopback address behind a
+private CA, exactly what the strict policy refuses. The `ssrf-test-support`
+feature adds the one way through:
+
+```rust,ignore
+use stridelabs_http::ssrf::{FetchPolicy, LoopbackTestServer};
+
+let server = LoopbackTestServer::new("127.0.0.1".parse()?, ca_pem.as_bytes())?;
+let policy = FetchPolicy::new("image", 1024)
+    .with_resolver(|_host: String, _port| async { Ok(vec!["127.0.0.1".parse().unwrap()]) })
+    .with_loopback_test_server(server);
+```
+
+It admits **the loopback addresses it names** (`new` takes one, `also_at`
+adds another; anything not loopback is refused at construction) next to the
+public-address policy — every other private address, a mixed DNS answer
+included, is still refused — and trusts **that CA alone** instead of the
+platform roots.
+
+What the gate does and does not promise:
+
+- **Without the feature** the type, the policy field and the setter are
+  compiled out; no build without it can admit a non-public address.
+- **With it**, nothing changes for a policy until code explicitly calls
+  `with_loopback_test_server`.
+- **Whether it reaches a shipped binary is yours to check.** Enabling it from
+  `[dev-dependencies]` keeps it out of a plain `cargo build`, but Cargo
+  unifies dev-dependency features into the library under `--all-targets`, and
+  a normal dependency anywhere in the workspace can enable it for every
+  member. Guard the release graph:
+
+  ```sh
+  cargo tree -p <service> -e normal,features -i stridelabs-http --prefix none \
+    | grep -F 'stridelabs-http feature "ssrf-test-support"' && exit 1 || true
+  ```
+
+This crate's `tests/ssrf_pinning.rs` uses it against an rcgen-issued
+certificate for `images.test` to prove the request reaches the pinned address
+with SNI and `Host` on the name, that a certificate for another name (or for
+the pinned IP) fails, the trailing-dot/IDNA/case normalization end to end,
+per-hop re-validation of redirects — including a hop whose predecessor's
+server held its connection open (keep-alive) for the same authority while DNS
+re-pinned it to a second server on `[::1]` — the body cap over the wire, the
+`identity`-only content coding, the budget against a stalled server and
+across a chain of individually short hops, and — in a child process born with
+`HTTPS_PROXY` set, with a positive control — that an environment proxy is
+never used.
+
+### Differences from Python
+
+- **One normalized host string**, enforced by the resolver, instead of
+  httpx's `sni_hostname` extension; the URL is rebuilt around it.
+- **IPv6 policy differences** as listed under *The address policy*.
+- **Alternative IPv4 spellings** (`0x7f.1`, `2130706433`, `127.1`) are parsed
+  as the address they are (WHATWG) and judged as literals.
+- **The resolver returns `IpAddr`s**, so Python's "an answer that does not
+  parse" case cannot arise; an IPv6 scope id is dropped (only link-local and
+  multicast carry one, and both are denied).
+- **No content coding**: `Accept-Encoding: identity`, and any other
+  `Content-Encoding` refused rather than decoded (above).
+- **Over a real HTTP/1.1 connection an understated `Content-Length` truncates
+  the body** (hyper frames by it) instead of overrunning; the streaming cap is
+  what bounds a chunked or unframed body, and the unit tests keep Python's
+  "lying header" assertion against a raw stream.

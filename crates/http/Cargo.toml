@@ -31,9 +31,42 @@ proxy = ["dep:reqwest", "dep:url", "dep:bytes", "dep:futures", "tokio/time"]
 # or one that publishes it some other way — shouldn't compile that to get
 # `AppError` and the security headers.
 openapi = ["dep:utoipa"]
+# Off by default, like `proxy` and for the same reason: an SSRF-guarded fetch
+# is an HTTP client and a TLS stack (the same reqwest dependency `proxy` uses,
+# so a service with both compiles it once). `tokio/time` is the fetch's
+# wall-clock budget and `tokio/net` the system resolver (`lookup_host`);
+# like `proxy`'s `tokio/time` they are declarative under the workspace's
+# `full` pin, and keep the feature compiling on its own terms if that is ever
+# narrowed.
+ssrf = ["dep:reqwest", "dep:url", "dep:bytes", "dep:futures", "tokio/time", "tokio/net"]
+# Test-only: `ssrf::LoopbackTestServer`, which lets a policy reach named
+# loopback addresses through one private CA — what proving the pinning
+# against a real TLS server takes, and exactly what the strict policy
+# refuses. A feature of its own, not part of `ssrf`, so a build without it
+# has no such code at all; with it, nothing is admitted until a caller asks
+# by name. Consumers enable it from `[dev-dependencies]` — which a plain
+# `cargo build` leaves out, though `--all-targets` or another workspace
+# member's normal dependency can unify it in — and should check the shipped
+# graph for it (`ssrf` module docs).
+ssrf-test-support = ["ssrf"]
+# Off by default: one function, but a direct `rustls` dependency, which a
+# service with no rustls in its graph has no reason to take on.
+tls = ["dep:rustls"]
 
 [lints]
 workspace = true
+
+# Process-global rustls state: alone in its own test binary (Cargo runs each
+# file under `tests/` as its own process), and only built when there is a
+# provider install to test.
+[[test]]
+name = "tls_provider"
+required-features = ["tls"]
+
+# The pinning, proven against a local TLS server: needs the loopback override.
+[[test]]
+name = "ssrf_pinning"
+required-features = ["ssrf-test-support"]
 
 [dependencies]
 axum = { workspace = true }
@@ -51,14 +84,17 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 
-# --- `proxy` only ---------------------------------------------------------
+# --- `proxy` and `ssrf` ----------------------------------------------------
 # `stream` is not in reqwest's default set, and everything in `proxy` is built
 # on it: `Response::bytes_stream` is what lets a body be relayed without ever
 # being held in memory, and what lets `buffer_or_stream` bail out to streaming
-# mid-body once it crosses the cap.
+# mid-body once it crosses the cap. `ssrf`'s capped read counts the same
+# stream.
 #
-# `rustls` (reqwest 0.13's rename of 0.12's `rustls-tls`) is the only TLS
-# feature anywhere in this workspace (see the workspace manifest). It brings
+# `rustls` (reqwest 0.13's rename of 0.12's `rustls-tls`) is the only reqwest
+# TLS feature anywhere in this workspace (see the workspace manifest; the
+# other rustls users are this crate's `tls` and stridelabs-redis's redis-rs,
+# neither of which picks a provider for reqwest). It brings
 # rustls's aws-lc-rs provider — used unless the process installed a default
 # provider first — and the OS trust store with no bundled roots; the README's
 # "Feature topology" says what that means for a consumer's image. Still no
@@ -68,6 +104,21 @@ reqwest = { workspace = true, features = ["stream", "rustls"], optional = true }
 url = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
+
+# --- `tls` only -----------------------------------------------------------
+# Declared for `rustls::crypto::aws_lc_rs::default_provider()` and nothing
+# else. `default-features = false` so this line adds none of rustls's own
+# defaults (logging, tls12, prefer-post-quantum) to a consumer's graph;
+# `aws_lc_rs` is the one provider the workspace allows; `std` is already on
+# for every rustls user here (reqwest, tokio-rustls) and backs the process
+# default with std's `OnceLock`. Never `ring`: next to aws-lc-rs it is the
+# second provider that makes `ClientConfig::builder()` panic. The same
+# features as slauth's direct rustls dependency, so the two unify to nothing
+# new.
+rustls = { version = "0.23", default-features = false, features = [
+    "aws_lc_rs",
+    "std",
+], optional = true }
 
 # --- `openapi` only -------------------------------------------------------
 # Default features on, so `utoipa`'s derive macros (`macros` -> `utoipa-gen`)
@@ -114,3 +165,19 @@ tracing-subscriber = { workspace = true }
 # dev-dependency on it (declared per-crate; nothing else in the workspace
 # shares the pin).
 tempfile = "3"
+# The `ssrf_pinning` tests' local TLS server: a throwaway CA and leaf
+# certificates for made-up names (`images.test`), generated per test.
+# `aws_lc_rs`, never the default `ring`: CI's "the workspace compiles no ring"
+# guard lists dev edges too, and one ring anywhere fails it. `pem` because the
+# CA reaches `LoopbackTestServer` as a PEM bundle, the way a consumer's would.
+rcgen = { version = "0.14", default-features = false, features = [
+    "aws_lc_rs",
+    "pem",
+] }
+# Terminates TLS for that server. `default-features = false` drops its
+# `logging` and `tls12` (the client speaks TLS 1.3) and, with `aws_lc_rs`
+# named, keeps its rustls on the one allowed provider; the server config is
+# built with that provider explicitly, so the tests install no process default.
+tokio-rustls = { version = "0.26", default-features = false, features = [
+    "aws_lc_rs",
+] }

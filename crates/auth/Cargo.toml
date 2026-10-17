@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "slauth resource-server client for StrideLabs services: JWKS cache, RS256 access-token verification, and personal-access-token hashing"
+description = "slauth resource-server client for StrideLabs services: JWKS cache, RS256 access-token verification, slauth PAT validation, and personal-access-token hashing"
 publish = false
 
 [features]
@@ -34,9 +34,10 @@ workspace = true
 jsonwebtoken = { workspace = true }
 # `json` so a JWKS response deserializes straight into `JwkSet`. Nothing
 # else, TLS above all: this crate never builds a client outside its tests
-# (`Verifier::new`/`JwksCache::new` take the consumer's), so the TLS stack —
-# and through it the process's rustls provider — is the consumer's choice
-# (see the workspace manifest). Its tests talk plain HTTP to wiremock.
+# (`Verifier::new`/`JwksCache::new`/`PatValidator::new` take the consumer's),
+# so the TLS stack — and through it the process's rustls provider — is the
+# consumer's choice (see the workspace manifest). Its tests talk plain HTTP to
+# wiremock.
 reqwest = { workspace = true, features = ["json"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -47,6 +48,9 @@ thiserror = { workspace = true }
 # consumer of this crate is running on tokio by construction.
 tokio = { workspace = true, features = ["sync"] }
 tracing = { workspace = true }
+# The identity a slauth PAT resolves to (`slauth_pat`): slauth answers with a
+# UUID, and parsing it here keeps a malformed answer from reaching a consumer.
+uuid = { workspace = true }
 
 # --- feature-gated ---------------------------------------------------------
 http = { workspace = true, optional = true }

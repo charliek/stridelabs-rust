@@ -1,0 +1,81 @@
+[package]
+name = "stridelabs-redis"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "A lazy, single-flight Redis handle for StrideLabs services: an atomic fixed-window counter that is never replayed, and idempotent GET / SET EX helpers"
+publish = false
+
+[features]
+default = []
+# NOT for consumers: it compiles this crate's own real-Redis suite
+# (`tests/live.rs`), which needs the compose Redis (`docker compose up -d
+# redis`) or CI's Redis service, and panics without one rather than skipping.
+# A feature, not an always-on test target, so `cargo test --workspace` keeps
+# needing no services; `--all-features` (CI's all-features lane) turns it on.
+# It enables a DEV-dependency's feature: `stridelabs-testing`'s `redis` stays
+# off in the default lane, so that crate's own `require_redis` tests (which
+# also need the server) only compile in when this does.
+live-tests = ["stridelabs-testing/redis"]
+
+[lints]
+workspace = true
+
+[[test]]
+name = "live"
+required-features = ["live-tests"]
+
+[dependencies]
+# **`tokio-rustls-comp`, because production's Redis is `rediss://`** (Upstash
+# accepts TLS only). Without a TLS feature redis-rs does not merely fail to
+# connect: `Client::open` REFUSES the URL ("can't connect with TLS, the feature
+# is not enabled"), which no plain-`redis://` dev or CI run would ever notice.
+# rustls rather than native-tls for the reason the rest of the house is on
+# rustls: no OpenSSL in the container.
+#
+# Two things follow, and the README spells both out for consumers:
+#
+# - **No crypto provider is chosen here.** redis 1.x builds rustls with
+#   `default-features = false` and its TLS dial calls
+#   `rustls::ClientConfig::builder()`, which takes the PROCESS-default provider
+#   the consumer installs at startup (aws-lc-rs, via
+#   `stridelabs_http::tls::install_default_provider`), or, with none installed,
+#   the one provider rustls's features name — and that must be exactly one, or
+#   the dial panics. (0.27's `tls-rustls` forced `rustls/ring`; 1.x does not,
+#   which is why this crate can be on 1.x and pull no `ring` — CI's "the
+#   workspace compiles no ring" guard holds it there.)
+# - **Certificates are verified against the OS trust store.** `tls-rustls`
+#   alone loads the platform roots through `rustls-native-certs`, the same
+#   store reqwest 0.13's `rustls` uses in `stridelabs-http`'s `proxy` (and
+#   tapper's `rediss://` connect), so the runtime image needs
+#   `ca-certificates` — which it already does for every HTTPS call. Not
+#   `tls-rustls-webpki-roots`: a second, bundled root set that has to be
+#   bumped to track Mozilla's, for a store the image already carries.
+#   (limen chose webpki roots; it has no other TLS client to agree with.)
+#   Not `tls-rustls-insecure` either: `#insecure` URLs are refused at
+#   `RedisHandle::open`.
+redis = { workspace = true, features = ["tokio-rustls-comp"] }
+# The dial runs as a spawned task (it must outlive a cancelled caller) and its
+# timeouts are tokio timers; redis-rs is on tokio already (`tokio-comp`).
+tokio = { workspace = true }
+# `future::Shared`: every caller that arrives during a dial awaits the same
+# outcome — the single-flight half of the handle.
+futures = { workspace = true }
+thiserror = { workspace = true }
+# One `warn!` when a cached connection turns out dead and an idempotent command
+# is retried on a fresh one (the caller sees `Ok`, so nothing else would
+# record it), and `debug!` when a connection is dropped.
+tracing = { workspace = true }
+
+[dev-dependencies]
+# `require_redis` — the fail-loud probe for the live suite. Its `redis`
+# feature is switched on by `live-tests` above, never here: dev-dependency
+# features unify into every `cargo test --workspace`, and that lane must need
+# no Redis.
+stridelabs-testing = { workspace = true }
+# The live suite's TCP proxy rewrites the probed `REDIS_URL` to point at
+# itself, keeping its userinfo and database.
+url = { workspace = true }
