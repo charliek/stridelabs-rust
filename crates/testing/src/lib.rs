@@ -1,6 +1,7 @@
 //! Test-only helpers for StrideLabs services: a fail-loud Postgres pool
-//! (feature `postgres`), `tower::ServiceExt::oneshot` helpers for axum
-//! `Router`s, and a one-line wiremock JSON stub.
+//! (feature `postgres`), a fail-loud Redis probe (feature `redis`),
+//! `tower::ServiceExt::oneshot` helpers for axum `Router`s, and a one-line
+//! wiremock JSON stub.
 //!
 //! Extracted from the ad hoc idioms duplicated across an existing service's
 //! integration tests: nine of its eleven test files carried their own
@@ -24,6 +25,7 @@
 //! | Feature | Default | Adds |
 //! |---|---|---|
 //! | `postgres` | off | `postgres::require_postgres`, via `sqlx`/`url` |
+//! | `redis` | off | `redis::require_redis` and its `RedisServer`, via `redis`/`url` |
 //!
 //! `postgres` is gated because `sqlx`'s Postgres driver drags in a real
 //! network stack; a consumer whose tests never touch a database shouldn't
@@ -34,21 +36,32 @@
 //! graph, where `ring` next to another rustls provider makes
 //! `rustls::ClientConfig::builder()` panic.)
 //!
+//! `redis` is gated for the same reason, and is built without TLS for the
+//! same reason: the probe talks to a local or CI Redis in the clear.
+//!
 //! # Fail loud, never skip
 //!
-//! `postgres::require_postgres` **panics** — with a message naming the URL
-//! it tried (password redacted), the `DATABASE_URL` env var, and the command
-//! to start the database — rather than returning `None` for a test to shrug
-//! off. A green test suite must mean the behavior it claims to cover was
-//! actually exercised; see the crate README for the pattern a consumer builds
-//! on top (migrations, seeding).
+//! `postgres::require_postgres` and `redis::require_redis` **panic** — with a
+//! message naming the URL they tried (password redacted), the env var they
+//! read (`DATABASE_URL`, `REDIS_URL`), and the command to start the server —
+//! rather than returning `None` for a test to shrug off. A green test suite
+//! must mean the behavior it claims to cover was actually exercised; see the
+//! crate README for the pattern a consumer builds on top (migrations,
+//! seeding).
 
 pub mod oneshot;
 pub mod wiremock;
 
 #[cfg(feature = "postgres")]
 pub mod postgres;
+#[cfg(feature = "redis")]
+pub mod redis;
 
+#[cfg(any(feature = "postgres", feature = "redis"))]
+mod redact;
+
+#[cfg(feature = "redis")]
+pub use crate::redis::{require_redis, RedisServer};
 #[cfg(feature = "postgres")]
 pub use postgres::require_postgres;
 

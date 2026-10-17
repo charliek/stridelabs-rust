@@ -39,11 +39,11 @@ doc:  ## Build docs with every feature enabled (matches CI)
 # ---- infra / db ------------------------------------------------------------
 
 .PHONY: up
-up:  ## Start local Postgres (used by stridelabs-testing's fail-loud tests)
+up:  ## Start local Postgres + Redis (the all-features lane's fail-loud tests)
 	docker compose up -d
 
 .PHONY: down
-down:  ## Stop local Postgres
+down:  ## Stop local Postgres + Redis
 	docker compose down
 
 # ---- misc -------------------------------------------------------------

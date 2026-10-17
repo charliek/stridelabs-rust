@@ -32,8 +32,10 @@ jobs:
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
 
-    # Postgres for stridelabs-testing's fail-loud integration tests. Mapped to
-    # 5438 to match docker-compose.yml / the local dev port.
+    # Postgres and Redis for the fail-loud integration tests the all-features
+    # lane compiles in: stridelabs-testing's `require_postgres` and
+    # `require_redis`, and stridelabs-redis's live suite. Mapped to 5438 and
+    # 6390 to match docker-compose.yml / the local dev ports.
     services:
       postgres:
         image: postgres:16-alpine
@@ -48,9 +50,19 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6390:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
 
     env:
       DATABASE_URL: postgres://postgres:localdev@localhost:5438/stridelabs_test
+      REDIS_URL: redis://localhost:6390/0
 
     steps:
       # fetch-depth: 0 (full history + tags) is needed below by

@@ -16,8 +16,8 @@ one of them.
 
 This is a **library-only workspace, never a running service**: no binary, no
 `main.rs`, no deployed container. `docker-compose.yml` exists solely to give
-`stridelabs-testing`'s fail-loud Postgres tests something real to fail loudly
-against.
+the fail-loud Postgres and Redis tests (`stridelabs-testing`'s, and
+`stridelabs-redis`'s live suite) something real to fail loudly against.
 
 ## Versioning and consumption
 
@@ -42,11 +42,15 @@ against.
   so the dependency graph resolves against the pinned compiler instead of
   grabbing a transitive crate that needs a newer rustc.
 - Local infra: `docker compose up -d` (Postgres 16 on host port 5438 rather than
-  5432, so it doesn't collide with other local Postgres stacks). If something
-  else already holds 5438 (cadence does), pick a free port and give it to both
-  sides: `STRIDELABS_PG_PORT=5439 make up` for compose, and
+  5432, and Redis 7 on host port 6390 rather than 6379, so neither collides
+  with other local stacks). If something else already holds 5438 (cadence
+  does), pick a free port and give it to both sides: `STRIDELABS_PG_PORT=5439
+  make up` for compose, and
   `DATABASE_URL=postgres://postgres:localdev@localhost:5439/stridelabs_test` for
   the tests (`require_postgres` reads `DATABASE_URL` before its default URL).
+  Redis works the same way: `STRIDELABS_REDIS_PORT=6391 make up` and
+  `REDIS_URL=redis://localhost:6391/0` (`require_redis` reads `REDIS_URL`
+  first). `docker compose up -d redis` starts Redis alone.
 
 ## Quality gate (run before every commit)
 
@@ -59,18 +63,19 @@ mise exec -- cargo test --workspace
 `mise exec -- make check` runs fmt-check + clippy + test together. CI
 (`.github/workflows/ci.yml`) additionally runs the full test suite with
 `--all-features`, a `--no-default-features` build, and `cargo doc`, all
-`--locked`, against a live Postgres service.
+`--locked`, against live Postgres and Redis services.
 
-**DB-touching tests need `docker compose up -d` (or `make up`) running
-first.** `cargo test --workspace` (default features) never needs it —
-`stridelabs-testing`'s `postgres` feature is off by default, so those tests
-don't even compile into that run. They *do* compile and run under
+**DB- and Redis-touching tests need `docker compose up -d` (or `make up`)
+running first.** `cargo test --workspace` (default features) never needs it —
+`stridelabs-testing`'s `postgres` and `redis` features and
+`stridelabs-redis`'s `live-tests` are off by default, so those tests don't
+even compile into that run. They *do* compile and run under
 `mise exec -- make test-all-features` (`cargo test --workspace
 --all-features`), which is why that's the lane to run before trusting a
-change touches Postgres correctly — and why CI runs it against a live
-Postgres service rather than only the default-features lane. If Postgres
-isn't up, `require_postgres`'s own test panics loudly (that's the point);
-it will not silently skip.
+change touches Postgres or Redis correctly — and why CI runs it against live
+services rather than only the default-features lane. If a server isn't up,
+`require_postgres` / `require_redis` panic loudly (that's the point); they
+will not silently skip.
 
 ## Crate map
 

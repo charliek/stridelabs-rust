@@ -1,8 +1,8 @@
 # stridelabs-testing
 
 Test-only helpers for StrideLabs services: a fail-loud real-Postgres pool, a
-`tower::ServiceExt::oneshot` wrapper for axum `Router`s, and a one-line
-wiremock JSON stub. Extracted from the ad hoc idioms duplicated across an
+fail-loud real-Redis probe, a `tower::ServiceExt::oneshot` wrapper for axum
+`Router`s, and a one-line wiremock JSON stub. Extracted from the ad hoc idioms duplicated across an
 existing service's integration tests.
 
 This crate is meant to sit in a consumer's **`[dev-dependencies]`**, never
@@ -11,11 +11,12 @@ This crate is meant to sit in a consumer's **`[dev-dependencies]`**, never
 ## Feature topology
 
 `default = []`. `oneshot` and `wiremock` are unconditional; one feature gates
-the database helper:
+each server helper:
 
 | Feature | Default | Adds |
 |---|---|---|
 | `postgres` | off | [`require_postgres`], via `sqlx`'s Postgres driver + `url` |
+| `redis` | off | [`require_redis`] and its `RedisServer`, via redis-rs (`tokio-comp`, no TLS) + `url` |
 
 `postgres` is gated because `sqlx`'s driver pulls in a real network stack — a
 consumer whose tests never touch a database shouldn't compile it just to get
@@ -34,12 +35,22 @@ no ring" step fails if a TLS feature brings `ring` back.
 crate's public API — so a consumer that names it (rather than just calling
 methods on the value) must depend on the same `sqlx` major, currently 0.9.
 
+`redis` is gated and TLS-free for the same reasons: redis-rs is a real client
+a consumer that never talks to Redis shouldn't compile, and the probe talks to
+a local or CI Redis in the clear, so it adds no rustls to a consumer's test
+graph. (A `rediss://` `REDIS_URL` only works where something else in the
+build — `stridelabs-redis`, say — turns redis-rs's TLS on.) `RedisServer`'s
+`connection()` is a `redis::aio::MultiplexedConnection`, the one redis-rs type
+in the public API: a consumer that names it needs redis-rs 1.x.
+
 ## Adding the dependency
 
 ```toml
 [dev-dependencies]
 stridelabs-testing = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.6.0", features = ["postgres"] }
 ```
+
+(`redis` is new in `v0.6.0`: `features = ["redis"]` from that tag on.)
 
 (During development against an unreleased commit, pin `rev = "<sha>"` instead
 of `tag`; see the workspace root README for the local `[patch]` co-development
@@ -116,6 +127,65 @@ its env helpers through an injectable lookup. Only one test in this crate
 (the happy path) reads `DATABASE_URL` for real, by calling the public
 function.
 
+## `redis` — fail loud, never skip
+
+```rust,no_run
+# #[cfg(feature = "redis")]
+# async fn example() {
+use stridelabs_testing::require_redis;
+
+let server = require_redis("redis://localhost:6390/0").await;
+
+// Build the code under test from the URL that answered…
+let url: &str = server.url();
+// …and inspect what it wrote over a connection of the test's own.
+let ttl: i64 = redis::cmd("TTL")
+    .arg("some-key")
+    .query_async(&mut server.connection())
+    .await
+    .unwrap();
+# let _ = (url, ttl);
+# }
+```
+
+`require_redis(default_url)` is `require_postgres`'s twin. It reads
+`REDIS_URL` from the environment — unset or **empty** falls back to
+`default_url` (empty counts as unset, as `stridelabs-config`'s `env_or` has
+it) — connects and sends `PING`, each within 2 seconds, and otherwise
+**panics** with a message naming the URL it tried (redacted, see below), the
+`REDIS_URL` env var, and the command that starts the server (`docker compose
+up -d redis`, or `make up`). A malformed URL panics the same way.
+
+**Redaction, for both probes.** A URL is rendered only when it parses with
+the expected structure: a `redis` / `rediss` / `valkey` / `valkeys` scheme
+(`postgres` / `postgresql` for `require_postgres`), a host, and no `@` or `:`
+in its path or fragment. Its userinfo password becomes `***`, and so does
+every query value except `sslmode`, `protocol` and `db` (a credential can
+hide under any other key). Anything else is shown as `<a REDIS_URL that is
+not a well-formed URL (not shown)>` — a typo such as
+`rediss:/default:secret@host`, one slash short, parses as a generic URL with
+the credentials in its PATH, where no userinfo mask would look. A Unix-socket
+URL (`redis+unix://…`) has no host, so it gets the placeholder too.
+
+It returns a `RedisServer`:
+
+- `url()` — the URL that answered, to build the code under test from (a
+  `stridelabs_redis::RedisHandle`, say), so it talks to the server the probe
+  reached;
+- `connection()` — a connection of the test's own, independent of that code,
+  for preparing keys or reading back what it wrote. It belongs to the Tokio
+  runtime the probe ran on, so call `require_redis` in each test.
+
+It **flushes nothing**. Every test that uses the same server shares its
+keyspace, so tests isolate themselves with unique keys (a test name plus a
+timestamp or counter), the same strategy the Postgres helper leaves to its
+consumers. `Debug` on a `RedisServer` shows the redacted URL.
+
+As with Postgres, the env read sits in front of two private seams — one that
+takes the lookup as a closure, and one that takes the URL — so this crate's own
+tests exercise the precedence and the panic path without mutating
+`REDIS_URL`.
+
 ## `oneshot` — driving a `Router` without a socket
 
 ```rust,no_run
@@ -183,7 +253,7 @@ way.
 
 ## Not included
 
-Schema-per-test isolation, transactional test rollback, fixture-seeding
-helpers (too app-specific — an invite code and a plan tier aren't the same
+Schema-per-test isolation, transactional test rollback, flushing or
+key-prefixing a test Redis, fixture-seeding helpers (too app-specific — an invite code and a plan tier aren't the same
 kind of fixture), and anything issuer/auth-shaped (see `stridelabs-auth`'s
 `test-support` feature for minting test JWTs).

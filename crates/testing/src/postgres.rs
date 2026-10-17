@@ -34,9 +34,18 @@ use std::time::Duration;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 
+use crate::redact::{redact_password, UrlShape};
+
 /// The env var [`require_postgres`] checks before falling back to its
 /// `default_url` argument.
 const DATABASE_URL_VAR: &str = "DATABASE_URL";
+
+/// What a URL must look like to be rendered (password masked) in a panic
+/// message; anything else is shown as a placeholder.
+const DATABASE_URL_SHAPE: UrlShape = UrlShape {
+    env_var: DATABASE_URL_VAR,
+    schemes: &["postgres", "postgresql"],
+};
 
 /// How long to wait for a connection before giving up. Short on purpose: a
 /// local or CI Postgres that is actually up answers in milliseconds, and a
@@ -102,50 +111,9 @@ fn connection_failure_message(url: &str, err: &sqlx::Error) -> String {
         \n\
         - start the local database: `docker compose up -d` (or `make up`)\n\
         - or point {var} at a Postgres instance that is actually reachable\n",
-        redacted = redact_password(url),
+        redacted = redact_password(url, &DATABASE_URL_SHAPE),
         var = DATABASE_URL_VAR,
     )
-}
-
-/// Mask the password segment of a `postgres://` URL so a panic message (which
-/// test runners happily print to CI logs) never carries a real credential.
-///
-/// Anything that doesn't parse as a URL at all is reported as opaque rather
-/// than echoed verbatim — the failure mode this exists to prevent is a typo'd
-/// URL that still happens to contain a password-shaped substring.
-fn redact_password(url: &str) -> String {
-    match url::Url::parse(url) {
-        Ok(mut parsed) => {
-            if parsed.password().is_some() {
-                // `set_password` only fails for URLs that "cannot have a
-                // password" (e.g. `data:` URLs); a parsed `postgres://` URL
-                // that already reported a password always accepts a new one.
-                let _ = parsed.set_password(Some("***"));
-            }
-            // sqlx also accepts credentials as QUERY parameters
-            // (`?password=...`), which `Url::password()` never sees — mask
-            // those too, case-insensitively, or the authority-only check
-            // above becomes a leak for that URL shape.
-            let query_masked: Vec<(String, String)> = parsed
-                .query_pairs()
-                .map(|(k, v)| {
-                    if k.eq_ignore_ascii_case("password") {
-                        (k.into_owned(), "***".to_string())
-                    } else {
-                        (k.into_owned(), v.into_owned())
-                    }
-                })
-                .collect();
-            if query_masked.iter().any(|(_, v)| v == "***") {
-                parsed
-                    .query_pairs_mut()
-                    .clear()
-                    .extend_pairs(query_masked.iter().map(|(k, v)| (k.as_str(), v.as_str())));
-            }
-            parsed.to_string()
-        }
-        Err(_) => "<a DATABASE_URL that failed to parse>".to_string(),
-    }
 }
 
 #[cfg(test)]
@@ -198,47 +166,9 @@ mod tests {
     }
 
     #[test]
-    fn redact_password_masks_only_the_password() {
-        let redacted =
-            redact_password("postgres://postgres:hunter2@localhost:5438/stridelabs_test");
-
-        assert!(!redacted.contains("hunter2"), "{redacted}");
-        assert!(redacted.contains("postgres://postgres:***@"), "{redacted}");
-        assert!(redacted.contains("localhost:5438"), "{redacted}");
-        assert!(redacted.contains("stridelabs_test"), "{redacted}");
-    }
-
-    #[test]
-    fn redact_password_is_a_no_op_without_one() {
-        let url = "postgres://postgres@localhost:5438/stridelabs_test";
-        assert_eq!(redact_password(url), url);
-    }
-
-    #[test]
-    fn redact_password_on_unparsable_input_stays_opaque() {
-        let redacted = redact_password("not a url");
-        assert!(!redacted.contains("not a url"));
-    }
-
-    #[test]
-    fn redact_password_masks_query_parameter_credentials_too() {
-        // sqlx also accepts `?password=...`, which `Url::password()` never
-        // sees — regression for a review-found leak where this shape sailed
-        // through the authority-only mask.
-        for url in [
-            "postgres://user@localhost:5438/db?password=hunter2",
-            "postgres://user@localhost:5438/db?PASSWORD=hunter2&sslmode=disable",
-        ] {
-            let redacted = redact_password(url);
-            assert!(!redacted.contains("hunter2"), "{redacted}");
-            assert!(redacted.contains("***"), "{redacted}");
-        }
-    }
-
-    #[test]
     fn the_panic_message_never_leaks_the_password() {
         // A direct assertion on the message builder, in addition to the
-        // dedicated `redact_password` unit tests above: this is the exact
+        // dedicated `redact_password` unit tests in `crate::redact`: this is the exact
         // string `require_postgres_at` panics with, built the same way a
         // real connection failure would build it.
         let err = sqlx::Error::Configuration("simulated failure".into());

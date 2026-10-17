@@ -18,5 +18,22 @@ services:
       timeout: 5s
       retries: 5
 
+  # For stridelabs-testing's `require_redis` and stridelabs-redis's live suite
+  # (both in the all-features lane). No password and no volume: the tests use
+  # unique keys and need nothing to survive a restart.
+  redis:
+    image: redis:7-alpine
+    container_name: stridelabs-rust-redis
+    ports:
+      # 6390 by default, clear of the 6379 every other local stack takes;
+      # STRIDELABS_REDIS_PORT overrides (and REDIS_URL then points the tests
+      # at it).
+      - "${STRIDELABS_REDIS_PORT:-6390}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
 volumes:
   postgres_data:

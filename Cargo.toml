@@ -32,6 +32,9 @@ http = "1"
 # every other dependency, and moving a crate is a one-line edit.
 stridelabs-http = { path = "crates/http" }
 stridelabs-auth = { path = "crates/auth" }
+# Only stridelabs-redis's real-Redis tests use it: a dev-dependency whose
+# `redis` feature that crate's `live-tests` feature switches on.
+stridelabs-testing = { path = "crates/testing" }
 
 # HTTP client (proxy primitives, JWKS fetch). Deliberately NO TLS feature
 # here: whatever is listed at workspace level reaches every member's graph, and
@@ -98,6 +101,20 @@ sqlx = { version = "0.9", default-features = false, features = [
     "migrate",
     "macros",
 ] }
+
+# Redis (stridelabs-redis's lazy handle, stridelabs-testing's `require_redis`).
+# `default-features = false` drops `acl`, `streams`, `geospatial`, `script` and
+# `num-bigint`, none of which either crate uses. `script` exists for `Script`'s
+# EVALSHA caching (and pulls in `sha1_smol`); the one script here, the fixed
+# window, goes out as a raw `EVAL` through `redis::cmd`, which needs nothing
+# from it. `tokio-comp` is the async runtime glue.
+#
+# Deliberately NO TLS feature at this level, for the reqwest reason above:
+# whatever is listed here reaches every member's graph, and so every
+# consumer's. stridelabs-redis turns `tokio-rustls-comp` on for itself
+# (crates/redis/Cargo.toml says why it must); stridelabs-testing's probe talks
+# to a local or CI Redis in the clear, as its Postgres pool does.
+redis = { version = "1", default-features = false, features = ["tokio-comp"] }
 
 # Auth (slauth JWT verification + PAT hashing). default-features = false drops
 # `use_pem` (pem + simple_asn1 + ~11 transitive crates) from production graphs:
