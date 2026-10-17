@@ -66,6 +66,16 @@ for a consumer's pin.
   until v0.6.0 is tagged); `downstream-limen` and
   `scripts/downstream-check.sh` patch all six crates.
 
+### Security
+
+- `Cargo.lock`: rustls 0.23.45 → 0.23.46 (RUSTSEC-2026-0346, -0347, -0348,
+  -0349) and quinn-proto 0.11.16 → 0.11.19 (RUSTSEC-2026-0338 to -0342), so
+  `cargo audit` is clean again. Lock only, no manifest change: rustls is
+  compiled only under `stridelabs-http`'s `proxy`, and quinn-proto is a
+  lock-only entry (reqwest's optional `quinn`) that nothing compiles. A
+  consumer's own `Cargo.lock` decides what it builds, so it bumps the same
+  two packages there.
+
 ## [0.5.0] - 2026-10-11
 
 Every pending dependency major in one release, and the guards and CI that
