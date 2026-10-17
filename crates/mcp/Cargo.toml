@@ -1,0 +1,48 @@
+[package]
+name = "stridelabs-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Hardened MCP-server middle for StrideLabs services: RFC 9728 protected-resource metadata, slauth bearer verification at the MCP boundary, a stateless rmcp Streamable HTTP router, and a scoped, audited tool boundary"
+publish = false
+
+[features]
+default = []
+# Offline MCP access-token minting for a `ProtectedResource`, for consumers'
+# tests (their /mcp end to end). Nothing more than stridelabs-auth's own
+# `test-support` (the committed throwaway keypairs and jsonwebtoken's PEM
+# machinery) plus a claims builder, so it belongs in dev-dependencies.
+test-support = ["stridelabs-auth/test-support"]
+
+[lints]
+workspace = true
+
+[dependencies]
+# `axum` for `bearer_token(&Parts)`. Not `http` (the stridelabs-http bridge):
+# the MCP boundary answers with its own RFC 6750 challenges, never `AppError`.
+stridelabs-auth = { workspace = true, features = ["axum"] }
+rmcp = { workspace = true }
+axum = { workspace = true }
+http = { workspace = true }
+tower = { workspace = true }
+# No features: only the `reqwest::Client` type, which `McpVerifier::new`
+# takes from the consumer and hands to stridelabs-auth's JWKS cache. The TLS
+# stack stays the consumer's choice (see the workspace manifest).
+reqwest = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["time"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+stridelabs-auth = { workspace = true, features = ["axum", "test-support"] }
+rmcp = { workspace = true, features = ["macros"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+reqwest = { workspace = true, features = ["json"] }
+wiremock = { workspace = true }
+tracing-subscriber = { workspace = true }

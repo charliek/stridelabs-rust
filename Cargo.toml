@@ -31,6 +31,7 @@ http = "1"
 # Intra-workspace. Declared here so a member says `{ workspace = true }` like
 # every other dependency, and moving a crate is a one-line edit.
 stridelabs-http = { path = "crates/http" }
+stridelabs-auth = { path = "crates/auth" }
 
 # HTTP client (proxy primitives, JWKS fetch). Deliberately NO TLS feature
 # here: whatever is listed at workspace level reaches every member's graph, and
@@ -51,6 +52,22 @@ reqwest = { version = "0.13", default-features = false }
 # utoipa-axum 0.3 (0.2 supports only utoipa 5); this workspace does not
 # depend on utoipa-axum itself.
 utoipa = "6"
+
+# MCP (Model Context Protocol) server SDK, for stridelabs-mcp. Default
+# features off: rmcp's defaults are `server` + `macros` + `base64`, and its
+# optional `__reqwest`/`auth` features bring an HTTP client (with a TLS feature
+# of their own choosing) and the `oauth2` crate, neither of which a resource
+# server needs. `server` (the `ServerHandler` trait and model, implies
+# `schemars`) and `transport-streamable-http-server` (the tower
+# `StreamableHttpService`) are the whole requirement. `macros` (`#[tool]`,
+# `#[tool_router]`) is a consumer's choice for writing its tools, so it is
+# only on in stridelabs-mcp's dev-dependencies; a consumer names it on its
+# own rmcp dependency.
+rmcp = { version = "3.5", default-features = false, features = [
+    "server",
+    "schemars",
+    "transport-streamable-http-server",
+] }
 
 # Serialization / config parsing
 serde = { version = "1", features = ["derive"] }
