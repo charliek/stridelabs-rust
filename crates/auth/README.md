@@ -285,6 +285,78 @@ touched, because a JWT's base64url is case-sensitive. The result borrows from
 header, non-UTF-8 header, another scheme, no scheme at all, empty credential)
 is the same `AuthError::MissingToken`.
 
+## slauth PATs: `PatValidator`
+
+```rust
+use stridelabs_auth::{PatValidationError, PatValidator, SLAUTH_PAT_PREFIX};
+
+// Once, at startup. `None` when the config names no `pat_validate_url`.
+// Ideally a client that follows no redirects (below).
+let pats = PatValidator::from_config(&config, http_client.clone());
+
+// Per request:
+if bearer.starts_with(SLAUTH_PAT_PREFIX) {
+    match pats.validate(bearer).await {
+        Ok(identity_id) => { /* a uuid::Uuid: the slauth identity */ }
+        Err(PatValidationError::Rejected { reason }) => { /* 401 */ }
+        Err(PatValidationError::Unavailable { reason }) => { /* 503 */ }
+    }
+}
+```
+
+slauth issues `slp_live_…` PATs and resolves them at
+`POST /api/v1/pat/validate` (`Authorization: Bearer <pat>`, no body). The
+validator is that call and nothing more — the Rust twin of
+stridelabs-python's `PATValidator`, with its outcomes and its messages:
+
+| What happened | Result |
+|---|---|
+| not `slp_live_` + exactly 43 characters (`is_slauth_pat`) | `Rejected("Invalid PAT format")`, without calling slauth |
+| the answer came from anywhere but the validate URL (a redirect was followed) | `Unavailable("Authentication service error")` |
+| no complete answer within 5 s (`PAT_VALIDATION_TIMEOUT`) | `Unavailable("Authentication service timeout")` |
+| any other transport failure | `Unavailable("Authentication service unavailable")` |
+| a body over 16 KiB (`slauth_pat::MAX_ANSWER_BYTES`) | `Unavailable("Authentication service error")` |
+| HTTP 401 | `Rejected("Invalid or expired PAT")` |
+| any other status but 200, a 3xx included | `Unavailable("Authentication service error")` |
+| a body that is not a JSON object | `Unavailable("Authentication service error")` |
+| `valid` anything but `true` | `Rejected(<reason>)` for one of slauth's codes (`invalid_format`, `not_found`, `revoked`, `expired`), else `Rejected("Invalid token")` |
+| `identity_id` not a UUID | `Unavailable("Authentication service error")` |
+| otherwise | `Ok(identity_id)` |
+
+**Pass a client built with `reqwest::redirect::Policy::none()`.** No
+redirect is trusted either way: an answer whose final URL is not the
+validate URL — another origin, or another path on slauth's — is a service
+error whatever it says, 401 and `valid: true` alike, because it is not
+slauth's validate endpoint answering. With that policy no redirect is even
+followed, and a 3xx is the service error Python's httpx (which follows none)
+made of it. (reqwest drops `Authorization` from a redirect that leaves the
+origin, so the PAT does not follow one either way.)
+
+`is_slauth_pat` is Python's `is_pat_token` rule to the letter: the prefix,
+then 43 Unicode scalar values, alphabet unchecked. Route a bearer token on
+the prefix alone and let `validate` refuse a wrong shape, so a mangled slauth
+PAT is refused as a PAT rather than tried as a JWT.
+
+Where Python's behaviour is undefined (an unhandled exception) or cannot be
+expressed, the answer is the nearest defined one: a token no HTTP header can
+carry is `Rejected("Invalid PAT format")`, and JSON that is not an object is
+a service error. Three hardenings go further than Python: redirects (above);
+a body cap, where Python read any size; and `reason`, which passes through
+only as one of slauth's four codes — Python passed any value through, so an
+endpoint echoing its request could put the token or the URL into an error.
+The 5 s is one deadline for the whole exchange (httpx's applied per phase).
+`PatValidator::with_timeout` replaces the 5 s, for tests.
+
+Caching is the consumer's to add (store and TTL are app-specific), and so is
+what a PAT may do: slauth's answer carries an identity and no scopes.
+
+Neither the token nor the validate URL ever appears in a
+`PatValidationError` — it holds a fixed message or one of slauth's codes —
+nor in the `warn` line each `Unavailable` outcome logs (a `reqwest::Error`
+is rendered `without_url()`), nor in `PatValidator`'s `Debug`, which prints
+the URL as `scheme://host[:port]/path`. The request's `Authorization` value
+is marked sensitive.
+
 ## Personal access tokens
 
 ```rust
@@ -360,6 +432,5 @@ global `*.pem` rule with an explicit exception for that directory.
 ## Not included
 
 Issuer-side signing (minting real tokens), OAuth2 authorization-code/PKCE flow
-handling, and slauth PAT introspection. `SlauthConfig::pat_validate_url`
-exists as a config field for the last of these — every consumer that eventually
-needs it would otherwise carry its own — but nothing here calls it yet.
+handling, and caching PAT validations (a [`PatValidator`](#slauth-pats-patvalidator)
+answer is the consumer's to cache — stridelabs-mcp's `redis` feature has one).

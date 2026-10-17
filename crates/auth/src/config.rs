@@ -30,12 +30,13 @@ pub struct SlauthConfig {
     /// Expected `aud` claim: this service's identifier at the issuer.
     pub audience: String,
     /// slauth's personal-access-token introspection endpoint, for services
-    /// that accept slauth-issued PATs in addition to JWTs.
+    /// that accept slauth-issued PATs in addition to JWTs (e.g.
+    /// `https://auth.example.com/api/v1/pat/validate`).
     ///
-    /// Unused by this crate today — [`crate::pat`] deals in *locally* issued
-    /// tokens, which are validated against the service's own database. It
-    /// lives here because it is slauth configuration and every consumer that
-    /// eventually needs it would otherwise carry its own field for it.
+    /// Read by [`crate::PatValidator::from_config`]; `None` (or empty) means
+    /// the service takes no slauth PATs. [`crate::Verifier`] never reads it,
+    /// and [`crate::pat`] is unrelated: it deals in *locally* issued tokens,
+    /// validated against the service's own database.
     #[serde(default)]
     pub pat_validate_url: Option<String>,
 }
