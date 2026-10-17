@@ -293,19 +293,22 @@ is the same `AuthError::MissingToken`.
 ```rust
 use stridelabs_auth::{PatValidationError, PatValidator, SLAUTH_PAT_PREFIX};
 
-// Once, at startup. `None` when the config names no `pat_validate_url`.
+// Once, at startup. `None` when the config names no `pat_validate_url`:
+// the service then takes no slauth PATs.
 // The client MUST follow no redirects (below).
 let no_redirects = reqwest::Client::builder()
     .redirect(reqwest::redirect::Policy::none())
     .build()?;
-let pats = PatValidator::from_config(&config, no_redirects);
+let pats: Option<PatValidator> = PatValidator::from_config(&config, no_redirects);
 
-// Per request:
-if bearer.starts_with(SLAUTH_PAT_PREFIX) {
-    match pats.validate(bearer).await {
-        Ok(identity_id) => { /* a uuid::Uuid: the slauth identity */ }
-        Err(PatValidationError::Rejected { reason }) => { /* 401 */ }
-        Err(PatValidationError::Unavailable { reason }) => { /* 503 */ }
+// Per request, when the service takes PATs:
+if let Some(pats) = &pats {
+    if bearer.starts_with(SLAUTH_PAT_PREFIX) {
+        match pats.validate(bearer).await {
+            Ok(identity_id) => { /* a uuid::Uuid: the slauth identity */ }
+            Err(PatValidationError::Rejected { reason }) => { /* 401 */ }
+            Err(PatValidationError::Unavailable { reason }) => { /* 503 */ }
+        }
     }
 }
 ```
