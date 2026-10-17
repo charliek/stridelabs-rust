@@ -12,7 +12,7 @@ to turn off.
 
 ```toml
 [dependencies]
-stridelabs-config = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.5.0" }
+stridelabs-config = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.6.0" }
 ```
 
 (During development against an unreleased commit, pin `rev = "<sha>"`
