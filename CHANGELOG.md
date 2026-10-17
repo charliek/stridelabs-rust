@@ -11,6 +11,22 @@ for a consumer's pin.
 
 ## [Unreleased]
 
+### Added
+
+- `stridelabs-auth`: `Verifier::verify_bearer_claims::<C>(token)` and its
+  network-free twin `Verifier::claims_with_jwks::<C>(token, &jwks, kid,
+  issuer, audience)`, for tokens whose claim rules are not a sign-in's (an
+  MCP access token: audience = the resource URL, scopes, optional email).
+  They run the same key selection, RS256 signature, `exp`, `iss` and `aud`
+  checks (all three required) and return the claims as the caller's type,
+  with no `email` or `sub` rules: the caller owns those. `verify_with_jwks`
+  and `verify_bearer` are now built on them, so there is one copy of the
+  validation logic; their behaviour is unchanged.
+- `stridelabs-auth`: `test_support::TestClaims::claim(name, value)` adds an
+  arbitrary claim to a minted token (`scope`, `scp`, `client_id`, …),
+  applied last so it can also replace one of the builder's own. A builder
+  that never calls it produces exactly the claim set it did before.
+
 ## [0.5.0] - 2026-10-11
 
 Every pending dependency major in one release, and the guards and CI that

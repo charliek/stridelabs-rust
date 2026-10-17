@@ -38,6 +38,14 @@
 //! UUID is a fact about a slauth deployment, not a contract of the token
 //! format; treat it as an opaque OIDC subject.
 //!
+//! The email and subject rules are [`VerifiedIdentity`]'s. A token minted for
+//! something else — an MCP access token, say, whose audience is a resource
+//! URL, whose `email` is optional and whose scopes are what matter — goes
+//! through [`Verifier::verify_bearer_claims`] (or the network-free
+//! [`Verifier::claims_with_jwks`]) instead: the same key selection,
+//! signature, `exp`, `iss` and `aud` checks, from the same code, with the
+//! claims returned as the caller's own type and their semantics left to it.
+//!
 //! Two deliberate hardenings over the original implementation this crate
 //! replaced, both pinned in the plan this crate was written from:
 //!

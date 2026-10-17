@@ -6,6 +6,7 @@ use jsonwebtoken::jwk::{
     AlgorithmParameters, Jwk, JwkSet, KeyAlgorithm, KeyOperations, PublicKeyUse,
 };
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
+use serde::de::DeserializeOwned;
 use serde::Deserialize;
 
 use crate::config::SlauthConfig;
@@ -90,12 +91,37 @@ impl Verifier {
     ///
     /// May fetch the issuer's JWKS; see [`crate::jwks`] for when.
     pub async fn verify_bearer(&self, token: &str) -> Result<VerifiedIdentity, AuthError> {
+        let claims: Claims = self.verify_bearer_claims(token).await?;
+        identity_from(claims)
+    }
+
+    /// Verify a bearer token's value and return its claims as `C`, with none
+    /// of [`Verifier::verify_bearer`]'s identity checks.
+    ///
+    /// The cryptographic and spec-claim checks are the same ones, from the
+    /// same code: key selection by `kid`, the RS256 signature, `exp`, `iss`
+    /// and `aud` (all three required). What is **not** checked is anything
+    /// about `email` or `sub`: those are [`VerifiedIdentity`]'s contract, and
+    /// a token for another purpose (an MCP access token, whose audience is a
+    /// resource URL and whose email is optional) has different claim rules.
+    /// The caller owns them, including rejecting an empty `sub` if its rows
+    /// are keyed on it.
+    ///
+    /// A claims shape that doesn't deserialize into `C` is
+    /// [`AuthError::InvalidToken`] ("claims are malformed"), never the serde
+    /// message, which can quote the offending value.
+    ///
+    /// May fetch the issuer's JWKS; see [`crate::jwks`] for when.
+    pub async fn verify_bearer_claims<C: DeserializeOwned>(
+        &self,
+        token: &str,
+    ) -> Result<C, AuthError> {
         let header = decode_header(token).map_err(|_| AuthError::MalformedToken)?;
         let kid = header.kid.ok_or(AuthError::MissingKid)?;
 
         let jwks = self.inner.jwks.jwks_for_kid(&kid).await?;
 
-        Verifier::verify_with_jwks(
+        Verifier::claims_with_jwks(
             token,
             &jwks,
             &kid,
@@ -111,11 +137,8 @@ impl Verifier {
     /// against a key set it obtained some other way — without a
     /// [`Verifier`] or an HTTP client.
     ///
-    /// Checks, in order: the set holds a key under `kid` that is fit for RS256
-    /// signatures (an RSA key whose `alg`, `use` and `key_ops`, where present,
-    /// allow it); the key is usable; RS256 signature; `exp`; `iss` equals
-    /// `issuer`; `aud` contains `audience`; a non-empty `email` claim; a
-    /// non-empty `sub` claim.
+    /// Checks, in order: everything [`Verifier::claims_with_jwks`] checks,
+    /// then a non-empty `email` claim and a non-empty `sub` claim.
     pub fn verify_with_jwks(
         token: &str,
         jwks: &JwkSet,
@@ -123,6 +146,27 @@ impl Verifier {
         issuer: &str,
         audience: &str,
     ) -> Result<VerifiedIdentity, AuthError> {
+        let claims: Claims = Verifier::claims_with_jwks(token, jwks, kid, issuer, audience)?;
+        identity_from(claims)
+    }
+
+    /// [`Verifier::verify_bearer_claims`] minus the network: the token's
+    /// claims as `C`, after every cryptographic and spec-claim check and no
+    /// claim semantics beyond them.
+    ///
+    /// Checks, in order: the set holds a key under `kid` that is fit for RS256
+    /// signatures (an RSA key whose `alg`, `use` and `key_ops`, where present,
+    /// allow it); the key is usable; RS256 signature; `exp`; `iss` equals
+    /// `issuer`; `aud` contains `audience`. `exp`, `iss` and `aud` must be
+    /// present. Nothing about `email` or `sub` — the caller owns those (see
+    /// [`Verifier::verify_bearer_claims`]).
+    pub fn claims_with_jwks<C: DeserializeOwned>(
+        token: &str,
+        jwks: &JwkSet,
+        kid: &str,
+        issuer: &str,
+        audience: &str,
+    ) -> Result<C, AuthError> {
         // Only a key the issuer published for RS256 signatures may verify one.
         // `DecodingKey::from_jwk` ignores the JWK's `alg`, `use` and `key_ops`,
         // so without this an RSA key labelled for encryption (`use: enc`,
@@ -161,30 +205,35 @@ impl Verifier {
         // line and had that hole; hardening, not parity.)
         validation.set_required_spec_claims(&["exp", "iss", "aud"]);
 
-        let data = decode::<Claims>(token, &key, &validation).map_err(|err| invalid_token(&err))?;
-
-        // Services key their user rows on email (usually a UNIQUE NOT NULL
-        // column), so a missing one must be rejected rather than collapsed to
-        // "" — which would make every emailless token the same user.
-        let email = data
-            .claims
-            .email
-            .filter(|email| !email.is_empty())
-            .ok_or(AuthError::MissingEmail)?;
-
-        // Hardening over the original implementation this crate replaced,
-        // which accepted `sub: ""`. An empty subject is the same
-        // collapse-to-one-user failure as an empty email, one layer down.
-        if data.claims.sub.is_empty() {
-            return Err(AuthError::MissingSubject);
-        }
-
-        Ok(VerifiedIdentity {
-            sub: data.claims.sub,
-            email,
-            name: data.claims.name.unwrap_or_default(),
-        })
+        decode::<C>(token, &key, &validation)
+            .map(|data| data.claims)
+            .map_err(|err| invalid_token(&err))
     }
+}
+
+/// [`VerifiedIdentity`]'s claim rules, applied to claims that already passed
+/// every cryptographic and spec-claim check.
+fn identity_from(claims: Claims) -> Result<VerifiedIdentity, AuthError> {
+    // Services key their user rows on email (usually a UNIQUE NOT NULL
+    // column), so a missing one must be rejected rather than collapsed to
+    // "" — which would make every emailless token the same user.
+    let email = claims
+        .email
+        .filter(|email| !email.is_empty())
+        .ok_or(AuthError::MissingEmail)?;
+
+    // Hardening over the original implementation this crate replaced,
+    // which accepted `sub: ""`. An empty subject is the same
+    // collapse-to-one-user failure as an empty email, one layer down.
+    if claims.sub.is_empty() {
+        return Err(AuthError::MissingSubject);
+    }
+
+    Ok(VerifiedIdentity {
+        sub: claims.sub,
+        email,
+        name: claims.name.unwrap_or_default(),
+    })
 }
 
 /// Whether `jwk` is an RSA key its issuer allows for RS256 signature
@@ -425,6 +474,132 @@ mod tests {
         assert!(!message.contains(PRIMARY_KID));
     }
 
+    // --- the generic claims path ---------------------------------------------
+
+    /// A claim set some other kind of token carries: no email in sight, a
+    /// space-separated `scope` string and Hydra's `scp` array.
+    #[derive(Debug, serde::Deserialize)]
+    struct ResourceClaims {
+        sub: String,
+        #[serde(default)]
+        scope: Option<String>,
+        #[serde(default)]
+        scp: Vec<String>,
+        #[serde(default)]
+        client_id: Option<String>,
+        #[serde(default)]
+        email: Option<String>,
+    }
+
+    fn resource_claims(token: &str) -> Result<ResourceClaims, AuthError> {
+        Verifier::claims_with_jwks(
+            token,
+            &TestKey::primary().jwks(),
+            PRIMARY_KID,
+            ISSUER,
+            AUDIENCE,
+        )
+    }
+
+    #[test]
+    fn claims_with_jwks_returns_the_callers_claim_type() {
+        let token = TestKey::primary().mint(
+            &claims()
+                .subject("kratos-uuid-1")
+                .without_email()
+                .claim("scope", json!("files:read files:write"))
+                .claim("scp", json!(["files:read"]))
+                .claim("client_id", json!("connector-1"))
+                .build(),
+        );
+
+        let claims = resource_claims(&token).expect("valid token");
+
+        assert_eq!(claims.sub, "kratos-uuid-1");
+        assert_eq!(claims.scope.as_deref(), Some("files:read files:write"));
+        assert_eq!(claims.scp, ["files:read"]);
+        assert_eq!(claims.client_id.as_deref(), Some("connector-1"));
+        assert_eq!(claims.email, None);
+    }
+
+    #[test]
+    fn claims_with_jwks_applies_no_email_or_subject_rules() {
+        // Both are `verify_with_jwks` rejections; the generic path leaves
+        // them to its caller.
+        for spoiled in [
+            claims().without_email(),
+            claims().email(""),
+            claims().subject(""),
+        ] {
+            let token = TestKey::primary().mint(&spoiled.build());
+
+            assert!(matches!(
+                verify(&token).unwrap_err(),
+                AuthError::MissingEmail | AuthError::MissingSubject
+            ));
+            Verifier::claims_with_jwks::<Value>(
+                &token,
+                &TestKey::primary().jwks(),
+                PRIMARY_KID,
+                ISSUER,
+                AUDIENCE,
+            )
+            .expect("the generic path checks no claim semantics");
+        }
+    }
+
+    #[test]
+    fn claims_with_jwks_runs_every_cryptographic_and_spec_claim_check() {
+        let wrong_key = TestKey::secondary().mint_with_kid(PRIMARY_KID, &claims().build());
+        let foreign_issuer =
+            TestKey::primary().mint(&TestClaims::new("https://evil.example", AUDIENCE).build());
+        let foreign_audience =
+            TestKey::primary().mint(&TestClaims::new(ISSUER, "some-other-app").build());
+        let expired = TestKey::primary().mint(&claims().expires_in(-3600).build());
+        let mut without_aud = claims().build();
+        without_aud
+            .as_object_mut()
+            .expect("claims are an object")
+            .remove("aud");
+        let without_aud = TestKey::primary().mint(&without_aud);
+
+        for (token, expected) in [
+            (&wrong_key, "token rejected: signature is invalid"),
+            (&foreign_issuer, "token rejected: issuer is not accepted"),
+            (
+                &foreign_audience,
+                "token rejected: audience is not accepted",
+            ),
+            (&expired, "token rejected: token has expired"),
+            (&without_aud, "token rejected: a required claim is missing"),
+        ] {
+            let err = resource_claims(token).unwrap_err();
+            assert_eq!(err.to_string(), expected);
+        }
+
+        let err = Verifier::claims_with_jwks::<Value>(
+            &TestKey::primary().mint(&claims().build()),
+            &TestKey::primary().jwks(),
+            "no-such-kid",
+            ISSUER,
+            AUDIENCE,
+        )
+        .unwrap_err();
+        assert!(matches!(err, AuthError::UnknownKid), "{err}");
+    }
+
+    #[test]
+    fn a_claim_shape_the_caller_cannot_read_is_malformed_not_quoted() {
+        // `scope` must be a string for `ResourceClaims`; the serde message
+        // for this would quote the value.
+        let token = TestKey::primary().mint(&claims().claim("scope", json!(["hunter2"])).build());
+
+        let err = resource_claims(&token).unwrap_err();
+
+        assert_eq!(err.to_string(), "token rejected: claims are malformed");
+        assert!(!format!("{err:?}").contains("hunter2"));
+    }
+
     // --- the network-facing half ------------------------------------------
 
     fn verifier_against(server: &MockServer) -> Verifier {
@@ -449,6 +624,46 @@ mod tests {
             let identity = verifier.verify_bearer(&token).await.expect("valid token");
             assert_eq!(identity.sub, format!("user-{i}"));
         }
+    }
+
+    #[tokio::test]
+    async fn verify_bearer_claims_fetches_once_and_skips_the_identity_rules() {
+        let server = primary_issuer(1).await;
+        let verifier = verifier_against(&server);
+
+        for i in 0..2 {
+            let token = TestKey::primary().mint(
+                &claims()
+                    .subject(format!("user-{i}"))
+                    .without_email()
+                    .claim("scope", json!("files:read"))
+                    .build(),
+            );
+            let claims: ResourceClaims = verifier
+                .verify_bearer_claims(&token)
+                .await
+                .expect("valid token");
+            assert_eq!(claims.sub, format!("user-{i}"));
+            assert_eq!(claims.scope.as_deref(), Some("files:read"));
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_bearer_claims_rejects_like_verify_bearer() {
+        let outage = issuer(ResponseTemplate::new(503), 1).await;
+        let token = TestKey::primary().mint(&claims().build());
+        let err = verifier_against(&outage)
+            .verify_bearer_claims::<Value>(&token)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AuthError::Jwks(_)), "{err}");
+
+        let silent = MockServer::start().await;
+        let err = verifier_against(&silent)
+            .verify_bearer_claims::<Value>("not-a-jwt")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AuthError::MalformedToken), "{err}");
     }
 
     #[tokio::test]
