@@ -152,8 +152,8 @@ pub use limits::{
 };
 pub use metadata::metadata_router;
 pub use pat::{
-    pat_cache_key, PatCache, PatCacheError, PatCacheFuture, SlauthPatCredential, PAT_CACHE_MAX_TTL,
-    PAT_CACHE_TIMEOUT, PAT_CACHE_TTL,
+    pat_cache_key, CachedPat, PatCache, PatCacheError, PatCacheFuture, SlauthPatCredential,
+    PAT_CACHE_MAX_TTL, PAT_CACHE_TIMEOUT, PAT_CACHE_TTL,
 };
 pub use principal::{AuthMethod, Principal, ScopeError};
 pub use resource::{ProtectedResource, ResourceError, ResourceMetadata, METADATA_PATH};

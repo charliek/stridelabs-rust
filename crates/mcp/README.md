@@ -320,14 +320,28 @@ ToolCall::new("create_image")
 use stridelabs_auth::{PatValidator, SLAUTH_PAT_PREFIX};
 use stridelabs_mcp::{McpVerifier, RedisPatCache, SlauthPatCredential};
 
+// The validator's client MUST follow no redirects (below).
+let no_redirects = reqwest::Client::builder()
+    .redirect(reqwest::redirect::Policy::none())
+    .build()?;
 let pats = SlauthPatCredential::new(
-    PatValidator::new(&config.slauth_pat_validate_url, http.clone()),
+    PatValidator::new(&config.slauth_pat_validate_url, no_redirects),
     ["image:generate"],                                        // the PAT ceiling
 )
 .with_cache(RedisPatCache::new(redis.clone(), "imgmcp:pat:validate"));
 let verifier = McpVerifier::new(&resource, &config.slauth_jwks_url, http)
     .with_credential(SLAUTH_PAT_PREFIX, pats);
 ```
+
+**The `PatValidator`'s client must not follow redirects**
+(`reqwest::redirect::Policy::none()`; reqwest's default follows them). The
+client is yours, so its TLS stack and roots stay your choice — and so does
+its redirect policy. With a following client, a redirect back to the
+validate URL itself (`POST` → `303` → `GET` of the same URL) is
+indistinguishable from slauth answering: whatever answers the `GET` is taken
+as the verdict, and a success is then cached. The validator's final-URL check
+(an answer from anywhere else is a service error) is defence in depth, not a
+substitute; see stridelabs-auth's README.
 
 | slauth's answer (`PatValidator::validate`) | Result |
 |---|---|
@@ -343,22 +357,32 @@ The cache (optional, any `PatCache`) follows Python imgmcp's rules, tightened:
   verifiers sharing a Redis never share each other's positive results. It is
   used as given, unchecked: a unique prefix per verifier is the caller's to
   choose.
-- **Only a success's identity is stored**, for `PAT_CACHE_TTL` (120 s;
-  `with_cache_ttl` changes it). The TTL is whole seconds rounded **down**,
-  so the one given is a true bound on staleness, from 1 s to
-  `PAT_CACHE_MAX_TTL` (a day; `Duration::MAX` is a day). The ceiling is
-  applied afresh on every hit; a rejection or an outage is never cached.
-- **Fail-through.** A cache error, a value that is not a UUID, or any cache
-  operation slower than `PAT_CACHE_TIMEOUT` (250 ms) is a `warn` line and a
-  direct validation against slauth. After a failed read nothing is written
-  back; a failed write still returns the success, with no second validation.
-- **A hit does not refresh the TTL**: an entry expires 120 s after the
-  validation that wrote it.
+- **Only a success is stored: the identity and an absolute expiry**
+  (`CachedPat`: the validation's start plus `PAT_CACHE_TTL`, 120 s by
+  default; `with_cache_ttl` changes it). The TTL is whole seconds rounded
+  **down**, so the one given is a true bound on staleness, from 1 s to
+  `PAT_CACHE_MAX_TTL` (a day; `Duration::MAX` is a day). `RedisPatCache`
+  stores `{uuid}:{expires_at}` (Unix seconds); anything else there, a bare
+  UUID included, is malformed. The ceiling is applied afresh on every hit; a
+  rejection or an outage is never cached.
+- **Fail-through.** A cache error, a malformed value, or any cache operation
+  slower than `PAT_CACHE_TIMEOUT` (250 ms) is a `warn` line and a direct
+  validation against slauth. After a failed read nothing is written back; a
+  failed write still returns the success, with no second validation.
+- **The expiry is absolute, and the credential enforces it**: an entry read
+  at or after its `expires_at` is a miss, whatever the store's own TTL says.
+  So nothing stretches it — not a hit (which writes nothing), and not a
+  write that lands late: a `SET` Redis runs after the credential gave up on
+  it at 250 ms restarts the key's own TTL (`SET … EX`, housekeeping only),
+  but the value it carries still expires 120 s after the validation.
+  `with_clock` injects the clock that stamps and judges expiries, for tests.
 
-**Staleness:** a cached success is trusted until it expires, so a PAT revoked
-in slauth keeps working here for up to the TTL — 120 s by default, Python's
-trade-off exactly. Shorten the TTL if that window matters more than slauth's
-load.
+**Staleness:** a cached success is trusted until its expiry, so a PAT revoked
+in slauth keeps working here for up to the TTL after the validation that
+cached it — 120 s by default, Python's trade-off, and a bound that holds
+against late writes (given that the instances sharing a cache keep their
+clocks in step: the expiry is a wall-clock time). Shorten the TTL if that
+window matters more than slauth's load.
 
 ### Redis (feature `redis`)
 

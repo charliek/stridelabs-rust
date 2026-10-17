@@ -13,7 +13,7 @@ use redis::aio::MultiplexedConnection;
 use serde_json::json;
 use stridelabs_auth::{PatValidator, SLAUTH_PAT_PREFIX};
 use stridelabs_mcp::{
-    pat_cache_key, CredentialVerifier, PatCache, RateClass, RateLimiter, RedisPatCache,
+    pat_cache_key, CachedPat, CredentialVerifier, PatCache, RateClass, RateLimiter, RedisPatCache,
     RedisRateLimiter, SlauthPatCredential,
 };
 use stridelabs_redis::RedisHandle;
@@ -238,18 +238,25 @@ async fn an_identity_round_trips_under_the_prefixed_digest_with_its_ttl() {
 
     assert_eq!(cache.get(&key).await.expect("a miss is not an error"), None);
     cache
-        .set(&key, identity, Duration::from_secs(120))
+        .set(
+            &key,
+            CachedPat::new(identity, 1_760_000_120),
+            Duration::from_secs(120),
+        )
         .await
         .expect("stored");
-    assert_eq!(cache.get(&key).await.expect("a hit"), Some(identity));
+    assert_eq!(
+        cache.get(&key).await.expect("a hit"),
+        Some(CachedPat::new(identity, 1_760_000_120))
+    );
 
     let stored = format!("{prefix}:{key}");
     assert_eq!(
         raw::<Option<String>>(&server, &["GET", &stored])
             .await
             .as_deref(),
-        Some(IDENTITY),
-        "the hyphenated UUID, under {{prefix}}:{{digest}}"
+        Some(format!("{IDENTITY}:1760000120").as_str()),
+        "{{uuid}}:{{expires_at}}, under {{prefix}}:{{digest}}"
     );
     let ttl: i64 = raw(&server, &["PTTL", &stored]).await;
     assert!((110_000..=120_000).contains(&ttl), "{ttl} ms");
@@ -268,7 +275,10 @@ async fn a_ttl_is_whole_seconds_rounded_down_and_at_most_a_day() {
         ("fraction", Duration::from_millis(2_900), 2_000, 1),
         ("zero", Duration::ZERO, 1_000, 1),
     ] {
-        cache.set(key, identity, ttl).await.expect("stored");
+        cache
+            .set(key, CachedPat::new(identity, 1_760_000_120), ttl)
+            .await
+            .expect("stored");
         let ttl_ms: i64 = raw(&server, &["PTTL", &format!("{prefix}:{key}")]).await;
         assert!(
             (shortest_ms..=longest_ms).contains(&ttl_ms),
@@ -304,17 +314,67 @@ async fn a_malformed_cached_value_falls_through_to_slauth() {
     let slauth = slauth().await;
     let prefix = unique_prefix("pat-malformed");
     let stored = format!("{prefix}:{}", pat_cache_key(&pat()));
-    raw::<()>(&server, &["SET", &stored, "not-a-uuid", "EX", "120"]).await;
     let cache = cache(&server, &prefix);
+    let credential = credential(&slauth, cache.clone());
 
-    assert!(cache.get(&pat_cache_key(&pat())).await.is_err());
-    let principal = credential(&slauth, cache)
+    // Garbage, the old bare-UUID form, and a non-numeric expiry.
+    let values = ["not-a-uuid", IDENTITY, &format!("{IDENTITY}:soon")];
+    for (attempt, value) in values.into_iter().enumerate() {
+        raw::<()>(&server, &["SET", &stored, value, "EX", "120"]).await;
+        assert!(cache.get(&pat_cache_key(&pat())).await.is_err(), "{value}");
+
+        let principal = credential.verify(&pat()).await.expect("slauth decided");
+
+        assert_eq!(principal.subject, IDENTITY);
+        assert_eq!(validations(&slauth).await, attempt + 1, "{value}");
+        assert_eq!(
+            raw::<Option<String>>(&server, &["GET", &stored])
+                .await
+                .as_deref(),
+            Some(value),
+            "nothing is written after a failed read"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_expired_entry_is_a_miss_and_the_fresh_one_carries_its_expiry() {
+    let server = server().await;
+    let slauth = slauth().await;
+    let prefix = unique_prefix("pat-expired");
+    let stored = format!("{prefix}:{}", pat_cache_key(&pat()));
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("after 1970")
+        .as_secs();
+    // Expired a second ago, though Redis would keep it two more minutes.
+    let expired = format!("{IDENTITY}:{}", now - 1);
+    raw::<()>(&server, &["SET", &stored, &expired, "EX", "120"]).await;
+
+    credential(&slauth, cache(&server, &prefix))
         .verify(&pat())
         .await
-        .expect("slauth decided");
+        .expect("validated again");
 
-    assert_eq!(principal.subject, IDENTITY);
     assert_eq!(validations(&slauth).await, 1);
+    let fresh: String = raw::<Option<String>>(&server, &["GET", &stored])
+        .await
+        .expect("rewritten");
+    let (identity, expires_at) = fresh.split_once(':').expect("{uuid}:{expires_at}");
+    let expires_at: u64 = expires_at.parse().expect("Unix seconds");
+    assert_eq!(identity, IDENTITY);
+    // Stamped from a clock read between `now` and `after`, so the bound is
+    // exact whatever the scheduler did in between.
+    let after = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("after 1970")
+        .as_secs();
+    assert!(
+        (now + 120..=after + 120).contains(&expires_at),
+        "validation time + 120: {expires_at} not in {}..={}",
+        now + 120,
+        after + 120
+    );
 }
 
 #[tokio::test]

@@ -28,12 +28,18 @@ plus `redis` 1 for the new crate. First consumer: imgmcp.
   Python's `PATValidator`, reading `SlauthConfig.pat_validate_url`. A
   malformed token (prefix plus exactly 43 characters) is never sent; a
   rejection is `PatValidationError::Rejected` (a 401) and an outage
-  `::Unavailable` (a 503), mapped as the Python client does. Hardened beyond
-  it: a redirect or any 3xx is never taken as slauth's verdict, the answer
-  is read with a 16 KiB cap, only slauth's own reason codes pass through,
-  and no error or log line renders the token or the URL (`Debug` shows the
-  endpoint redacted: no userinfo, query or fragment). One 5 s deadline for
-  the whole exchange.
+  `::Unavailable` (a 503), mapped as the Python client does. It takes the
+  consumer's `reqwest::Client`, which **must not follow redirects**
+  (`reqwest::redirect::Policy::none()`): then every 3xx is a service error,
+  as with Python's httpx. With a following client, an answer whose final URL
+  is not the validate URL is still refused, but that check is defence in
+  depth only: a redirect back to the validate URL itself (`POST` → `303` →
+  `GET` of the same URL) cannot be told from slauth answering, and a test
+  pins that limitation. Hardened beyond Python: the answer is read with a
+  16 KiB cap, only slauth's own reason codes pass through, and no error or
+  log line renders the token or the URL (`Debug` shows the endpoint
+  redacted: no userinfo, query or fragment). One 5 s deadline for the whole
+  exchange.
 - `stridelabs-http`, feature `tls`: `install_default_provider()` installs
   the aws-lc-rs rustls provider as the process default
   (`ProviderInstall`).
@@ -60,7 +66,9 @@ plus `redis` 1 for the new crate. First consumer: imgmcp.
   shows the URL). `fixed_window_hit` is Python `stridelabs-mcp`'s
   `INCR` + `EXPIRE` Lua as a raw `EVAL`, never replayed after an
   outcome-unknown failure; `get` / `set_ex` retry once on a fresh connection
-  after an I/O error on a cached one. Errors classify by where the round
+  after an I/O error on a cached one, and when that fresh connection cannot
+  be made the caller gets the first attempt's outcome-unknown `Io`, never
+  the dial's "never sent" `Connect`. Errors classify by where the round
   trip failed. `rediss://` through redis-rs `tokio-rustls-comp` in this
   crate only (native roots, no provider chosen: the consumer installs
   aws-lc-rs). Feature `live-tests` compiles the crate's real-Redis suite.
@@ -104,13 +112,17 @@ plus `redis` 1 for the new crate. First consumer: imgmcp.
 - `stridelabs-mcp`: `SlauthPatCredential`, a `CredentialVerifier` for
   `slp_live_` PATs on `PatValidator` (rejected is `Invalid`, unavailable is
   `Unavailable`, the ceiling scopes applied on every call), with an
-  optional `PatCache` (key = the first 32 hex of sha256 of the token, the
-  identity UUID only, successes only, whole-second TTL of 1 s to 1 day,
-  every cache operation bounded at 250 ms, fail-through on any cache
-  error).
+  optional `PatCache` (key = the first 32 hex of sha256 of the token;
+  successes only, stored as a `CachedPat` of the identity UUID and an
+  absolute expiry, the validation's start plus a whole-second TTL of 1 s to
+  1 day, which the credential enforces on every read so that neither a hit
+  nor a write that lands late can extend it; every cache operation bounded
+  at 250 ms; fail-through on any cache error or malformed entry). The
+  validator's client must not follow redirects (above).
 - `stridelabs-mcp`, feature `redis`: `RedisRateLimiter` (fixed window on
   `stridelabs-redis`, fails open on any backend error, never replayed) and
-  `RedisPatCache`.
+  `RedisPatCache` (`{uuid}:{expires_at}` under a required prefix, `SET … EX`
+  as housekeeping only).
 - `stridelabs-mcp`, feature `image-fetch`: `ImageFetcher`, Python
   `fetch.py`'s twin over the pinned public-only fetch (`data:` URIs,
   Content-Type and magic-byte checks, Python's messages); its setters cannot

@@ -9,7 +9,7 @@ Where the Rust tests live:
 
 | Short name | File |
 |---|---|
-| `tool::`, `principal::`, `verifier::`, `auth::`, `metadata::`, `resource::`, `limits::`, `pat::`, `image_fetch::` (unit), `test_support::`, `tools_json::` | `crates/mcp/src/<module>.rs`, `#[cfg(test)]` |
+| `tool::`, `principal::`, `verifier::`, `auth::`, `metadata::`, `resource::`, `limits::`, `pat::`, `redis::` (unit), `image_fetch::` (unit), `test_support::`, `tools_json::` | `crates/mcp/src/<module>.rs`, `#[cfg(test)]` |
 | `mcp_http::` | `crates/mcp/tests/mcp_http.rs` (v0.6.0's end-to-end suite) |
 | `rate_limit_http::`, `pat_credential::`, `redis_backed::`, `redis_live::`, `image_fetch::` (suite), `cors::`, `tools_freshness::` | `crates/mcp/tests/<name>.rs` |
 | `http ssrf::…`, `http ssrf_pinning::…` | stridelabs-http: `crates/http/src/ssrf/*.rs` unit tests, `crates/http/tests/ssrf_pinning.rs` — the SSRF core lives there |
@@ -280,11 +280,15 @@ Added, with no Python row (the PAT cache was imgmcp's, not this package's):
 `…::a_cache_write_failure_still_succeeds_without_a_second_validation`,
 `…::a_cache_that_hangs_is_skipped_after_the_bound`,
 `…::a_token_not_shaped_like_a_pat_skips_the_cache`,
+`…::an_entry_past_its_expiry_is_a_miss_and_is_replaced`,
+`…::a_late_write_cannot_extend_validity_past_validation_plus_ttl`,
 `pat::the_key_is_pythons_truncated_sha256_hex`,
 `pat::a_ttl_is_whole_seconds_rounded_down_from_one_second_to_a_day`,
+`redis::an_entry_is_stored_as_uuid_colon_expiry_and_nothing_else_reads_back`,
 `redis_backed::a_dead_cache_is_an_error_and_the_credential_falls_through`,
-and the `redis_live` PAT-cache rows (round trip under the prefixed digest
-with its TTL, the TTL rule, no TTL refresh on a hit, a malformed value,
+and the `redis_live` PAT-cache rows (round trip of `{uuid}:{expires_at}`
+under the prefixed digest with its TTL, the TTL rule, no TTL refresh on a
+hit, malformed values including the bare-UUID form, an expired entry,
 prefix isolation).
 CORS (`cors::*`) and the tools snapshot (`tools_json::*`,
 `test_support::*` freshness rows, `tools_freshness::*`) are Rust additions

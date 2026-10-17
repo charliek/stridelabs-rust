@@ -107,8 +107,10 @@ impl RedisHandle {
     /// # Errors
     ///
     /// [`RedisError::Connect`] / [`RedisError::Io`] if the command (and its
-    /// one retry, where it earned one) failed; [`RedisError::Command`] if the
-    /// key holds a non-string value (`WRONGTYPE`) or bytes that are not UTF-8.
+    /// one retry, where it earned one) failed — and `Io`, the first
+    /// attempt's, when the retry could not even connect, since the first may
+    /// have run; [`RedisError::Command`] if the key holds a non-string value
+    /// (`WRONGTYPE`) or bytes that are not UTF-8.
     pub async fn get(&self, key: &str) -> Result<Option<String>, RedisError> {
         let mut get = redis::cmd("GET");
         get.arg(key);

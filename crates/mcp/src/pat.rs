@@ -11,8 +11,13 @@
 //! use stridelabs_auth::{PatValidator, SLAUTH_PAT_PREFIX};
 //! use stridelabs_mcp::{McpVerifier, SlauthPatCredential};
 //!
+//! // The validator's client must follow no redirects (see below).
+//! let no_redirects = reqwest::Client::builder()
+//!     .redirect(reqwest::redirect::Policy::none())
+//!     .build()
+//!     .expect("a client builds");
 //! let pats = SlauthPatCredential::new(
-//!     PatValidator::new("https://auth.stridelabs.ai/api/v1/pat/validate", http.clone()),
+//!     PatValidator::new("https://auth.stridelabs.ai/api/v1/pat/validate", no_redirects),
 //!     ["image:generate"],
 //! );
 //! let verifier = McpVerifier::new(resource, "https://auth.stridelabs.ai/.well-known/jwks.json", http)
@@ -42,24 +47,38 @@
 //!   namespaces under its own prefix (Python's `pat:validate:{digest}`;
 //!   `RedisPatCache` requires the prefix so verifiers sharing a Redis never
 //!   share each other's positive results).
-//! - **Only the identity is stored**, and only a success's. The ceiling
-//!   scopes are applied afresh on every hit, so changing them takes effect
-//!   at once; a rejection or an outage is never cached.
+//! - **Only the identity is stored, with an absolute expiry**, and only a
+//!   success's: a [`CachedPat`] of the identity UUID and the moment the
+//!   verdict stops being trusted (the validation's start plus the TTL, Unix
+//!   seconds). The ceiling scopes are applied afresh on every hit, so
+//!   changing them takes effect at once; a rejection or an outage is never
+//!   cached.
 //! - **Fail-through.** A cache that errors, times out (every operation is
-//!   bounded by [`PAT_CACHE_TIMEOUT`]) or holds something that is not a UUID
-//!   is skipped with a warning, and the token is validated against slauth
+//!   bounded by [`PAT_CACHE_TIMEOUT`]) or holds something malformed is
+//!   skipped with a warning, and the token is validated against slauth
 //!   directly: a cache blip never breaks authentication. After a failed
 //!   read nothing is written back (as in Python); a failed write still
 //!   returns the success it was caching, without validating again.
-//! - **A hit does not refresh the TTL.** An entry expires
-//!   [`PAT_CACHE_TTL`] after the validation that wrote it, however often it
-//!   is read.
+//! - **The expiry is absolute, and the credential enforces it.** An entry
+//!   read at or after its `expires_at` is a miss, whatever the store's own
+//!   TTL says, so nothing can stretch it: not a hit (which never writes),
+//!   and not a write that lands late — a `SET` that Redis runs after the
+//!   credential gave up on it at the 250 ms bound still carries the original
+//!   expiry, though its own housekeeping TTL starts when it lands.
 //!
-//! **Staleness.** A cached success is trusted until it expires, so a PAT
+//! **Staleness.** A cached success is trusted until its expiry, so a PAT
 //! revoked in slauth keeps working here for up to the TTL (120 s by
-//! default) — exactly Python's trade-off. Shorten it with
-//! [`SlauthPatCredential::with_cache_ttl`] if that window matters more than
-//! slauth's load.
+//! default) after the validation that cached it — exactly Python's
+//! trade-off, now a bound that holds against late writes too (with the
+//! clocks of the instances sharing a cache in step: an expiry is a
+//! wall-clock time). Shorten it with [`SlauthPatCredential::with_cache_ttl`]
+//! if that window matters more than slauth's load.
+//!
+//! **The validator's client must not follow redirects**
+//! (`reqwest::redirect::Policy::none()`): with a following client, a
+//! redirect back to the validate URL is indistinguishable from slauth's
+//! answer, and whatever answers it would be taken as the verdict — and
+//! cached. See [`PatValidator`].
 //!
 //! A token that is not shaped like a slauth PAT ([`is_slauth_pat`]) is refused
 //! by the validator without a call, and skips the cache too: only a
@@ -68,6 +87,7 @@
 use std::borrow::Cow;
 use std::fmt;
 use std::future::Future;
+use std::panic::{RefUnwindSafe, UnwindSafe};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -77,6 +97,7 @@ use stridelabs_auth::{is_slauth_pat, PatValidationError, PatValidator};
 use uuid::Uuid;
 
 use crate::auth::AUTH_LOG_TARGET;
+use crate::limits::Clock;
 use crate::principal::{AuthMethod, Principal};
 use crate::verifier::{CredentialVerifier, VerifyError, VerifyFuture};
 
@@ -121,6 +142,28 @@ impl PatCacheError {
     }
 }
 
+/// What a [`PatCache`] holds for one token: the identity slauth resolved it
+/// to, and when that verdict stops being trusted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct CachedPat {
+    /// The slauth identity the token belongs to.
+    pub identity: Uuid,
+    /// Unix seconds: the validation's start plus the TTL. Read at or after
+    /// it, the entry is a miss.
+    pub expires_at: u64,
+}
+
+impl CachedPat {
+    /// An entry for `identity`, trusted until `expires_at` (Unix seconds).
+    pub fn new(identity: Uuid, expires_at: u64) -> CachedPat {
+        CachedPat {
+            identity,
+            expires_at,
+        }
+    }
+}
+
 /// The future a [`PatCache`] operation returns.
 pub type PatCacheFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, PatCacheError>> + Send + 'a>>;
@@ -131,19 +174,22 @@ pub type PatCacheFuture<'a, T> =
 /// never the token itself. A cache that shares a store with anything else
 /// namespaces it (`RedisPatCache` prefixes it).
 ///
-/// Any `Err` (including from a `get` whose stored value is not a UUID) makes
+/// Any `Err` (including from a `get` whose stored value is malformed) makes
 /// the credential skip the cache and ask slauth; so does an operation slower
-/// than [`PAT_CACHE_TIMEOUT`].
+/// than [`PAT_CACHE_TIMEOUT`]. The cache need not judge expiry: the
+/// credential treats an entry past its [`CachedPat::expires_at`] as a miss.
 pub trait PatCache: Send + Sync + 'static {
-    /// The identity cached under `key`, or `None` on a miss. A stored value
-    /// that is not a UUID is an `Err`.
-    fn get<'a>(&'a self, key: &'a str) -> PatCacheFuture<'a, Option<Uuid>>;
+    /// The entry cached under `key`, or `None` on a miss. A stored value
+    /// that is not an entry is an `Err`.
+    fn get<'a>(&'a self, key: &'a str) -> PatCacheFuture<'a, Option<CachedPat>>;
 
-    /// Cache `identity` under `key` for `ttl`, replacing whatever is there.
+    /// Cache `entry` under `key`, replacing whatever is there, and let the
+    /// store drop it after `ttl` — housekeeping only: validity is
+    /// `entry.expires_at`, which the credential enforces on every read.
     ///
     /// From [`SlauthPatCredential`], `ttl` is always whole seconds from 1 s
     /// to [`PAT_CACHE_MAX_TTL`] (see [`SlauthPatCredential::with_cache_ttl`]).
-    fn set<'a>(&'a self, key: &'a str, identity: Uuid, ttl: Duration) -> PatCacheFuture<'a, ()>;
+    fn set<'a>(&'a self, key: &'a str, entry: CachedPat, ttl: Duration) -> PatCacheFuture<'a, ()>;
 }
 
 /// The cache key for `token`: the first 32 lowercase hex characters (128
@@ -169,6 +215,7 @@ pub struct SlauthPatCredential {
     ceiling: Arc<[String]>,
     cache: Option<Arc<dyn PatCache>>,
     cache_ttl: Duration,
+    clock: Clock,
 }
 
 impl SlauthPatCredential {
@@ -184,6 +231,7 @@ impl SlauthPatCredential {
             ceiling: ceiling_scopes.into_iter().map(Into::into).collect(),
             cache: None,
             cache_ttl: PAT_CACHE_TTL,
+            clock: Clock::system(),
         }
     }
 
@@ -210,6 +258,18 @@ impl SlauthPatCredential {
         self
     }
 
+    /// Replace the clock (Unix seconds) that stamps and judges cache
+    /// entries' expiry, so a test can move time without sleeping. Like the
+    /// limiters', the closure must itself be `UnwindSafe + RefUnwindSafe`.
+    #[must_use]
+    pub fn with_clock(
+        mut self,
+        now: impl Fn() -> u64 + Send + Sync + UnwindSafe + RefUnwindSafe + 'static,
+    ) -> SlauthPatCredential {
+        self.clock = Clock::from_fn(now);
+        self
+    }
+
     /// The identity `token` belongs to: from the cache, or from slauth.
     async fn identity(&self, token: &str) -> Result<Uuid, PatValidationError> {
         // A token not shaped like a PAT is refused by the validator without a
@@ -220,8 +280,11 @@ impl SlauthPatCredential {
         };
         let key = pat_cache_key(token);
         match bounded(cache.get(&key)).await {
-            Ok(Some(identity)) => return Ok(identity),
-            Ok(None) => {}
+            // Judged after the read returns, so a slow read cannot carry an
+            // entry past its expiry.
+            Ok(Some(entry)) if entry.expires_at > self.clock.now() => return Ok(entry.identity),
+            // Expired: a miss, whatever the store's own TTL kept it for.
+            Ok(Some(_)) | Ok(None) => {}
             Err(error) => {
                 tracing::warn!(
                     target: AUTH_LOG_TARGET,
@@ -231,8 +294,12 @@ impl SlauthPatCredential {
                 return self.validator.validate(token).await;
             }
         }
+        // Stamped before slauth is asked: the verdict may be that old by the
+        // time it is stored, never older.
+        let expires_at = self.clock.now().saturating_add(self.cache_ttl.as_secs());
         let identity = self.validator.validate(token).await?;
-        if let Err(error) = bounded(cache.set(&key, identity, self.cache_ttl)).await {
+        let entry = CachedPat::new(identity, expires_at);
+        if let Err(error) = bounded(cache.set(&key, entry, self.cache_ttl)).await {
             tracing::warn!(target: AUTH_LOG_TARGET, %error, "PAT cache write failed; continuing");
         }
         Ok(identity)

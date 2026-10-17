@@ -62,13 +62,18 @@
 //! asking slauth (`SlauthConfig::pat_validate_url`), with the outcomes and
 //! messages of stridelabs-python's `PATValidator`: a [`PatValidationError`]
 //! is `Rejected` (the token, a 401) or `Unavailable` (slauth, a 503).
-//! Caching the answer is the consumer's.
+//! Caching the answer is the consumer's. The client it is given **must not
+//! follow redirects** ([`PatValidator`]'s docs say why).
 //!
 //! ```no_run
-//! # async fn example(config: stridelabs_auth::SlauthConfig, http: reqwest::Client)
+//! # async fn example(config: stridelabs_auth::SlauthConfig)
 //! # -> Result<(), stridelabs_auth::PatValidationError> {
 //! use stridelabs_auth::{PatValidator, SLAUTH_PAT_PREFIX};
 //!
+//! let http = reqwest::Client::builder()
+//!     .redirect(reqwest::redirect::Policy::none())
+//!     .build()
+//!     .expect("a client builds");
 //! // `None` when the config names no validate URL.
 //! let pats = PatValidator::from_config(&config, http).expect("PATs are configured");
 //!

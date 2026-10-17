@@ -406,6 +406,33 @@ async fn an_idempotent_command_is_retried_once_on_a_fresh_connection() {
     proxy.assert_accepted(4).await;
 }
 
+/// A `SET` whose reply was lost on a cached connection, when the retry
+/// cannot reconnect: the caller learns the outcome is unknown (the first
+/// attempt's `Io`), not "never sent" (the dial's `Connect`) — and the `SET`
+/// did run.
+#[tokio::test]
+async fn a_failed_reconnect_for_the_retry_keeps_the_outcome_unknown() {
+    let server = server().await;
+    let (proxy, handle) = warm_handle(&server).await;
+    let key = unique_key("retry-cannot-reconnect");
+
+    proxy.set_refusing(true);
+    proxy.set_replies(Replies::CloseOnNext);
+    let error = handle
+        .set_ex(&key, "maybe", 120)
+        .await
+        .expect_err("no reply, and no fresh connection");
+
+    assert!(matches!(error, RedisError::Io(_)), "{error:?}");
+    assert!(error.is_outcome_unknown());
+    assert_eq!(
+        raw_get(&server, &key).await.as_deref(),
+        Some("maybe"),
+        "the first attempt ran: \"unknown\" was the truth"
+    );
+    proxy.assert_accepted(2).await;
+}
+
 /// Many calls failing together on one dead connection share ONE redial.
 ///
 /// Overlap is forced, not hoped for: on this single-threaded runtime each

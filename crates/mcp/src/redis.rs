@@ -26,7 +26,7 @@ use uuid::Uuid;
 use crate::limits::{
     refusal, Clock, LimitFuture, Limits, RateClass, RateLimiter, RATE_LIMIT_LOG_TARGET, WINDOW_SECS,
 };
-use crate::pat::{cache_ttl_secs, PatCache, PatCacheError, PatCacheFuture};
+use crate::pat::{cache_ttl_secs, CachedPat, PatCache, PatCacheError, PatCacheFuture};
 
 /// The key prefix Python's `enforce_rate_limit` uses (`key_prefix="mcp:rl"`).
 /// Give each service its own when several share one Redis.
@@ -140,23 +140,28 @@ impl fmt::Debug for RedisRateLimiter {
     }
 }
 
-/// A [`PatCache`] in Redis: `GET` / `SET … EX` of the identity UUID under
-/// `{prefix}:{key}` (`key` is [`pat_cache_key`](crate::pat_cache_key)'s
-/// digest).
+/// A [`PatCache`] in Redis: `GET` / `SET … EX` of `{uuid}:{expires_at}`
+/// (the identity, hyphenated, and the entry's absolute expiry in Unix
+/// seconds) under `{prefix}:{key}` (`key` is
+/// [`pat_cache_key`](crate::pat_cache_key)'s digest). Anything else stored
+/// there — a bare UUID included — is malformed: a cache error, and the
+/// credential falls through to slauth.
 ///
 /// The prefix is **required**, and should name the service (imgmcp uses
 /// `imgmcp:pat:validate`): two verifiers on one Redis with one prefix would
 /// share each other's positive results, whatever audience or ceiling each
 /// enforces. It is used as given — not checked, even for being empty — so
 /// keeping it unique among everything that shares the Redis is the
-/// caller's job. A stored value that is not a UUID is a cache error, so the
-/// credential falls through to slauth.
+/// caller's job.
 ///
-/// `set` stores for the TTL in whole seconds, rounded down, from 1 s to
+/// `SET … EX` is housekeeping: the key's TTL is the one given, in whole
+/// seconds, rounded down, from 1 s to
 /// [`PAT_CACHE_MAX_TTL`](crate::PAT_CACHE_MAX_TTL) (one day), the rule
 /// [`SlauthPatCredential::with_cache_ttl`](crate::SlauthPatCredential::with_cache_ttl)
-/// applies: a `Duration::MAX` from another caller is a day, never an entry
-/// that does not expire.
+/// applies — a `Duration::MAX` from another caller is a day, never a key
+/// that does not expire. Validity is the stored expiry, which the credential
+/// enforces: a `SET` Redis runs late (after the credential gave up on it)
+/// restarts the key's TTL but not the entry's validity.
 #[derive(Debug, Clone)]
 pub struct RedisPatCache {
     handle: RedisHandle,
@@ -179,29 +184,48 @@ impl RedisPatCache {
 }
 
 impl PatCache for RedisPatCache {
-    fn get<'a>(&'a self, key: &'a str) -> PatCacheFuture<'a, Option<Uuid>> {
+    fn get<'a>(&'a self, key: &'a str) -> PatCacheFuture<'a, Option<CachedPat>> {
         Box::pin(async move {
             let Some(value) = self.handle.get(&self.key(key)).await.map_err(cache_error)? else {
                 return Ok(None);
             };
-            Uuid::parse_str(&value)
-                .map(Some)
-                .map_err(|_| PatCacheError::new("the cached value is not a UUID"))
+            decode(&value).map(Some)
         })
     }
 
-    fn set<'a>(&'a self, key: &'a str, identity: Uuid, ttl: Duration) -> PatCacheFuture<'a, ()> {
+    fn set<'a>(&'a self, key: &'a str, entry: CachedPat, ttl: Duration) -> PatCacheFuture<'a, ()> {
         Box::pin(async move {
             // The credential's TTL rule (whole seconds, rounded down, 1 s to
             // a day), applied again for a caller of the trait that is not the
             // credential: `SET … EX` takes whole seconds, refuses 0, and a
             // `Duration::MAX` must not become a key that never expires.
             self.handle
-                .set_ex(&self.key(key), &identity.to_string(), cache_ttl_secs(ttl))
+                .set_ex(&self.key(key), &encode(entry), cache_ttl_secs(ttl))
                 .await
                 .map_err(cache_error)
         })
     }
+}
+
+/// The stored form of an entry: `{uuid}:{expires_at}`.
+fn encode(entry: CachedPat) -> String {
+    format!("{}:{}", entry.identity.hyphenated(), entry.expires_at)
+}
+
+/// [`encode`]'s inverse; anything else is malformed. Strict: a hyphenated
+/// UUID and a plain decimal expiry, nothing more.
+fn decode(value: &str) -> Result<CachedPat, PatCacheError> {
+    let malformed = || PatCacheError::new("the cached value is malformed");
+    let (identity, expires_at) = value.split_once(':').ok_or_else(malformed)?;
+    if identity.len() != 36
+        || expires_at.is_empty()
+        || !expires_at.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Err(malformed());
+    }
+    let identity = Uuid::try_parse(identity).map_err(|_| malformed())?;
+    let expires_at = expires_at.parse().map_err(|_| malformed())?;
+    Ok(CachedPat::new(identity, expires_at))
 }
 
 /// `RedisError`'s rendering never includes the URL (or its password).
@@ -219,6 +243,36 @@ mod tests {
         fn cache<T: PatCache>() {}
         limiter::<RedisRateLimiter>();
         cache::<RedisPatCache>();
+    }
+
+    #[test]
+    fn an_entry_is_stored_as_uuid_colon_expiry_and_nothing_else_reads_back() {
+        let identity = Uuid::parse_str("6f1c1b7e-2d4f-4c55-9a51-0d7e2b1f3a10").unwrap();
+        let entry = CachedPat::new(identity, 1_760_000_120);
+
+        assert_eq!(
+            encode(entry),
+            "6f1c1b7e-2d4f-4c55-9a51-0d7e2b1f3a10:1760000120"
+        );
+        assert_eq!(decode(&encode(entry)), Ok(entry));
+        for malformed in [
+            "6f1c1b7e-2d4f-4c55-9a51-0d7e2b1f3a10", // a bare UUID (the old form)
+            "6f1c1b7e-2d4f-4c55-9a51-0d7e2b1f3a10:",
+            "6f1c1b7e-2d4f-4c55-9a51-0d7e2b1f3a10:12x",
+            "6f1c1b7e-2d4f-4c55-9a51-0d7e2b1f3a10:-1",
+            "6f1c1b7e-2d4f-4c55-9a51-0d7e2b1f3a10:+1",
+            "6f1c1b7e-2d4f-4c55-9a51-0d7e2b1f3a10:1:2",
+            "6f1c1b7e-2d4f-4c55-9a51-0d7e2b1f3a10:99999999999999999999",
+            "6f1c1b7e2d4f4c559a510d7e2b1f3a10:1760000120", // not hyphenated
+            "not-a-uuid:1760000120",
+            "",
+        ] {
+            assert_eq!(
+                decode(malformed),
+                Err(PatCacheError::new("the cached value is malformed")),
+                "{malformed:?}"
+            );
+        }
     }
 
     #[test]

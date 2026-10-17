@@ -19,7 +19,7 @@
 //! | What happened | Result |
 //! |---|---|
 //! | not `slp_live_` + 43 characters ([`is_slauth_pat`]) | `Rejected("Invalid PAT format")`, without calling slauth |
-//! | the answer came from anywhere but the validate URL (a redirect was followed) | `Unavailable("Authentication service error")` |
+//! | the answer came from anywhere but the validate URL (a redirect was followed elsewhere) | `Unavailable("Authentication service error")` |
 //! | no complete answer within [`PAT_VALIDATION_TIMEOUT`] | `Unavailable("Authentication service timeout")` |
 //! | any other transport failure | `Unavailable("Authentication service unavailable")` |
 //! | a body over [`MAX_ANSWER_BYTES`] | `Unavailable("Authentication service error")` |
@@ -57,14 +57,23 @@
 //!   hyphenated form.
 //! - The 5 s timeout is one deadline for the whole exchange (reqwest's),
 //!   where httpx's 5 s applied to each phase separately.
-//! - **No redirect is trusted.** httpx followed none, so a 3xx was a service
-//!   error; reqwest follows them by the injected client's policy. A verdict
-//!   from wherever a redirect led — another origin, or another path — is
-//!   not slauth's validate endpoint speaking, so an answer whose final URL is
-//!   not the one requested is a service error, whatever it says. (reqwest
-//!   also drops `Authorization` from a redirect that leaves the origin, so
-//!   the PAT itself does not follow.) Pass a client built with
-//!   `reqwest::redirect::Policy::none()` and no redirect is made at all.
+//! - **The client must follow no redirects.** httpx followed none, so a 3xx
+//!   was a service error; reqwest follows them by the injected client's
+//!   policy, and the client is the consumer's (its TLS stack and roots are
+//!   their choice). So **build it with `reqwest::redirect::Policy::none()`**:
+//!   then every 3xx is the service error Python made of it, and no
+//!   redirect's answer is ever read as slauth's verdict.
+//!
+//!   With a following client, a check remains as defence in depth, and it is
+//!   only that: an answer whose final URL is not the one requested — a
+//!   redirect to another origin, or another path — is a service error,
+//!   whatever it says. It **cannot see** a redirect that ends where it
+//!   started: `POST /validate` → `303` → `GET /validate` has the requested
+//!   URL as its final one, so whatever that `GET` is answered with — a
+//!   `valid: true`, a 401 where slauth was really unavailable — decides
+//!   (`a_redirect_back_to_the_validate_url_is_invisible_to_a_following_client`
+//!   pins it). (reqwest drops `Authorization` from a redirect that leaves
+//!   the origin, so the PAT itself does not follow one there.)
 //! - The body is read to at most [`MAX_ANSWER_BYTES`]; Python read any size.
 //!
 //! # Never the token, never the URL
@@ -170,11 +179,16 @@ impl PatValidationError {
 /// every call is one request.
 ///
 /// Cheap to clone (the URL is shared, and a `reqwest::Client` is an `Arc`
-/// already). Build it once with the service's shared client, so validations
+/// already). Build it once with a client of the service's, so validations
 /// reuse its connection pool and its TLS stack — which, as everywhere in
-/// this crate, is the consumer's choice. Ideally that client is built with
-/// `reqwest::redirect::Policy::none()`: a redirect is never trusted either
-/// way (module docs), but with that policy none is followed at all.
+/// this crate, is the consumer's choice.
+///
+/// **That client must not follow redirects**: build it with
+/// `reqwest::redirect::Policy::none()` (a client of its own if the service's
+/// shared one follows them). With a following client, a redirect back to the
+/// validate URL itself is indistinguishable from slauth answering, so its
+/// answer would be taken as the verdict; the final-URL check catches only a
+/// redirect that ends somewhere else (module docs).
 #[derive(Clone)]
 pub struct PatValidator {
     validate_url: Arc<str>,
@@ -196,7 +210,8 @@ impl fmt::Debug for PatValidator {
 
 impl PatValidator {
     /// A validator calling `validate_url` — slauth's
-    /// `…/api/v1/pat/validate` — with `http`.
+    /// `…/api/v1/pat/validate` — with `http`, which **must not follow
+    /// redirects** (`reqwest::redirect::Policy::none()`; see the type docs).
     ///
     /// The URL is not checked here: one that cannot be requested makes
     /// every validation `Unavailable("Authentication service
@@ -213,6 +228,12 @@ impl PatValidator {
     /// A validator for `config.pat_validate_url`, or `None` when the config
     /// names none — a service that takes no slauth PATs. An empty URL is
     /// none, as Python's `if not config.pat_validate_url` has it.
+    ///
+    /// The same precondition as [`PatValidator::new`]: `http` **must not
+    /// follow redirects** (`reqwest::redirect::Policy::none()`). Handed a
+    /// redirect-following client (e.g. `reqwest::Client::new()`), a redirect
+    /// back to the validate URL is followed invisibly and its answer trusted;
+    /// see the [module docs](self) for why the final-URL check cannot catch it.
     pub fn from_config(config: &SlauthConfig, http: reqwest::Client) -> Option<PatValidator> {
         config
             .pat_validate_url
@@ -719,7 +740,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_redirected_answer_is_never_trusted() {
+    async fn a_redirect_to_another_origin_is_not_trusted() {
         // A second origin, answering whatever arrives — any method, any
         // headers — with a verdict that would validate (or reject).
         for (status, verdict) in [
@@ -791,6 +812,58 @@ mod tests {
             let err = validator.validate(PAT).await.unwrap_err();
 
             assert_eq!(err, unavailable("Authentication service error"), "{status}");
+        }
+    }
+
+    /// The final-URL check's limit, pinned so the docs stay honest: a
+    /// following client redirected back to the validate URL itself (`POST`
+    /// → `303` → `GET` of the same URL) ends where it started, so the check
+    /// cannot see the redirect and the `GET`'s answer decides — a
+    /// `valid: true` is trusted, an outage can turn into a rejection. A
+    /// client that follows no redirects, as the docs require, refuses both.
+    #[tokio::test]
+    async fn a_redirect_back_to_the_validate_url_is_invisible_to_a_following_client() {
+        let strict = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("a plain client builds");
+        for (verdict, with_a_following_client) in [
+            (
+                answer(json!({ "valid": true, "identity_id": IDENTITY })),
+                Ok(identity()),
+            ),
+            (
+                ResponseTemplate::new(401),
+                Err(rejected("Invalid or expired PAT")),
+            ),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path(VALIDATE_PATH))
+                .respond_with(
+                    ResponseTemplate::new(303).insert_header("location", validate_url(&server)),
+                )
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(VALIDATE_PATH))
+                .respond_with(verdict)
+                .mount(&server)
+                .await;
+
+            // The documented limitation: reqwest's default policy follows
+            // the 303, and the GET's answer is taken as the verdict.
+            assert_eq!(
+                validator(&server).validate(PAT).await,
+                with_a_following_client
+            );
+            // The requirement: with redirects off, the 303 is a service error.
+            assert_eq!(
+                PatValidator::new(validate_url(&server), strict.clone())
+                    .validate(PAT)
+                    .await,
+                Err(unavailable("Authentication service error"))
+            );
         }
     }
 

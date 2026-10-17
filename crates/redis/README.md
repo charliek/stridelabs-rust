@@ -93,7 +93,7 @@ serves everything that does not need Redis. The first command dials:
 | Command | After an I/O failure |
 |---|---|
 | `fixed_window_hit` | **Never replayed.** Redis may have run the `INCR` before the reply was lost, so a retry could count one hit twice. The caller gets `RedisError::Io` (`is_outcome_unknown()` is `true`); a rate limiter fails open on it. |
-| `get`, `set_ex` | Idempotent: sent **once more** on a fresh connection — but only after an I/O failure on a connection that was already cached (the kind that can die while idle). A connection the call dialled itself is never retried on, and neither is a malformed reply: it is outcome-unknown, but not a stale connection. |
+| `get`, `set_ex` | Idempotent: sent **once more** on a fresh connection — but only after an I/O failure on a connection that was already cached (the kind that can die while idle). A connection the call dialled itself is never retried on, and neither is a malformed reply: it is outcome-unknown, but not a stale connection. If the fresh connection cannot be made, the caller gets the **first** attempt's `Io` (outcome unknown: that `SET` may have run), not the dial's `Connect`. |
 
 So one fixed-window hit takes at most a dial plus a response timeout (1.5 s by
 default), and an idempotent call at most response + dial + response (2 s).

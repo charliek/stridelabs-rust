@@ -298,7 +298,18 @@ impl RedisHandle {
         drop(lease);
         // `send` has already discarded the failed generation, so this lease
         // is a new dial — or a newer connection another call just made.
-        let retry = self.shared.lease().await?;
+        //
+        // If it cannot be had, the first attempt's error stands: that
+        // command may have run before its reply was lost, and a reconnect
+        // failing says nothing about it. Reporting the dial's `Connect`
+        // ("never sent") instead would erase that outcome-unknown.
+        let retry = match self.shared.lease().await {
+            Ok(retry) => retry,
+            Err(reconnect) => {
+                tracing::debug!(error = %reconnect, "no fresh Redis connection for the retry");
+                return Err(RedisError::no_valid_reply(&error));
+            }
+        };
         let reply = self
             .shared
             .send(&retry, command)
