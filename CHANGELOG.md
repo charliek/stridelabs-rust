@@ -11,6 +11,17 @@ for a consumer's pin.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-17
+
+A sixth crate, `stridelabs-mcp`: what a Rust service needs to serve MCP on
+slauth, as the Python services do with stridelabs-python's `stridelabs-mcp`
+(RFC 9728 metadata, slauth tokens bound to the resource, a stateless rmcp
+Streamable HTTP endpoint, and a scoped, audited tool boundary). Everything
+else is additive: `stridelabs-auth` can verify a token into the caller's
+own claims type, which the new crate builds on. No breaking change; the
+dependency majors are v0.5.0's, plus `rmcp` 3.5 for consumers of the new
+crate.
+
 ### Added
 
 - `stridelabs-auth`: `Verifier::verify_bearer_claims::<C>(token)` and its
