@@ -1997,6 +1997,7 @@ dependencies = [
  "rustls-platform-verifier",
  "serde",
  "serde_json",
+ "serde_urlencoded",
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
@@ -2721,6 +2722,25 @@ dependencies = [
  "tempfile",
  "thiserror",
  "yaml_serde",
+]
+
+[[package]]
+name = "stridelabs-gcp"
+version = "0.6.0"
+dependencies = [
+ "base64 0.22.1",
+ "bytes",
+ "futures",
+ "jsonwebtoken",
+ "percent-encoding",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "url",
+ "wiremock",
 ]
 
 [[package]]

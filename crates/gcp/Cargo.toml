@@ -1,0 +1,64 @@
+[package]
+name = "stridelabs-gcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Policy-free Google Cloud building blocks for StrideLabs services: an ADC access-token provider, a small GCS JSON-API client, and Vertex generateContent types"
+publish = false
+
+[features]
+default = []
+# Signing the RS256 JWT-bearer assertion a `service_account` key exchanges for
+# a token. It is the only thing here that needs jsonwebtoken, and it needs
+# `use_pem` (pem + simple_asn1 + their transitive crates) to read the key's
+# PEM. Off by default: a service that runs only on ADC (the metadata server,
+# or a developer's gcloud `authorized_user` login) never parses a PEM. With it
+# off, a `service_account` credential is `GcpAuthError::Unsupported`, never a
+# silent fallthrough to another identity. The backend stays the workspace's
+# `aws_lc_rs` — never `rust_crypto` (see the root README, "One crypto
+# provider").
+service-account-key = ["dep:jsonwebtoken", "jsonwebtoken/use_pem"]
+# Vertex AI `generateContent`: request/response types, the endpoint builder
+# (global vs regional host) and the inline-image classifier. Code only; it
+# adds no dependency.
+vertex = []
+
+[lints]
+workspace = true
+
+[dependencies]
+# `json` for request bodies (`RequestBuilder::json`), `form` for the two
+# token-endpoint grants (`application/x-www-form-urlencoded`). Nothing else,
+# TLS above all: like stridelabs-auth, this crate never builds a client — every
+# constructor takes the consumer's — so the TLS stack and the process's rustls
+# provider stay the consumer's choice. Its tests talk plain HTTP to wiremock.
+reqwest = { workspace = true, features = ["json", "form"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# `rt` to run each token refresh on a task of its own (no caller's
+# cancellation reaches it), `sync` for the oneshot that carries its outcome to
+# the waiters, `time` for the per-operation deadlines. A consumer of this crate
+# is on tokio by construction (reqwest).
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
+# `Shared`: every caller waiting on a refresh attempt awaits the same
+# outcome. Already in the lock (stridelabs-http's `proxy`).
+futures = { workspace = true }
+tracing = { workspace = true }
+# GCS object bodies in and out, without a copy through `Vec<u8>`.
+bytes = { workspace = true }
+base64 = { workspace = true }
+percent-encoding = { workspace = true }
+
+# --- feature-gated ---------------------------------------------------------
+jsonwebtoken = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+wiremock = { workspace = true }
+# Decoding the form bodies the token endpoints receive. Already in the lock
+# (reqwest depends on it).
+url = { workspace = true }

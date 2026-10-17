@@ -131,6 +131,10 @@ redis = { version = "1", default-features = false, features = ["tokio-comp"] }
 # `signing_and_verifying_work_on_the_one_crypto_backend` panics if this breaks.
 jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_rs"] }
 sha2 = "0.11"
+# stridelabs-gcp decodes a base64 service-account key (the GOOGLE_CREDENTIALS
+# convention) and Vertex `inlineData` image bytes. 0.22, the major
+# jsonwebtoken 11 and wiremock already lock, so no second copy.
+base64 = "0.22"
 
 # Misc
 rand = "0.10"
@@ -139,6 +143,9 @@ time = { version = "0.3", features = ["serde"] }
 bytes = "1"
 futures = "0.3"
 url = "2"
+# stridelabs-gcp: GCS object names are percent-encoded into a path segment or
+# query value, `/` included. Already in every graph through `url` and reqwest.
+percent-encoding = "2"
 
 # Test-only
 wiremock = "0.6"
