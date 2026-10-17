@@ -33,7 +33,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 /// The `kid` of [`TestKey::primary`].
 pub const PRIMARY_KID: &str = "stridelabs-test-key-1";
@@ -139,6 +139,8 @@ pub fn test_jwks_json() -> &'static str {
 ///
 /// Defaults are a token that verifies: a subject, an email, a name, and an
 /// hour of validity. Each setter takes the token one step away from that.
+/// [`TestClaims::claim`] adds anything else a token for another purpose
+/// carries (`scope`, `scp`, `client_id`, …).
 #[derive(Debug, Clone)]
 pub struct TestClaims {
     issuer: String,
@@ -147,6 +149,7 @@ pub struct TestClaims {
     email: Option<String>,
     name: Option<String>,
     expires_in_secs: i64,
+    extra: Map<String, Value>,
 }
 
 impl TestClaims {
@@ -159,6 +162,7 @@ impl TestClaims {
             email: Some("user@example.com".to_string()),
             name: Some("Test User".to_string()),
             expires_in_secs: 3600,
+            extra: Map::new(),
         }
     }
 
@@ -202,6 +206,19 @@ impl TestClaims {
         self
     }
 
+    /// Add the claim `name` with `value`, e.g.
+    /// `.claim("scope", json!("files:read files:write"))` or
+    /// `.claim("scp", json!(["files:read"]))`.
+    ///
+    /// Applied last, so it **replaces** a claim this builder sets itself:
+    /// `.claim("aud", json!(["a", "b"]))` mints an audience array, and
+    /// `.claim("exp", json!(0))` an expiry of the epoch. Setting the same
+    /// name twice keeps the second value.
+    pub fn claim(mut self, name: impl Into<String>, value: Value) -> TestClaims {
+        self.extra.insert(name.into(), value);
+        self
+    }
+
     /// Render to the JSON object [`TestKey::mint`] signs.
     pub fn build(&self) -> Value {
         let now = unix_now();
@@ -220,6 +237,9 @@ impl TestClaims {
         }
         if let Some(name) = &self.name {
             object.insert("name".to_string(), json!(name));
+        }
+        for (name, value) in &self.extra {
+            object.insert(name.clone(), value.clone());
         }
         claims
     }
@@ -271,6 +291,48 @@ mod tests {
         assert!(claims.get("email").is_none());
         assert!(claims.get("name").is_none());
         assert!(claims.get("sub").is_some());
+    }
+
+    #[test]
+    fn extra_claims_are_added_verbatim() {
+        let claims = TestClaims::new(ISSUER, AUDIENCE)
+            .claim("scope", json!("files:read files:write"))
+            .claim("scp", json!(["files:read"]))
+            .claim("client_id", json!("connector-1"))
+            .build();
+
+        assert_eq!(claims["scope"], json!("files:read files:write"));
+        assert_eq!(claims["scp"], json!(["files:read"]));
+        assert_eq!(claims["client_id"], json!("connector-1"));
+        // The builder's own claims are untouched by an unrelated extra.
+        assert_eq!(claims["iss"], json!(ISSUER));
+        assert_eq!(claims["email"], json!("user@example.com"));
+    }
+
+    #[test]
+    fn an_extra_claim_replaces_a_built_in_one_and_the_last_write_wins() {
+        let claims = TestClaims::new(ISSUER, AUDIENCE)
+            .claim("aud", json!([AUDIENCE, "another"]))
+            .claim("scope", json!("first"))
+            .claim("scope", json!("second"))
+            .build();
+
+        assert_eq!(claims["aud"], json!([AUDIENCE, "another"]));
+        assert_eq!(claims["scope"], json!("second"));
+    }
+
+    #[test]
+    fn without_extras_the_claim_set_is_unchanged() {
+        let claims = TestClaims::new(ISSUER, AUDIENCE).build();
+        let mut keys: Vec<&str> = claims
+            .as_object()
+            .expect("claims are an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+
+        assert_eq!(keys, ["aud", "email", "exp", "iat", "iss", "name", "sub"]);
     }
 
     #[test]

@@ -3,13 +3,78 @@
 All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
-Versioning is lockstep across all five crates in this workspace (one
+Versioning is lockstep across all six crates in this workspace (one
 `[workspace.package].version`, bumped together regardless of which crate(s)
 changed) rather than independent per-crate versioning —
 see the root README's "Consuming these crates" section for what that means
 for a consumer's pin.
 
 ## [Unreleased]
+
+### Added
+
+- `stridelabs-auth`: `Verifier::verify_bearer_claims::<C>(token)` and its
+  network-free twin `Verifier::claims_with_jwks::<C>(token, &jwks, kid,
+  issuer, audience)`, for tokens whose claim rules are not a sign-in's (an
+  MCP access token: audience = the resource URL, scopes, optional email).
+  They run the same key selection, RS256 signature, `exp`, `iss` and `aud`
+  checks (all three required) and return the claims as the caller's type,
+  with no `email` or `sub` rules: the caller owns those. `verify_with_jwks`
+  and `verify_bearer` are now built on them, so there is one copy of the
+  validation logic; their behaviour is unchanged.
+- `stridelabs-auth`: `test_support::TestClaims::claim(name, value)` adds an
+  arbitrary claim to a minted token (`scope`, `scp`, `client_id`, …),
+  applied last so it can also replace one of the builder's own. A builder
+  that never calls it produces exactly the claim set it did before.
+- **`stridelabs-mcp`**, a new crate: the hardened middle of an MCP server on
+  rmcp 3.5, the Rust twin of Python `stridelabs-mcp`. First consumer:
+  parcel's `/mcp`.
+  - `ProtectedResource`: the canonical resource URL under slauth's
+    `normalize_mcp_resource` rule (https only, no trailing slash, default
+    port, query, fragment, userinfo, escapes or dot segments). Non-canonical
+    input is rejected naming the canonical form rather than rewritten, so
+    the configured string is the token audience. Derives the RFC 9728
+    document, the challenge's metadata URL, the route and the allowed host.
+  - `metadata_router`: the RFC 9728 document at both origin-root well-known
+    paths, generic over the app's state.
+  - `McpVerifier`: slauth JWTs with audience = the resource URL (scopes from
+    `scope` and `scp`, string or array; `client_id`, else `azp`; email
+    optional; non-empty `sub`), plus app credentials selected by prefix
+    (`CredentialVerifier`, any async closure). `VerifyError` separates
+    `Invalid` (401) from `Unavailable` (503; a JWKS fetch failure).
+  - `McpAuthLayer`: RFC 6750 challenges (no `error` without a credential,
+    `invalid_token` for a refused one, both with `resource_metadata` and the
+    scope hint), `503 temporarily_unavailable` on an outage, optional
+    boundary-level scopes (`403 insufficient_scope`), the `Principal` into
+    the request extensions.
+  - `server_config` / `router`: rmcp's Streamable HTTP service stateless
+    (no sessions, JSON responses), `allowed_hosts` = the resource host plus
+    extras, a pinned 4 MiB body limit, at exactly the resource's path behind
+    the auth layer; `principal(&ctx)` reads the caller back in a tool.
+  - `ToolCall`: per-tool scopes (`ScopeError`, the Python message), a
+    timeout (default 30 s), cancellation, `ToolError` (`user` / `denied`
+    shown to the model; `internal` and panics become "Internal server
+    error." and are audited by type only), all as `isError` tool results,
+    and exactly one `stridelabs.mcp.tool` audit line per run of the tool's
+    code. Plus
+    `clamp_limit` / `clamp_offset` / `Page`.
+  - Feature `test-support`: `test_support::access_token(&resource)` mints MCP
+    access tokens with stridelabs-auth's throwaway test keys.
+- CI and tooling, not part of the crates: a "Guard: stridelabs-mcp pulls no
+  rustls" step; `cargo-semver-checks` covers every crate and passes over,
+  with a notice, a crate the baseline tag does not have yet (stridelabs-mcp
+  until v0.6.0 is tagged); `downstream-limen` and
+  `scripts/downstream-check.sh` patch all six crates.
+
+### Security
+
+- `Cargo.lock`: rustls 0.23.45 → 0.23.46 (RUSTSEC-2026-0346, -0347, -0348,
+  -0349) and quinn-proto 0.11.16 → 0.11.19 (RUSTSEC-2026-0338 to -0342), so
+  `cargo audit` is clean again. Lock only, no manifest change: rustls is
+  compiled only under `stridelabs-http`'s `proxy`, and quinn-proto is a
+  lock-only entry (reqwest's optional `quinn`) that nothing compiles. A
+  consumer's own `Cargo.lock` decides what it builds, so it bumps the same
+  two packages there.
 
 ## [0.5.0] - 2026-10-11
 

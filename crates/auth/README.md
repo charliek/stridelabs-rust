@@ -110,6 +110,40 @@ config naming another is a hole no amount of verification logic can close.
 logic with the network removed: an associated function, public, so a consumer
 can test its own wiring without an HTTP client.
 
+### Tokens with other claim rules
+
+`verify_bearer` is for *sign-in* tokens: it insists on a non-empty `email` and
+`sub` and hands back a `VerifiedIdentity`. A token minted for another purpose
+— an MCP access token, whose audience is the MCP resource URL, whose email is
+optional and whose scopes are the point — needs the same cryptography with
+different claims:
+
+```rust
+#[derive(serde::Deserialize)]
+struct McpClaims {
+    #[serde(default)]
+    sub: String,
+    #[serde(default)]
+    scope: Option<String>,
+}
+
+let claims: McpClaims = verifier.verify_bearer_claims(token).await?;
+if claims.sub.is_empty() {
+    // the caller's rule to enforce, not this crate's
+}
+```
+
+`Verifier::verify_bearer_claims::<C>` fetches the key set by `kid` exactly as
+`verify_bearer` does, and `Verifier::claims_with_jwks::<C>(token, &jwks, kid,
+issuer, audience)` is its network-free twin. Both run the one copy of the key
+selection and validation logic (`verify_with_jwks` is built on
+`claims_with_jwks`): an RS256-fit key under the `kid`, the signature, `exp`,
+`iss` and `aud`, all three required. **Nothing about `email` or `sub` is
+checked** — the caller owns those, including rejecting an empty `sub` if it
+keys rows on it. A claim set that does not deserialize into `C` is
+`AuthError::InvalidToken("claims are malformed")`, never serde's message
+(which can quote the value). `stridelabs-mcp`'s verifier is built on this.
+
 ## Security notes
 
 ### What is checked
@@ -309,6 +343,10 @@ Mock::given(method("GET")).and(path("/jwks"))
 
 `TestClaims` defaults to a token that verifies; each setter takes it one step
 away (`.email("")`, `.without_email()`, `.subject("")`, `.expires_in(-3600)`).
+`.claim(name, value)` adds any other claim — `.claim("scope", json!("a b"))`,
+`.claim("scp", json!(["a"]))`, `.claim("client_id", json!("c"))` — and is
+applied last, so it also replaces one of the builder's own (an `aud` array,
+say).
 `TestKey::secondary()` is an unrelated keypair, for the two cases that need a
 key the verifier does not trust: a wrong-key signature (`mint_with_kid` with
 the primary kid) and a rotation the cache has to notice.

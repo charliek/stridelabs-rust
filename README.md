@@ -4,10 +4,10 @@ Shared Rust crates for StrideLabs services — the Rust twin of
 [stridelabs-python](https://github.com/charliek/stridelabs-python). Common
 patterns and practices live here once, so services stay consistent.
 
-**Status: all five crates implemented.** The workspace scaffold (Cargo
+**Status: all six crates implemented.** The workspace scaffold (Cargo
 workspace, CI, toolchain pins) and `stridelabs-config`,
-`stridelabs-observability`, `stridelabs-http`, `stridelabs-auth` and
-`stridelabs-testing` are all in place. See each crate's own README for its
+`stridelabs-observability`, `stridelabs-http`, `stridelabs-auth`,
+`stridelabs-testing` and `stridelabs-mcp` are all in place. See each crate's own README for its
 full API and feature topology.
 
 ## Crates
@@ -19,8 +19,9 @@ full API and feature topology.
 | `stridelabs-http` | Implemented | `AppError`→`IntoResponse` convention, security-headers + CORS layers, graceful shutdown, reverse-proxy primitives (feature `proxy`), OpenAPI spec mechanics (feature `openapi`) | An existing service's `error.rs`, a reverse proxy's HTTP layer, and the `http/openapi.rs` of slauth, the StrideLabs auth service |
 | `stridelabs-auth` | Implemented | slauth resource-server client: rate-limited JWKS cache, RS256 verification, bearer extraction, PAT hashing, offline test-key minting | An existing service's `auth/` module |
 | `stridelabs-testing` | Implemented | Fail-loud real-Postgres pool, `oneshot` axum router-test helpers, a one-line wiremock JSON stub | Existing integration-test idioms, hardened |
+| `stridelabs-mcp` | Implemented | The middle of an MCP server on rmcp: RFC 9728 protected-resource metadata, slauth bearer verification at the MCP boundary (audience = the resource URL, 503 on an issuer outage), a stateless Streamable HTTP router, and a scoped, audited tool boundary | Python `stridelabs-mcp` (itself extracted from slaudio's MCP surface) |
 
-See [§ Feature topology](#feature-topology-all-five-crates) below for what
+See [§ Feature topology](#feature-topology-all-six-crates) below for what
 each crate turns on by default versus behind a feature flag.
 
 ## Conventions
@@ -72,7 +73,7 @@ stridelabs-config = { git = "https://github.com/charliek/stridelabs-rust.git", r
 released and tagged, bump the consumer back to `tag = "vX.Y.Z"` so its
 manifest reads the same way for everyone, forever. Every crate is versioned
 in lockstep (one `[workspace.package].version` for the whole workspace), so a
-consumer pins **one** tag/rev for however many of the five crates it uses.
+consumer pins **one** tag/rev for however many of the six crates it uses.
 
 ### MSRV policy
 
@@ -108,6 +109,7 @@ stridelabs-observability = { path = "../stridelabs-rust/crates/observability" }
 stridelabs-http = { path = "../stridelabs-rust/crates/http" }
 stridelabs-auth = { path = "../stridelabs-rust/crates/auth" }
 stridelabs-testing = { path = "../stridelabs-rust/crates/testing" }
+stridelabs-mcp = { path = "../stridelabs-rust/crates/mcp" }
 ```
 
 `[patch]` keys the whole *source* (the git URL), not one crate — list every
@@ -116,7 +118,7 @@ or transitively (e.g. `stridelabs-auth`'s `http` feature depends on
 `stridelabs-http`, so the consumer's `[patch]` block needs both if it uses
 that feature). A patch entry for a crate the consumer doesn't depend on is
 harmless — Cargo only applies the ones that match a real dependency — so
-listing all five up front, as above, is the simplest thing that stays correct
+listing all six up front, as above, is the simplest thing that stays correct
 as a consumer's dependency set grows. The `[patch]` key must match the
 `https://…` source URL the consumer's `[dependencies]` actually used.
 
@@ -136,7 +138,7 @@ dependency, so after adding the block:
 checkout for tapper, slauth, limen or spendwise-rs, then proves with `cargo
 metadata` that every `stridelabs-*` package is this checkout's own crate.
 
-### Feature topology (all five crates)
+### Feature topology (all six crates)
 
 Every crate that defines optional features defaults to `default = []` — a
 consumer opts into the heavier parts of its dependency graph (a TLS stack, a
@@ -158,15 +160,18 @@ on what.
 | `stridelabs-auth` | `http` | off | `From<AuthError> for stridelabs_http::AppError` |
 | `stridelabs-auth` | `test-support` | off | offline JWT minting against two committed throwaway keypairs |
 | `stridelabs-testing` | `postgres` | off | `require_postgres`, via `sqlx`'s Postgres driver + `url` |
+| `stridelabs-mcp` | `test-support` | off | MCP access-token minting for a `ProtectedResource` (via `stridelabs-auth/test-support`) |
 
 `stridelabs-testing`'s `oneshot` and `wiremock` modules have no feature gate
 of their own — both are cheap and every consumer of the crate wants them; only
 the Postgres driver is worth gating.
 
 `stridelabs-http`'s `proxy` is the only feature anywhere here that turns on
-TLS. `stridelabs-auth` has none — it takes the consumer's `reqwest::Client`,
-so the TLS stack and the process's rustls provider stay the consumer's choice —
-and `stridelabs-testing`'s Postgres pool talks to its database in the clear.
+TLS. `stridelabs-auth` and `stridelabs-mcp` have none — both take the
+consumer's `reqwest::Client`, so the TLS stack and the process's rustls
+provider stay the consumer's choice (and `stridelabs-mcp` builds rmcp with no
+HTTP-client feature) — and `stridelabs-testing`'s Postgres pool talks to its
+database in the clear.
 
 ### One crypto provider: aws-lc-rs
 

@@ -74,8 +74,8 @@ it will not silently skip.
 
 ## Crate map
 
-All five crates are implemented: `stridelabs-config`, `stridelabs-observability`,
-`stridelabs-http`, `stridelabs-auth` and `stridelabs-testing`.
+All six crates are implemented: `stridelabs-config`, `stridelabs-observability`,
+`stridelabs-http`, `stridelabs-auth`, `stridelabs-testing` and `stridelabs-mcp`.
 
 | Crate | Status | Contents |
 |---|---|---|
@@ -84,6 +84,7 @@ All five crates are implemented: `stridelabs-config`, `stridelabs-observability`
 | `stridelabs-http` | Implemented | `AppError`→`IntoResponse` convention, security-headers layer, CORS layer (feature `cors`), graceful-shutdown helpers, reverse-proxy primitives (feature `proxy`), OpenAPI spec mechanics — canonical serialization, route enumeration, committed-spec freshness (feature `openapi`) |
 | `stridelabs-auth` | Implemented | slauth resource-server client: rate-limited JWKS cache, RS256 verification, bearer extraction (feature `axum`), PAT hashing, offline test-key minting (feature `test-support`) |
 | `stridelabs-testing` | Implemented | Fail-loud real-Postgres pool (feature `postgres`), `oneshot` axum router-test helpers, a one-line wiremock JSON stub |
+| `stridelabs-mcp` | Implemented | MCP-server middle on rmcp: canonical protected resource + RFC 9728 metadata router, slauth bearer verification (audience = resource URL; JWKS outage → 503) and its `401` challenges, stateless Streamable HTTP router, scoped/audited tool boundary, MCP token minting (feature `test-support`) |
 
 Each crate documents its own **feature topology** in its README — most are
 `default = []` so a consumer's dependency graph stays as lean as it wants.
