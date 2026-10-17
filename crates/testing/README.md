@@ -2,8 +2,8 @@
 
 Test-only helpers for StrideLabs services: a fail-loud real-Postgres pool, a
 fail-loud real-Redis probe, a `tower::ServiceExt::oneshot` wrapper for axum
-`Router`s, and a one-line wiremock JSON stub. Extracted from the ad hoc idioms duplicated across an
-existing service's integration tests.
+`Router`s, and a one-line wiremock JSON stub. Extracted from the ad hoc
+idioms duplicated across an existing service's integration tests.
 
 This crate is meant to sit in a consumer's **`[dev-dependencies]`**, never
 `[dependencies]` — nothing here has any business in a production binary.
@@ -50,7 +50,7 @@ in the public API: a consumer that names it needs redis-rs 1.x.
 stridelabs-testing = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.6.0", features = ["postgres"] }
 ```
 
-(`redis` is new in `v0.6.0`: `features = ["redis"]` from that tag on.)
+(`redis` is new in `v0.7.0`: `features = ["redis"]` from that tag on.)
 
 (During development against an unreleased commit, pin `rev = "<sha>"` instead
 of `tag`; see the workspace root README for the local `[patch]` co-development
@@ -254,6 +254,7 @@ way.
 ## Not included
 
 Schema-per-test isolation, transactional test rollback, flushing or
-key-prefixing a test Redis, fixture-seeding helpers (too app-specific — an invite code and a plan tier aren't the same
-kind of fixture), and anything issuer/auth-shaped (see `stridelabs-auth`'s
-`test-support` feature for minting test JWTs).
+key-prefixing a test Redis, fixture-seeding helpers (too app-specific — an
+invite code and a plan tier aren't the same kind of fixture), and anything
+issuer/auth-shaped (see `stridelabs-auth`'s `test-support` feature for
+minting test JWTs).

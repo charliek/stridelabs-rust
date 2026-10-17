@@ -474,7 +474,7 @@ jobs:
           status=0
           failed=""
           checked=0
-          for crate in stridelabs-config stridelabs-observability stridelabs-http stridelabs-auth stridelabs-testing stridelabs-mcp; do
+          for crate in stridelabs-config stridelabs-observability stridelabs-http stridelabs-auth stridelabs-testing stridelabs-mcp stridelabs-redis stridelabs-gcp; do
             if ! git cat-file -e "$baseline:crates/${crate#stridelabs-}/Cargo.toml" 2>/dev/null; then
               echo "::notice::$crate is new since $baseline (no crates/${crate#stridelabs-}/Cargo.toml there), so it has no baseline API to check; it is checked from the next tag on"
               continue
@@ -548,7 +548,7 @@ jobs:
   #
   # limen is checked out at a pinned commit SHA, never at a branch: a branch
   # moves under a PR, and this check must say the same thing on a re-run.
-  # `[patch]` points all six stridelabs-* crates at this checkout (the same
+  # `[patch]` points every stridelabs-* crate at this checkout (the same
   # --config the script uses). The run is deliberately NOT `--locked`: limen's
   # lock names the pinned git crates, and the patched path packages (and what
   # they newly pull in) have to be resolved into it. So this is a drift
@@ -604,15 +604,15 @@ jobs:
 
       # One definition of the override, passed to every cargo call as
       # `--config <file>`: the same [patch] scripts/downstream-check.sh gives
-      # cargo inline, with explicit absolute paths into this checkout. All
-      # six crates are listed whether or not limen uses them (an unused entry
-      # only draws a cargo warning).
+      # cargo inline, with explicit absolute paths into this checkout. Every
+      # crate is listed whether or not limen uses it (an unused entry only
+      # draws a cargo warning).
       - name: Point limen's stridelabs-rust dependency at this checkout
         run: |
           set -euo pipefail
           patch="$RUNNER_TEMP/stridelabs-patch.toml"
           echo '[patch."https://github.com/charliek/stridelabs-rust.git"]' > "$patch"
-          for c in config observability http auth testing mcp; do
+          for c in config observability http auth testing mcp redis gcp; do
             echo "stridelabs-$c = { path = \"$GITHUB_WORKSPACE/stridelabs-rust/crates/$c\" }" >> "$patch"
           done
           cat "$patch"

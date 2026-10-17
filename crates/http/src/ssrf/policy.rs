@@ -217,7 +217,7 @@ impl FetchPolicy {
     }
 
     /// The one address decision every fetch makes: the public-address
-    /// policy, plus the single loopback address of a test server when the
+    /// policy, plus the loopback addresses a test server names when the
     /// test-support override is on.
     pub(super) fn permits(&self, ip: IpAddr) -> bool {
         #[cfg(feature = "ssrf-test-support")]

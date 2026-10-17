@@ -1,7 +1,8 @@
 //! What the HTTP suites added for rate limiting, PATs and CORS share: a
 //! loopback server for an assembled app, the JWKS mock, tokens, JSON-RPC
 //! messages and a capturing `tracing` subscriber. (`tests/mcp_http.rs`, the
-//! v0.6.0 suite, keeps its own copy.)
+//! v0.6.0 suite, keeps its own server, tokens and messages, and takes only
+//! the capture from here.)
 //!
 //! `#[tokio::test]` is a current-thread runtime, so the server, rmcp's
 //! per-request tasks and the client all run on the test's thread, and every

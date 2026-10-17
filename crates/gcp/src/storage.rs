@@ -135,7 +135,8 @@ pub enum StorageError {
     Request {
         /// `upload`, `download` or `delete`.
         operation: &'static str,
-        /// The transport's reason, rendered without the URL.
+        /// The transport failure's fixed category (`timed out`,
+        /// `connection failed`, …), never its text.
         reason: String,
     },
     /// The operation outlived the client's timeout.

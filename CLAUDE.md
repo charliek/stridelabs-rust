@@ -17,7 +17,8 @@ one of them.
 This is a **library-only workspace, never a running service**: no binary, no
 `main.rs`, no deployed container. `docker-compose.yml` exists solely to give
 the fail-loud Postgres and Redis tests (`stridelabs-testing`'s, and
-`stridelabs-redis`'s live suite) something real to fail loudly against.
+`stridelabs-redis`'s and `stridelabs-mcp`'s live suites) something real to
+fail loudly against.
 
 ## Versioning and consumption
 
@@ -67,9 +68,9 @@ mise exec -- cargo test --workspace
 
 **DB- and Redis-touching tests need `docker compose up -d` (or `make up`)
 running first.** `cargo test --workspace` (default features) never needs it —
-`stridelabs-testing`'s `postgres` and `redis` features and
-`stridelabs-redis`'s `live-tests` are off by default, so those tests don't
-even compile into that run. They *do* compile and run under
+`stridelabs-testing`'s `postgres` and `redis` features and the `live-tests`
+features of `stridelabs-redis` and `stridelabs-mcp` are off by default, so
+those tests don't even compile into that run. They *do* compile and run under
 `mise exec -- make test-all-features` (`cargo test --workspace
 --all-features`), which is why that's the lane to run before trusting a
 change touches Postgres or Redis correctly — and why CI runs it against live
@@ -79,17 +80,21 @@ will not silently skip.
 
 ## Crate map
 
-All six crates are implemented: `stridelabs-config`, `stridelabs-observability`,
-`stridelabs-http`, `stridelabs-auth`, `stridelabs-testing` and `stridelabs-mcp`.
+All eight crates are implemented: `stridelabs-config`,
+`stridelabs-observability`, `stridelabs-http`, `stridelabs-auth`,
+`stridelabs-testing`, `stridelabs-mcp`, `stridelabs-redis` and
+`stridelabs-gcp`.
 
 | Crate | Status | Contents |
 |---|---|---|
 | `stridelabs-config` | Implemented | Env-var helpers (`env_or`/`env_parse`/`parse_string_array`), layered YAML/JSON file loading with field-pathed errors, a validation-error accumulator + socket/fraction checks |
 | `stridelabs-observability` | Implemented | tracing init (text/JSON/Google Cloud Logging lines, `LogFormat::from_environment`), a `RequestLogLayer` (outermost: request id, request/trace span, one `httpRequest` entry per request) and a `RequestIdLayer` tower middleware, optional Prometheus wiring |
-| `stridelabs-http` | Implemented | `AppError`→`IntoResponse` convention, security-headers layer, CORS layer (feature `cors`), graceful-shutdown helpers, reverse-proxy primitives (feature `proxy`), OpenAPI spec mechanics — canonical serialization, route enumeration, committed-spec freshness (feature `openapi`) |
-| `stridelabs-auth` | Implemented | slauth resource-server client: rate-limited JWKS cache, RS256 verification, bearer extraction (feature `axum`), PAT hashing, offline test-key minting (feature `test-support`) |
-| `stridelabs-testing` | Implemented | Fail-loud real-Postgres pool (feature `postgres`), `oneshot` axum router-test helpers, a one-line wiremock JSON stub |
-| `stridelabs-mcp` | Implemented | MCP-server middle on rmcp: canonical protected resource + RFC 9728 metadata router, slauth bearer verification (audience = resource URL; JWKS outage → 503) and its `401` challenges, stateless Streamable HTTP router, scoped/audited tool boundary, MCP token minting (feature `test-support`) |
+| `stridelabs-http` | Implemented | `AppError`→`IntoResponse` convention, security-headers layer, CORS layer (feature `cors`), graceful-shutdown helpers, reverse-proxy primitives (feature `proxy`), an SSRF-hardened outbound fetch (feature `ssrf`; `ssrf-test-support` admits a local TLS test server), the aws-lc-rs rustls provider install (feature `tls`), OpenAPI spec mechanics — canonical serialization, route enumeration, committed-spec freshness (feature `openapi`) |
+| `stridelabs-auth` | Implemented | slauth resource-server client: rate-limited JWKS cache, RS256 verification, bearer extraction (feature `axum`), slauth PAT validation (`PatValidator`), PAT hashing, offline test-key minting (feature `test-support`) |
+| `stridelabs-testing` | Implemented | Fail-loud real-Postgres pool (feature `postgres`) and real-Redis probe (feature `redis`), `oneshot` axum router-test helpers, a one-line wiremock JSON stub |
+| `stridelabs-mcp` | Implemented | MCP-server middle on rmcp: canonical protected resource + RFC 9728 metadata router, slauth bearer verification (audience = resource URL; JWKS outage → 503) and its `401` challenges, stateless Streamable HTTP router, scoped/rate-limited/audited tool boundary, slauth PATs as a credential with a fail-through cache, the committed `tools/list` snapshot, MCP token minting (feature `test-support`); a Redis-backed limiter and PAT cache (feature `redis`), the SSRF-hardened image fetch (feature `image-fetch`), the CORS preset (feature `cors`) |
+| `stridelabs-redis` | Implemented | A lazy, single-flight Redis handle (`rediss://` over rustls, no crypto provider of its own): an atomic fixed-window counter that is never replayed, idempotent `GET` / `SET EX` |
+| `stridelabs-gcp` | Implemented | Policy-free Google Cloud building blocks on the consumer's `reqwest::Client`: an ADC access-token provider with a single-flight cache (`service_account` keys behind feature `service-account-key`), a small GCS JSON-API client, Vertex AI `generateContent` (feature `vertex`) |
 
 Each crate documents its own **feature topology** in its README — most are
 `default = []` so a consumer's dependency graph stays as lean as it wants.

@@ -41,10 +41,9 @@ use base64::alphabet;
 use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
 use base64::Engine;
 use http::HeaderValue;
-use stridelabs_http::ssrf::fetch_public;
-use stridelabs_http::ssrf::FetchPolicy;
 #[cfg(feature = "test-support")]
 pub use stridelabs_http::ssrf::LoopbackTestServer;
+use stridelabs_http::ssrf::{fetch_public, FetchPolicy};
 pub use stridelabs_http::ssrf::{HostResolver, SsrfError};
 
 use crate::tool::ToolError;

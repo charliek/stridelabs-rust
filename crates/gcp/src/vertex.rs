@@ -577,7 +577,8 @@ pub enum VertexError {
     #[error("Vertex AI: {0}")]
     Auth(#[from] GcpAuthError),
     /// The request did not complete: a connection failure or an unreadable
-    /// body.
+    /// body. The payload is the failure's fixed category (`timed out`,
+    /// `connection failed`, …), never its text.
     #[error("Vertex AI request failed: {0}")]
     Request(String),
     /// The call outlived the client's timeout.

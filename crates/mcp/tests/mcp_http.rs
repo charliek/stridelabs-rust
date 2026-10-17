@@ -9,8 +9,9 @@
 //! per-request tasks and the client all run on that thread, and every audit
 //! line a request produces lands in that test's capture.
 
-use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+mod support;
+
+use std::sync::Arc;
 use std::time::Duration;
 
 use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE, HOST, WWW_AUTHENTICATE};
@@ -26,9 +27,7 @@ use stridelabs_mcp::{
     AuthMethod, McpAuthLayer, McpVerifier, Principal, ProtectedResource, ToolCall, ToolError,
     VerifyError, AUDIT_TARGET,
 };
-use tracing::field::{Field, Visit};
-use tracing_subscriber::layer::{Context, SubscriberExt};
-use tracing_subscriber::Layer;
+use support::Capture;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -321,84 +320,6 @@ fn text_of(result: &Value) -> &str {
     content[0]["text"].as_str().expect("a text block")
 }
 
-// --- capturing the audit lines ------------------------------------------------
-
-#[derive(Debug, Clone)]
-struct Captured {
-    target: String,
-    level: tracing::Level,
-    fields: BTreeMap<String, String>,
-}
-
-/// `take_audit` forgets the lines it hands out; `everything` still covers
-/// them, so a secrecy check after a take sees every line ever written.
-#[derive(Clone, Default)]
-struct Capture {
-    pending: Arc<Mutex<Vec<Captured>>>,
-    all: Arc<Mutex<Vec<Captured>>>,
-}
-
-impl Capture {
-    /// Install for this thread; keep the guard alive for the test.
-    fn install() -> (Capture, tracing::subscriber::DefaultGuard) {
-        let capture = Capture::default();
-        let subscriber = tracing_subscriber::registry().with(capture.clone());
-        (capture, tracing::subscriber::set_default(subscriber))
-    }
-
-    /// The audit lines written since the last call, and forget them.
-    fn take_audit(&self) -> Vec<Captured> {
-        let mut events = self.pending.lock().expect("capture lock");
-        let audit = events
-            .iter()
-            .filter(|event| event.target == AUDIT_TARGET)
-            .cloned()
-            .collect();
-        events.retain(|event| event.target != AUDIT_TARGET);
-        audit
-    }
-
-    fn everything(&self) -> String {
-        format!("{:?}", self.all.lock().expect("capture lock"))
-    }
-
-    /// The one audit line a call must have written.
-    fn one_audit_line(&self) -> Captured {
-        let mut lines = self.take_audit();
-        assert_eq!(lines.len(), 1, "exactly one audit line per call: {lines:?}");
-        lines.remove(0)
-    }
-}
-
-struct Fields<'a>(&'a mut BTreeMap<String, String>);
-
-impl Visit for Fields<'_> {
-    fn record_str(&mut self, field: &Field, value: &str) {
-        self.0.insert(field.name().to_owned(), value.to_owned());
-    }
-
-    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-        self.0.insert(field.name().to_owned(), format!("{value:?}"));
-    }
-}
-
-impl<S: tracing::Subscriber> Layer<S> for Capture {
-    fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
-        let mut fields = BTreeMap::new();
-        event.record(&mut Fields(&mut fields));
-        let captured = Captured {
-            target: event.metadata().target().to_owned(),
-            level: *event.metadata().level(),
-            fields,
-        };
-        self.all
-            .lock()
-            .expect("capture lock")
-            .push(captured.clone());
-        self.pending.lock().expect("capture lock").push(captured);
-    }
-}
-
 // --- the tests ------------------------------------------------------------------
 
 #[tokio::test]
@@ -564,7 +485,7 @@ async fn legacy_clients_initialize_list_and_call_statelessly() {
             "{version}"
         );
         assert!(
-            capture.take_audit().is_empty(),
+            capture.take(AUDIT_TARGET).is_empty(),
             "listing is not a tool call"
         );
 

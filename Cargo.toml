@@ -40,16 +40,17 @@ stridelabs-redis = { path = "crates/redis" }
 # switches on.
 stridelabs-testing = { path = "crates/testing" }
 
-# HTTP client (proxy primitives, JWKS fetch). Deliberately NO TLS feature
-# here: whatever is listed at workspace level reaches every member's graph, and
-# so every consumer's. reqwest 0.13's `rustls` switches on rustls's aws-lc-rs
-# provider, and next to a consumer's rustls `ring` (redis-rs, sqlx
+# HTTP client (proxy primitives, the SSRF-guarded fetch, JWKS fetch, PAT
+# validation, GCP calls). Deliberately NO TLS feature here: whatever is listed
+# at workspace level reaches every member's graph, and so every consumer's.
+# reqwest 0.13's `rustls` switches on rustls's aws-lc-rs provider, and next to
+# a consumer's rustls `ring` (redis-rs 0.27's `tls-rustls`, sqlx
 # `tls-rustls-ring`) every `rustls::ClientConfig::builder()` that relies on the
-# crate-feature default panics. Only stridelabs-http's `proxy` builds a client
-# of its own, so only it turns TLS on (crates/http/Cargo.toml).
-# stridelabs-auth is handed the consumer's client and must not pick a TLS
-# stack for it; CI's "Guard: stridelabs-auth pulls no rustls" keeps rustls out
-# of its graph.
+# crate-feature default panics. Only stridelabs-http's `proxy` and `ssrf` build
+# a client of their own, so only they turn reqwest's TLS on
+# (crates/http/Cargo.toml). stridelabs-auth and stridelabs-gcp are handed the
+# consumer's client and must not pick a TLS stack for it; CI's "Guard:
+# stridelabs-auth pulls no rustls" keeps rustls out of stridelabs-auth's graph.
 reqwest = { version = "0.13", default-features = false }
 
 # OpenAPI. No schema features (`uuid`, `time`, …) here: the shared crate

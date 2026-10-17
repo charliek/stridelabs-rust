@@ -70,13 +70,13 @@
 //! # Never the token, never the URL
 //!
 //! A [`PatValidationError`] holds one of the fixed messages above, or one
-//! of slauth's four reason codes, and nothing else. The `warn` line each `Unavailable`
-//! outcome logs (as Python logs one) names the failure and never the token
-//! or the URL: a `reqwest::Error` is rendered `without_url()`, because the
-//! validate URL is configuration, and configuration can carry a credential.
-//! [`PatValidator`]'s `Debug` prints the URL as `scheme://host[:port]/path`,
-//! like [`crate::SlauthConfig`]'s, and the request's `Authorization` value
-//! is marked sensitive.
+//! of slauth's four reason codes, and nothing else. The `warn` line each
+//! `Unavailable` outcome logs (as Python logs one) names the failure and
+//! never the token or the URL: a `reqwest::Error` is rendered
+//! `without_url()`, because the validate URL is configuration, and
+//! configuration can carry a credential. [`PatValidator`]'s `Debug` prints
+//! the URL as `scheme://host[:port]/path`, like [`crate::SlauthConfig`]'s,
+//! and the request's `Authorization` value is marked sensitive.
 
 use std::fmt;
 use std::sync::Arc;

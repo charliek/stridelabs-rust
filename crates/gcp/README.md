@@ -51,8 +51,12 @@ crypto provider").
 
 ```toml
 [dependencies]
-stridelabs-gcp = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.6.0", features = ["service-account-key", "vertex"] }
+stridelabs-gcp = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.7.0", features = ["service-account-key", "vertex"] }
 ```
+
+(`v0.7.0` is the first release with this crate. During development against
+an unreleased commit, pin `rev = "<sha>"` instead of `tag`; see the workspace
+root README for the local `[patch]` co-development snippet.)
 
 A service that runs only on ADC (the metadata server in production, a
 developer's gcloud login locally) can leave out `service-account-key`. Turn
@@ -180,8 +184,8 @@ an access token, or a URL's query or userinfo:
   may fill with anything, so it is dropped.
 - Endpoints are rendered as `scheme://host[:port]/path`. A `reqwest::Error`
   becomes a fixed category: `timed out`, `connection failed`, `redirect
-  refused`, `body error`, `decode error`, `invalid request` or `request
-  error`. Its text is never formatted, because `without_url()` strips only
+  refused`, `body error`, `decode error`, `invalid request`, `request error`
+  or, for anything else, `request failed`. Its text is never formatted, because `without_url()` strips only
   the outer URL, and a refused redirect nests its target URL, query and all,
   in the source chain.
 - `TokenProvider`'s, `AccessToken`'s and `TokenOptions`' `Debug` never print

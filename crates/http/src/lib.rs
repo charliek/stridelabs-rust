@@ -54,12 +54,12 @@
 //! that function is a direct `rustls` dependency, which a service with no
 //! rustls in its graph has no reason to take on.
 //!
-//! `openapi` stays namespaced for the same reason as `proxy` (and pays a smaller but
-//! real gate: `utoipa` drags a proc-macro crate in). It holds only the
-//! *mechanics* of publishing a spec — canonical serialization, `(method,
-//! path)` enumeration, a committed-file freshness check. The document itself
-//! — security schemes, `info`, tags, which routes are in it — is per-service
-//! policy and stays in the service; see that module's docs.
+//! `openapi` stays namespaced for the same reason as `proxy` (and pays a
+//! smaller but real gate: `utoipa` drags a proc-macro crate in). It holds
+//! only the *mechanics* of publishing a spec — canonical serialization,
+//! `(method, path)` enumeration, a committed-file freshness check. The
+//! document itself — security schemes, `info`, tags, which routes are in it
+//! — is per-service policy and stays in the service; see that module's docs.
 //!
 //! # A deliberate exception to the workspace's "typed errors only" rule
 //!

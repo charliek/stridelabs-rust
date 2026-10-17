@@ -17,7 +17,9 @@
 //!   `error_description` is free text a server may fill with anything, so it
 //!   is dropped, along with the rest of the body.
 //! - Endpoints appear as `scheme://host[:port]/path`. A `reqwest::Error` is
-//!   rendered `without_url()`.
+//!   reduced to a fixed category (`timed out`, `connection failed`, …) and
+//!   its text is never formatted: `without_url()` strips only the outer URL,
+//!   and the source chain can carry another one.
 
 use crate::util::detail_suffix;
 
@@ -57,7 +59,8 @@ pub enum GcpAuthError {
     Request {
         /// The endpoint, as `scheme://host[:port]/path`.
         endpoint: String,
-        /// The transport's reason, rendered without the URL.
+        /// The transport failure's fixed category (`timed out`,
+        /// `connection failed`, …), never its text.
         reason: String,
     },
 

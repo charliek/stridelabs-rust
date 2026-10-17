@@ -28,18 +28,19 @@ everyone already depends on.
 
 `ssrf` is the same gate for the same reason, and shares `proxy`'s one
 reqwest declaration, so a service with both compiles the client once. Between
-them they are the only TLS features in this workspace (`tls` adds a direct
-`rustls` dependency, but only to install a provider). reqwest 0.13's `rustls`
-means rustls's aws-lc-rs provider (unless the process installed a default
-provider first; aws-lc-sys is a C build) and `rustls-platform-verifier`: the
-OS trust store plus `UpstreamClient::build`'s `ca_bundle_pem`, and **no
-bundled roots** — 0.12's webpki roots are gone. On Linux that store is the
+them they are the only features in this workspace that turn on reqwest's TLS
+(`tls` adds a direct `rustls` dependency, but only to install a provider, and
+stridelabs-redis turns on redis-rs's). reqwest 0.13's `rustls` means
+rustls's aws-lc-rs provider (unless the process installed a default provider
+first; aws-lc-sys is a C build) and `rustls-platform-verifier`: the OS trust
+store plus `UpstreamClient::build`'s `ca_bundle_pem`, and **no bundled
+roots** — 0.12's webpki roots are gone. On Linux that store is the
 system CA bundle (`SSL_CERT_FILE`/`SSL_CERT_DIR` respected), so an image
 without `ca-certificates` fails `UpstreamClient::build(true, None)` with
 `ClientBuildError::Build`. Keep aws-lc-rs the only rustls provider in the
-consumer's graph: rustls `ring` from anywhere else (redis-rs `tls-rustls`,
-sqlx `tls-rustls-ring`) next to it makes `rustls::ClientConfig::builder()`
-panic.
+consumer's graph: rustls `ring` from anywhere else (redis-rs 0.27's
+`tls-rustls`, sqlx `tls-rustls-ring`) next to it makes
+`rustls::ClientConfig::builder()` panic.
 
 `tokio` is a **non-optional** dependency (`signal`, `sync`, `macros`) because
 `shutdown` is signal/watch machinery. A service with no tokio in its graph

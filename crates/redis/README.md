@@ -10,10 +10,10 @@ slot so the next service does not write a fourth copy.
 
 ```toml
 [dependencies]
-stridelabs-redis = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.6.0" }
+stridelabs-redis = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.7.0" }
 ```
 
-(`v0.6.0` is the first release with this crate. During development against
+(`v0.7.0` is the first release with this crate. During development against
 an unreleased commit, pin `rev = "<sha>"` instead of `tag`; see the workspace
 root README for the local `[patch]` co-development snippet.)
 

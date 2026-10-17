@@ -91,8 +91,10 @@ tracing = { workspace = true }
 # mid-body once it crosses the cap. `ssrf`'s capped read counts the same
 # stream.
 #
-# `rustls` (reqwest 0.13's rename of 0.12's `rustls-tls`) is the only TLS
-# feature anywhere in this workspace (see the workspace manifest). It brings
+# `rustls` (reqwest 0.13's rename of 0.12's `rustls-tls`) is the only reqwest
+# TLS feature anywhere in this workspace (see the workspace manifest; the
+# other rustls users are this crate's `tls` and stridelabs-redis's redis-rs,
+# neither of which picks a provider for reqwest). It brings
 # rustls's aws-lc-rs provider — used unless the process installed a default
 # provider first — and the OS trust store with no bundled roots; the README's
 # "Feature topology" says what that means for a consumer's image. Still no

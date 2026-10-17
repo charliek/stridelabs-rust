@@ -78,6 +78,9 @@ stridelabs-auth = { git = "https://github.com/charliek/stridelabs-rust.git", tag
 stridelabs-auth = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.6.0", features = ["test-support"] }
 ```
 
+`PatValidator` (slauth PAT validation, below) is new in v0.7.0: pin
+`tag = "v0.7.0"` or later to use it.
+
 (During development against an unreleased commit, pin `rev = "<sha>"` instead
 of `tag`; see the workspace root README for the local `[patch]` snippet.)
 

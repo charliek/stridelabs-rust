@@ -168,9 +168,9 @@ mod tests {
     #[test]
     fn the_panic_message_never_leaks_the_password() {
         // A direct assertion on the message builder, in addition to the
-        // dedicated `redact_password` unit tests in `crate::redact`: this is the exact
-        // string `require_postgres_at` panics with, built the same way a
-        // real connection failure would build it.
+        // dedicated `redact_password` unit tests in `crate::redact`: this is
+        // the exact string `require_postgres_at` panics with, built the same
+        // way a real connection failure would build it.
         let err = sqlx::Error::Configuration("simulated failure".into());
         let message = connection_failure_message(
             "postgres://postgres:hunter2@127.0.0.1:1/stridelabs_test",
