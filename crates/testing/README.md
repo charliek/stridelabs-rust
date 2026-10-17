@@ -47,7 +47,7 @@ in the public API: a consumer that names it needs redis-rs 1.x.
 
 ```toml
 [dev-dependencies]
-stridelabs-testing = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.6.0", features = ["postgres"] }
+stridelabs-testing = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.7.0", features = ["postgres"] }
 ```
 
 (`redis` is new in `v0.7.0`: `features = ["redis"]` from that tag on.)

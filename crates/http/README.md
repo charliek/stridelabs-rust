@@ -51,16 +51,16 @@ build.
 
 ```toml
 [dependencies]
-stridelabs-http = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.6.0" }
+stridelabs-http = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.7.0" }
 
 # with the CORS layer builder:
-stridelabs-http = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.6.0", features = ["cors"] }
+stridelabs-http = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.7.0", features = ["cors"] }
 
 # for a service that proxies to an upstream:
-stridelabs-http = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.6.0", features = ["proxy"] }
+stridelabs-http = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.7.0", features = ["proxy"] }
 
 # for a service that publishes an OpenAPI document:
-stridelabs-http = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.6.0", features = ["openapi"] }
+stridelabs-http = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.7.0", features = ["openapi"] }
 
 # for a service that fetches user-supplied URLs, and installs the rustls provider at startup:
 stridelabs-http = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.7.0", features = ["ssrf", "tls"] }

@@ -48,11 +48,11 @@ The app writes its tools as an rmcp `ServerHandler`. This crate supplies:
 
 ```toml
 [dependencies]
-stridelabs-mcp = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.6.0" }
+stridelabs-mcp = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.7.0" }
 rmcp = { version = "3.5", default-features = false, features = ["server", "macros"] }
 
 [dev-dependencies]
-stridelabs-mcp = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.6.0", features = ["test-support"] }
+stridelabs-mcp = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.7.0", features = ["test-support"] }
 ```
 
 Rate limiting, `SlauthPatCredential`, `canonical_tools_json` and the

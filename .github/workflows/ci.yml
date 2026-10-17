@@ -135,6 +135,29 @@ jobs:
           cargo clippy --locked -p stridelabs-mcp --all-targets --all-features -- -D warnings
           echo "::endgroup::"
 
+      # The same per-feature lanes for the other crates with optional
+      # surfaces (stridelabs-mcp's is above). Each line is `crate:features`;
+      # an empty feature list is the core.
+      - name: Other crates, feature by feature (build + clippy)
+        run: |
+          set -euo pipefail
+          for entry in \
+            stridelabs-gcp: \
+            stridelabs-gcp:service-account-key \
+            stridelabs-gcp:vertex \
+            stridelabs-http:tls \
+            stridelabs-http:ssrf \
+            stridelabs-http:ssrf-test-support \
+            stridelabs-redis: \
+            stridelabs-testing:redis; do
+            crate="${entry%%:*}"
+            features="${entry#*:}"
+            echo "::group::$crate [${features:-core}]"
+            cargo build --locked -p "$crate" --no-default-features ${features:+--features "$features"}
+            cargo clippy --locked -p "$crate" --all-targets --no-default-features ${features:+--features "$features"} -- -D warnings
+            echo "::endgroup::"
+          done
+
       - name: Doc
         run: cargo doc --workspace --all-features --no-deps --locked
 
@@ -242,6 +265,37 @@ jobs:
             exit 1
           fi
           echo "ok: rustls absent with every feature on, jsonwebtoken and stridelabs-http present"
+
+      # stridelabs-gcp is handed the consumer's `reqwest::Client` and never
+      # builds one, so, like stridelabs-auth, it must pick no TLS stack: its
+      # reqwest has only `json` and `form`. Every feature on (features only
+      # add crates, so absence there is absence everywhere); jsonwebtoken (the
+      # `service-account-key` edge, on the aws-lc-rs backend) and reqwest are
+      # the positive controls proving the feature edges were walked.
+      - name: "Guard: stridelabs-gcp pulls no rustls"
+        run: |
+          set -euo pipefail
+          pkgs="$(mktemp)"
+          trap 'rm -f "$pkgs"' EXIT
+          cargo tree --locked --target all -e normal -p stridelabs-gcp --all-features \
+            --prefix none --format '{p}' | awk '{print $1}' | sort -u > "$pkgs"
+          echo "$(wc -l < "$pkgs") packages in stridelabs-gcp[all features]'s normal graph"
+          if [ ! -s "$pkgs" ]; then
+            echo "::error::the stridelabs-gcp package listing is empty; the guard proved nothing"
+            exit 1
+          fi
+          for control in jsonwebtoken reqwest; do
+            if ! grep -qx "$control" "$pkgs"; then
+              echo "::error::positive control failed: $control is not in stridelabs-gcp[all features]'s graph, so this listing is not the one the guard means to inspect"
+              exit 1
+            fi
+          done
+          if grep -qx rustls "$pkgs"; then
+            echo "::error::rustls is in stridelabs-gcp's graph; a TLS feature on its reqwest picks a rustls provider for every consumer"
+            cargo tree --locked --target all -e normal -p stridelabs-gcp --all-features -i rustls || true
+            exit 1
+          fi
+          echo "ok: rustls absent with every feature on, jsonwebtoken and reqwest present"
 
       # stridelabs-mcp sits in consumers' production graphs too, and its core
       # has the same reason to pick no TLS stack: its reqwest (no features) is
