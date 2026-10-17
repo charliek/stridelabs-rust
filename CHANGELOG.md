@@ -60,6 +60,11 @@ for a consumer's pin.
     `clamp_limit` / `clamp_offset` / `Page`.
   - Feature `test-support`: `test_support::access_token(&resource)` mints MCP
     access tokens with stridelabs-auth's throwaway test keys.
+- CI and tooling, not part of the crates: a "Guard: stridelabs-mcp pulls no
+  rustls" step; `cargo-semver-checks` covers every crate and passes over,
+  with a notice, a crate the baseline tag does not have yet (stridelabs-mcp
+  until v0.6.0 is tagged); `downstream-limen` and
+  `scripts/downstream-check.sh` patch all six crates.
 
 ## [0.5.0] - 2026-10-11
 

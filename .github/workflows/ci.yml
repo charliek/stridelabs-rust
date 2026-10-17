@@ -206,6 +206,39 @@ jobs:
           fi
           echo "ok: rustls absent with every feature on, jsonwebtoken and stridelabs-http present"
 
+      # stridelabs-mcp sits in consumers' production graphs too, with the same
+      # reason to pick no TLS stack: its reqwest (no features) is only the
+      # `reqwest::Client` type `McpVerifier::new` takes from the consumer, and
+      # rmcp is built with default features off, so neither its HTTP client
+      # (`__reqwest`, with a TLS feature of its own) nor its OAuth client
+      # (`auth`) comes along. One listing with every feature on (features
+      # only add crates); rmcp and jsonwebtoken are the positive controls,
+      # proving the listing walked both the transport and the verifier.
+      - name: "Guard: stridelabs-mcp pulls no rustls"
+        run: |
+          set -euo pipefail
+          pkgs="$(mktemp)"
+          trap 'rm -f "$pkgs"' EXIT
+          cargo tree --locked --target all -e normal -p stridelabs-mcp --all-features \
+            --prefix none --format '{p}' | awk '{print $1}' | sort -u > "$pkgs"
+          echo "$(wc -l < "$pkgs") packages in stridelabs-mcp[all features]'s normal graph"
+          if [ ! -s "$pkgs" ]; then
+            echo "::error::the stridelabs-mcp package listing is empty; the guard proved nothing"
+            exit 1
+          fi
+          for control in rmcp jsonwebtoken; do
+            if ! grep -qx "$control" "$pkgs"; then
+              echo "::error::positive control failed: $control is not in stridelabs-mcp[all features]'s graph, so this listing is not the one the guard means to inspect"
+              exit 1
+            fi
+          done
+          if grep -qx rustls "$pkgs"; then
+            echo "::error::rustls is in stridelabs-mcp[all features]'s graph; a TLS feature (on its reqwest, or an rmcp client feature) picks a rustls provider for every consumer"
+            cargo tree --locked --target all -e normal -p stridelabs-mcp --all-features -i rustls || true
+            exit 1
+          fi
+          echo "ok: rustls absent with every feature on, rmcp and jsonwebtoken present"
+
       # rsa (RUSTSEC-2023-0071, no upstream fix) has to stay out of the lock
       # entirely: cargo-audit reads Cargo.lock, so even a crate that is never
       # compiled would put the advisory back, and `cargo tree` cannot see
@@ -322,13 +355,35 @@ jobs:
       # checked, and that is treated as a hard failure of this step
       # regardless of cargo-semver-checks's own exit code — a vacuously
       # "passing" check is worse than a loudly failing one.
-      - name: cargo-semver-checks (all five crates)
+      #
+      # A crate added since the baseline tag has no API there to break, and
+      # cargo-semver-checks cannot build a baseline for it (it exits 101 with
+      # no "Summary" line). Such a crate, one whose crates/<name>/Cargo.toml
+      # (crate `stridelabs-<name>`) is absent at the baseline tag, is named in
+      # a notice and passed over; from the next tag on it is checked like the
+      # rest. Only an absent manifest counts: a manifest that is there but
+      # does not build still fails below. `git cat-file -e` cannot tell an
+      # absent manifest from a baseline that does not resolve, so the baseline
+      # is resolved first, and a run that checked no crate at all fails: a
+      # skip of every crate would be the vacuous pass this step exists to
+      # refuse.
+      - name: cargo-semver-checks (every crate)
         run: |
           set +e -uo pipefail
           baseline="${{ steps.semver-baseline.outputs.tag }}"
+          if ! git rev-parse --verify --quiet "$baseline^{commit}" >/dev/null; then
+            echo "::error::the baseline '$baseline' does not resolve to a commit; nothing can be checked against it"
+            exit 1
+          fi
           status=0
           failed=""
-          for crate in stridelabs-config stridelabs-observability stridelabs-http stridelabs-auth stridelabs-testing; do
+          checked=0
+          for crate in stridelabs-config stridelabs-observability stridelabs-http stridelabs-auth stridelabs-testing stridelabs-mcp; do
+            if ! git cat-file -e "$baseline:crates/${crate#stridelabs-}/Cargo.toml" 2>/dev/null; then
+              echo "::notice::$crate is new since $baseline (no crates/${crate#stridelabs-}/Cargo.toml there), so it has no baseline API to check; it is checked from the next tag on"
+              continue
+            fi
+            checked=$((checked + 1))
             echo "::group::cargo semver-checks -p $crate (baseline $baseline)"
             out="$(cargo semver-checks check-release -p "$crate" --all-features --baseline-rev "$baseline" 2>&1)"
             check_exit=$?
@@ -343,7 +398,11 @@ jobs:
             fi
             echo "::endgroup::"
           done
-          if [ "$status" -ne 0 ]; then
+          if [ "$checked" -eq 0 ]; then
+            echo "::error::no crate was checked against $baseline; every crate was passed over as new, which cannot be right"
+            status=1
+          fi
+          if [ "$status" -ne 0 ] && [ -n "$failed" ]; then
             echo "::error::cargo semver-checks failed for:$failed"
           fi
           exit "$status"
@@ -393,7 +452,7 @@ jobs:
   #
   # limen is checked out at a pinned commit SHA, never at a branch: a branch
   # moves under a PR, and this check must say the same thing on a re-run.
-  # `[patch]` points all five stridelabs-* crates at this checkout (the same
+  # `[patch]` points all six stridelabs-* crates at this checkout (the same
   # --config the script uses). The run is deliberately NOT `--locked`: limen's
   # lock names the pinned git crates, and the patched path packages (and what
   # they newly pull in) have to be resolved into it. So this is a drift
@@ -450,14 +509,14 @@ jobs:
       # One definition of the override, passed to every cargo call as
       # `--config <file>`: the same [patch] scripts/downstream-check.sh gives
       # cargo inline, with explicit absolute paths into this checkout. All
-      # five crates are listed whether or not limen uses them (an unused entry
+      # six crates are listed whether or not limen uses them (an unused entry
       # only draws a cargo warning).
       - name: Point limen's stridelabs-rust dependency at this checkout
         run: |
           set -euo pipefail
           patch="$RUNNER_TEMP/stridelabs-patch.toml"
           echo '[patch."https://github.com/charliek/stridelabs-rust.git"]' > "$patch"
-          for c in config observability http auth testing; do
+          for c in config observability http auth testing mcp; do
             echo "stridelabs-$c = { path = \"$GITHUB_WORKSPACE/stridelabs-rust/crates/$c\" }" >> "$patch"
           done
           cat "$patch"
