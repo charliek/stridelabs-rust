@@ -1,7 +1,8 @@
 //! Shared HTTP plumbing for StrideLabs axum services: the house error type
 //! and its wire representation, ready-made security-header and CORS layers,
-//! graceful-shutdown primitives, and (behind a feature) the mechanical layer
-//! of a reverse proxy.
+//! graceful-shutdown primitives, and (behind features) the mechanical layer
+//! of a reverse proxy, an SSRF-hardened outbound fetch, and the process-wide
+//! rustls provider install.
 //!
 //! Extracted from an existing service's `error.rs` (the [`error::AppError`]
 //! enum and its redacting [`axum::response::IntoResponse`] impl) and a
@@ -34,6 +35,9 @@
 //! | `cors` | off | `cors::cors_layer`, via `tower-http/cors` |
 //! | `openapi` | off | `openapi` — spec canonicalization, route enumeration and a freshness check, via `utoipa` |
 //! | `proxy` | off | `proxy` — reverse-proxy primitives, plus `AppError::bad_gateway_upstream` (it takes a `reqwest::Error`) — via `reqwest`/`url`/`bytes`/`futures` (and `tokio/time`) |
+//! | `ssrf` | off | `ssrf` — an SSRF-hardened outbound fetch (public-address policy, DNS pinning, capped body), via `reqwest`/`url`/`bytes`/`futures` (and `tokio/time`, `tokio/net`) |
+//! | `ssrf-test-support` | off | `ssrf::LoopbackTestServer`, the one way to point a fetch at a local TLS test server — enable from `[dev-dependencies]`, and check the shipped graph for it (`ssrf` docs) |
+//! | `tls` | off | `tls::install_default_provider`, making aws-lc-rs the process's rustls provider, via `rustls` |
 //!
 //! `proxy` is the one that really earns its gate: it pulls in an HTTP
 //! *client* and a TLS stack, which no service that merely answers requests
@@ -42,7 +46,15 @@
 //! only mean anything in that context, and a dozen more names at the root
 //! would bury the four that every service uses.
 //!
-//! `openapi` stays namespaced for the same reason (and pays a smaller but
+//! `ssrf` shares `proxy`'s client stack and earns its gate the same way. It
+//! is a separate feature because the two answer different questions —
+//! `proxy` talks to an upstream the operator configured, `ssrf` to a URL
+//! somebody else chose — and a service that needs one rarely needs the other.
+//! `tls` is the smallest gate (one function), and is gated anyway because
+//! that function is a direct `rustls` dependency, which a service with no
+//! rustls in its graph has no reason to take on.
+//!
+//! `openapi` stays namespaced for the same reason as `proxy` (and pays a smaller but
 //! real gate: `utoipa` drags a proc-macro crate in). It holds only the
 //! *mechanics* of publishing a spec — canonical serialization, `(method,
 //! path)` enumeration, a committed-file freshness check. The document itself
@@ -75,6 +87,12 @@ pub mod openapi;
 
 #[cfg(feature = "proxy")]
 pub mod proxy;
+
+#[cfg(feature = "ssrf")]
+pub mod ssrf;
+
+#[cfg(feature = "tls")]
+pub mod tls;
 
 pub use error::{AppError, AppResult};
 pub use headers::{security_headers, SecurityHeadersLayer};
