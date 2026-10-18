@@ -11,6 +11,78 @@ for a consumer's pin.
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-10-17
+
+Two additive pieces for imgmcp's image privacy and cost work: a daily
+window for the MCP rate limiter, and GCS uploads that set object metadata
+at creation. Purely additive: every existing constructor, method and text
+keeps its signature and meaning (the per-minute refusal text is unchanged
+byte for byte), `cargo-semver-checks` in patch mode against v0.7.0 is clean
+for every crate, and no dependency major changed. First consumer: imgmcp.
+
+### Added
+
+- `stridelabs-mcp`: windows as part of a limit. `Window` (`#[non_exhaustive]`:
+  `Minute` = `unix_seconds / 60`, Python's; `Day` = `unix_seconds / 86_400`,
+  the UTC day, resetting at 00:00 UTC; `secs()`, `as_str()`) and
+  `RateLimit { class, window, limit }` (`RateLimit::per_minute`,
+  `RateLimit::per_day`). New constructors `MemoryLimiter::from_limits` and
+  `RedisRateLimiter::from_limits(handle, limits, prefix)`; the `new`
+  constructors keep their per-minute `(RateClass, u32)` signatures. A
+  repeated `(class, window)` is the last entry; a limit of 0 turns that
+  window off.
+  - One check reads the clock once and counts the call in the class's
+    windows shortest first, stopping at the first refusal: a call counts in
+    every window up to and including the one that refused it, so a burst
+    refused per minute does not spend the day, and a call the day refuses
+    still counts in the minute.
+  - `MemoryLimiter`: one critical section covers all of a class's windows;
+    each window length keeps its own forward-only index and drops its counts
+    when it rolls over.
+  - `RedisRateLimiter`: the minute key is unchanged
+    (`{prefix}:{subject}:{class}:{unix/60}`); the day key is
+    `{prefix}:{subject}:{class}:day:{unix/86400}`, each hit by the existing
+    single-key `fixed_window_hit` with the window's length as TTL (no
+    multi-key script). Fail-open is per check: the first Redis error allows
+    the call, logs one warning (now with a `window` field), and stops — a
+    counted minute is not rolled back, and a failed minute skips the day.
+  - `RateLimited` (`#[non_exhaustive]`) gains `pub window: Window`;
+    `RateLimited::new` still means a minute, and `RateLimited::in_window`
+    names the window. A day refusal reads "Rate limit exceeded for {class}
+    operations ({limit} per day). The limit resets at 00:00 UTC, in {H} h
+    {M} min.", the time left rounded up to the minute. The minute text is
+    Python's, unchanged.
+  - The day window has no Python ancestor; `PARITY.md` lists its tests.
+- `stridelabs-gcp`: `GcsClient::upload_with(bucket, object, bytes,
+  content_type, &UploadOptions)`. `UploadOptions` (`#[non_exhaustive]`,
+  `Default`, setters `with_custom_time`, `with_if_generation_match`,
+  `with_cache_control`) carries a `customTime`, a `cacheControl` and an
+  `ifGenerationMatch` precondition. Default options send exactly
+  `upload`'s media upload; any option set makes it one multipart upload
+  (`uploadType=multipart[&ifGenerationMatch=N]`): CRLF-framed, the
+  serde_json metadata part (`name`, `contentType`, then `customTime` as RFC
+  3339 UTC at whole seconds and `cacheControl`, when set) before the bytes,
+  which go in unchanged, with a random boundary drawn again until it appears
+  in neither part. The content type, the cache control (header values: no
+  CR, LF or other control characters), the custom time (1970 to 9999) and
+  the generation (not negative) are checked before a token is fetched,
+  refused as the new `StorageError::InvalidArgument { reason }` (appended
+  last, so no other variant's discriminant moves), which quotes neither the
+  value nor the object. A failed precondition is GCS's
+  412, a `StorageError::Status` like any other: no retry, no fallback.
+  Timeout, auth, emulator base URL and error sanitizing are `upload`'s;
+  `upload` itself is unchanged.
+
+### Dependencies
+
+- `stridelabs-gcp` now depends on `rand` 0.10 (the boundary's 128 random
+  bits; already in every StrideLabs service's graph through
+  `stridelabs-auth` and `stridelabs-observability`) and `memchr` 2 (a new
+  workspace entry; already in every graph through futures-util), and on
+  `time` 0.3 as a dev-dependency only (a reference for the hand-written RFC
+  3339 formatter). `Cargo.lock` changes only in those edges and the eight
+  versions.
+
 ## [0.7.0] - 2026-10-17
 
 Two new crates, `stridelabs-redis` and `stridelabs-gcp`, and the additive

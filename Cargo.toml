@@ -9,7 +9,7 @@ resolver = "2"
 # Lockstep versioning: every crate in this workspace ships at the same
 # version, bumped together at release time regardless of which crate(s)
 # changed. Consumers pin a single git rev/tag for the whole set.
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 rust-version = "1.97"
 license = "MIT"
@@ -151,6 +151,9 @@ url = "2"
 # stridelabs-gcp: GCS object names are percent-encoded into a path segment or
 # query value, `/` included. Already in every graph through `url` and reqwest.
 percent-encoding = "2"
+# stridelabs-gcp: finding a candidate multipart boundary in a part (`memmem`,
+# linear in a 10 MiB image). Already in every graph through futures-util.
+memchr = "2"
 
 # Test-only
 wiremock = "0.6"

@@ -2693,7 +2693,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "stridelabs-auth"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -2715,7 +2715,7 @@ dependencies = [
 
 [[package]]
 name = "stridelabs-config"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2727,17 +2727,20 @@ dependencies = [
 
 [[package]]
 name = "stridelabs-gcp"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "base64 0.22.1",
  "bytes",
  "futures",
  "jsonwebtoken",
+ "memchr",
  "percent-encoding",
+ "rand 0.10.2",
  "reqwest",
  "serde",
  "serde_json",
  "thiserror",
+ "time",
  "tokio",
  "tracing",
  "url",
@@ -2746,7 +2749,7 @@ dependencies = [
 
 [[package]]
 name = "stridelabs-http"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -2772,7 +2775,7 @@ dependencies = [
 
 [[package]]
 name = "stridelabs-mcp"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -2803,7 +2806,7 @@ dependencies = [
 
 [[package]]
 name = "stridelabs-observability"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "axum",
  "http",
@@ -2822,7 +2825,7 @@ dependencies = [
 
 [[package]]
 name = "stridelabs-redis"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "futures",
  "redis",
@@ -2835,7 +2838,7 @@ dependencies = [
 
 [[package]]
 name = "stridelabs-testing"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "axum",
  "http",

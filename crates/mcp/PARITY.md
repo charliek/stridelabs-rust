@@ -31,8 +31,10 @@ with the reason. The recurring ones:
   class)` names the class per tool; Python's `resolve_rate_class(scopes,
   override, write_scopes)` is not ported.
 - **D4 — limits are a table.** `MemoryLimiter::new` / `RedisRateLimiter::new`
-  take `(RateClass, u32)` pairs; a dynamic lookup (Python's callable `limits`)
-  is a custom `RateLimiter`.
+  take `(RateClass, u32)` pairs, per minute; `from_limits` takes
+  `RateLimit`s, each in a `Window` — the minute, or a UTC day, which has no
+  Python ancestor (v0.8.0). A dynamic lookup (Python's callable `limits`) is
+  a custom `RateLimiter`.
 - **D5 — audit vocabulary.** v0.6.0's audit line: target `stridelabs.mcp.tool`,
   snake_case fields, scope lists space-joined, outcome `internal` for
   unexpected errors (Python: `error`), and the error classes `ScopeError`,
@@ -204,6 +206,25 @@ Added, with no Python row: `limits::refused_calls_count_too`,
 `redis_live::concurrent_hits_are_counted_atomically`, and the boundary rows of
 `rate_limit_http` (the hanging, panicking and cancelled limiter; state shared
 across the per-request handler instances).
+
+The day window (v0.8.0) has no Python ancestor, so none of its tests has a
+Python row: in `limits::`, the day text's rounding
+(`the_day_refusal_says_when_00_00_utc_is_rounded_up_to_the_minute`), the
+order and counting rules (`a_minute_refusal_is_not_counted_in_the_day`,
+`a_day_refusal_still_counts_in_the_minute`), per-window rollover, forward
+motion and memory (`each_window_rolls_over_on_its_own`,
+`the_day_window_only_moves_forward_too`,
+`day_counts_are_dropped_when_the_day_rolls_over`), one clock reading per
+check, last-entry-wins and a final 0, minute-only and day-only classes, and
+concurrent threads against a day ceiling; in `redis::` (unit), the
+fail-open policy with each window's outcome scripted (a day error after a
+counted minute; a minute error skipping the day) and the key shapes; in
+`redis_live::`, the day key and its TTL, the counting rules, two limiters on
+one Redis against one day cap, the next UTC day, one reading naming every
+key, and a real partial failure (a planted day or minute key); in
+`redis_backed::`, fail-open once per check on both windows (a refused port
+and an endpoint that drops every connection) and on a day-only class; and
+`rate_limit_http::an_exceeded_day_limit_is_the_day_text_and_a_ratelimited_audit_line`.
 
 ## `test_metadata.py`
 

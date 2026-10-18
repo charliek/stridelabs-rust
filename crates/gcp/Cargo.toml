@@ -52,6 +52,12 @@ tracing = { workspace = true }
 bytes = { workspace = true }
 base64 = { workspace = true }
 percent-encoding = { workspace = true }
+# `upload_with`'s multipart boundary: 128 random bits per candidate, from the
+# OS-seeded thread RNG. Already in every StrideLabs service's graph through
+# stridelabs-auth and stridelabs-observability.
+rand = { workspace = true }
+# Checking a candidate boundary against the parts it separates.
+memchr = { workspace = true }
 
 # --- feature-gated ---------------------------------------------------------
 jsonwebtoken = { workspace = true, optional = true }
@@ -62,3 +68,7 @@ wiremock = { workspace = true }
 # Decoding the form bodies the token endpoints receive. Already in the lock
 # (reqwest depends on it).
 url = { workspace = true }
+# The reference the hand-written RFC 3339 formatter (`customTime`) is checked
+# against, across its whole range. Already in the lock (sqlx, simple_asn1);
+# a dev-dependency only, so no consumer's graph gets it from here.
+time = { workspace = true, features = ["formatting"] }

@@ -1,8 +1,9 @@
 //! A small Google Cloud Storage client over the JSON API: media upload,
-//! media download, delete, and the public object URL.
+//! multipart upload with object metadata, media download, delete, and the
+//! public object URL.
 //!
-//! Policy-free: no object naming, no bucket from the environment, no retry.
-//! The service decides those.
+//! Policy-free: no object naming, no bucket from the environment, no retry,
+//! no metadata of its own choosing. The service decides those.
 //!
 //! ```no_run
 //! # async fn example(http: reqwest::Client) -> Result<(), Box<dyn std::error::Error>> {
@@ -39,6 +40,45 @@
 //! resource — and what google-cloud-storage's `_quote` and tapper's and
 //! parcel's clients send.
 //!
+//! # Upload options
+//!
+//! [`GcsClient::upload_with`] takes [`UploadOptions`]: a `customTime`, a
+//! `cacheControl` and an `ifGenerationMatch` precondition. With none set it
+//! is [`GcsClient::upload`]'s media upload, on the wire byte for byte. With
+//! any set it is a **multipart** upload
+//! (`POST {base}/upload/storage/v1/b/{bucket}/o?uploadType=multipart[&ifGenerationMatch=N]`,
+//! `Content-Type: multipart/related; boundary=…`), the JSON API's one-request
+//! way to create an object together with its metadata:
+//!
+//! ```text
+//! --{boundary}\r\n
+//! Content-Type: application/json; charset=UTF-8\r\n
+//! \r\n
+//! {"name":…,"contentType":…[,"customTime":…][,"cacheControl":…]}\r\n
+//! --{boundary}\r\n
+//! Content-Type: {content_type}\r\n
+//! \r\n
+//! {bytes}\r\n
+//! --{boundary}--
+//! ```
+//!
+//! — the layout google-resumable-media's `construct_multipart_request` (the
+//! Python client's) sends. The metadata is serialized with serde_json (the
+//! object name is a JSON string there, not a query value), and the bytes go
+//! in unchanged. The boundary is `stridelabs-gcp-` plus 128 random bits in
+//! hex, drawn again until it appears in neither part, so no content can end
+//! a part early.
+//!
+//! Everything `upload_with` interpolates is checked first, with nothing
+//! sent: the content type and the cache control must be header values that
+//! need no trimming (visible ASCII, inner spaces and tabs, never CR or LF),
+//! a custom time must be writable in RFC 3339 (1970 to the year 9999), and a
+//! generation must not be negative ([`StorageError::InvalidArgument`]).
+//!
+//! A precondition that fails is GCS's 412, which is [`StorageError::Status`]
+//! like any non-2xx answer: nothing retries it or falls back to an upload
+//! that could overwrite.
+//!
 //! # Emulators
 //!
 //! [`GcsClient::emulator`] points the client at a fake-gcs-server or similar
@@ -65,11 +105,13 @@
 //! failure is reported as a fixed category.
 
 use std::fmt;
+use std::fmt::Write as _;
 use std::future::Future;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use reqwest::StatusCode;
+use serde::Serialize;
 
 use crate::auth::{GcpAuthError, TokenProvider};
 use crate::util::{
@@ -170,6 +212,17 @@ pub enum StorageError {
         /// routine logging. Its `Debug` prints only its length.
         message: Option<SensitiveMessage>,
     },
+    /// A value [`GcsClient::upload_with`] cannot send: a content type or
+    /// cache control that is not a plain header value, a custom time RFC
+    /// 3339 cannot write, a negative generation. Nothing was sent.
+    ///
+    /// (The last variant, added after the others, so that none of theirs
+    /// changes its discriminant.)
+    #[error("invalid GCS request argument: {reason}")]
+    InvalidArgument {
+        /// Which rule; never the value.
+        reason: &'static str,
+    },
 }
 
 impl StorageError {
@@ -184,6 +237,74 @@ impl StorageError {
             StorageError::Status { message, .. } => message.as_ref().map(SensitiveMessage::as_str),
             _ => None,
         }
+    }
+}
+
+/// Object metadata set at creation, and a precondition, for
+/// [`GcsClient::upload_with`].
+///
+/// `UploadOptions::default()` sets nothing, and the upload is
+/// [`GcsClient::upload`]'s media upload; any option set makes it a multipart
+/// upload (see [the module docs](self#upload-options)).
+///
+/// ```
+/// use std::time::{Duration, SystemTime};
+/// use stridelabs_gcp::storage::UploadOptions;
+///
+/// let options = UploadOptions::default()
+///     .with_custom_time(SystemTime::now() - Duration::from_secs(335 * 86_400))
+///     .with_if_generation_match(0) // create only: never overwrite
+///     .with_cache_control("private, max-age=86400");
+/// ```
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct UploadOptions {
+    /// The object's `customTime` (its `Custom-Time`), sent as RFC 3339 UTC
+    /// at whole seconds (`YYYY-MM-DDTHH:MM:SSZ`), the fraction truncated.
+    /// Lifecycle rules can count from it (`daysSinceCustomTime`).
+    pub custom_time: Option<SystemTime>,
+    /// The `ifGenerationMatch` precondition: the upload happens only if the
+    /// object's live generation is this one, and `0` means "only if there is
+    /// no live object of that name" — create, never overwrite. A mismatch is
+    /// GCS's 412, [`StorageError::Status`].
+    pub if_generation_match: Option<i64>,
+    /// The object's `cacheControl`, which GCS serves as the `Cache-Control`
+    /// of every read of it. Without one, a publicly readable object is
+    /// served `public, max-age=3600`: any cache, Google's edge included, may
+    /// keep it an hour, deleted or not.
+    pub cache_control: Option<String>,
+}
+
+impl UploadOptions {
+    /// Set [`UploadOptions::custom_time`].
+    #[must_use]
+    pub fn with_custom_time(mut self, time: SystemTime) -> UploadOptions {
+        self.custom_time = Some(time);
+        self
+    }
+
+    /// Set [`UploadOptions::if_generation_match`].
+    #[must_use]
+    pub fn with_if_generation_match(mut self, generation: i64) -> UploadOptions {
+        self.if_generation_match = Some(generation);
+        self
+    }
+
+    /// Set [`UploadOptions::cache_control`].
+    #[must_use]
+    pub fn with_cache_control(mut self, cache_control: impl Into<String>) -> UploadOptions {
+        self.cache_control = Some(cache_control.into());
+        self
+    }
+
+    /// Nothing set: the upload is a media upload.
+    fn is_empty(&self) -> bool {
+        let UploadOptions {
+            custom_time,
+            if_generation_match,
+            cache_control,
+        } = self;
+        custom_time.is_none() && if_generation_match.is_none() && cache_control.is_none()
     }
 }
 
@@ -299,6 +420,83 @@ impl GcsClient {
             .post(url)
             .header(reqwest::header::CONTENT_TYPE, content_type)
             .body(bytes);
+        self.bounded(OP, async {
+            let response = self.send(OP, request).await?;
+            if !response.status().is_success() {
+                return Err(status_error(OP, response).await);
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    /// Write `bytes` to `object` in `bucket` with `options`' metadata and
+    /// precondition: with none set, exactly [`GcsClient::upload`]'s media
+    /// upload; otherwise one multipart upload
+    /// (`POST {base}/upload/storage/v1/b/{bucket}/o?uploadType=multipart[&ifGenerationMatch=N]`)
+    /// whose metadata part names the object and its content type, and the
+    /// options set (see [the module docs](self#upload-options)). Without an
+    /// `ifGenerationMatch`, it replaces any object of that name.
+    ///
+    /// The timeout, the token, the emulator base URL and the errors are
+    /// [`GcsClient::upload`]'s. The multipart body is built in memory: one
+    /// copy of `bytes`.
+    ///
+    /// # Errors
+    ///
+    /// An invalid name, or [`StorageError::InvalidArgument`] for a content
+    /// type, cache control, custom time or generation it cannot send — in
+    /// every case before a token is fetched or anything is sent (unlike
+    /// `upload`, which leaves its content type to reqwest). Any non-2xx
+    /// answer is [`StorageError::Status`], a failed precondition (412)
+    /// included; nothing is retried.
+    pub async fn upload_with(
+        &self,
+        bucket: &str,
+        object: &str,
+        bytes: Bytes,
+        content_type: &str,
+        options: &UploadOptions,
+    ) -> Result<(), StorageError> {
+        const OP: &str = "upload";
+        check_bucket(bucket)?;
+        check_object(object)?;
+        check_header_value(
+            content_type,
+            "the content type must be a header value: visible ASCII, \
+             spaces and tabs only inside it",
+        )?;
+        if options.is_empty() {
+            return self.upload(bucket, object, bytes, content_type).await;
+        }
+        let metadata = metadata_json(object, content_type, options)?;
+        if options
+            .if_generation_match
+            .is_some_and(|generation| generation < 0)
+        {
+            return Err(StorageError::InvalidArgument {
+                reason: "ifGenerationMatch must not be negative",
+            });
+        }
+
+        let (boundary, body) = multipart_body(&metadata, content_type, &bytes, random_boundary);
+        let mut url = format!(
+            "{}/upload/storage/v1/b/{}/o?uploadType=multipart",
+            self.base_url,
+            encode_component(bucket)
+        );
+        if let Some(generation) = options.if_generation_match {
+            // An i64 in decimal: nothing to encode.
+            let _ = write!(url, "&ifGenerationMatch={generation}");
+        }
+        let request = self
+            .http
+            .post(url)
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                format!("multipart/related; boundary={boundary}"),
+            )
+            .body(body);
         self.bounded(OP, async {
             let response = self.send(OP, request).await?;
             if !response.status().is_success() {
@@ -484,6 +682,175 @@ fn check_object(object: &str) -> Result<(), StorageError> {
     Ok(())
 }
 
+/// Whether `value` can go into a header line as it is: non-empty, visible
+/// ASCII with spaces and tabs only inside it (nothing a parser would trim),
+/// and above all no CR or LF, which would end the line and start another.
+fn is_header_value(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let plain = |byte: &u8| *byte == b'\t' || (0x20..=0x7e).contains(byte);
+    let blank = |byte: Option<&u8>| matches!(byte, Some(b' ' | b'\t'));
+    !bytes.is_empty() && bytes.iter().all(plain) && !blank(bytes.first()) && !blank(bytes.last())
+}
+
+fn check_header_value(value: &str, reason: &'static str) -> Result<(), StorageError> {
+    if is_header_value(value) {
+        Ok(())
+    } else {
+        Err(StorageError::InvalidArgument { reason })
+    }
+}
+
+/// The metadata part of a multipart upload, as GCS's object resource names
+/// its fields. A struct, not a `serde_json::Value`: its fields serialize in
+/// this order whatever features (`preserve_order`) the graph turns on.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ObjectMetadata<'a> {
+    name: &'a str,
+    content_type: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    custom_time: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<&'a str>,
+}
+
+/// `object`'s metadata part, with `options`' fields checked first.
+fn metadata_json(
+    object: &str,
+    content_type: &str,
+    options: &UploadOptions,
+) -> Result<Vec<u8>, StorageError> {
+    let cache_control = options.cache_control.as_deref();
+    if let Some(cache_control) = cache_control {
+        check_header_value(
+            cache_control,
+            "the cache control must be a header value: visible ASCII, \
+             spaces and tabs only inside it",
+        )?;
+    }
+    let custom_time = options.custom_time.map(rfc3339).transpose()?;
+    serde_json::to_vec(&ObjectMetadata {
+        name: object,
+        content_type,
+        custom_time,
+        cache_control,
+    })
+    // Strings and nothing else: serializing cannot fail.
+    .map_err(|_| StorageError::InvalidArgument {
+        reason: "the object metadata could not be serialized",
+    })
+}
+
+/// The latest instant RFC 3339's four-digit year can write,
+/// 9999-12-31T23:59:59Z, in Unix seconds.
+const MAX_RFC3339_SECS: u64 = 253_402_300_799;
+
+/// `time` in RFC 3339, UTC, at whole seconds (`YYYY-MM-DDTHH:MM:SSZ`), the
+/// fraction truncated. Plain arithmetic rather than a date crate: this is
+/// the one date the crate writes.
+fn rfc3339(time: SystemTime) -> Result<String, StorageError> {
+    let secs = time
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| StorageError::InvalidArgument {
+            reason: "the custom time must not be before 1970-01-01T00:00:00Z",
+        })?
+        .as_secs();
+    if secs > MAX_RFC3339_SECS {
+        return Err(StorageError::InvalidArgument {
+            reason: "the custom time must be before the year 10000",
+        });
+    }
+    let (days, seconds) = (secs / 86_400, secs % 86_400);
+    let (year, month, day) = civil_from_days(days);
+    Ok(format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        seconds / 3_600,
+        seconds % 3_600 / 60,
+        seconds % 60
+    ))
+}
+
+/// The proleptic Gregorian `(year, month, day)` of `days` after 1970-01-01:
+/// Howard Hinnant's `civil_from_days`, for days on or after the epoch (so
+/// every intermediate is unsigned). Eras are 400-year cycles of 146 097
+/// days, counted from 0000-03-01 so that a leap day ends its year.
+fn civil_from_days(days: u64) -> (u64, u64, u64) {
+    let z = days + 719_468; // days since 0000-03-01
+    let era = z / 146_097;
+    let day_of_era = z - era * 146_097; // [0, 146096]
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365; // [0, 399]
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100); // [0, 365]
+    let month_index = (5 * day_of_year + 2) / 153; // [0, 11], from March
+    let day = day_of_year - (153 * month_index + 2) / 5 + 1; // [1, 31]
+    let month = if month_index < 10 {
+        month_index + 3
+    } else {
+        month_index - 9
+    }; // [1, 12]
+    let year = year_of_era + era * 400 + u64::from(month <= 2);
+    (year, month, day)
+}
+
+/// What every boundary starts with: a fixed, recognisable token prefix.
+const BOUNDARY_PREFIX: &str = "stridelabs-gcp-";
+
+/// A candidate boundary: the prefix and 128 random bits in hex. Token
+/// characters only, so the `boundary=` parameter needs no quoting, and well
+/// within RFC 2046's 70.
+fn random_boundary() -> String {
+    format!("{BOUNDARY_PREFIX}{:032x}", rand::random::<u128>())
+}
+
+/// The `multipart/related` body for a metadata part (`metadata`, JSON) and
+/// a media part (`media`, of `content_type`), and the boundary it uses: the
+/// first candidate from `boundaries` that appears in neither part, headers
+/// included. A candidate that does is discarded and the body built again —
+/// rare enough (2^-128 per byte offset for a random one) that rebuilding
+/// beats searching the media up front.
+fn multipart_body(
+    metadata: &[u8],
+    content_type: &str,
+    media: &[u8],
+    mut boundaries: impl FnMut() -> String,
+) -> (String, Vec<u8>) {
+    const METADATA_HEADER: &[u8] = b"Content-Type: application/json; charset=UTF-8\r\n\r\n";
+    loop {
+        let boundary = boundaries();
+        let delimiter = boundary.as_bytes();
+        let mut body = Vec::with_capacity(
+            metadata.len() + content_type.len() + media.len() + 3 * delimiter.len() + 96,
+        );
+        body.extend_from_slice(b"--");
+        body.extend_from_slice(delimiter);
+        body.extend_from_slice(b"\r\n");
+        let first = body.len();
+        body.extend_from_slice(METADATA_HEADER);
+        body.extend_from_slice(metadata);
+        let first_end = body.len();
+        body.extend_from_slice(b"\r\n--");
+        body.extend_from_slice(delimiter);
+        body.extend_from_slice(b"\r\n");
+        let second = body.len();
+        body.extend_from_slice(b"Content-Type: ");
+        body.extend_from_slice(content_type.as_bytes());
+        body.extend_from_slice(b"\r\n\r\n");
+        body.extend_from_slice(media);
+        let second_end = body.len();
+        body.extend_from_slice(b"\r\n--");
+        body.extend_from_slice(delimiter);
+        body.extend_from_slice(b"--");
+
+        let finder = memchr::memmem::Finder::new(delimiter);
+        if !delimiter.is_empty()
+            && finder.find(&body[first..first_end]).is_none()
+            && finder.find(&body[second..second_end]).is_none()
+        {
+            return (boundary, body);
+        }
+    }
+}
+
 fn normalize_base_url(base_url: &str) -> String {
     let base_url = base_url.trim().trim_end_matches('/');
     if base_url.contains("://") {
@@ -560,6 +927,192 @@ mod tests {
                 "{bucket:?}"
             );
         }
+    }
+
+    #[test]
+    fn custom_times_are_rfc_3339_utc_at_whole_seconds() {
+        let at = |secs: u64| rfc3339(UNIX_EPOCH + Duration::from_secs(secs)).unwrap();
+        for (secs, expected) in [
+            (0, "1970-01-01T00:00:00Z"),
+            (68_256_000, "1972-03-01T00:00:00Z"),
+            (951_782_400, "2000-02-29T00:00:00Z"),
+            (1_731_196_799, "2024-11-09T23:59:59Z"),
+            (1_760_000_000, "2025-10-09T08:53:20Z"),
+            (4_102_444_800, "2100-01-01T00:00:00Z"),
+            (MAX_RFC3339_SECS, "9999-12-31T23:59:59Z"),
+        ] {
+            assert_eq!(at(secs), expected, "{secs}");
+        }
+        // Truncated, never rounded up into the next second.
+        assert_eq!(
+            rfc3339(UNIX_EPOCH + Duration::from_millis(1_760_000_000_999)).unwrap(),
+            "2025-10-09T08:53:20Z"
+        );
+    }
+
+    #[test]
+    fn a_custom_time_rfc_3339_cannot_write_is_refused() {
+        for time in [
+            UNIX_EPOCH - Duration::from_secs(1),
+            UNIX_EPOCH - Duration::from_nanos(1),
+            UNIX_EPOCH + Duration::from_secs(MAX_RFC3339_SECS + 1),
+        ] {
+            assert!(
+                matches!(rfc3339(time), Err(StorageError::InvalidArgument { .. })),
+                "{time:?}"
+            );
+        }
+    }
+
+    /// The hand-written formatter against `time`'s, across the whole
+    /// representable range: every day boundary in four centuries around the
+    /// epoch's leap-year rules, and a spread of instants up to 9999.
+    #[test]
+    fn the_formatter_agrees_with_the_time_crate_everywhere() {
+        use time::format_description::well_known::Rfc3339;
+
+        let reference = |secs: u64| {
+            time::OffsetDateTime::from_unix_timestamp(i64::try_from(secs).unwrap())
+                .unwrap()
+                .format(&Rfc3339)
+                .unwrap()
+        };
+        let mine = |secs: u64| rfc3339(UNIX_EPOCH + Duration::from_secs(secs)).unwrap();
+        // 1970 to 2370 day by day, at midnight and at the day's last second.
+        for day in 0..146_097 {
+            for secs in [day * 86_400, day * 86_400 + 86_399] {
+                assert_eq!(mine(secs), reference(secs), "{secs}");
+            }
+        }
+        // Up to 9999, at a stride coprime to the day length.
+        let mut secs = 0;
+        while secs <= MAX_RFC3339_SECS {
+            assert_eq!(mine(secs), reference(secs), "{secs}");
+            secs += 1_000_003_717;
+        }
+        assert_eq!(mine(MAX_RFC3339_SECS), reference(MAX_RFC3339_SECS));
+    }
+
+    #[test]
+    fn header_values_are_plain_visible_ascii() {
+        for value in [
+            "image/png",
+            "text/plain; charset=utf-8",
+            "private, max-age=86400",
+            "a\tb",
+            "x",
+        ] {
+            assert!(is_header_value(value), "{value:?}");
+        }
+        for value in [
+            "",
+            "image/png\r\nX-Injected: 1",
+            "image/png\n",
+            "a\rb",
+            " image/png",
+            "image/png ",
+            "\timage/png",
+            "image/\u{e9}",
+            "nul\0",
+            "del\u{7f}",
+        ] {
+            assert!(!is_header_value(value), "{value:?}");
+        }
+    }
+
+    #[test]
+    fn the_multipart_body_is_crlf_framed_metadata_first() {
+        let (boundary, body) = multipart_body(br#"{"name":"o"}"#, "image/png", b"\x89PNG", || {
+            "B0".to_owned()
+        });
+
+        assert_eq!(boundary, "B0");
+        assert_eq!(
+            body,
+            b"--B0\r\n\
+              Content-Type: application/json; charset=UTF-8\r\n\
+              \r\n\
+              {\"name\":\"o\"}\r\n\
+              --B0\r\n\
+              Content-Type: image/png\r\n\
+              \r\n\
+              \x89PNG\r\n\
+              --B0--"
+        );
+    }
+
+    /// The boundary seam, scripted: every candidate that appears in the
+    /// media, in the metadata, or in a part's header is passed over, and the
+    /// first clean one is used. The negative control takes its first.
+    #[test]
+    fn a_boundary_found_in_either_part_is_drawn_again() {
+        // The candidates drawn, and the boundary and body chosen.
+        let script = |candidates: &[&str]| {
+            let drawn = std::cell::Cell::new(0);
+            let (boundary, body) = multipart_body(
+                br#"{"name":"has-zzMETAzz-in-it"}"#,
+                "image/zzheadzz",
+                b"bytes with zzMEDIAzz inside",
+                || {
+                    let candidate = candidates[drawn.get()].to_owned();
+                    drawn.set(drawn.get() + 1);
+                    candidate
+                },
+            );
+            (drawn.get(), boundary, body)
+        };
+
+        // In the media, in the metadata, in the media part's header: each
+        // passed over, and the first clean candidate used.
+        let (drawn, boundary, body) = script(&["zzMEDIAzz", "zzMETAzz", "zzheadzz", "fresh"]);
+        assert_eq!((drawn, boundary.as_str()), (4, "fresh"));
+        assert!(body.starts_with(b"--fresh\r\n"));
+        assert!(body.ends_with(b"\r\n--fresh--"));
+        assert_eq!(
+            memchr::memmem::find_iter(&body, b"fresh").count(),
+            3,
+            "two delimiters and the close, nothing more"
+        );
+        assert_eq!(memchr::memmem::find_iter(&body, b"zzMEDIAzz").count(), 1);
+
+        // The negative control: a clean first candidate is the only one drawn.
+        let (drawn, boundary, _) = script(&["fresh", "never drawn"]);
+        assert_eq!((drawn, boundary.as_str()), (1, "fresh"));
+    }
+
+    #[test]
+    fn random_boundaries_are_token_characters_and_differ() {
+        let (one, two) = (random_boundary(), random_boundary());
+        for boundary in [&one, &two] {
+            let random = boundary.strip_prefix(BOUNDARY_PREFIX).expect("the prefix");
+            assert_eq!(random.len(), 32, "{boundary}");
+            assert!(random
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()));
+            assert!(boundary.len() <= 70, "RFC 2046's bound");
+        }
+        assert_ne!(one, two);
+    }
+
+    #[test]
+    fn metadata_is_json_in_a_fixed_field_order() {
+        let options = UploadOptions::default()
+            .with_cache_control("private, max-age=86400")
+            .with_custom_time(UNIX_EPOCH + Duration::from_secs(1_760_000_000))
+            .with_if_generation_match(0);
+        assert_eq!(
+            String::from_utf8(metadata_json("a/\"b\"\\c/é.png", "image/png", &options).unwrap())
+                .unwrap(),
+            r#"{"name":"a/\"b\"\\c/é.png","contentType":"image/png","customTime":"2025-10-09T08:53:20Z","cacheControl":"private, max-age=86400"}"#
+        );
+        assert_eq!(
+            metadata_json("o", "image/png", &UploadOptions::default()).unwrap(),
+            br#"{"name":"o","contentType":"image/png"}"#
+        );
+        assert!(UploadOptions::default().is_empty());
+        assert!(!UploadOptions::default()
+            .with_if_generation_match(0)
+            .is_empty());
     }
 
     #[test]
