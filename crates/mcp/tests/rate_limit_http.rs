@@ -16,15 +16,20 @@ use rmcp::service::RequestContext;
 use rmcp::{tool, tool_handler, tool_router, ErrorData, RoleServer, ServerHandler};
 use serde_json::json;
 use stridelabs_mcp::{
-    LimitFuture, McpAuthLayer, MemoryLimiter, RateClass, RateLimiter, ToolCall, AUDIT_TARGET,
+    LimitFuture, McpAuthLayer, MemoryLimiter, RateClass, RateLimit, RateLimiter, ToolCall,
+    AUDIT_TARGET,
 };
 use support::*;
 use tokio::sync::Notify;
 
 const GENERATE: RateClass = RateClass("generate");
 const FREE: RateClass = RateClass("free");
+/// Limited per minute and per day.
+const DAILY: RateClass = RateClass("daily");
 
 /// 1_000_040 is 20 s into its minute: every refusal here says "Retry in 40".
+/// It is also 49 640 s into its UTC day: 36 760 s are left, 10 h 13 min
+/// rounded up.
 const NOW: u64 = 1_000_040;
 
 // --- limiters ---------------------------------------------------------------
@@ -101,11 +106,13 @@ impl Limiters {
     fn new() -> Limiters {
         Limiters {
             recording: Arc::new(Recording {
-                inner: MemoryLimiter::new([
-                    (RateClass::READ, 3),
-                    (RateClass::WRITE, 1),
-                    (GENERATE, 2),
-                    (FREE, 0),
+                inner: MemoryLimiter::from_limits([
+                    RateLimit::per_minute(RateClass::READ, 3),
+                    RateLimit::per_minute(RateClass::WRITE, 1),
+                    RateLimit::per_minute(GENERATE, 2),
+                    RateLimit::per_minute(FREE, 0),
+                    RateLimit::per_minute(DAILY, 5),
+                    RateLimit::per_day(DAILY, 2),
                 ])
                 .with_clock(|| NOW),
                 checks: Mutex::default(),
@@ -165,6 +172,12 @@ impl Limited {
     #[tool(description = "Generate class.")]
     async fn generate(&self, ctx: RequestContext<RoleServer>) -> Result<CallToolResult, ErrorData> {
         let call = ToolCall::new("generate").rate_limit(self.recording(), GENERATE);
+        self.run(&ctx, call).await
+    }
+
+    #[tool(description = "Daily class: 5 a minute, 2 a day.")]
+    async fn daily(&self, ctx: RequestContext<RoleServer>) -> Result<CallToolResult, ErrorData> {
+        let call = ToolCall::new("daily").rate_limit(self.recording(), DAILY);
         self.run(&ctx, call).await
     }
 
@@ -304,6 +317,34 @@ async fn an_exceeded_limit_is_pythons_text_and_a_ratelimited_audit_line() {
     assert_eq!(
         app.limiters.bodies.load(Ordering::SeqCst),
         1,
+        "the refused body never ran"
+    );
+}
+
+/// A day refusal reaches the model and the audit line exactly as a minute
+/// one does, with the day's text.
+#[tokio::test]
+async fn an_exceeded_day_limit_is_the_day_text_and_a_ratelimited_audit_line() {
+    let (capture, _guard) = Capture::install();
+    let app = start().await;
+    let alice = token("alice", "notes:read");
+
+    for _ in 0..2 {
+        assert!(!is_error(&call(&app.base, &alice, "daily").await));
+        capture.one_audit_line();
+    }
+    let refused = call(&app.base, &alice, "daily").await;
+
+    assert!(is_error(&refused), "{refused}");
+    let text = "Rate limit exceeded for daily operations (2 per day). \
+                The limit resets at 00:00 UTC, in 10 h 13 min.";
+    assert_eq!(text_of(&refused), text);
+    let line = capture.one_audit_line();
+    assert_eq!(line.field("outcome"), Some("ratelimited"));
+    assert_eq!(line.field("error_class"), Some("RateLimited"));
+    assert_eq!(
+        app.limiters.bodies.load(Ordering::SeqCst),
+        2,
         "the refused body never ran"
     );
 }

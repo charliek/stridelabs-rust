@@ -51,11 +51,12 @@ crypto provider").
 
 ```toml
 [dependencies]
-stridelabs-gcp = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.7.0", features = ["service-account-key", "vertex"] }
+stridelabs-gcp = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.8.0", features = ["service-account-key", "vertex"] }
 ```
 
-(`v0.7.0` is the first release with this crate. During development against
-an unreleased commit, pin `rev = "<sha>"` instead of `tag`; see the workspace
+(`v0.7.0` is the first release with this crate; `upload_with` and
+`UploadOptions` are new in `v0.8.0`. During development against an
+unreleased commit, pin `rev = "<sha>"` instead of `tag`; see the workspace
 root README for the local `[patch]` co-development snippet.)
 
 A service that runs only on ADC (the metadata server in production, a
@@ -211,6 +212,7 @@ let url = public_url(bucket, "user/20261017-120000-ab12cd34.png")?;
 | Call | Request | Result |
 |---|---|---|
 | `upload(bucket, object, Bytes, content_type)` | `POST {base}/upload/storage/v1/b/{bucket}/o?uploadType=media&name={object}` | `()`; any non-2xx is an error |
+| `upload_with(bucket, object, Bytes, content_type, &UploadOptions)` | default options: `upload`'s request, byte for byte; otherwise `POST {base}/upload/storage/v1/b/{bucket}/o?uploadType=multipart[&ifGenerationMatch=N]` (below) | `()`; any non-2xx is an error, a failed precondition's 412 included |
 | `download(bucket, object)` | `GET {base}/storage/v1/b/{bucket}/o/{object}?alt=media` | `Some((bytes, content_type))`, or `None` on 404 |
 | `delete(bucket, object)` | `DELETE {base}/storage/v1/b/{bucket}/o/{object}` | `true` if deleted, `false` on 404 |
 | `public_url(bucket, object)` | (none) | `Ok("https://storage.googleapis.com/{bucket}/{object}")`, with the object's `/` kept |
@@ -244,7 +246,8 @@ let url = public_url(bucket, "user/20261017-120000-ab12cd34.png")?;
   the cap, reading stops and the result is `StorageError::TooLarge`. An
   error body is read only as far as its first 16 KiB.
 - **Errors.** `StorageError::{InvalidBucketName, InvalidObjectName, Auth,
-  Request, Timeout, TooLarge, Status}` names the operation.
+  Request, Timeout, TooLarge, Status, InvalidArgument}` names the
+  operation.
   - **`Display` and `Debug` are safe for routine logs.** They carry the HTTP
     status and, from Google's JSON envelope, `error.status` when it matches
     `[A-Za-z0-9_.-]{1,64}` (for example `GCS upload answered HTTP 403
@@ -256,6 +259,53 @@ let url = public_url(bucket, "user/20261017-120000-ab12cd34.png")?;
     because GCS messages name the object.
   - A body that is not the envelope, such as an HTML proxy page,
     contributes nothing beyond the status code.
+
+### `upload_with`: object metadata at creation
+
+```rust
+use stridelabs_gcp::storage::UploadOptions;
+
+let options = UploadOptions::default()
+    .with_custom_time(custom_time)                // the lifecycle's clock
+    .with_if_generation_match(0)                  // create only, never overwrite
+    .with_cache_control("private, max-age=86400");
+gcs.upload_with(bucket, &object, bytes, "image/png", &options).await?;
+```
+
+`UploadOptions` is `#[non_exhaustive]` (build it from `default()` and the
+`with_*` setters):
+
+| Option | Sent as | Rule |
+|---|---|---|
+| `custom_time: Option<SystemTime>` | metadata `customTime`, RFC 3339 UTC at whole seconds (`2025-10-09T08:53:20Z`), the fraction truncated | 1970-01-01 to 9999-12-31, else `StorageError::InvalidArgument` |
+| `cache_control: Option<String>` | metadata `cacheControl`, which GCS serves as every read's `Cache-Control` (a public object without one is served `public, max-age=3600`, so an edge cache may keep it an hour) | a header value: non-empty visible ASCII, spaces and tabs only inside, never CR or LF |
+| `if_generation_match: Option<i64>` | the `ifGenerationMatch` query parameter; `0` means only if no live object of that name exists | not negative |
+
+- **Default options are the media upload**, the request `upload` sends.
+  Any option set makes it a **multipart** upload, the JSON API's
+  one-request way to create an object with metadata. The body is the layout
+  google-resumable-media (the Python client) sends, framed with CRLF:
+  `--{b}`, a `Content-Type: application/json; charset=UTF-8` part holding
+  `{"name","contentType"[,"customTime"][,"cacheControl"]}` (serde_json, in
+  that order; the name is a JSON string here, never a query value), `--{b}`,
+  a `Content-Type: {content_type}` part holding the bytes unchanged, and
+  `--{b}--`. The request's `Content-Type` is `multipart/related;
+  boundary={b}`.
+- **The boundary** is `stridelabs-gcp-` plus 128 random bits in hex, drawn
+  again until it appears in neither part (headers included), so no image
+  can end a part early.
+- **Checked before anything is sent** (no token, no request), as names
+  are, for a multipart upload: the content type (written into a part header
+  by hand, so it must be a header value), the cache control, the custom time
+  and the generation. The refusal, `StorageError::InvalidArgument { reason }`,
+  names the rule, never the value or the object. With **default options**
+  `upload_with` is `upload` itself and takes exactly the content types
+  `upload` takes (reqwest checks those).
+- **A failed precondition is a 412**, `StorageError::Status` like any
+  other non-2xx answer: no retry, and no fallback upload that would
+  overwrite.
+- Timeout, token, emulator base URL and sanitized errors are `upload`'s.
+  The body is built in memory: one copy of the bytes.
 
 ## `vertex` (feature `vertex`)
 
@@ -330,7 +380,8 @@ match first_inline_image(&vertex.generate_content(model, &request).await?) {
 
 ## Not included
 
-There is no retry or backoff, no resumable or multipart upload, no object
-metadata calls, no service-account impersonation and no workload-identity
-federation (the `external_account` family). There is no Windows
+There is no retry or backoff, no resumable upload, no object metadata
+calls beyond what `upload_with` sets at creation (no read-back, no patch),
+no service-account impersonation and no workload-identity federation (the
+`external_account` family). There is no Windows
 well-known-file lookup and no `GCE_METADATA_HOST` override.

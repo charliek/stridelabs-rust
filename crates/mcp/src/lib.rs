@@ -26,7 +26,8 @@
 //!   list tools.
 //! - [`RateLimiter`] — the rate-limit seam [`ToolCall::rate_limit`] calls
 //!   after the scope check, with [`MemoryLimiter`] (Python's fixed
-//!   one-minute window, in memory) and [`NoLimit`].
+//!   one-minute window, and a UTC day: [`RateLimit`] per [`Window`], in
+//!   memory) and [`NoLimit`].
 //! - [`SlauthPatCredential`] — slauth `slp_live_` PATs as a
 //!   [`CredentialVerifier`]: slauth's verdict, the app's ceiling scopes, and
 //!   an optional fail-through [`PatCache`].
@@ -148,7 +149,8 @@ pub use rmcp;
 
 pub use auth::{McpAuthLayer, McpAuthService, AUTH_LOG_TARGET};
 pub use limits::{
-    LimitFuture, MemoryLimiter, NoLimit, RateClass, RateLimited, RateLimiter, RATE_LIMIT_LOG_TARGET,
+    LimitFuture, MemoryLimiter, NoLimit, RateClass, RateLimit, RateLimited, RateLimiter, Window,
+    RATE_LIMIT_LOG_TARGET,
 };
 pub use metadata::metadata_router;
 pub use pat::{

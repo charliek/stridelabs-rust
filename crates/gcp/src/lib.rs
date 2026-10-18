@@ -4,8 +4,9 @@
 //!   Default Credentials (an explicit base64 key, `GOOGLE_APPLICATION_CREDENTIALS`,
 //!   gcloud's well-known file, the metadata server), with a single-flight
 //!   token cache and the quota project as part of the token.
-//! - [`storage`]: a small GCS JSON-API client — media upload, media
-//!   download, delete — and the public object URL.
+//! - [`storage`]: a small GCS JSON-API client — media upload, multipart
+//!   upload with object metadata ([`UploadOptions`]), media download,
+//!   delete — and the public object URL.
 //! - `vertex` (feature `vertex`): typed `generateContent` request and
 //!   response, the endpoint builder (the `global` host included), a thin
 //!   client, and the inline-image classifier.
@@ -39,5 +40,5 @@ pub mod vertex;
 mod util;
 
 pub use auth::{AccessToken, CredentialKind, CredentialSource, GcpAuthError, TokenProvider};
-pub use storage::{public_url, GcsClient, StorageError};
+pub use storage::{public_url, GcsClient, StorageError, UploadOptions};
 pub use util::SensitiveMessage;

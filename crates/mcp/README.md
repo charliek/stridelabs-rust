@@ -29,9 +29,10 @@ The app writes its tools as an rmcp `ServerHandler`. This crate supplies:
   rate limit, timeout, safe errors (`ToolError`), exactly one audit line per
   run. Plus `clamp_limit` / `clamp_offset` / `Page` for list tools.
 - **`RateLimiter`**: the seam `ToolCall::rate_limit` calls after the scope
-  check, with `MemoryLimiter` (Python's fixed one-minute window, in memory)
-  and `NoLimit`; `RedisRateLimiter` (feature `redis`) shares the window
-  across instances and fails open.
+  check, with `MemoryLimiter` (Python's fixed one-minute window, and a UTC
+  day: a `RateLimit` per `Window`, in memory) and `NoLimit`;
+  `RedisRateLimiter` (feature `redis`) shares the windows across instances
+  and fails open.
 - **`SlauthPatCredential`**: slauth `slp_live_` PATs as a
   `CredentialVerifier` — slauth's verdict, the app's ceiling scopes — with an
   optional fail-through `PatCache` (`RedisPatCache`, feature `redis`).
@@ -48,22 +49,23 @@ The app writes its tools as an rmcp `ServerHandler`. This crate supplies:
 
 ```toml
 [dependencies]
-stridelabs-mcp = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.7.0" }
+stridelabs-mcp = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.8.0" }
 rmcp = { version = "3.5", default-features = false, features = ["server", "macros"] }
 
 [dev-dependencies]
-stridelabs-mcp = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.7.0", features = ["test-support"] }
+stridelabs-mcp = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.8.0", features = ["test-support"] }
 ```
 
 Rate limiting, `SlauthPatCredential`, `canonical_tools_json` and the
-`cors`, `redis` and `image-fetch` features are new in v0.7.0:
+`cors`, `redis` and `image-fetch` features are new in v0.7.0; the day
+window (`Window`, `RateLimit`, `from_limits`) in v0.8.0:
 
 ```toml
 [dependencies]
-stridelabs-mcp = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.7.0", features = ["cors", "redis", "image-fetch"] }
+stridelabs-mcp = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.8.0", features = ["cors", "redis", "image-fetch"] }
 
 [dev-dependencies]
-stridelabs-mcp = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.7.0", features = ["cors", "redis", "image-fetch", "test-support"] }
+stridelabs-mcp = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.8.0", features = ["cors", "redis", "image-fetch", "test-support"] }
 ```
 
 rmcp's types are this crate's API (`ServerHandler`, `RequestContext`,
@@ -233,7 +235,8 @@ subpath.)
 | body returns `Ok(result)` | the result | `ok` (`error` if the result is itself `isError`) | — (`CallToolResult`) |
 | no principal (not behind the layer) | "Not authenticated." | `denied` | `NotAuthenticated` |
 | missing scope | "Missing required scope(s): X. This credential grants: Y. Reconnect with the required scopes to use this tool." | `denied` | `ScopeError` |
-| the rate limiter refuses | "Rate limit exceeded for {class} operations ({limit} per minute). Retry in {n} seconds." | `ratelimited` | `RateLimited` |
+| the rate limiter refuses (minute) | "Rate limit exceeded for {class} operations ({limit} per minute). Retry in {n} seconds." | `ratelimited` | `RateLimited` |
+| the rate limiter refuses (day) | "Rate limit exceeded for {class} operations ({limit} per day). The limit resets at 00:00 UTC, in {H} h {M} min." | `ratelimited` | `RateLimited` |
 | `ToolError::user(msg)` | `msg` | `error` | `ToolError::User` |
 | `ToolError::denied(msg)` | `msg` | `denied` | `ToolError::Denied` |
 | timeout (default 30 s; the rate limit check and the body together) | "The operation timed out. Please try again." | `timeout` | `Timeout` |
@@ -267,13 +270,18 @@ reaches the process's panic hook before the boundary catches it.
 
 ```rust
 use std::sync::Arc;
-use stridelabs_mcp::{MemoryLimiter, RateClass, RateLimiter, ToolCall};
+use stridelabs_mcp::{MemoryLimiter, RateClass, RateLimit, RateLimiter, ToolCall};
 
 const GENERATE: RateClass = RateClass("generate");
 
 // Once, in the app state: one limiter shared by every handler instance (the
 // stateless router builds a handler per request).
-let limiter: Arc<dyn RateLimiter> = Arc::new(MemoryLimiter::new([(RateClass::READ, 60), (GENERATE, 6)]));
+let limiter: Arc<dyn RateLimiter> = Arc::new(MemoryLimiter::from_limits([
+    RateLimit::per_minute(RateClass::READ, 60),
+    RateLimit::per_minute(GENERATE, 6),
+    RateLimit::per_day(GENERATE, 30),
+]));
+// Per-minute ceilings only: MemoryLimiter::new([(RateClass::READ, 60), (GENERATE, 6)]).
 
 // Per tool:
 ToolCall::new("create_image")
@@ -290,22 +298,35 @@ ToolCall::new("create_image")
   `timeout`, one that panics as `internal`, and a cancelled request stops
   waiting for it. (A deliberate broadening: Python's timeout covered the
   body alone.) The body gets what is left of the deadline.
-- **A fixed one-minute window**, `unix_seconds / 60` per `(subject, class)`,
-  not a sliding one; the refusal's "Retry in N seconds" is what is left of
-  the current window. A class with no limit, or a limit of 0, is not limited
-  (and not counted).
-- **`MemoryLimiter`'s windows only move forward**: it reads the clock inside
-  its lock, and a reading from an earlier window than the newest it has seen
-  (a delayed check, a clock stepped back) counts against the newest window
-  instead of reopening an old one or resetting the current one. Counts are
-  `u64`, so even a limit of `u32::MAX` refuses the call after it. An
-  injected clock (`with_clock`, on either limiter) must itself be
-  `UnwindSafe + RefUnwindSafe`.
+- **Fixed windows, aligned to the Unix epoch**, per `(subject, class)`, not
+  sliding ones: `Window::Minute` is `unix_seconds / 60` (Python's), and
+  `Window::Day` is `unix_seconds / 86_400`, the UTC day, resetting at
+  00:00 UTC. A refusal says what is left of its window: "Retry in N
+  seconds" for the minute, "in H h M min" (rounded up) for the day. A
+  class with no limit in a window, or a limit of 0, is not limited (and not
+  counted) there. `RateLimit::per_minute` / `per_day` build the entries;
+  for a repeated `(class, window)` the last entry wins, a final 0 included.
+- **Several windows: shortest first, from one clock reading.** A check
+  counts the call in each of its class's windows in order and stops at the
+  first one it exceeds. So a burst refused per minute does **not** spend the
+  day, while a call the day refuses **does** count in the minute (it got
+  that far). Fixed UTC days allow up to twice the day's ceiling across
+  midnight, the fixed-window property the minute has always had.
+- **`MemoryLimiter`'s windows only move forward**, each on its own: it
+  reads the clock inside its lock, once per check, and a reading from an
+  earlier window than the newest of that length it has seen (a delayed
+  check, a clock stepped back) counts against the newest window instead of
+  reopening an old one or resetting the current one. One critical section
+  covers all of a class's windows, so concurrent calls never over-admit in
+  any. Counts are `u64`, so even a limit of `u32::MAX` refuses the call
+  after it. An injected clock (`with_clock`, on either limiter) must itself
+  be `UnwindSafe + RefUnwindSafe`.
 - **`RateClass` is the app's vocabulary** (`RateClass("generate")`);
   `RateClass::READ` and `RateClass::WRITE` are Python's two default buckets.
-- **Implementations.** `NoLimit`; `MemoryLimiter` (in process; its counts
-  are dropped when the window rolls over, so memory is bounded by the
-  subjects active in one minute); `RedisRateLimiter` (feature `redis`, below).
+- **Implementations.** `NoLimit`; `MemoryLimiter` (in process; a window's
+  counts are dropped when it rolls over, so memory is bounded by the
+  subjects active in one window of the longest length configured: a day,
+  with a day ceiling); `RedisRateLimiter` (feature `redis`, below).
   Your own: implement `RateLimiter::check` (object-safe, a boxed `Send`
   future). Every `Err` it returns is shown to the model as a refusal; what a
   failure of its own store means is its policy — fail open, as the house
@@ -386,19 +407,29 @@ window matters more than slauth's load.
 
 ### Redis (feature `redis`)
 
-`RedisRateLimiter::new(handle, limits, prefix)` and
-`RedisPatCache::new(handle, prefix)`, on stridelabs-redis's lazy,
+`RedisRateLimiter::new(handle, limits, prefix)` (per-minute ceilings) or
+`RedisRateLimiter::from_limits(handle, rate_limits, prefix)` (any window),
+and `RedisPatCache::new(handle, prefix)`, on stridelabs-redis's lazy,
 single-flight `RedisHandle` (open it at boot: a malformed URL fails the boot,
 not every command).
 
-- The limiter's key is Python's, `{prefix}:{subject}:{class}:{unix_minute}`
+- The minute key is Python's, `{prefix}:{subject}:{class}:{unix_minute}`
   (`DEFAULT_RATE_LIMIT_PREFIX` is Python's `mcp:rl`; give each service its
-  own on a shared Redis). The hit is stridelabs-redis's atomic
-  `fixed_window_hit` (`INCR`, plus the 60 s `EXPIRE` on the first hit, in one
-  script), **never replayed** after a lost reply.
-- **It fails open**: any Redis error is a `warn` line on
-  `stridelabs.mcp.ratelimit` (`RATE_LIMIT_LOG_TARGET`) and an allowed call.
-  The limit is a cost bound, not an authorization check.
+  own on a shared Redis); the day key is
+  `{prefix}:{subject}:{class}:day:{unix_day}`. Each window is one key, hit
+  by stridelabs-redis's atomic single-key `fixed_window_hit` (`INCR`, plus
+  an `EXPIRE` of the window's length — 60 s, 86 400 s — on the first hit,
+  in one script), **never replayed** after a lost reply. No multi-key
+  script, so Upstash's and a cluster's constraints are unchanged. The TTL
+  is cleanup: the window ends when the key changes, and later hits never
+  extend it.
+- **It fails open, per check**: the first Redis error is a `warn` line on
+  `stridelabs.mcp.ratelimit` (`RATE_LIMIT_LOG_TARGET`, with `class` and
+  `window` fields) and an allowed call, and the check stops there. A minute
+  hit that succeeded before a day hit failed keeps its count (no rollback);
+  a minute hit that failed is not followed by the day. So a Redis outage
+  lifts both windows. The limit is a cost bound, not an authorization
+  check.
 - `rediss://` means rustls: stridelabs-redis installs **no** crypto provider,
   so install aws-lc-rs at startup (`stridelabs_http::tls::install_default_provider`,
   stridelabs-http feature `tls`) — see stridelabs-redis's README.
@@ -520,8 +551,9 @@ leeway, so a token a few seconds past `exp` still verifies),
 `.signed_by_untrusted_key()`, `.claim("aud", json!("other"))`,
 `.subject("")`.
 
-Offline doubles for the rest: `MemoryLimiter::new(..).with_clock(|| t)` pins
-the window (and `RedisRateLimiter::with_clock` for a live Redis test); any
+Offline doubles for the rest: `MemoryLimiter::new(..).with_clock(|| t)` (or
+`from_limits`, for a day window) pins the windows (and
+`RedisRateLimiter::with_clock` for a live Redis test); any
 `PatCache` (an in-memory map) stands in for Redis; a wiremock answering
 `POST /api/v1/pat/validate` stands in for slauth. `tests/` here has worked
 examples of each, and `PARITY.md` maps the Python package's tests onto them.
