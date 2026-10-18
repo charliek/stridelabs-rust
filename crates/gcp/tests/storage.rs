@@ -505,6 +505,57 @@ async fn upload_with_default_options_is_the_media_upload_unchanged() {
     server.verify().await;
 }
 
+/// With no options, `upload_with` accepts and refuses exactly what `upload`
+/// does — content types reqwest takes that the multipart path would not
+/// (surrounding spaces) included, and a CR/LF one refused by both without a
+/// request.
+#[tokio::test]
+async fn upload_with_default_options_takes_and_refuses_what_upload_does() {
+    for content_type in [
+        "image/png",
+        "image/png ",
+        " image/png",
+        "image/png\r\nX-Injected: CANARY",
+    ] {
+        let mut outcomes = Vec::new();
+        for via_upload_with in [false, true] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path(format!("/upload/storage/v1/b/{BUCKET}/o")))
+                .and(query_param("uploadType", "media"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"name": OBJECT})))
+                .mount(&server)
+                .await;
+            let gcs = authorized_client(&server).await;
+            let bytes = Bytes::from_static(MEDIA);
+            let result = if via_upload_with {
+                gcs.upload_with(
+                    BUCKET,
+                    OBJECT,
+                    bytes,
+                    content_type,
+                    &UploadOptions::default(),
+                )
+                .await
+            } else {
+                gcs.upload(BUCKET, OBJECT, bytes, content_type).await
+            };
+            let sent = server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|request| request.url.path().starts_with("/upload/"))
+                .count();
+            outcomes.push((result.is_ok(), sent));
+        }
+        assert_eq!(
+            outcomes[0], outcomes[1],
+            "upload vs upload_with(default) for {content_type:?}: (ok, uploads sent)"
+        );
+    }
+}
+
 #[tokio::test]
 async fn each_option_alone_and_together_is_one_exact_multipart_upload() {
     let name = r#""name":"a/b c.png","contentType":"image/png""#;
@@ -698,14 +749,14 @@ async fn unsendable_arguments_are_refused_before_anything_is_sent() {
     let defaults = UploadOptions::default;
 
     let cases = [
-        // The content type, even with no options (a media upload).
-        ("image/png\r\nX-Injected: CANARY", defaults()),
+        // The content type of a multipart upload (with no options it is
+        // `upload`'s, tested below).
         (
             "image/png\r\nX-Injected: CANARY",
             defaults().with_if_generation_match(0),
         ),
         ("", defaults().with_if_generation_match(0)),
-        (" image/png", defaults()),
+        (" image/png", defaults().with_if_generation_match(0)),
         ("image/CANARY-é", defaults().with_if_generation_match(0)),
         // The cache control.
         (

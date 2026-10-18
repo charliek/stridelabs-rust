@@ -444,12 +444,14 @@ impl GcsClient {
     ///
     /// # Errors
     ///
-    /// An invalid name, or [`StorageError::InvalidArgument`] for a content
-    /// type, cache control, custom time or generation it cannot send — in
-    /// every case before a token is fetched or anything is sent (unlike
-    /// `upload`, which leaves its content type to reqwest). Any non-2xx
-    /// answer is [`StorageError::Status`], a failed precondition (412)
-    /// included; nothing is retried.
+    /// With no options set, exactly [`GcsClient::upload`]'s. Otherwise an
+    /// invalid name, or [`StorageError::InvalidArgument`] for a content type,
+    /// cache control, custom time or generation it cannot send — in every
+    /// case before a token is fetched or anything is sent (the content type
+    /// is written into the multipart body by hand, so it is checked here
+    /// rather than left to reqwest as `upload` leaves it). Any non-2xx answer
+    /// is [`StorageError::Status`], a failed precondition (412) included;
+    /// nothing is retried.
     pub async fn upload_with(
         &self,
         bucket: &str,
@@ -459,16 +461,20 @@ impl GcsClient {
         options: &UploadOptions,
     ) -> Result<(), StorageError> {
         const OP: &str = "upload";
+        // No options: `upload` itself, so every input it accepts (and every
+        // one it refuses) behaves the same here.
+        if options.is_empty() {
+            return self.upload(bucket, object, bytes, content_type).await;
+        }
         check_bucket(bucket)?;
         check_object(object)?;
+        // Interpolated into the multipart body's part header by hand, so
+        // checked here (reqwest only checks real request headers).
         check_header_value(
             content_type,
             "the content type must be a header value: visible ASCII, \
              spaces and tabs only inside it",
         )?;
-        if options.is_empty() {
-            return self.upload(bucket, object, bytes, content_type).await;
-        }
         let metadata = metadata_json(object, content_type, options)?;
         if options
             .if_generation_match
