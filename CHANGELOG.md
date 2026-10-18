@@ -63,9 +63,10 @@ for every crate, and no dependency major changed. First consumer: imgmcp.
   serde_json metadata part (`name`, `contentType`, then `customTime` as RFC
   3339 UTC at whole seconds and `cacheControl`, when set) before the bytes,
   which go in unchanged, with a random boundary drawn again until it appears
-  in neither part. The content type, the cache control (header values: no
-  CR, LF or other control characters), the custom time (1970 to 9999) and
-  the generation (not negative) are checked before a token is fetched,
+  in neither part. On that multipart path the content type, the cache
+  control (header values: no CR, LF or other control characters), the custom
+  time (1970 to 9999) and the generation (not negative) are checked before a
+  token is fetched,
   refused as the new `StorageError::InvalidArgument { reason }` (appended
   last, so no other variant's discriminant moves), which quotes neither the
   value nor the object. A failed precondition is GCS's

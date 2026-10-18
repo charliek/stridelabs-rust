@@ -295,10 +295,12 @@ gcs.upload_with(bucket, &object, bytes, "image/png", &options).await?;
   again until it appears in neither part (headers included), so no image
   can end a part early.
 - **Checked before anything is sent** (no token, no request), as names
-  are: the content type (with default options too, unlike `upload`, which
-  leaves it to reqwest), the cache control, the custom time and the
-  generation. The refusal, `StorageError::InvalidArgument { reason }`,
-  names the rule, never the value or the object.
+  are, for a multipart upload: the content type (written into a part header
+  by hand, so it must be a header value), the cache control, the custom time
+  and the generation. The refusal, `StorageError::InvalidArgument { reason }`,
+  names the rule, never the value or the object. With **default options**
+  `upload_with` is `upload` itself and takes exactly the content types
+  `upload` takes (reqwest checks those).
 - **A failed precondition is a 412**, `StorageError::Status` like any
   other non-2xx answer: no retry, and no fallback upload that would
   overwrite.
