@@ -4,55 +4,112 @@
 //!
 //! [`JwksCache::jwks_for_kid`] returns a [`JwkSet`] that **contains** the
 //! requested `kid`, or an error. It never returns a set the caller then has to
-//! re-check.
+//! re-check, and **it never returns a set past its TTL**.
 //!
-//! Three rules decide whether that costs a network call:
+//! A set's *age* is the time since its last **successful** fetch. Every bound
+//! below is per cache instance and read off that instance's monotonic clock.
 //!
-//! 1. **Fresh hit.** The cached set is younger than [`JWKS_TTL`] *and*
-//!    contains the kid → served from memory.
-//! 2. **Miss → refetch.** Either condition failing is a miss, and a miss
-//!    refetches. Refetching on an unknown kid (rather than only on age) is
-//!    what makes a key rotation take effect in seconds instead of an hour.
-//! 3. **…but at most one refetch per [`MIN_REFETCH_INTERVAL`].** This is the
-//!    hardening that rule 2 needs. Without it, anyone can mint a syntactically
-//!    valid token carrying a random `kid` and turn every request into an
-//!    outbound HTTPS call to the issuer — a request amplifier pointed at the
-//!    single service every other service depends on. Inside the interval the
-//!    answer comes from memory, and only from a set within the *stale bound*
-//!    (below): that set if it contains the kid (a stale key beats a spurious
-//!    401 — the interval exists to protect the issuer), otherwise
-//!    [`AuthError::UnknownKid`]. With no set within the bound — nothing ever
-//!    cached, or a set past it — the last fetch failed and the error is
-//!    [`AuthError::Jwks`]. Saying "unknown key" there would blame the
-//!    caller's token for this service's outage.
+//! 1. **Fresh hit.** A set younger than its TTL ([`JWKS_TTL`], an hour) that
+//!    contains the kid is served from memory.
+//! 2. **Refresh ahead.** In the last tenth of the TTL (at least 60 s, at most
+//!    10 min: the last 6 min at the defaults), a lookup the set answers is
+//!    still served at once, and it also starts a background refresh that
+//!    nobody waits on. A failed refresh is retried 1 s after it *completed*,
+//!    doubling, at most the refetch floor (below), and the set keeps
+//!    answering until its TTL. So an issuer blip near the hour costs nothing.
+//!    Refresh-ahead needs traffic in that window, and it is off for a TTL
+//!    under three floors. Without it, the first lookup at or after the TTL
+//!    fetches.
+//! 3. **Never past the TTL.** From the TTL on, the set answers nothing: a
+//!    lookup waits for the fetch in flight, or starts one, and is refused
+//!    with [`AuthError::Jwks`] if that fails. There is no stale fallback. A
+//!    key the issuer retired (say, because it leaked) stops passing this
+//!    cache no later than one TTL after the last successful fetch that still
+//!    published it, whatever the issuer is doing. (Through v0.8.0 that bound
+//!    was `ttl + min_refetch_interval`.) After a failure, the next fetch of a
+//!    needed set is allowed 1 s after that failure completed, doubling to
+//!    8 s; a lookup in between is refused at once, from memory ("recent fetch
+//!    failed; refetch suppressed"). So once the issuer is back, recovery
+//!    takes at most what is left of an attempt still failing at that moment
+//!    (up to [`FETCH_TIMEOUT`]), then the backoff (up to 8 s), then one
+//!    successful fetch (up to [`FETCH_TIMEOUT`]): about 28 s at the
+//!    defaults, and only once a lookup arrives to start that fetch.
+//! 4. **Unknown kids are rate-limited.** A set inside its TTL that lacks the
+//!    kid refetches (what makes a key rotation take effect in seconds rather
+//!    than an hour), but at most once per refetch floor, counted from the
+//!    *start* of the last attempt of any kind. Without that floor, anyone
+//!    could mint a syntactically valid token carrying a random `kid` and turn
+//!    every request into an outbound HTTPS call to the issuer: a request
+//!    amplifier pointed at the one service every other service depends on.
+//!    Inside the floor the answer is [`AuthError::UnknownKid`] from memory, the
+//!    issuer's word on which keys exist. Only a set inside its TTL gives that
+//!    verdict: without one the answer is `Jwks`, because "unknown key" would
+//!    blame the caller's token for this service's outage.
 //!
-//!    The stale bound is `ttl + min_refetch_interval` (3630 s at the
-//!    defaults), measured from the set's last **successful** fetch, never
-//!    from an attempt. Every failed attempt opens a fresh interval, so a set
-//!    bounded by the interval alone outlives any issuer outage: a key the
-//!    issuer retired — say, because it leaked — would keep verifying for as
-//!    long as the outage lasted. Bounded this way it stops verifying at most
-//!    one interval past the TTL, however many attempts fail after the last
-//!    success. With a zero interval the bound is the TTL itself: nothing is
-//!    served stale, and nothing is suppressed either.
+//! The **refetch floor** `F` is `min(min_refetch_interval, max(ttl, 1 s))`:
+//! [`MIN_REFETCH_INTERVAL`] (30 s) at the defaults; the TTL, when that is
+//! shorter, so that a TTL of 1 s or more refetches at expiry instead of
+//! waiting out an interval longer than the set lives; and never under 1 s
+//! unless the interval itself is, so a zero TTL is still rate-limited. A TTL
+//! under 1 s outlives nothing: from its expiry until `F` after the last
+//! completed attempt, a lookup is refused ("key set expired inside the
+//! minimum refetch spacing; refetch suppressed"). A zero TTL caches nothing:
+//! a fetched set answers only the lookups that waited on that fetch, and
+//! fetches start at most once per `F`, which is 1 s while the interval is at
+//! least 1 s and the interval itself when it is shorter (zero: no limit).
 //!
-//! The cost of rule 3 is bounded and worth naming: a key rotation that lands
-//! within [`MIN_REFETCH_INTERVAL`] of the last fetch is invisible for the
-//! remainder of that interval, so tokens signed by the new key are rejected
-//! for up to 30 seconds. Issuers roll keys on the order of days.
+//! The cost of rule 4 is bounded and worth naming: a key rotation that lands
+//! within the floor of the last attempt is invisible for the rest of it, so
+//! tokens signed by the new key are rejected for up to 30 seconds. A failed
+//! attempt counts, so a rotation that coincides with an issuer blip waits out
+//! both. Issuers roll keys on the order of days.
 //!
-//! A fetch *attempt* starts the interval, successful or not. A failing issuer
-//! is precisely when hammering it is least helpful. The attempt that fails
-//! answers [`AuthError::Jwks`] itself; it never falls back to the cached set.
+//! # Load on the issuer
+//!
+//! With a zero-latency failing issuer and steady traffic, one cache makes at
+//! most: one unknown-kid fetch per floor against a valid set (2 a minute);
+//! refresh-ahead attempts at the window's start plus 0, 1, 3, 7, 15 and 31 s,
+//! then one per floor (16 in the 6-minute window at the defaults); and after
+//! expiry, attempts 1, 2, 4, 8, 8 … s apart (7.5 a minute). Nobody can make
+//! the two age-driven kinds happen early. Fetch latency lowers each rate,
+//! because spacing runs from completion. v0.8.0 made 2 a minute;
+//! stridelabs-python refetches on every request once its set has expired.
+//! Replicas of one service expire, and so retry, in lockstep.
 //!
 //! # Concurrency
 //!
-//! The refetch happens while holding the write half of the lock, and the
-//! hit-check is repeated after acquiring it (double-checked locking). So a
-//! thundering herd of concurrent misses — the shape a restart or a rotation
-//! actually produces — makes **one** request; the rest wake up to a populated
-//! cache. Holding a lock across an await is usually a smell; here it is the
-//! mechanism.
+//! A fetch is single-flight and runs on a tokio task of its own, so
+//! cancelling the lookup that started it (a client disconnect, a request
+//! timeout, a task abort) never cancels it, and no lock is held across it: a
+//! fresh hit never waits behind a fetch. A lookup that needs the fetch in
+//! flight joins it, with a bound of its own: [`FETCH_TIMEOUT`] plus 1 s for
+//! a *first* attempt (one made with no failure since the last success),
+//! which the fetch's own timeout normally ends first; 2 s for a *retry*, so
+//! a black-holed issuer cannot hold every request for a whole fetch timeout
+//! over and over. A joiner that reaches its bound gets `Jwks` ("JWKS refetch
+//! still in progress") while the fetch carries on. A joiner checks the
+//! result's age again when it resumes: a set that crossed its TTL while the
+//! lookup was waiting is refused, not served (a zero TTL excepted, whose
+//! whole point is serving the joiners). A herd of concurrent misses, the
+//! shape a restart or a rotation produces, makes one request.
+//!
+//! Each bound is a timer on the joining lookup's own runtime, never on the
+//! runtime hosting the fetch: it holds whatever that one is doing, including
+//! when it is no longer being driven.
+//!
+//! **Lookups require a Tokio runtime with the time driver enabled, as
+//! reqwest does** (its timeouts need it, and so do the bounds above). The
+//! fetch is spawned on the runtime of the lookup that starts it, which
+//! therefore needs IO and time, and which **must keep being driven until the
+//! fetch ends**: a fetch on a current-thread runtime whose `block_on` has
+//! returned is frozen with it, and while it is, every lookup that needs it
+//! joins it and gives up at its bound, because the slot stays taken until
+//! that runtime finishes the fetch or is dropped. A runtime that shuts down
+//! mid-fetch drops the fetch's task; the attempt counts as a failure and its
+//! waiters get `Jwks` ("refetch aborted"). Outside any tokio runtime the
+//! cache does not panic: a refresh-ahead is skipped (the set answers), and a
+//! lookup that would start or join a fetch is `Jwks` ("no tokio runtime to
+//! fetch the JWKS on").
 //!
 //! # Departures from the original implementation this crate replaced
 //!
@@ -63,25 +120,70 @@
 //! isolated cache needs — silently shared one key set.
 
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 use std::time::{Duration, Instant};
 
+use futures_util::future::{BoxFuture, FutureExt as _, Shared};
 use jsonwebtoken::jwk::JwkSet;
-use tokio::sync::RwLock;
+use tokio::sync::oneshot;
+use tracing::Instrument as _;
 
 use crate::config::redact_url;
 use crate::error::AuthError;
 
-/// How long a fetched key set is considered fresh.
+/// How long a fetched key set is served: the most it is ever served for,
+/// counted from its last successful fetch (module docs, rule 3).
 pub const JWKS_TTL: Duration = Duration::from_secs(3600);
 
-/// The floor between two JWKS fetches, whatever the reason for the second.
+/// The floor between two fetch attempts made for an unknown kid against a
+/// set inside its TTL, and the cap on the retry spacing after a failure
+/// (module docs). Never longer than the TTL, and never under 1 s unless this
+/// interval is: [`JwksCache::with_ttl`].
 pub const MIN_REFETCH_INTERVAL: Duration = Duration::from_secs(30);
 
-/// Hard bound on a single JWKS fetch. The fetch can run under the cache's
-/// write lock, so this is the longest a hanging issuer can stall the
-/// process's verification before the attempt fails with [`AuthError::Jwks`].
+/// Hard bound on a single JWKS fetch, connect to the end of the body. A
+/// lookup that joins a first attempt waits at most this plus 1 s, so a
+/// hanging issuer holds such a lookup until the attempt fails with
+/// [`AuthError::Jwks`] and no longer. A lookup that joins a retry waits at
+/// most 2 s (module docs, "Concurrency").
 pub const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a lookup waits on a retry, an attempt made after a failure,
+/// before giving up on it while it carries on.
+const RETRY_JOIN_WAIT: Duration = Duration::from_secs(2);
+
+/// How much longer than the fetch timeout a lookup waits on a first attempt:
+/// room for the fetch's own timeout to end the attempt first, so that the
+/// lookup gets the attempt's real outcome, and an end to the wait if the
+/// runtime hosting the fetch has stopped running it.
+const FIRST_JOIN_MARGIN: Duration = Duration::from_secs(1);
+
+/// The floor's own floor: below it only an explicitly sub-second interval
+/// takes the floor (module docs).
+const FLOOR_MIN: Duration = Duration::from_secs(1);
+
+/// The refresh window is a tenth of the TTL, clamped to these.
+const WINDOW_MIN: Duration = Duration::from_secs(60);
+const WINDOW_MAX: Duration = Duration::from_secs(600);
+
+/// The first retry spacing after a failure, doubling from there. Whole
+/// seconds, which `Tuning::backoff` relies on.
+const BACKOFF_START: Duration = Duration::from_secs(1);
+const _: () = assert!(BACKOFF_START.subsec_nanos() == 0);
+
+/// The cap on the retry spacing once the set has expired: what bounds
+/// recovery after the issuer returns.
+const EXPIRED_BACKOFF_MAX: Duration = Duration::from_secs(8);
+
+/// v0.8.0's text, kept: no usable set, and a failure too recent to retry.
+const SUPPRESSED: &str = "recent fetch failed; refetch suppressed";
+/// No usable set and no failure: only a TTL under 1 s, whose set expires
+/// inside the floor, gets here.
+const TOO_SOON: &str = "key set expired inside the minimum refetch spacing; refetch suppressed";
+const STILL_IN_PROGRESS: &str = "JWKS refetch still in progress";
+const EXPIRED_BEFORE_USE: &str = "key set expired before the lookup could use it";
+const ABORTED: &str = "refetch aborted";
+const NO_RUNTIME: &str = "no tokio runtime to fetch the JWKS on";
 
 /// A JWKS endpoint plus the last thing it said.
 ///
@@ -89,104 +191,309 @@ pub const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 /// inside its `Arc`, which is the intended way to hold it.
 ///
 /// `Debug` prints the JWKS URL without its userinfo, query or fragment, as
-/// [`crate::SlauthConfig`]'s does.
+/// [`crate::SlauthConfig`]'s does, then the tuning and the cache state (or
+/// `<locked>` if another thread holds it at that instant).
 pub struct JwksCache {
+    tuning: Tuning,
+    inner: Arc<Inner>,
+}
+
+/// What a fetch task shares with the cache, and so outlives a lookup.
+struct Inner {
     jwks_url: String,
     http: reqwest::Client,
-    tuning: Tuning,
-    state: RwLock<State>,
+    state: Mutex<State>,
+    /// Test seam: the clock is frozen at this cache's construction and moves
+    /// only when a test advances it, so no scheduler pause can carry a gate
+    /// past its edge, and a test carries a set through its TTL without
+    /// waiting an hour. The network timeouts stay on the real clock.
+    #[cfg(test)]
+    clock: Mutex<Instant>,
+    /// Test seam: how many upcoming fetches panic instead of fetching.
+    #[cfg(test)]
+    panics_left: std::sync::atomic::AtomicUsize,
 }
 
 impl fmt::Debug for JwksCache {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("JwksCache")
-            .field("jwks_url", &redact_url(&self.jwks_url))
+        let mut debug = f.debug_struct("JwksCache");
+        debug
+            .field("jwks_url", &redact_url(&self.inner.jwks_url))
             // Never the client itself: reqwest::Client's Debug prints its
             // default headers, and an injected client may carry credentials.
             .field("http", &format_args!("reqwest::Client {{ .. }}"))
-            .field("tuning", &self.tuning)
-            .field("state", &self.state)
-            .finish()
+            .field("tuning", &self.tuning);
+        // `try_lock`: a `Debug` reached while this thread holds the state (a
+        // log line formatting the cache) must not deadlock on it.
+        match self.inner.state.try_lock() {
+            Ok(state) => debug.field("state", &*state),
+            Err(TryLockError::Poisoned(poisoned)) => debug.field("state", &*poisoned.into_inner()),
+            Err(TryLockError::WouldBlock) => debug.field("state", &format_args!("<locked>")),
+        };
+        debug.finish()
     }
 }
 
-/// The two durations of the cache contract: [`JWKS_TTL`] and
+/// The durations of the cache contract: [`JWKS_TTL`] and
 /// [`MIN_REFETCH_INTERVAL`] unless [`JwksCache::with_ttl`] or
-/// [`JwksCache::with_min_refetch_interval`] replaced them.
+/// [`JwksCache::with_min_refetch_interval`] replaced them, and the two
+/// fetch-side bounds, which only the crate's tests replace.
 ///
 /// Private so that consumers reach the durations through those builders,
-/// never a struct literal, and a third one can join without a breaking
-/// change.
+/// never a struct literal, and another one can join without a breaking
+/// change. Everything derived from them saturates or is checked, because the
+/// builders take any `Duration`.
 #[derive(Debug, Clone, Copy)]
 struct Tuning {
     ttl: Duration,
     min_refetch_interval: Duration,
+    fetch_timeout: Duration,
+    /// How long a lookup waits on a first attempt: [`FETCH_TIMEOUT`] plus
+    /// [`FIRST_JOIN_MARGIN`], unless a test replaced it.
+    first_join_wait: Duration,
+    retry_join_wait: Duration,
 }
 
 impl Default for Tuning {
     fn default() -> Tuning {
-        Tuning {
-            ttl: JWKS_TTL,
-            min_refetch_interval: MIN_REFETCH_INTERVAL,
-        }
+        Tuning::new(JWKS_TTL, MIN_REFETCH_INTERVAL)
     }
 }
 
 impl Tuning {
-    /// The oldest a set may be, counted from its last successful fetch, and
-    /// still answer a lookup inside the refetch interval (module docs, rule
-    /// 3). Saturating: [`JwksCache::with_ttl`] takes any `Duration`, and
-    /// `Duration + Duration` panics on overflow.
-    fn stale_bound(&self) -> Duration {
-        self.ttl.saturating_add(self.min_refetch_interval)
+    const fn new(ttl: Duration, min_refetch_interval: Duration) -> Tuning {
+        Tuning {
+            ttl,
+            min_refetch_interval,
+            fetch_timeout: FETCH_TIMEOUT,
+            first_join_wait: FETCH_TIMEOUT.saturating_add(FIRST_JOIN_MARGIN),
+            retry_join_wait: RETRY_JOIN_WAIT,
+        }
+    }
+
+    /// `F = min(interval, max(ttl, 1 s))` (module docs). Never longer than a
+    /// TTL of 1 s or more, or the cache could not refetch a healthy issuer's
+    /// set between its expiry and the floor's end. Never shorter than 1 s for
+    /// a shorter TTL, or a zero TTL would turn the rate limit off.
+    fn floor(&self) -> Duration {
+        self.min_refetch_interval.min(self.ttl.max(FLOOR_MIN))
+    }
+
+    /// `W`: a tenth of the TTL clamped to [60 s, 10 min], and at most
+    /// `ttl - floor` so that one floor of the TTL is outside it. Zero, so no
+    /// refresh-ahead, unless the TTL holds three floors: a shorter TTL leaves
+    /// no room for a refresh and its retry before expiry, so the first lookup
+    /// after expiry fetches instead.
+    fn refresh_window(&self) -> Duration {
+        let floor = self.floor();
+        match floor.checked_mul(3) {
+            Some(three_floors) if self.ttl >= three_floors => (self.ttl / 10)
+                .clamp(WINDOW_MIN, WINDOW_MAX)
+                .min(self.ttl.saturating_sub(floor)),
+            _ => Duration::ZERO,
+        }
+    }
+
+    /// `R = ttl - W`: the age from which a lookup the set answers also
+    /// starts a background refresh.
+    fn refresh_at(&self) -> Duration {
+        self.ttl.saturating_sub(self.refresh_window())
+    }
+
+    /// The spacing after `failures` consecutive failed or aborted attempts,
+    /// from the last one's completion, while the set still answers:
+    /// `min(1 s × 2^(n-1), floor)`, and the floor itself after a success.
+    fn window_backoff(&self, failures: u32) -> Duration {
+        self.backoff(failures, self.floor())
+    }
+
+    /// The same once the set has expired, capped at 8 s as well: the cap is
+    /// what bounds recovery after the issuer returns.
+    fn expired_backoff(&self, failures: u32) -> Duration {
+        self.backoff(failures, self.floor().min(EXPIRED_BACKOFF_MAX))
+    }
+
+    fn backoff(&self, failures: u32, cap: Duration) -> Duration {
+        let Some(doublings) = failures.checked_sub(1) else {
+            return self.floor();
+        };
+        // 2^(n-1) whole seconds, in u64 seconds so that any cap a `Duration`
+        // holds is reached exactly; only a step beyond `Duration::MAX`
+        // (2^64 s and up) saturates.
+        let step = 1u64
+            .checked_shl(doublings)
+            .and_then(|factor| BACKOFF_START.as_secs().checked_mul(factor))
+            .map_or(Duration::MAX, Duration::from_secs);
+        step.min(cap)
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct State {
-    cached: Option<CachedJwks>,
-    /// When a fetch was last *attempted* — including one that failed.
-    last_fetch: Option<Instant>,
+    /// The last successful fetch's set, written only by a success (never
+    /// under a zero TTL), so no failed or cancelled attempt can move its age.
+    cached: Option<Fetched>,
+    /// The attempt in flight, if any. Cleared only by that attempt's own
+    /// [`SlotGuard`], when it finishes, panics or is dropped.
+    in_flight: Option<InFlight>,
+    /// When the last attempt of any kind started: the unknown-kid gate.
+    last_start: Option<Instant>,
+    /// When the last attempt ended, success or failure: the retry gates.
+    last_end: Option<Instant>,
+    /// Consecutive failed or aborted attempts since the last success.
+    failures: u32,
+    next_id: u64,
 }
 
-/// The set is behind an `Arc` so that handing it to a caller is a refcount
-/// bump rather than a deep copy of every key — this happens on the fresh-hit
-/// path, i.e. on essentially every authenticated request.
-#[derive(Debug)]
-struct CachedJwks {
-    set: Arc<JwkSet>,
-    /// When the last SUCCESSFUL fetch completed: both the TTL and the stale
-    /// bound are measured from here. Only a successful fetch writes
-    /// `State::cached`, so no failed or cancelled attempt can move it.
-    fetched: Instant,
+impl fmt::Debug for State {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("State")
+            .field("cached", &self.cached)
+            .field("in_flight", &self.in_flight.is_some())
+            .field("last_start", &self.last_start)
+            .field("last_end", &self.last_end)
+            .field("failures", &self.failures)
+            .finish_non_exhaustive()
+    }
 }
 
 impl State {
-    /// The cached set, if it is within `ttl` and has the key.
-    fn fresh_with_kid(&self, kid: &str, ttl: Duration) -> Option<&Arc<JwkSet>> {
-        let cached = self.cached.as_ref()?;
-        (cached.fetched.elapsed() < ttl && cached.set.find(kid).is_some()).then_some(&cached.set)
+    fn holds(&self, id: u64) -> bool {
+        self.in_flight.as_ref().is_some_and(|slot| slot.id == id)
     }
 
-    /// The cached set, if at `now` its last successful fetch is younger than
-    /// `bound`. Deliberately blind to `last_fetch`: attempts open intervals,
-    /// and an interval must never extend the bound.
-    ///
-    /// `now` is a parameter so that the suppression arm's two checks read one
-    /// instant, and so that the bound's test can pin it to the second without
-    /// racing the clock.
-    fn within_bound(&self, bound: Duration, now: Instant) -> Option<&CachedJwks> {
-        self.cached
-            .as_ref()
-            .filter(|cached| now.saturating_duration_since(cached.fetched) < bound)
+    /// Attempt `id` ended at `now`: clear its slot, stamp the end and count
+    /// the outcome, but only while the slot still holds it, so that a stale
+    /// guard can never clear or charge a newer reservation. False, with
+    /// nothing changed, otherwise. The one transition out of an attempt:
+    /// [`SlotGuard::complete`] and the guard's `Drop` both end here.
+    fn finish(&mut self, id: u64, now: Instant, succeeded: bool) -> bool {
+        if !self.holds(id) {
+            return false;
+        }
+        self.in_flight = None;
+        self.last_end = Some(now);
+        self.failures = if succeeded {
+            0
+        } else {
+            self.failures.saturating_add(1)
+        };
+        true
     }
+}
 
-    /// The cached set, if it has the key and is within `bound` at `now`.
-    fn any_with_kid(&self, kid: &str, bound: Duration, now: Instant) -> Option<&Arc<JwkSet>> {
-        self.within_bound(bound, now)
-            .filter(|cached| cached.set.find(kid).is_some())
-            .map(|cached| &cached.set)
+/// One successful fetch: its set and when it completed, which is what a
+/// joiner re-checks the set's age against (module docs, "Concurrency").
+///
+/// The set is behind an `Arc` so that handing it to a caller is a refcount
+/// bump rather than a deep copy of every key — this happens on the fresh-hit
+/// path, i.e. on essentially every authenticated request.
+#[derive(Debug, Clone)]
+struct Fetched {
+    set: Arc<JwkSet>,
+    fetched_at: Instant,
+    /// The attempt that fetched it.
+    id: u64,
+}
+
+/// One fetch attempt as every waiter sees it: the outcome its task sends,
+/// shareable. A failure is its [`AuthError::Jwks`] message. A sender dropped
+/// unsent (a task that panicked, or was dropped before or while running)
+/// resolves it to "refetch aborted".
+type Attempt = Shared<BoxFuture<'static, Result<Fetched, String>>>;
+
+/// A new attempt's sender, and the [`Attempt`] its waiters share.
+fn attempt_channel() -> (oneshot::Sender<Result<Fetched, String>>, Attempt) {
+    let (sender, receiver) = oneshot::channel();
+    let attempt = receiver
+        .map(|sent| sent.unwrap_or_else(|_| Err(ABORTED.to_owned())))
+        .boxed()
+        .shared();
+    (sender, attempt)
+}
+
+struct InFlight {
+    id: u64,
+    /// Made after a failure, so its joiners wait at most `retry_join_wait`.
+    retry: bool,
+    attempt: Attempt,
+}
+
+/// What a lookup does, decided under the lock from the state and the clock
+/// alone (`decide`). The module docs' rules, as a table:
+///
+/// | the set | in flight | has the kid | gate | decision |
+/// |---|---|---|---|---|
+/// | `age < R` | any | yes | — | `Serve` |
+/// | `R ≤ age < T` | any | yes | none in flight and `last_end + Bw(n)` | open: `ServeAndRefresh`; closed: `Serve` |
+/// | `age < T` | yes | no | — | `Join` |
+/// | `age < T` | no | no | `last_start + F` | open: `Start`; closed: `UnknownKid` |
+/// | none, or `age ≥ T` | yes | any | — | `Join` (never the expired set) |
+/// | none, or `age ≥ T` | no | any | `last_end + Bx(n)` | open: `Start`; closed: `Suppressed`, or `TooSoon` with no failure |
+///
+/// `T` is the TTL, `R` the age the refresh window opens at, `F` the refetch
+/// floor, `Bw(n)` and `Bx(n)` the backoffs in the window and after expiry
+/// ([`Tuning`]), and `n` the failure count; `Bw(0) = Bx(0) = F`.
+enum Decision<'a> {
+    Serve(&'a Arc<JwkSet>),
+    ServeAndRefresh(&'a Arc<JwkSet>),
+    Join(&'a InFlight),
+    Start,
+    UnknownKid,
+    Suppressed,
+    TooSoon,
+}
+
+/// Pure: the state, the kid, one reading of the clock and the tuning in, a
+/// [`Decision`] out. Every gate is `elapsed >= spacing` on a saturating
+/// `elapsed`, so no instant arithmetic can overflow, and a gate with no
+/// attempt behind it is open.
+fn decide<'a>(state: &'a State, kid: &str, now: Instant, tuning: &Tuning) -> Decision<'a> {
+    let since =
+        |at: Option<Instant>| at.map_or(Duration::MAX, |at| now.saturating_duration_since(at));
+    let valid = state
+        .cached
+        .as_ref()
+        .map(|cached| (cached, now.saturating_duration_since(cached.fetched_at)))
+        .filter(|&(_, age)| age < tuning.ttl);
+    match (valid, &state.in_flight) {
+        (Some((cached, age)), in_flight) if cached.set.find(kid).is_some() => {
+            let refresh = age >= tuning.refresh_at()
+                && in_flight.is_none()
+                && since(state.last_end) >= tuning.window_backoff(state.failures);
+            if refresh {
+                Decision::ServeAndRefresh(&cached.set)
+            } else {
+                Decision::Serve(&cached.set)
+            }
+        }
+        (_, Some(in_flight)) => Decision::Join(in_flight),
+        (Some(_), None) if since(state.last_start) >= tuning.floor() => Decision::Start,
+        (Some(_), None) => Decision::UnknownKid,
+        (None, None) if since(state.last_end) >= tuning.expired_backoff(state.failures) => {
+            Decision::Start
+        }
+        (None, None) if state.failures == 0 => Decision::TooSoon,
+        (None, None) => Decision::Suppressed,
     }
+}
+
+/// Why an attempt was started: a refresh-ahead nobody waits on, or a fetch a
+/// lookup needs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Purpose {
+    RefreshAhead,
+    Needed,
+}
+
+/// A reserved attempt, not yet spawned. Built under the lock and spawned
+/// only after it is released (`start`).
+struct Reservation {
+    handle: tokio::runtime::Handle,
+    id: u64,
+    retry: bool,
+    attempt: Attempt,
+    sender: oneshot::Sender<Result<Fetched, String>>,
 }
 
 impl JwksCache {
@@ -197,29 +504,47 @@ impl JwksCache {
     /// its timeouts and proxy settings.
     pub fn new(jwks_url: impl Into<String>, http: reqwest::Client) -> JwksCache {
         JwksCache {
-            jwks_url: jwks_url.into(),
-            http,
             tuning: Tuning::default(),
-            state: RwLock::new(State::default()),
+            inner: Arc::new(Inner {
+                jwks_url: jwks_url.into(),
+                http,
+                state: Mutex::new(State::default()),
+                #[cfg(test)]
+                clock: Mutex::new(Instant::now()),
+                #[cfg(test)]
+                panics_left: std::sync::atomic::AtomicUsize::new(0),
+            }),
         }
     }
 
     /// Replace the TTL ([`JWKS_TTL`] by default): how long a fetched set is
-    /// served from memory before a lookup refetches it. It moves the stale
-    /// bound too, which is `ttl + min_refetch_interval` (module docs, rule 3).
+    /// served from memory, and the most it is ever served for, whatever the
+    /// issuer is doing (module docs, rule 3).
+    ///
+    /// A TTL below the refetch interval lowers the refetch floor `F` with
+    /// it: `F = min(interval, max(ttl, 1 s))` (module docs). A TTL of 1 s or
+    /// more is refetched at expiry rather than refused for the rest of an
+    /// interval it no longer lives through. A lookup on a sub-second TTL is
+    /// refused from its expiry until `F` after the last completed attempt:
+    /// 1 s while the interval is at least 1 s, the interval itself when it
+    /// is shorter (a 100 ms TTL under a 250 ms interval: 250 ms). A zero TTL
+    /// caches nothing: each fetch serves only the lookups that waited on it,
+    /// and fetches start at most once per `F`.
     #[must_use]
     pub fn with_ttl(mut self, ttl: Duration) -> JwksCache {
         self.tuning.ttl = ttl;
         self
     }
 
-    /// Replace the refetch floor ([`MIN_REFETCH_INTERVAL`] by default).
+    /// Replace the refetch interval ([`MIN_REFETCH_INTERVAL`] by default),
+    /// which the refetch floor is derived from (module docs).
     ///
-    /// For tests: the 30-second default is the contract. Zero turns the floor
-    /// off (every miss dials the issuer, and nothing is served stale); a short
-    /// interval lets a test watch the window open and close without a 30 s
+    /// For tests: the 30-second default is the contract. Zero turns all rate
+    /// limiting off (every miss dials the issuer, and a failure is retried at
+    /// once); a sub-second interval gives a sub-second floor; a short
+    /// interval lets a test watch a floor open and close without a 30 s
     /// sleep. A production service that lowers it reopens the request
-    /// amplifier rule 3 of the module docs exists to close.
+    /// amplifier rule 4 of the module docs exists to close.
     #[must_use]
     pub fn with_min_refetch_interval(mut self, interval: Duration) -> JwksCache {
         self.tuning.min_refetch_interval = interval;
@@ -228,89 +553,349 @@ impl JwksCache {
 
     /// The endpoint this cache reads from.
     pub fn jwks_url(&self) -> &str {
-        &self.jwks_url
+        &self.inner.jwks_url
     }
 
-    /// A key set containing `kid`, from memory or from the issuer.
+    /// A key set containing `kid`, from memory or from the issuer, and never
+    /// one past its TTL.
     ///
-    /// See the module docs for when this makes a network call. Errors are
-    /// [`AuthError::UnknownKid`] (the issuer doesn't publish that key, or
-    /// hasn't within the refetch interval) or [`AuthError::Jwks`] (the
-    /// endpoint could not be reached, answered non-2xx, answered with
-    /// something that isn't a JWKS, or — inside the refetch interval — has
-    /// not answered successfully within the stale bound; see the module
-    /// docs, rule 3).
+    /// See the module docs for when this makes a network call, and for when
+    /// it waits on one. Errors are [`AuthError::UnknownKid`] (a set inside its
+    /// TTL lacks the kid: just refetched, or within the refetch floor of the
+    /// last attempt) or [`AuthError::Jwks`]: the endpoint could not be
+    /// reached, answered non-2xx or answered with something that isn't a
+    /// JWKS; or, with no set inside its TTL, a refetch is not allowed yet,
+    /// the fetch this lookup joined outlasted its wait (2 s on a retry,
+    /// [`FETCH_TIMEOUT`] plus 1 s on a first attempt), the set it waited for
+    /// aged past its TTL first, the attempt was aborted, or there is no tokio
+    /// runtime to start or wait on a fetch on.
     ///
     /// Returned behind an `Arc`: a cache hit costs a refcount bump, not a
     /// copy of the key set.
+    ///
+    /// # Panics
+    ///
+    /// Requires a Tokio runtime with the time driver enabled, as reqwest
+    /// does: a lookup that has to wait on a fetch, polled on a runtime built
+    /// without `enable_time`, panics in tokio's timer. Outside any runtime it
+    /// never panics (module docs, "Concurrency").
     pub async fn jwks_for_kid(&self, kid: &str) -> Result<Arc<JwkSet>, AuthError> {
-        {
-            let state = self.state.read().await;
-            if let Some(set) = state.fresh_with_kid(kid, self.tuning.ttl) {
-                return Ok(Arc::clone(set));
+        let (attempt, retry) = {
+            let state = self.inner.state();
+            let now = self.inner.now();
+            match decide(&state, kid, now, &self.tuning) {
+                Decision::Serve(set) => return Ok(Arc::clone(set)),
+                Decision::ServeAndRefresh(set) => {
+                    let set = Arc::clone(set);
+                    // No runtime: the set still answers, and the refresh
+                    // waits for a lookup that has one.
+                    let _nobody_waits = self.start(state, now, Purpose::RefreshAhead);
+                    return Ok(set);
+                }
+                // A wait, like a start, needs a runtime: outside one, the
+                // lookup is refused at once (module docs, "Concurrency").
+                Decision::Join(_) if tokio::runtime::Handle::try_current().is_err() => {
+                    return Err(AuthError::Jwks(NO_RUNTIME.into()));
+                }
+                Decision::Join(in_flight) => (in_flight.attempt.clone(), in_flight.retry),
+                Decision::Start => {
+                    let Some(joined) = self.start(state, now, Purpose::Needed) else {
+                        return Err(AuthError::Jwks(NO_RUNTIME.into()));
+                    };
+                    joined
+                }
+                Decision::UnknownKid => {
+                    tracing::debug!(
+                        "unknown JWKS kid inside the refetch floor; refetch suppressed"
+                    );
+                    return Err(AuthError::UnknownKid);
+                }
+                Decision::Suppressed => {
+                    tracing::debug!("suppressing JWKS refetch after a recent failure");
+                    return Err(AuthError::Jwks(SUPPRESSED.into()));
+                }
+                Decision::TooSoon => {
+                    tracing::debug!("suppressing JWKS refetch inside the minimum spacing");
+                    return Err(AuthError::Jwks(TOO_SOON.into()));
+                }
+            }
+        };
+
+        // Every wait has a bound of its own, on this lookup's runtime (it has
+        // one: both arms above that reach here checked). Not the fetch's own
+        // timeout alone: that fires only while the runtime hosting the fetch
+        // is being driven, and this lookup may be on another runtime.
+        let wait = if retry {
+            self.tuning.retry_join_wait
+        } else {
+            self.tuning.first_join_wait
+        };
+        match tokio::time::timeout(wait, attempt).await {
+            Ok(outcome) => self.resolve(outcome, kid),
+            Err(_) => {
+                tracing::debug!("JWKS fetch still in flight; this lookup stops waiting on it");
+                Err(AuthError::Jwks(STILL_IN_PROGRESS.into()))
             }
         }
+    }
 
-        let mut state = self.state.write().await;
-
-        // Re-check under the write lock: another task may have refetched
-        // while this one waited for it.
-        if let Some(set) = state.fresh_with_kid(kid, self.tuning.ttl) {
-            return Ok(Arc::clone(set));
+    /// What a lookup that waited on an attempt gets from it (module docs,
+    /// "Concurrency").
+    fn resolve(
+        &self,
+        outcome: Result<Fetched, String>,
+        kid: &str,
+    ) -> Result<Arc<JwkSet>, AuthError> {
+        let fetched = outcome.map_err(AuthError::Jwks)?;
+        // The clock is read again, under the lock like every reading the
+        // gates use: the set may have crossed its TTL while this lookup was
+        // waiting (or before a slow caller polled it again), and rule 3 is
+        // about the moment the set is handed out. A zero TTL serves its
+        // joiners by definition.
+        let usable = {
+            let _state = self.inner.state();
+            let age = self
+                .inner
+                .now()
+                .saturating_duration_since(fetched.fetched_at);
+            self.tuning.ttl.is_zero() || age < self.tuning.ttl
+        };
+        if !usable {
+            tracing::debug!(
+                attempt = fetched.id,
+                "JWKS set expired before the lookup that waited for it could use it"
+            );
+            return Err(AuthError::Jwks(EXPIRED_BEFORE_USE.into()));
         }
-
-        if state
-            .last_fetch
-            .is_some_and(|last| last.elapsed() < self.tuning.min_refetch_interval)
-        {
-            // Bounded by the last SUCCESS, not by this interval: a run of
-            // failed attempts opens interval after interval, and none of them
-            // may keep a retired key verifying (module docs, rule 3).
-            let bound = self.tuning.stale_bound();
-            let now = Instant::now();
-            if let Some(set) = state.any_with_kid(kid, bound, now) {
-                tracing::debug!("serving a stale JWKS: refetch is within the minimum interval");
-                return Ok(Arc::clone(set));
-            }
-            tracing::debug!("suppressing JWKS refetch");
-            return Err(match state.within_bound(bound, now) {
-                Some(_) => AuthError::UnknownKid,
-                // Nothing cached, or a set past the bound — which inside the
-                // interval only a failed or cancelled attempt leaves behind
-                // (a success would have refreshed it). Either way the last
-                // attempt failed, and "unknown key" would blame the caller.
-                None => AuthError::Jwks("recent fetch failed; refetch suppressed".into()),
-            });
-        }
-
-        // The attempt timestamp is recorded BEFORE the await, for two
-        // reasons: a caller canceling the verification future mid-fetch
-        // (request timeout, task abort) must still burn the suppression
-        // window — otherwise repeated cancellation defeats the rate limit —
-        // and the documented "an attempt starts the interval" reading stays
-        // true rather than measuring from completion.
-        state.last_fetch = Some(Instant::now());
-        let set = Arc::new(self.fetch().await?);
-
-        // Replace rather than merge: a rotation that *retires* a key must
-        // actually retire it here too.
-        state.cached = Some(CachedJwks {
-            set: Arc::clone(&set),
-            fetched: Instant::now(),
-        });
-
-        match set.find(kid) {
-            Some(_) => Ok(set),
+        match fetched.set.find(kid) {
+            Some(_) => Ok(fetched.set),
             None => Err(AuthError::UnknownKid),
         }
     }
 
-    async fn fetch(&self) -> Result<JwkSet, AuthError> {
-        // Per-request timeout, because this fetch can run while the cache's
-        // write lock is held: without a bound, a hanging issuer would block
-        // every verification in the process until the socket died on its own.
-        // reqwest::Client has NO default timeout, and we can't assume the
-        // injected client configured one.
+    /// Reserve the slot for a new attempt, under the lock. `None`, with
+    /// nothing changed, outside a tokio runtime.
+    fn reserve(&self, state: &mut State, now: Instant) -> Option<Reservation> {
+        let handle = tokio::runtime::Handle::try_current().ok()?;
+        let id = state.next_id;
+        state.next_id = id.wrapping_add(1);
+        let retry = state.failures > 0;
+        let (sender, attempt) = attempt_channel();
+        state.in_flight = Some(InFlight {
+            id,
+            retry,
+            attempt: attempt.clone(),
+        });
+        state.last_start = Some(now);
+        Some(Reservation {
+            handle,
+            id,
+            retry,
+            attempt,
+            sender,
+        })
+    }
+
+    /// Start an attempt: reserve the slot, release the lock, spawn the
+    /// fetch, and return what a lookup joins (the attempt, and whether it is
+    /// a retry). `None`, with nothing changed, outside a tokio runtime.
+    ///
+    /// The lock is taken by value so that it is always released before the
+    /// spawn: nothing that runs a guard's drop — a runtime that drops the
+    /// task on the spot because it is shutting down — can then do so while
+    /// this thread holds the lock the guard takes. There is no await between
+    /// the reservation and the spawn, so no cancellation can strand a slot.
+    fn start(
+        &self,
+        mut state: MutexGuard<'_, State>,
+        now: Instant,
+        purpose: Purpose,
+    ) -> Option<(Attempt, bool)> {
+        let Reservation {
+            handle,
+            id,
+            retry,
+            attempt,
+            sender,
+        } = self.reserve(&mut state, now)?;
+        drop(state);
+        // The guard exists before the task does, so even a task dropped
+        // before its first poll clears the slot it reserved.
+        let guard = SlotGuard {
+            inner: Arc::clone(&self.inner),
+            id,
+            sender: Some(sender),
+            cache_success: !self.tuning.ttl.is_zero(),
+            purpose,
+        };
+        // A needed fetch logs inside the request that waits on it. A
+        // refresh-ahead belongs to no request: the one that triggered it has
+        // already been answered.
+        let span = match purpose {
+            Purpose::Needed => tracing::Span::current(),
+            Purpose::RefreshAhead => tracing::Span::none(),
+        };
+        drop(handle.spawn(run(guard, self.tuning.fetch_timeout).instrument(span)));
+        Some((attempt, retry))
+    }
+
+    /// Test seam: move this cache's clock forward.
+    #[cfg(test)]
+    pub(crate) fn advance_for_test(&self, by: Duration) {
+        *self
+            .inner
+            .clock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) += by;
+    }
+
+    /// Test seam: wait for the attempt in flight, if any, to finish, so that
+    /// a test asserts on the state after spawned work and not during it. The
+    /// state is final when its outcome arrives: a guard updates the state
+    /// before it sends, and clears the slot before an abort is seen.
+    #[cfg(test)]
+    pub(crate) async fn settle(&self) {
+        let attempt = self
+            .inner
+            .state()
+            .in_flight
+            .as_ref()
+            .map(|in_flight| in_flight.attempt.clone());
+        if let Some(attempt) = attempt {
+            let _outcome = attempt.await;
+        }
+    }
+}
+
+/// Attempt `guard.id`, on its own task: no caller's cancellation reaches it.
+async fn run(guard: SlotGuard, timeout: Duration) {
+    #[cfg(test)]
+    guard.inner.panic_if_asked();
+    let result = guard.inner.fetch(timeout).await;
+    guard.complete(result);
+}
+
+/// Attempt `id`'s claim on the in-flight slot, and the only way its outcome
+/// reaches the waiters.
+///
+/// Created before the task is spawned and moved into it, so it is dropped
+/// however the task ends — completed, panicked, or dropped by the runtime
+/// before its first poll or at shutdown. It touches the state only while the
+/// slot still holds attempt `id`, so a stale guard can never clear or charge
+/// a newer reservation. It is never dropped while this thread holds the
+/// state lock: [`JwksCache::start`] spawns only after releasing it, and
+/// [`SlotGuard::complete`] releases it before returning.
+struct SlotGuard {
+    inner: Arc<Inner>,
+    id: u64,
+    /// `None` once [`SlotGuard::complete`] has sent the outcome.
+    sender: Option<oneshot::Sender<Result<Fetched, String>>>,
+    /// False under a zero TTL, which caches nothing.
+    cache_success: bool,
+    purpose: Purpose,
+}
+
+impl SlotGuard {
+    /// Record the outcome and clear the slot in one critical section, then
+    /// hand the outcome to the waiters.
+    fn complete(mut self, result: Result<JwkSet, AuthError>) {
+        let outcome = {
+            let mut state = self.inner.state();
+            let now = self.inner.now();
+            let outcome = match result {
+                Ok(set) => Ok(Fetched {
+                    set: Arc::new(set),
+                    fetched_at: now,
+                    id: self.id,
+                }),
+                Err(AuthError::Jwks(message)) => Err(message),
+                Err(other) => Err(other.to_string()),
+            };
+            if state.finish(self.id, now, outcome.is_ok()) && self.cache_success {
+                if let Ok(fetched) = &outcome {
+                    // Replace rather than merge: a rotation that *retires* a
+                    // key must actually retire it here too.
+                    state.cached = Some(fetched.clone());
+                }
+            }
+            outcome
+        };
+        if self.purpose == Purpose::RefreshAhead {
+            if let Err(message) = &outcome {
+                // The message is URL-free (`fetch` renders every error
+                // `without_url()`), and nothing here names a kid or a token.
+                tracing::warn!(
+                    error = %message,
+                    "JWKS refresh-ahead failed; the cached set answers until its TTL"
+                );
+            }
+        }
+        if let Some(sender) = self.sender.take() {
+            // Every waiter may be gone; the state is updated either way.
+            let _ = sender.send(outcome);
+        }
+    }
+}
+
+impl Drop for SlotGuard {
+    fn drop(&mut self) {
+        // A no-op after `complete`; otherwise the attempt was aborted (a
+        // panic, a task dropped before or while running) and counts as a
+        // failure, stamped now, so the retry gates still apply.
+        if self.sender.is_none() {
+            return;
+        }
+        {
+            let mut state = self.inner.state();
+            let now = self.inner.now();
+            state.finish(self.id, now, false);
+        }
+        tracing::debug!("JWKS fetch attempt aborted");
+        // Dropped only now, with the slot clear: a waiter woken by it finds
+        // the state final.
+        drop(self.sender.take());
+    }
+}
+
+impl Inner {
+    /// The cache state. A std mutex: it is never held across an await, and a
+    /// panic while holding it cannot leave the state half-written.
+    fn state(&self) -> MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The clock every gate reads. Called with the state lock held, so that
+    /// the instants a lookup compares and the ones a completion writes are
+    /// ordered by the lock.
+    fn now(&self) -> Instant {
+        #[cfg(test)]
+        {
+            *self.clock.lock().unwrap_or_else(PoisonError::into_inner)
+        }
+        #[cfg(not(test))]
+        {
+            Instant::now()
+        }
+    }
+
+    #[cfg(test)]
+    fn panic_if_asked(&self) {
+        use std::sync::atomic::Ordering::SeqCst;
+        if self
+            .panics_left
+            .fetch_update(SeqCst, SeqCst, |left| left.checked_sub(1))
+            .is_ok()
+        {
+            panic!("injected JWKS fetch panic");
+        }
+    }
+
+    async fn fetch(&self, timeout: Duration) -> Result<JwkSet, AuthError> {
+        // Per-request timeout, because a lookup that joined a first attempt
+        // waits for it: without a bound, a hanging issuer would hold those
+        // lookups until the socket died on its own. reqwest::Client has NO
+        // default timeout, and we can't assume the injected client configured
+        // one.
         //
         // Every `reqwest::Error` is rendered `without_url()`: its `Display`
         // otherwise ends " for url (…)", query string included (reqwest moves
@@ -321,7 +906,7 @@ impl JwksCache {
         let response = self
             .http
             .get(&self.jwks_url)
-            .timeout(FETCH_TIMEOUT)
+            .timeout(timeout)
             .send()
             .await
             .map_err(|err| AuthError::Jwks(format!("fetch failed: {}", err.without_url())))?;
@@ -341,720 +926,4 @@ impl JwksCache {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    use super::*;
-    use crate::mock_issuer::{issuer, jwks_body, jwks_url_of, primary_issuer};
-    use crate::test_support::{TestKey, PRIMARY_KID, SECONDARY_KID};
-
-    fn cache(server: &MockServer, tuning: Tuning) -> JwksCache {
-        cache_at(jwks_url_of(server), tuning)
-    }
-
-    /// Through the public builders, so every test below exercises them.
-    fn cache_at(jwks_url: String, tuning: Tuning) -> JwksCache {
-        JwksCache::new(jwks_url, reqwest::Client::new())
-            .with_ttl(tuning.ttl)
-            .with_min_refetch_interval(tuning.min_refetch_interval)
-    }
-
-    const NO_THROTTLE: Tuning = Tuning {
-        ttl: JWKS_TTL,
-        min_refetch_interval: Duration::ZERO,
-    };
-
-    /// Small on purpose. The stale-bound tests fabricate instants under three
-    /// minutes old, and an age near the 3600 s default could exceed the
-    /// monotonic clock of a freshly booted CI VM (`earlier`'s `checked_sub`).
-    ///
-    /// Every test that reads the real clock keeps its fabricated ages at
-    /// least 15 s from each edge it asserts (TTL, interval, bound), so a
-    /// scheduler or VM pause between seeding and the lookup cannot flip the
-    /// answer. Only the pure `State` test, which passes its own `now`, checks
-    /// the bound to the second.
-    const TTL: Duration = Duration::from_secs(60);
-    const WINDOW: Duration = Duration::from_secs(30);
-    /// Stale bound: 90 s.
-    const BOUNDED: Tuning = Tuning {
-        ttl: TTL,
-        min_refetch_interval: WINDOW,
-    };
-    /// Under [`BOUNDED`]: 15 s past the TTL and 15 s inside the bound.
-    const INSIDE_THE_BOUND: Duration = Duration::from_secs(75);
-    /// Under [`BOUNDED`]: 15 s past the bound.
-    const PAST_THE_BOUND: Duration = Duration::from_secs(105);
-
-    fn secs(n: u64) -> Duration {
-        Duration::from_secs(n)
-    }
-
-    /// `by` before `at`. Fabricated rather than slept for, so the bound is
-    /// checked to the second without minutes of waiting.
-    fn earlier(at: Instant, by: Duration) -> Instant {
-        at.checked_sub(by)
-            .expect("the monotonic clock is further along than a test's fabricated age")
-    }
-
-    fn ago(age: Duration) -> Instant {
-        earlier(Instant::now(), age)
-    }
-
-    /// A state holding the primary key set, last fetched successfully at
-    /// `fetched`, whose most recent attempt was at `last_fetch`.
-    fn fetched_at(fetched: Instant, last_fetch: Option<Instant>) -> State {
-        State {
-            cached: Some(CachedJwks {
-                set: Arc::new(TestKey::primary().jwks()),
-                fetched,
-            }),
-            last_fetch,
-        }
-    }
-
-    async fn seed(cache: &JwksCache, age: Duration, last_fetch: Option<Instant>) {
-        *cache.state.write().await = fetched_at(ago(age), last_fetch);
-    }
-
-    /// Time passing, without sleeping: every instant the cache holds becomes
-    /// `by` older — including any the code under test wrote, which a re-seed
-    /// would overwrite.
-    async fn advance(cache: &JwksCache, by: Duration) {
-        let mut state = cache.state.write().await;
-        if let Some(cached) = state.cached.as_mut() {
-            cached.fetched = earlier(cached.fetched, by);
-        }
-        state.last_fetch = state.last_fetch.map(|at| earlier(at, by));
-    }
-
-    /// The outage answer: `Jwks`, from the suppression arm.
-    fn assert_suppressed_outage(result: Result<Arc<JwkSet>, AuthError>, context: &str) {
-        let Err(err) = result else {
-            panic!("{context}: served a set; expected the suppressed outage");
-        };
-        assert!(matches!(err, AuthError::Jwks(_)), "{context}: {err}");
-        assert!(err.to_string().contains("suppressed"), "{context}: {err}");
-    }
-
-    /// Requests the mock issuer has answered so far — checked mid-test, where
-    /// `expect(n)` only checks the total when the server drops.
-    async fn requests(server: &MockServer) -> usize {
-        server
-            .received_requests()
-            .await
-            .expect("wiremock records requests by default")
-            .len()
-    }
-
-    #[tokio::test]
-    async fn a_fresh_hit_costs_no_request() {
-        let server = primary_issuer(1).await;
-        let cache = cache(&server, Tuning::default());
-
-        for _ in 0..5 {
-            cache.jwks_for_kid(PRIMARY_KID).await.expect("cached");
-        }
-    }
-
-    #[tokio::test]
-    async fn an_expired_entry_is_refetched() {
-        let server = primary_issuer(2).await;
-        let cache = cache(
-            &server,
-            Tuning {
-                // Zero TTL: every lookup finds the entry already stale.
-                ttl: Duration::ZERO,
-                min_refetch_interval: Duration::ZERO,
-            },
-        );
-
-        cache.jwks_for_kid(PRIMARY_KID).await.expect("first");
-        cache.jwks_for_kid(PRIMARY_KID).await.expect("after expiry");
-    }
-
-    #[tokio::test]
-    async fn an_unknown_kid_refetches_and_picks_up_a_rotated_key() {
-        let server = MockServer::start().await;
-        // First response has only key 1; the second has only key 2, i.e. the
-        // issuer rotated between the two lookups.
-        Mock::given(method("GET"))
-            .and(path("/jwks"))
-            .respond_with(jwks_body(TestKey::primary().jwks_json()))
-            .up_to_n_times(1)
-            .expect(1)
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/jwks"))
-            .respond_with(jwks_body(TestKey::secondary().jwks_json()))
-            .expect(1)
-            .mount(&server)
-            .await;
-        let cache = cache(&server, NO_THROTTLE);
-
-        let before = cache.jwks_for_kid(PRIMARY_KID).await.expect("first key");
-        assert!(before.find(SECONDARY_KID).is_none());
-
-        let after = cache
-            .jwks_for_kid(SECONDARY_KID)
-            .await
-            .expect("rotated key");
-
-        assert!(after.find(SECONDARY_KID).is_some());
-        assert!(
-            after.find(PRIMARY_KID).is_none(),
-            "the refetched set replaces the old one; a retired key stays retired"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_kid_still_missing_after_a_refetch_is_unknown() {
-        let server = primary_issuer(2).await;
-        let cache = cache(&server, NO_THROTTLE);
-
-        cache.jwks_for_kid(PRIMARY_KID).await.expect("known key");
-        let err = cache.jwks_for_kid("no-such-kid").await.unwrap_err();
-
-        assert!(matches!(err, AuthError::UnknownKid), "{err}");
-    }
-
-    /// The first fetch ever succeeds but lacks the kid: the issuer's verdict,
-    /// not an outage. The set it brought back answers the same kid inside the
-    /// interval that fetch opened, without a second request.
-    #[tokio::test]
-    async fn a_cold_fetch_without_the_kid_is_unknown_and_opens_the_interval() {
-        let server = primary_issuer(1).await;
-        let cache = cache(&server, BOUNDED);
-
-        let err = cache
-            .jwks_for_kid("attacker-supplied-kid")
-            .await
-            .unwrap_err();
-        assert!(matches!(err, AuthError::UnknownKid), "cold fetch: {err}");
-        assert_eq!(requests(&server).await, 1, "the cold lookup dials once");
-
-        let err = cache
-            .jwks_for_kid("attacker-supplied-kid")
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(err, AuthError::UnknownKid),
-            "inside the interval: {err}"
-        );
-        assert_eq!(requests(&server).await, 1, "answered from memory");
-    }
-
-    /// A set younger than the TTL, an unknown kid, and the last attempt a
-    /// full interval ago: a rotation, picked up by one refetch rather than
-    /// after the rest of the TTL.
-    #[tokio::test]
-    async fn an_unknown_kid_outside_the_interval_refetches_and_picks_up_a_rotated_key() {
-        let server = issuer(jwks_body(TestKey::secondary().jwks_json()), 1).await;
-        let cache = cache(&server, BOUNDED);
-        // Fetched 45 s ago by the attempt then: 15 s inside the 60 s TTL, and
-        // 15 s outside the 30 s interval.
-        seed(&cache, secs(45), Some(ago(secs(45)))).await;
-
-        let after = cache
-            .jwks_for_kid(SECONDARY_KID)
-            .await
-            .expect("the rotated key, refetched");
-        assert!(after.find(SECONDARY_KID).is_some());
-        assert_eq!(requests(&server).await, 1, "one refetch");
-
-        // The refetch replaced the set and opened a new interval: the retired
-        // key is unknown now, and that is answered from memory.
-        let err = cache.jwks_for_kid(PRIMARY_KID).await.unwrap_err();
-        assert!(matches!(err, AuthError::UnknownKid), "{err}");
-        assert_eq!(requests(&server).await, 1, "answered from memory");
-    }
-
-    #[tokio::test]
-    async fn an_unknown_kid_inside_the_interval_does_not_refetch() {
-        // One request total: the lookup for the known key. The ones that
-        // follow are answered from memory, without touching the issuer.
-        let server = primary_issuer(1).await;
-        let cache = cache(&server, BOUNDED);
-
-        cache.jwks_for_kid(PRIMARY_KID).await.expect("known key");
-
-        for _ in 0..2 {
-            let err = cache
-                .jwks_for_kid("attacker-supplied-kid")
-                .await
-                .unwrap_err();
-            assert!(matches!(err, AuthError::UnknownKid), "{err}");
-        }
-
-        // Past the TTL but within the stale bound, the set is still the
-        // issuer's word on which keys exist: unknown, not an outage.
-        let attempt = cache.state.read().await.last_fetch;
-        seed(&cache, INSIDE_THE_BOUND, attempt).await;
-        let err = cache
-            .jwks_for_kid("attacker-supplied-kid")
-            .await
-            .unwrap_err();
-        assert!(matches!(err, AuthError::UnknownKid), "{err}");
-    }
-
-    #[tokio::test]
-    async fn a_stale_entry_is_served_when_a_refetch_is_suppressed() {
-        let server = primary_issuer(1).await;
-        let cache = cache(
-            &server,
-            Tuning {
-                // Stale immediately, but the interval forbids refetching —
-                // the key is still the issuer's key, so serve it.
-                ttl: Duration::ZERO,
-                min_refetch_interval: MIN_REFETCH_INTERVAL,
-            },
-        );
-
-        cache.jwks_for_kid(PRIMARY_KID).await.expect("first");
-        cache
-            .jwks_for_kid(PRIMARY_KID)
-            .await
-            .expect("stale but usable");
-
-        // ...but only within the stale bound (ttl 0 + the interval). The same
-        // set 15 s past it, with the interval still open — which only a
-        // failed attempt leaves behind — is an outage, not a key.
-        let attempt = cache.state.read().await.last_fetch;
-        seed(&cache, MIN_REFETCH_INTERVAL + secs(15), attempt).await;
-        assert_suppressed_outage(cache.jwks_for_kid(PRIMARY_KID).await, "past the bound");
-    }
-
-    #[tokio::test]
-    async fn a_suppressed_refetch_after_a_failure_reports_the_outage() {
-        let server = issuer(ResponseTemplate::new(503), 1).await;
-        let cache = cache(&server, BOUNDED);
-
-        let first = cache.jwks_for_kid(PRIMARY_KID).await.unwrap_err();
-        let second = cache.jwks_for_kid(PRIMARY_KID).await;
-
-        // With nothing ever cached, the caller's token can't be blamed.
-        assert!(matches!(first, AuthError::Jwks(_)), "{first}");
-        assert_suppressed_outage(second, "nothing ever cached");
-
-        // Nor with a set that has the kid but is past the stale bound: inside
-        // the interval the failure opened, it is no usable set at all.
-        let attempt = cache.state.read().await.last_fetch;
-        seed(&cache, PAST_THE_BOUND, attempt).await;
-        assert_suppressed_outage(
-            cache.jwks_for_kid(PRIMARY_KID).await,
-            "a set past the bound",
-        );
-    }
-
-    /// The bound is `ttl + interval`, read off the last SUCCESS whatever
-    /// `last_fetch` says: every state here has an attempt stamped at `now`,
-    /// i.e. sits inside an interval a failure opened. One fixed `now`, so the
-    /// edges are checked to the second with no clock to race.
-    #[test]
-    fn the_stale_bound_is_ttl_plus_one_window_past_the_last_success() {
-        let now = Instant::now();
-        let just_failed = |age| fetched_at(earlier(now, age), Some(now));
-        let served = |state: &State, tuning: Tuning| {
-            let bound = tuning.stale_bound();
-            let served = state.within_bound(bound, now).is_some();
-            assert_eq!(
-                state.any_with_kid(PRIMARY_KID, bound, now).is_some(),
-                served,
-                "the kid lookup obeys the same bound"
-            );
-            served
-        };
-
-        assert!(served(&just_failed(secs(89)), BOUNDED), "inside the bound");
-        assert!(
-            !served(&just_failed(secs(90)), BOUNDED),
-            "the bound itself is past it"
-        );
-        assert!(
-            !served(&just_failed(secs(91)), BOUNDED),
-            "fetched 91 s ago: a fresh attempt stamp must not stretch the bound"
-        );
-
-        // A zero interval: the bound is the TTL — nothing is served stale.
-        let unthrottled = Tuning {
-            ttl: TTL,
-            min_refetch_interval: Duration::ZERO,
-        };
-        assert!(served(&just_failed(secs(59)), unthrottled));
-        assert!(!served(&just_failed(secs(61)), unthrottled));
-
-        // `with_ttl` takes any `Duration`; the bound saturates, not panics.
-        let forever = Tuning {
-            ttl: Duration::MAX,
-            min_refetch_interval: WINDOW,
-        };
-        assert_eq!(forever.stale_bound(), Duration::MAX);
-        assert!(served(&just_failed(secs(91)), forever));
-
-        // Never fetched successfully: nothing to serve, whatever the interval.
-        assert!(!served(&State::default(), BOUNDED));
-    }
-
-    /// The suppressed rows of the behaviour table through the public entry
-    /// point. Every lookup sits inside an interval a failed attempt opened,
-    /// so none may dial (`expect(0)`, and `last_fetch` must not move).
-    #[tokio::test]
-    async fn a_suppressed_lookup_past_the_bound_is_an_outage_not_a_verdict() {
-        let server = primary_issuer(0).await;
-        let cache = cache(&server, BOUNDED);
-        let attempt = Some(Instant::now());
-
-        // Past the bound: an outage whether or not the set has the kid.
-        seed(&cache, PAST_THE_BOUND, attempt).await;
-        for kid in [PRIMARY_KID, "attacker-supplied-kid"] {
-            assert_suppressed_outage(cache.jwks_for_kid(kid).await, kid);
-        }
-        assert_eq!(cache.state.read().await.last_fetch, attempt, "not dialed");
-
-        // Past the TTL but within the bound: still the issuer's word.
-        seed(&cache, INSIDE_THE_BOUND, attempt).await;
-        cache
-            .jwks_for_kid(PRIMARY_KID)
-            .await
-            .expect("stale but bounded");
-        let err = cache
-            .jwks_for_kid("attacker-supplied-kid")
-            .await
-            .unwrap_err();
-        assert!(matches!(err, AuthError::UnknownKid), "{err}");
-        assert_eq!(cache.state.read().await.last_fetch, attempt, "not dialed");
-    }
-
-    /// The module's claim that a caller cancelling mid-fetch still burns the
-    /// interval — and that the cancelled attempt, not being a success, leaves
-    /// the bound where the last success put it.
-    #[tokio::test]
-    async fn a_cancelled_fetch_burns_the_window_and_does_not_move_the_bound() {
-        // Accepts the connection (the kernel backlog does) and never answers,
-        // so the fetch hangs until it is dropped.
-        let silent = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a silent listener");
-        let url = format!(
-            "http://{}/jwks",
-            silent.local_addr().expect("listener address")
-        );
-        let cache = cache_at(url, BOUNDED);
-        // Past the TTL, so the lookup dials; no attempt yet, so it may.
-        seed(&cache, PAST_THE_BOUND, None).await;
-        let last_success = cache.state.read().await.cached.as_ref().map(|c| c.fetched);
-
-        let cancelled =
-            tokio::time::timeout(Duration::from_millis(200), cache.jwks_for_kid(PRIMARY_KID)).await;
-        assert!(cancelled.is_err(), "the fetch hung and was cancelled");
-
-        let state = cache.state.read().await;
-        assert!(
-            state.last_fetch.is_some_and(|at| at.elapsed() < WINDOW),
-            "the cancelled attempt opened an interval"
-        );
-        assert_eq!(
-            state.cached.as_ref().map(|c| c.fetched),
-            last_success,
-            "a cancelled attempt is not a success"
-        );
-        drop(state);
-
-        assert_suppressed_outage(
-            cache.jwks_for_kid(PRIMARY_KID).await,
-            "inside that interval, past the bound",
-        );
-        drop(silent);
-    }
-
-    /// The outage timeline the bound exists for, compressed with `advance`
-    /// (t counts from the last success). Two attempts reach the issuer and
-    /// both fail; no run of them revives the set.
-    ///
-    /// The interval here is 60 s (TTL 60 s, bound 120 s), not 30 s: one
-    /// interval must hold a lookup inside the bound and one past it, each
-    /// 15 s from the bound and from the interval's own end, which takes an
-    /// interval of at least 45 s.
-    #[tokio::test]
-    async fn failed_attempts_never_extend_the_stale_bound() {
-        let server = issuer(ResponseTemplate::new(503), 2).await;
-        let cache = cache(
-            &server,
-            Tuning {
-                ttl: TTL,
-                min_refetch_interval: secs(60),
-            },
-        );
-        // t = 90: 30 s past the TTL, and the last attempt — the success
-        // itself — 30 s outside the interval.
-        seed(&cache, secs(90), Some(ago(secs(90)))).await;
-        let last_success = cache.state.read().await.cached.as_ref().map(|c| c.fetched);
-
-        let err = cache.jwks_for_kid(PRIMARY_KID).await.unwrap_err();
-        assert!(
-            matches!(&err, AuthError::Jwks(detail) if detail.contains("503")),
-            "attempt 1 dials, and the failure is its own answer: {err}"
-        );
-        assert_eq!(
-            cache.state.read().await.cached.as_ref().map(|c| c.fetched),
-            last_success,
-            "a failed attempt is not a success"
-        );
-        // Inside attempt 1's interval, and 30 s inside the bound.
-        cache
-            .jwks_for_kid(PRIMARY_KID)
-            .await
-            .expect("inside attempt 1's interval and the bound: stale but served");
-
-        // t = 135: the same interval (15 s before it ends), now 15 s past the
-        // bound.
-        advance(&cache, secs(45)).await;
-        assert_suppressed_outage(cache.jwks_for_kid(PRIMARY_KID).await, "t = 135");
-
-        // t = 165: the interval closed 15 s ago, so attempt 2 dials — and
-        // fails.
-        advance(&cache, secs(30)).await;
-        let err = cache.jwks_for_kid(PRIMARY_KID).await.unwrap_err();
-        assert!(
-            matches!(&err, AuthError::Jwks(detail) if detail.contains("503")),
-            "attempt 2 dials, and the failure is its own answer: {err}"
-        );
-        assert_suppressed_outage(
-            cache.jwks_for_kid(PRIMARY_KID).await,
-            "inside attempt 2's interval",
-        );
-    }
-
-    #[tokio::test]
-    async fn a_non_2xx_response_is_a_jwks_error() {
-        let server = issuer(ResponseTemplate::new(500), 1).await;
-        let cache = cache(&server, Tuning::default());
-
-        let err = cache.jwks_for_kid(PRIMARY_KID).await.unwrap_err();
-
-        assert!(matches!(err, AuthError::Jwks(_)), "{err}");
-        assert!(err.to_string().contains("500"));
-    }
-
-    #[tokio::test]
-    async fn a_malformed_body_is_a_jwks_error() {
-        let server = issuer(jwks_body("{\"keys\": \"not a list\"}"), 1).await;
-        let cache = cache(&server, Tuning::default());
-
-        let err = cache.jwks_for_kid(PRIMARY_KID).await.unwrap_err();
-
-        assert!(matches!(err, AuthError::Jwks(_)), "{err}");
-        assert!(err.to_string().contains("not a valid JWKS"));
-    }
-
-    #[tokio::test]
-    async fn an_unreachable_endpoint_is_a_jwks_error() {
-        // Port 1 on loopback: nothing listens, and no request escapes the host.
-        let cache = JwksCache::new("http://127.0.0.1:1/jwks", reqwest::Client::new());
-
-        let err = cache.jwks_for_kid(PRIMARY_KID).await.unwrap_err();
-
-        assert!(matches!(err, AuthError::Jwks(_)), "{err}");
-    }
-
-    // --- the URL canary ----------------------------------------------------
-    //
-    // A JWKS URL is configuration, and configuration can carry a credential:
-    // userinfo in the authority, a token in the query. Each marker stands for
-    // one of them, and any of them in a rendered `AuthError` — or in the line
-    // the `http` feature logs for it — is the leak `fetch`'s `without_url()`
-    // closes; in the `Debug` of a type holding the URL, the leak the
-    // redacting `Debug` impls close.
-
-    const CANARY_MARKERS: &[&str] = &["CANARY-user", "CANARY-pass", "CANARY-token"];
-
-    /// A JWKS URL at `authority` (`host:port`) carrying every marker.
-    fn canary_url(authority: impl std::fmt::Display) -> String {
-        format!("http://CANARY-user:CANARY-pass@{authority}/jwks?token=CANARY-token")
-    }
-
-    #[track_caller]
-    fn assert_no_canary(haystack: &str, what: &str) {
-        for marker in CANARY_MARKERS {
-            assert!(
-                !haystack.contains(marker),
-                "{what} leaked JWKS URL material ({marker:?}): {haystack}"
-            );
-        }
-    }
-
-    /// What the naive fetch — `send()`, then `json()` — fails with, unredacted.
-    async fn naive_fetch_error(url: &str) -> reqwest::Error {
-        match reqwest::Client::new().get(url).send().await {
-            Err(err) => err,
-            Ok(response) => response
-                .json::<JwkSet>()
-                .await
-                .expect_err("no fixture here serves a JWKS"),
-        }
-    }
-
-    /// One failure per arm of `fetch`: `send()` (nothing listens on port 1),
-    /// the status check (a 503) and `json()` (a 200 that is not a JWKS).
-    #[tokio::test]
-    async fn a_jwks_failure_never_renders_url_material() {
-        // Two requests each: the naive fetch's, then the cache's.
-        let unavailable = issuer(ResponseTemplate::new(503), 2).await;
-        let not_a_jwks = issuer(jwks_body("{\"keys\": \"not a list\"}"), 2).await;
-        let cases = [
-            ("send", canary_url("127.0.0.1:1")),
-            ("status", canary_url(unavailable.address())),
-            ("decode", canary_url(not_a_jwks.address())),
-        ];
-
-        for (name, url) in cases {
-            // The control: reqwest renders the query (it moves userinfo into
-            // an `Authorization` header itself). Without this, a fixture
-            // whose URL never reached the error would pass everything below.
-            let naive = naive_fetch_error(&url).await;
-            assert!(
-                naive.to_string().contains("CANARY-token"),
-                "{name}: reqwest no longer renders the URL, so this test is vacuous: {naive}"
-            );
-
-            let err = cache_at(url, NO_THROTTLE)
-                .jwks_for_kid(PRIMARY_KID)
-                .await
-                .unwrap_err();
-            assert!(matches!(err, AuthError::Jwks(_)), "{name}: {err}");
-            assert_no_canary(&format!("{err} / {err:?}"), name);
-            #[cfg(feature = "http")]
-            assert_no_canary(&http_log::logged_as_500(err), name);
-        }
-    }
-
-    /// The other road from configuration to a log: `?config`, `?verifier`.
-    /// None of the three types holding the JWKS URL may print its userinfo or
-    /// query, and each must still name the endpoint — redacted, not dropped.
-    #[test]
-    fn debug_never_renders_url_material() {
-        let url = canary_url("jwks.example:8443");
-        let config = crate::SlauthConfig {
-            issuer: "https://issuer.example".into(),
-            jwks_url: url.clone(),
-            audience: "svc".into(),
-            pat_validate_url: Some(url.clone()),
-        };
-        // An injected client with a default credential header that nobody
-        // marked sensitive: reqwest::Client's own Debug would print it.
-        let client = || {
-            let mut headers = reqwest::header::HeaderMap::new();
-            headers.insert(
-                reqwest::header::AUTHORIZATION,
-                reqwest::header::HeaderValue::from_static("Bearer CANARY-header"),
-            );
-            reqwest::Client::builder()
-                .default_headers(headers)
-                .build()
-                .expect("a plain client builds")
-        };
-        let cache = JwksCache::new(url, client());
-        let verifier = crate::Verifier::new(config.clone(), client());
-
-        for (name, debug) in [
-            ("SlauthConfig", format!("{config:?}")),
-            ("JwksCache", format!("{cache:?}")),
-            ("Verifier", format!("{verifier:?}")),
-        ] {
-            assert!(
-                !debug.contains("CANARY"),
-                "{name}'s Debug leaked URL or client-header material: {debug}"
-            );
-            assert!(
-                debug.contains(r#""http://jwks.example:8443/jwks""#),
-                "{name}'s Debug no longer names the JWKS endpoint: {debug}"
-            );
-        }
-    }
-
-    /// The `http` feature's log line: `From<AuthError> for AppError` makes a
-    /// JWKS failure `AppError::Internal`, whose `IntoResponse` logs it in full.
-    #[cfg(feature = "http")]
-    mod http_log {
-        use std::sync::{Arc, Mutex};
-
-        use axum::response::IntoResponse as _;
-        use tracing_subscriber::fmt::MakeWriter;
-
-        use crate::AuthError;
-
-        /// A `MakeWriter` that keeps every byte the fmt subscriber writes —
-        /// the same capture `stridelabs-http`'s upstream leak tests use.
-        #[derive(Clone, Default)]
-        struct LogSink(Arc<Mutex<Vec<u8>>>);
-
-        impl std::io::Write for LogSink {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().expect("log sink").extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-
-        impl<'a> MakeWriter<'a> for LogSink {
-            type Writer = LogSink;
-            fn make_writer(&'a self) -> Self::Writer {
-                self.clone()
-            }
-        }
-
-        /// Everything logged while `err` is rendered as the 500 it becomes.
-        /// A thread-local subscriber (`with_default`), so tests running in
-        /// parallel never write into each other's capture.
-        pub(super) fn logged_as_500(err: AuthError) -> String {
-            let app: stridelabs_http::AppError = err.into();
-            // `AppError::Internal` is `#[error(transparent)]`, so this is the
-            // JWKS detail exactly as the line carries it.
-            let expected = app.to_string();
-            let sink = LogSink::default();
-            let subscriber = tracing_subscriber::fmt()
-                .with_writer(sink.clone())
-                .with_ansi(false)
-                .finish();
-            tracing::subscriber::with_default(subscriber, || drop(app.into_response()));
-
-            let logs = String::from_utf8(sink.0.lock().expect("log sink").clone())
-                .expect("utf-8 log output");
-            // Absence proves nothing unless the line was captured, detail and
-            // all. (Any `err` but a JWKS failure becomes a 401, logs nothing,
-            // and fails here too.)
-            assert!(
-                logs.contains("internal error") && logs.contains(&expected),
-                "the 500's log line was not captured with its detail: {logs}"
-            );
-            logs
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn concurrent_misses_make_one_request() {
-        let server = issuer(
-            // A slow response widens the window in which every other task
-            // piles up behind the first one's fetch.
-            jwks_body(TestKey::primary().jwks_json()).set_delay(Duration::from_millis(100)),
-            1,
-        )
-        .await;
-        let cache = Arc::new(cache(&server, Tuning::default()));
-
-        let mut tasks = Vec::new();
-        for _ in 0..16 {
-            let cache = Arc::clone(&cache);
-            tasks.push(tokio::spawn(async move {
-                cache.jwks_for_kid(PRIMARY_KID).await
-            }));
-        }
-
-        for task in tasks {
-            task.await.expect("task").expect("jwks");
-        }
-    }
-}
+mod tests;

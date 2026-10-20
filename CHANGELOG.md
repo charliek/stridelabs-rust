@@ -11,6 +11,75 @@ for a consumer's pin.
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING (behaviour, security, for `Verifier`, `JwksCache` and
+  `McpVerifier` users): a JWKS lookup never returns a set past its TTL.**
+  Through v0.8.0 the TTL itself was not the serving bound. After a failed or
+  cancelled refetch at expiry, the expired set answered again for the rest of
+  a `MIN_REFETCH_INTERVAL` (30 s), up to `JWKS_TTL + MIN_REFETCH_INTERVAL`
+  after its last successful fetch. A key the issuer had retired kept
+  verifying while the issuer was failing, and a `with_ttl` below 30 s still
+  served for `ttl + 30 s`. Now:
+  - **Refresh ahead.** In the last 10 % of the TTL (at least 60 s, at most
+    10 min; 6 min at the defaults), a lookup the set answers starts a
+    background refresh. A failed refresh is retried from its completion
+    (1 s, doubling, at most `MIN_REFETCH_INTERVAL`) while the set keeps
+    answering until its TTL. Refresh-ahead needs traffic in that window.
+    Without it, or with a TTL under three intervals, the first lookup at or
+    after the TTL fetches.
+  - **No stale fallback.** From the TTL on, a lookup waits for a fetch in
+    flight or is refused with `AuthError::Jwks` (a 500 under `http`, a 503
+    `Unavailable` in stridelabs-mcp), as stridelabs-python's `JWKSCache`
+    refuses (`jwks.py:35-61`).
+  - **Prompt recovery.** After a failure, the next fetch of a needed set is
+    allowed 1 s after that failure completes, doubling to 8 s. Lookups in
+    between are refused at once. A lookup that joins such a retry waits at
+    most 2 s. Once the issuer returns, recovery takes at most what is left of
+    an attempt still failing at that moment (up to `FETCH_TIMEOUT`), then the
+    backoff (up to 8 s), then one successful fetch (up to `FETCH_TIMEOUT`):
+    about 28 s at the defaults, and only once a lookup arrives. Python
+    refetches on every request instead.
+  - **Unknown kids stay rate-limited.** Against a set inside its TTL, an
+    unknown `kid` refetches at most once per `MIN_REFETCH_INTERVAL`, as
+    before.
+  - **Fetches run on their own task, single-flight.** Cancelling the request
+    that started one does not cancel it, and fresh lookups never wait behind
+    it. Every lookup that joins a fetch has its own bound (`FETCH_TIMEOUT`
+    plus 1 s on a first attempt, 2 s on a retry), a timer on the lookup's
+    own runtime, so it holds whatever happens to the runtime hosting the
+    fetch.
+  - **Short TTLs.** The refetch floor `F` is `min(interval, max(ttl, 1 s))`.
+    A TTL from 1 s up to the interval refetches at expiry. A TTL under 1 s is
+    refused from its expiry until `F` after the last completed attempt. A
+    zero TTL caches nothing, serves each fetch only to the lookups that
+    waited on it, and starts fetches at most once per `F`: once a second
+    while the interval is at least 1 s, once per interval when it is
+    shorter.
+
+  These bounds are per `JwksCache` instance, on its monotonic clock. Replicas
+  that expire together retry together.
+
+  **Migration:** no code change.
+  - During an issuer outage that outlasts the refresh window, or that starts
+    in an idle window, JWT requests are refused from the TTL on (previously
+    up to 30 s later). They recover as above.
+  - A lookup polled outside a tokio runtime gets `AuthError::Jwks` when it
+    would start or join a fetch.
+  - Lookups require a Tokio runtime with the time driver enabled, as reqwest
+    does: a lookup that has to wait on a fetch, polled on a runtime built
+    without `enable_time`, panics in tokio's timer.
+  - The runtime that starts a fetch must keep being driven until it ends. A
+    fetch frozen in an undriven runtime (a current-thread runtime whose
+    `block_on` returned) holds the slot: lookups elsewhere give up at their
+    bound until that runtime runs the fetch or is dropped.
+  - `JwksCache`'s `Debug` output changed.
+  - No public item was added, removed or re-typed.
+- `stridelabs-auth` now names tokio's `rt` and `time` features (alongside
+  `sync`) and depends on `futures-util` with `std` only. Both were already in every
+  consumer's graph (reqwest, hyper); `futures-executor` stays out of an
+  auth-only consumer's.
+
 ## [0.8.0] - 2026-10-17
 
 Two additive pieces for imgmcp's image privacy and cost work: a daily

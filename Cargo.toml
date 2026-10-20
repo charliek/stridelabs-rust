@@ -147,6 +147,11 @@ uuid = { version = "1", features = ["v4", "serde"] }
 time = { version = "0.3", features = ["serde"] }
 bytes = "1"
 futures = "0.3"
+# stridelabs-auth's JWKS cache hands one fetch's outcome to every waiter
+# (`Shared`, `BoxFuture`). `std` only: `futures`' default features bring
+# `futures-executor`, which no auth-only consumer should compile. Already in
+# every graph (reqwest, hyper).
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 url = "2"
 # stridelabs-gcp: GCS object names are percent-encoded into a path segment or
 # query value, `/` included. Already in every graph through `url` and reqwest.

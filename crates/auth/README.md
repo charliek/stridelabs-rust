@@ -12,7 +12,12 @@ admin checks — stays in the service; that is the part that differs everywhere.
 ## Feature topology
 
 `default = []`. Verification, the JWKS cache and the PAT helpers are
-unconditional: they are the crate.
+unconditional: they are the crate. So is its tokio dependency (`sync`, `rt`,
+`time`) and `futures-util` (`std` only): the JWKS cache runs each fetch on a
+task of its own, spawned on the runtime the lookup is polled on, and bounds
+each lookup's wait on a fetch with a timer on that lookup's runtime.
+**Lookups require a Tokio runtime with the time driver enabled, as reqwest
+does.**
 
 | Feature | Default | Adds |
 |---|---|---|
@@ -184,50 +189,101 @@ replaced:
   A token with no `sub` claim at all fails the same way.
 - **JWKS refetches are rate-limited** — see below.
 
-### The JWKS cache, and the 30-second interval
+### The JWKS cache: never past the TTL, refreshed ahead of it
 
 `JwksCache::jwks_for_kid(kid)` returns a key set that *contains* `kid`, or an
-error.
+error, and **never a set past its TTL**. A set's age counts from its last
+*successful* fetch; every bound below is per cache instance, on its own
+monotonic clock.
 
-- A cached set younger than `JWKS_TTL` (**1 hour**) that contains the kid is
-  served from memory.
-- Anything else is a miss and refetches. Refetching on an unknown kid, not
-  just on age, is what makes a key rotation take effect in seconds rather than
-  an hour.
-- **At most one fetch per `MIN_REFETCH_INTERVAL` (30 seconds).** Without this,
-  anyone can mint a syntactically valid token carrying a random `kid` and turn
-  every request into an outbound HTTPS call — a request amplifier pointed at
-  the one service every other service depends on. Inside the interval the
-  answer comes from memory, and only from a set within the *stale bound*
-  (next bullet): that set if it contains the kid (a stale key beats a spurious
-  401 — the interval protects the issuer), otherwise `AuthError::UnknownKid`.
-  With no set within the bound — nothing ever cached, or a set past it — the
-  last *fetch* failed and the error is `Jwks` (a 500 under the `http`
-  feature), not a verdict on the caller's token.
-- **The stale bound is `JWKS_TTL + MIN_REFETCH_INTERVAL` (3630 s), measured
-  from the last *successful* fetch.** Every failed attempt opens a new
-  interval, so without the bound a set would outlive any issuer outage: a key
-  the issuer retired (say, because it leaked) would keep verifying for as long
-  as the outage lasted. With it, a retired key stops verifying at most 3630 s
-  after the last successful fetch, however many attempts fail after that.
-- A fetch *attempt* starts the interval, successful or not. A failing issuer
-  is exactly when hammering it helps least. The attempt that fails answers
-  `Jwks` itself; it never falls back to the cached set.
+- **Fresh hit.** A set younger than `JWKS_TTL` (**1 hour**) that contains the
+  kid is served from memory.
+- **Refresh ahead.** In the last tenth of the TTL (at least 60 s, at most
+  10 min: the last 6 minutes at the defaults), a lookup the set answers is
+  still served at once and also starts a background refresh nobody waits on.
+  A failed refresh is retried 1 s after it *completed*, doubling, at most
+  `MIN_REFETCH_INTERVAL`, while the set keeps answering until its TTL, so an
+  issuer blip near the hour costs nothing. It needs traffic in that window,
+  and it is off for a TTL under three refetch floors (below); without it,
+  the first lookup at or after the TTL fetches.
+- **No stale fallback.** From the TTL on, a lookup waits for the fetch in
+  flight or starts one, and is refused with `AuthError::Jwks` (a 500 under
+  the `http` feature, a 503 `Unavailable` in stridelabs-mcp) if that fails,
+  as stridelabs-python's `JWKSCache` refuses. A key the issuer retired (say,
+  because it leaked) stops verifying no later than one TTL after the last
+  successful fetch that still published it, whatever the issuer is doing.
+  Through v0.8.0 that bound was `JWKS_TTL + MIN_REFETCH_INTERVAL`.
+- **Prompt recovery.** After a failure, the next fetch of a needed set is
+  allowed 1 s after that failure completed, doubling to 8 s; lookups in
+  between are refused at once. Once the issuer is back, recovery takes at
+  most what is left of an attempt still failing at that moment (up to
+  `FETCH_TIMEOUT`, 10 s), then the backoff (up to 8 s), then one successful
+  fetch (up to `FETCH_TIMEOUT`): about 28 s at the defaults, and only once a
+  lookup arrives to start that fetch. (Python refetches on every request
+  instead.)
+- **Unknown kids are rate-limited.** Refetching on an unknown kid, not just
+  on age, is what makes a key rotation take effect in seconds rather than an
+  hour. Against a set inside its TTL it happens **at most once per refetch
+  floor** (30 s at the defaults), counted from the start of the last attempt
+  of any kind. Without that floor, anyone can mint a syntactically valid
+  token carrying a random `kid` and turn every request into an outbound
+  HTTPS call — a request amplifier pointed at the one service every other
+  service depends on. Inside the floor the answer is `AuthError::UnknownKid`
+  from memory. Only a set inside its TTL gives that verdict: without one the
+  error is `Jwks`, not a 401 blaming the caller's token for an outage.
 
-The cost is bounded and worth naming: **a key rotation landing within 30
-seconds of the last fetch is invisible for the rest of that interval**, so
-tokens signed by the brand-new key are rejected for up to 30 seconds. Issuers
-roll keys on the order of days.
+The **refetch floor** `F` is `min(MIN_REFETCH_INTERVAL, max(ttl, 1 s))`. A
+TTL below the interval lowers it, so a TTL of 1 s or more is refetched at
+expiry rather than refused for an interval longer than the set lives; but
+never under 1 s unless the interval itself is, so a zero TTL is still
+rate-limited. A TTL under 1 s is refused from its expiry until `F` after the
+last completed attempt ("key set expired inside the minimum refetch
+spacing"). A zero TTL caches nothing: each fetch serves only the lookups that
+waited on it, and fetches start at most once per `F`: once a second while the
+interval is at least 1 s, and once per interval when it is shorter (a zero
+interval: no limit).
+
+The cost of the floor is bounded and worth naming: **a key rotation landing
+within 30 seconds of the last attempt is invisible for the rest of that
+floor**, so tokens signed by the brand-new key are rejected for up to 30
+seconds. A failed attempt counts, so a rotation that coincides with an issuer
+blip waits out both. Issuers roll keys on the order of days.
+
+**Load on the issuer**, per cache, with a failing issuer and steady traffic:
+at most one unknown-kid fetch per floor against a valid set (2 a minute);
+16 refresh-ahead attempts in the 6-minute window; and after expiry, attempts
+1, 2, 4, 8, 8 … s apart (7.5 a minute). Nobody can make the age-driven ones
+happen early. Replicas of one service expire, and so retry, in lockstep.
+
+**Concurrency.** A fetch is single-flight and runs on a tokio task of its
+own: cancelling the request that started it never cancels it, no lock is
+held across it, and a fresh hit never waits behind one. A herd of misses —
+what a restart or a rotation actually produces — makes one request. Every
+lookup that joins a fetch has a bound of its own, a timer on its own runtime:
+`FETCH_TIMEOUT` plus 1 s on a *first* attempt (the fetch's own 10 s timeout
+normally ends it first), 2 s on a *retry*, so a black-holed issuer cannot
+hold every request for a whole fetch timeout over and over. At its bound a
+lookup gets `Jwks` while the fetch carries on. A joiner checks the set's age again when it resumes, and refuses
+a set that crossed its TTL meanwhile.
+
+**The tokio runtime.** Lookups require a Tokio runtime with the time driver
+enabled, as reqwest does: on a runtime built without `enable_time`, a lookup
+that has to wait on a fetch panics in tokio's timer. The fetch is spawned on
+the runtime of the lookup that starts it, which needs IO and time enabled
+and **must keep being driven until the fetch ends**. A fetch on a
+current-thread runtime whose `block_on` has returned is frozen with it:
+lookups on other runtimes that need it give up at their own bound (their
+own runtime's timer, never the frozen one's), but the slot stays taken until
+that runtime finishes the fetch or is dropped. A runtime shut down mid-fetch
+drops the task, which counts as a failed attempt; its waiters get `Jwks`.
+Outside any runtime nothing panics: a refresh-ahead is skipped, and a lookup
+that would start or join a fetch is `Jwks`.
 
 `JwksCache::with_ttl` and `JwksCache::with_min_refetch_interval` replace the
-two durations (the stale bound follows them), for tests that need to watch a
-set expire or an interval close without sleeping. The defaults are the
-contract: a zero interval turns the floor off, and `Verifier::new` always
-builds its cache with the defaults.
-
-Concurrency: the fetch happens under the write lock and the hit-check is
-repeated after acquiring it (double-checked locking), so a thundering herd of
-misses — what a restart or a rotation actually produces — makes one request.
+two durations, for tests that need to watch a set expire or a floor close
+without sleeping. The defaults are the contract: a zero interval turns all
+rate limiting off, and `Verifier::new` always builds its cache with the
+defaults.
 
 The cache is an **instance** holding an **injected, shared** `reqwest::Client`.
 The original was a process-global `OnceLock` that built and discarded a fresh

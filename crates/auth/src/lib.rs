@@ -51,10 +51,11 @@
 //!
 //! - **An empty `sub` is rejected** ([`AuthError::MissingSubject`]). The
 //!   original accepted `""` and would have keyed a user row on it.
-//! - **JWKS refetches are rate-limited** to one per
-//!   [`MIN_REFETCH_INTERVAL`], so a stream of tokens carrying unknown key
-//!   ids can't turn this service into a load generator against the issuer.
-//!   See [`jwks`] for the full cache contract.
+//! - **JWKS refetches are rate-limited**: an unknown key id refetches at
+//!   most once per [`MIN_REFETCH_INTERVAL`], so a stream of tokens carrying
+//!   unknown key ids can't turn this service into a load generator against
+//!   the issuer, and a key set is never served past its [`JWKS_TTL`]. See
+//!   [`jwks`] for the full cache contract.
 //!
 //! # slauth PATs: [`slauth_pat`]
 //!
