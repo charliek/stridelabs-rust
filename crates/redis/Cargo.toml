@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "A lazy, single-flight Redis handle for StrideLabs services: an atomic fixed-window counter that is never replayed, and idempotent GET / SET EX helpers"
+description = "A lazy, single-flight Redis handle for StrideLabs services: an atomic fixed-window counter that is never replayed, idempotent GET / SET EX helpers, EVAL under a caller-chosen replay policy, and PING"
 publish = false
 
 [features]

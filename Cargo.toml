@@ -90,6 +90,9 @@ anyhow = "1"
 # Observability
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+# The `log` → `tracing` bridge. The same version, and features, as
+# tracing-subscriber's default `tracing-log` feature already locks.
+tracing-log = "0.2"
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
 
@@ -110,9 +113,10 @@ sqlx = { version = "0.9", default-features = false, features = [
 # Redis (stridelabs-redis's lazy handle, stridelabs-testing's `require_redis`).
 # `default-features = false` drops `acl`, `streams`, `geospatial`, `script` and
 # `num-bigint`, none of which either crate uses. `script` exists for `Script`'s
-# EVALSHA caching (and pulls in `sha1_smol`); the one script here, the fixed
-# window, goes out as a raw `EVAL` through `redis::cmd`, which needs nothing
-# from it. `tokio-comp` is the async runtime glue.
+# EVALSHA caching (and pulls in `sha1_smol`); the scripts here, the fixed
+# window and whatever a caller hands `RedisHandle::eval`, go out as a raw
+# `EVAL` through `redis::cmd`, which needs nothing from it. `tokio-comp` is
+# the async runtime glue.
 #
 # Deliberately NO TLS feature at this level, for the reqwest reason above:
 # whatever is listed here reaches every member's graph, and so every

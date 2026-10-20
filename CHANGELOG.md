@@ -13,6 +13,74 @@ for a consumer's pin.
 
 ### Added
 
+- `stridelabs-redis`: `RedisHandle::eval::<T>(script, keys, args, replay)`
+  and `RedisHandle::ping()` (lumen plan 001 S1, for a voice relay's Lua
+  lease and budget scripts and a readiness probe).
+  - `eval` sends a raw `EVAL` (no `EVALSHA`, no redis-rs `script` feature,
+    no `sha1_smol`) under a `Replay` the caller chooses: `Never` for any
+    script that writes, including a lease acquire or takeover;
+    `OnceOnFreshConnection` only for reads and writes whose re-execution is
+    harmless (a script whose reply was lost after it ran IS run again).
+    `T: EvalReply` is sealed and covers `i64` and `Vec<i64>`; decoding is
+    strict (`{1,false,3}` is refused) and an error names the reply's shape,
+    never its contents. Arguments are `EvalArg`s (text or integers via
+    `.into()`) whose `Debug` names the kind and a text's length, never the
+    value.
+  - `ping` sends `PING` and is `Ok(())` only on the `PONG` status; after an
+    I/O failure on a cached connection it is retried once on a fresh one.
+
+- `stridelabs-auth`: verifying another issuer's tokens under claim rules the
+  consumer chooses (lumen plan 001 S1: WorkOS access tokens, which carry no
+  `aud` and whose `iss` names the client).
+  - `ClaimChecks::new(issuer, Audience)`: `iss` must match exactly and is
+    required; `exp` is required; `aud` is checked per the `Audience`. The
+    leeway on `exp` and `nbf` is `with_leeway(Duration)` (default
+    `DEFAULT_LEEWAY`, 60 s; whole seconds, capped at a day because
+    jsonwebtoken's `now ± leeway` is unchecked `u64` arithmetic). A present
+    `nbf` is checked by default (`with_nbf_validation(false)` turns it off).
+    Accessors `issuer`, `audience`, `leeway`, `validates_nbf`. Its `Debug`
+    renders an issuer carrying userinfo, a query or a fragment as
+    `scheme://host[:port]/path`.
+  - `Audience` (`#[non_exhaustive]`): `Required(String)` or `NotValidated`.
+    There is no `Default` and no conversion that yields `NotValidated`; it
+    skips the `aud` check and is safe only when the issuer binds the
+    audience some other way.
+  - `Verifier::for_issuer(checks, jwks_url, jwks_ttl: Option<Duration>,
+    http)` builds its own `JwksCache` (`None` means `JWKS_TTL`), so it
+    inherits the cache contract: a key set is never served past its TTL (a
+    test pins it through `for_issuer`). `verify_bearer_claims` applies its
+    rules; `Verifier::claim_checks()` returns them. `config()` is
+    informational: a synthesized `SlauthConfig` whose audience under
+    `NotValidated` is a NUL-prefixed sentinel no issuer mints, so a verifier
+    wrongly rebuilt from it with `Verifier::new` refuses every real token.
+  - `Verifier::claims_with_jwks_checked::<C>(token, &jwks, kid, &checks)`,
+    the network-free form.
+  - `test_support::TestClaims::without_audience()` and
+    `TestClaims::not_before_in(secs)`.
+
+- `stridelabs-observability`: per-target level caps that hold even when
+  `RUST_LOG` is set (lumen plan 001 S1, for a WebSocket relay whose frame
+  logs carry an API key). `TargetCaps` (`new`, `cap(target, Level |
+  LevelFilter)`) are ceilings checked on top of the level filter, so neither
+  `RUST_LOG=trace` nor `RUST_LOG=<target>=trace` can lift a capped target. A
+  cap covers its target and module paths beneath it (not
+  `tungstenite_extra`); a trailing `::` is ignored and an empty target is not
+  a wildcard; every covering cap applies (the strictest wins). Spans and
+  `log`-crate records (through the `tracing-log` bridge) are capped by their
+  real target, and the filter's max-level hint is unchanged.
+  - `init_logging_with(format, default_filter, &TargetCaps)`;
+    `init_logging` is it with no caps, output byte-for-byte unchanged.
+  - `try_init_logging_with(..) -> Result<(), LoggingInitError>` installs the
+    same stack and returns `Ok` only when this call installed both the
+    subscriber and the `log` bridge (`LoggingInitError`, `#[non_exhaustive]`:
+    `AlreadyInitialized`, `SubscriberAlreadySet`, `LogBridgeNotInstalled`).
+    Use it when the caps guard a secret: an earlier subscriber or `log`
+    logger would otherwise leave them silently not in force.
+- `stridelabs-http`: feature `redact-url` (pulls in `url` only: no client, no
+  TLS) with `redact_url(raw) -> String`: `scheme://host[:port]/path`,
+  userinfo, query and fragment dropped, `<unparseable URL>` for anything
+  without a host. The same rule as stridelabs-auth's and stridelabs-gcp's
+  private copies and tapper-rs's `http_tls::redact_url`.
 - `stridelabs-http` (`ssrf`): the options a feed fetch needs, every one
   opt-in. A default policy's request is v0.8.0's byte for byte (pinned by a
   snapshot recorded on the v0.8.0 tree), and `fetch_public` returns the
@@ -188,6 +256,44 @@ for a consumer's pin.
   new items are re-exported from the crate root.
 
 ### Changed
+
+- `stridelabs-redis`: `Replay` (`Never`, `OnceOnFreshConnection`) is public,
+  re-exported at the crate root, `#[non_exhaustive]`, with no `Default`; the
+  built-in commands keep their policies.
+- `stridelabs-redis` (error **text** only; no signature change): every
+  `RedisError` payload is now a fixed summary the crate composes. None
+  carries redis-rs's or the server's text any more, because both can echo
+  passwords, keys, tokens and user ids (e.g. `unknown command 'EVAL', with
+  args beginning with: …`, or a refused handshake echoing `HELLO 3 AUTH
+  <user> <password>`).
+  - `Command`: an error reply's code when Redis defines it (`ERR`,
+    `WRONGTYPE`, `NOSCRIPT`, `BUSY`, `READONLY`, `OOM`, …) plus a fixed
+    description of its class that says whether the command ran; any other
+    code shows as undefined; a reply that did not convert shows as
+    "incompatible type".
+  - `Connect` and `Io`: the failure's class (timed out, connection refused,
+    closed or reset, an I/O error's kind, not well-formed RESP,
+    authentication failed, or an error reply's code). A refused handshake
+    is still `Connect`.
+  - `InvalidUrl`: only the name of the URL check that failed (redis-rs's
+    "Invalid protocol version" appended the URL's `protocol` value).
+  - The crate's own log lines use the same summaries. Reproduce with
+    `redis-cli` to see the server's words; code that matched on payload
+    text should match on the variant instead. A TLS or DNS failure now
+    reads as an I/O error kind rather than rustls's or the resolver's
+    message.
+
+- `stridelabs-observability`: `thiserror` is a non-optional dependency (it
+  was enabled only by `prometheus`) and `tracing-log` a normal one (it was a
+  dev-dependency); neither adds a package to the lock.
+
+- `stridelabs-auth`: `claims_with_jwks`, `verify_with_jwks` and
+  `Verifier::new`'s verification run through `claims_with_jwks_checked` with
+  slauth's rules (`aud` required, 60 s leeway, `nbf` unchecked); no
+  behaviour change (the existing tests and `verifier_new_keeps_slauths_rules`
+  pin it). `SlauthConfig`'s `Debug` now renders an issuer carrying userinfo,
+  a query or a fragment as `scheme://host[:port]/path` (every other issuer
+  prints exactly as before).
 
 - **BREAKING (behaviour, security, for `Verifier`, `JwksCache` and
   `McpVerifier` users): a JWKS lookup never returns a set past its TTL.**

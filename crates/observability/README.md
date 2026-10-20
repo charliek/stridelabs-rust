@@ -94,6 +94,90 @@ init_logging(LogFormat::from_environment(&env_or("ENVIRONMENT", "development")),
   once); later calls, even with different arguments, are a silent no-op.
   Safe to call from every integration test's setup.
 
+### Caps that survive `RUST_LOG`: `init_logging_with` and `TargetCaps`
+
+```rust
+use stridelabs_config::env_or;
+use stridelabs_observability::{init_logging_with, LogFormat, TargetCaps};
+use tracing::Level;
+
+// tungstenite logs every WebSocket frame it reads or writes at `trace`,
+// payload included (a handshake's API key, audio, transcripts).
+let caps = TargetCaps::new()
+    .cap("tungstenite", Level::INFO)
+    .cap("tokio_tungstenite", Level::INFO);
+init_logging_with(
+    LogFormat::from_environment(&env_or("ENVIRONMENT", "development")),
+    "info",
+    &caps,
+);
+```
+
+`RUST_LOG` replaces `default_filter` wholesale, so a cap written into the
+default filter string (`"info,tungstenite=info"`) is gone the moment someone
+sets `RUST_LOG=trace` to debug something else. `init_logging_with(format,
+default_filter, &caps)` is `init_logging` plus `TargetCaps`: per-target level
+ceilings checked *in addition to* whichever filter is in force, so a span or
+event has to pass both. Neither `RUST_LOG=trace` nor
+`RUST_LOG=tungstenite=trace` lifts a capped target above its cap.
+
+- **Matching.** A cap covers its target and every module path beneath it:
+  `tungstenite` covers `tungstenite` and `tungstenite::protocol::frame`, but
+  not `tungstenite_extra` (an `EnvFilter` directive would). Exact and
+  case-sensitive. Several caps covering one target all apply, so the
+  strictest wins whatever the order: a more specific cap cannot loosen a
+  broader one.
+- A trailing `::` is ignored (`tungstenite::` is `tungstenite`). An empty
+  target (`""`, or `"::"`) is **not** a wildcard: it covers only a target
+  that is empty or starts with `::`, so it caps nothing a crate logs.
+- **`log`-crate records** (tungstenite logs through `log`, which
+  `init_logging` bridges into `tracing`) are matched on the record's own
+  target.
+- **Spans too.** A capped span is never created, so its fields reach no line
+  (`Text`'s span prefix, `Json`'s `spans`, or a `requestId` lifted by
+  `Cloud`). Capping `stridelabs_observability` below `info` drops
+  `RequestLogLayer`'s request span, and with it every line's request ids.
+- `cap` takes a `tracing::Level` or a `LevelFilter`; `LevelFilter::OFF`
+  silences a target.
+- Caps only remove, and leave the subscriber's max-level hint (and so the
+  `log` bridge's max level) to the level filter, as `init_logging` does.
+- **One initialization per process, shared with `init_logging`.** Whichever
+  is called first installs the subscriber; a later call to either is a
+  silent no-op, its caps included. Call it first, before anything else sets
+  up logging. `init_logging(format, filter)` is exactly
+  `init_logging_with(format, filter, &TargetCaps::new())`.
+
+#### When the caps must be in force: `try_init_logging_with`
+
+`init_logging_with` can't tell you its caps didn't take. An earlier
+`init_logging(.., "trace")`, a host's own subscriber, or a `log` logger set
+first (`env_logger`, say) each leave them out of force without a word.
+`try_init_logging_with(format, default_filter, &caps)` installs exactly the
+same thing and returns `Result<(), LoggingInitError>`. It is `Ok(())` only when
+this call installed both the `tracing` subscriber and the `log` bridge, so a
+relay can refuse to start without its caps:
+
+```rust
+// `caps` as above. `?`: no relay without them.
+try_init_logging_with(
+    LogFormat::from_environment(&env_or("ENVIRONMENT", "development")),
+    "info",
+    &caps,
+)?;
+```
+
+| `LoggingInitError` | what happened | caps in force? |
+|---|---|---|
+| `AlreadyInitialized` | an earlier `init_logging`, `init_logging_with` or `try_init_logging_with` already made the process's one attempt (successful or not); this call installed nothing | only if that earlier attempt succeeded, with them |
+| `SubscriberAlreadySet` | something outside this crate installed a global `tracing` subscriber first; this call installed nothing | no |
+| `LogBridgeNotInstalled` | the `tracing` subscriber is installed, caps included, but a `log` logger was set first, so `log` records (tungstenite's) go to it, past the caps | for `tracing` events only |
+
+It shares the one-time initialization with the other two: whichever of the
+three is called first makes the attempt, and every later
+`try_init_logging_with` returns `AlreadyInitialized`, never a second `Ok`.
+Later `init_logging`/`init_logging_with` calls stay silent no-ops.
+`LoggingInitError` is `#[non_exhaustive]`.
+
 ## `cloud` — Google Cloud Logging lines
 
 `LogFormat::Cloud` installs `CloudLayer`, which writes the shape Python

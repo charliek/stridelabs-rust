@@ -1,8 +1,9 @@
 # stridelabs-auth
 
 The resource-server half of slauth, the StrideLabs auth service: verify the
-RS256 access tokens slauth (Ory Hydra) issues, and hash the personal access
-tokens a service issues for itself.
+RS256 access tokens slauth (Ory Hydra) issues — or, through
+`Verifier::for_issuer`, another issuer's, under claim rules you choose — and
+hash the personal access tokens a service issues for itself.
 
 A service holds one `Verifier` in its application state, hands it a bearer
 token per request, and gets back a `VerifiedIdentity`. Turning that identity
@@ -65,8 +66,10 @@ build like ring before it, comes along into production graphs.
 test that panics when the backend set is wrong; a consumer's own mint-and-verify
 test does the same for its graph.
 
-`Verifier::verify_with_jwks`, `JwksCache::jwks_for_kid`, `TestKey::jwks` and
-`test_support::test_jwks` take or return jsonwebtoken 11's `JwkSet`. To name
+`Verifier::verify_with_jwks`, `Verifier::claims_with_jwks`,
+`Verifier::claims_with_jwks_checked`, `JwksCache::jwks_for_kid`,
+`TestKey::jwks` and `test_support::test_jwks` take or return jsonwebtoken
+11's `JwkSet`. To name
 it, depend on the same major with the same backend:
 
 ```toml
@@ -152,6 +155,113 @@ keys rows on it. A claim set that does not deserialize into `C` is
 `AuthError::InvalidToken("claims are malformed")`, never serde's message
 (which can quote the value). `stridelabs-mcp`'s verifier is built on this.
 
+### Tokens from another issuer: `Verifier::for_issuer`
+
+`Verifier::new`'s claim rules are slauth's: `iss` exact, `aud` required, a
+60 s leeway on `exp`, `nbf` not checked. An issuer with other rules — WorkOS,
+whose access tokens carry no `aud` — gets a verifier built from a
+`ClaimChecks`:
+
+```rust
+use std::time::Duration;
+use stridelabs_auth::{Audience, ClaimChecks, Verifier};
+
+// WorkOS: no `aud` in its access tokens; `iss` names the client.
+let checks = ClaimChecks::new(
+    format!("https://api.workos.com/user_management/{client_id}"),
+    Audience::NotValidated,
+)
+.with_leeway(Duration::ZERO);          // `nbf` is checked by default
+
+let verifier = Verifier::for_issuer(
+    checks,
+    format!("https://api.workos.com/sso/jwks/{client_id}"),
+    Some(Duration::from_secs(3600)),   // JWKS TTL; `None` is `JWKS_TTL`
+    http_client.clone(),
+);
+
+#[derive(serde::Deserialize)]
+struct WorkosClaims {
+    #[serde(default)]
+    sub: String,
+}
+
+let claims: WorkosClaims = verifier.verify_bearer_claims(token).await?;
+if claims.sub.is_empty() {
+    // the caller's rule to enforce, not this crate's
+}
+```
+
+`ClaimChecks::new(issuer, audience)` holds the claim rules, applied after
+the signature:
+
+| Rule | Default | Change with |
+|---|---|---|
+| `iss` equals the issuer, exactly (a trailing slash is a mismatch) | always; `iss` required | — |
+| `exp` | always; required | — |
+| `aud` | `Audience::Required(aud)`: required, and equal to `aud` or an array containing it. `Audience::NotValidated`: not checked, whatever the token carries | the `Audience` you pass |
+| Leeway on `exp` and `nbf` | 60 s (`DEFAULT_LEEWAY`) | `.with_leeway(Duration)` — whole seconds (a fraction is dropped), at most a day |
+| `nbf`, when present | checked; never required | `.with_nbf_validation(false)` |
+
+Times are whole Unix seconds: with no leeway a token is accepted through the
+second its `exp` names and refused from the next, and refused while its
+`nbf` is later than now. A present `nbf` that is not a number is "token is
+malformed" while `nbf` is checked. As everywhere in jsonwebtoken, an `iss`
+*array* that contains the issuer passes too; RFC 7519 makes `iss` one string,
+and only the issuer's own key can sign one.
+
+**`Audience::NotValidated` skips the `aud` check, and is safe only when the
+issuer binds the audience some other way**: when the exact `iss` you require
+can only be stamped on tokens minted for your service. WorkOS's is
+`https://api.workos.com/user_management/{client_id}`, so the issuer match
+pins the client. Against an issuer that serves several services under one
+`iss` (slauth, any shared OIDC provider) it accepts a token minted for any of
+them. There is no `Default` for `Audience` and no conversion into
+`NotValidated`: a consumer has to write it out, where a reviewer will see it.
+
+Everything else is `Verifier::new`'s, from the same code: RS256 only (`none`
+and HS256 refused before the signature), a `kid` required
+(`AuthError::MissingKid`), the key-fitness rules below, and the error
+classification. `for_issuer` builds its own `JwksCache` from the URL, as `new`
+does — no cache for one issuer can be paired with rules for another — with
+the TTL you give it (`None` is `JWKS_TTL`, an hour) and every other bound at
+its default, so it inherits the whole cache contract below: a key set is
+never served past its TTL, a lookup once it has expired and cannot be
+refetched is `AuthError::Jwks` (a 5xx), and so on.
+
+On a `for_issuer` verifier:
+
+- `verify_bearer_claims::<C>` applies its `ClaimChecks`, and
+  `claim_checks()` returns them. `Verifier::claims_with_jwks_checked::<C>(token,
+  &jwks, kid, &checks)` is the network-free twin, and `claims_with_jwks` is
+  that function with slauth's rules (`claim_checks()` on a `Verifier::new`
+  verifier).
+- `verify_bearer` applies its `ClaimChecks`, then `VerifiedIdentity`'s rules
+  (a non-empty `email` and `sub`). That is meaningful only for an issuer
+  whose access tokens carry an email: a WorkOS access token has none by
+  default, so every one would be `AuthError::MissingEmail`. Use
+  `verify_bearer_claims` with your own claims type, and check `sub` yourself.
+- `config()` is **informational only**: a `SlauthConfig` synthesized from
+  its arguments, with the issuer, the JWKS URL, no `pat_validate_url`, and
+  `audience` the `Required` value or, under `NotValidated`, a sentinel no
+  issuer mints (`"\0audience not validated"`, starting with a NUL
+  character; never empty). It does not hold this verifier's rules
+  (`claim_checks()` does). **Never rebuild the verifier with
+  `Verifier::new(config)`**: that applies slauth's rules (`aud` required, a
+  60 s leeway, `nbf` unchecked), not this verifier's leeway or `nbf`
+  setting, so under `Required` it can accept tokens this verifier refuses.
+  Under `NotValidated` the sentinel makes that mistake refuse every real
+  token instead. Clone the verifier.
+- `Debug` prints the JWKS URL redacted, as `Verifier::new`'s does. The
+  issuer and the audience print as configured (the issuer exactly, so a
+  trailing-slash mismatch is visible), except that an issuer that is a URL
+  carrying userinfo, a query or a fragment prints as
+  `scheme://host[:port]/path`, as `SlauthConfig`'s does.
+
+`TestClaims::without_audience()` mints a token with no `aud`, and
+`TestClaims::not_before_in(secs)` one with an `nbf` (feature
+`test-support`, below).
+
 ## Security notes
 
 ### What is checked
@@ -159,7 +269,10 @@ keys rows on it. A claim set that does not deserialize into `C` is
 In order: the issuer's key set has a key under the token's `kid` that is
 **fit for RS256 signatures**; the key is usable; the **RS256** signature;
 `exp`; `iss` equals the configured issuer; `aud` contains the configured
-audience; a **non-empty `email`** claim; a **non-empty `sub`**.
+audience; a **non-empty `email`** claim; a **non-empty `sub`**. (That is
+`verify_bearer` on a `Verifier::new` verifier. A `Verifier::for_issuer`
+verifier's claim rules are its `ClaimChecks`, above; the key and signature
+checks are the same.)
 
 "Fit" means an RSA key whose `alg`, `use` and `key_ops`, where present, say
 RS256, `sig` and `verify`. jsonwebtoken builds a verifier from a JWK without
@@ -173,9 +286,10 @@ considered, so a listed-first encryption key cannot hide the signing key.
 
 Pinning the algorithm to RS256 is what rules out the two classic forgeries
 (`alg: none`, and HS256 signed with the issuer's public key as an HMAC
-secret). The HS256 confusion attack is covered by a test; `alg: none` has no
-test because it cannot be constructed — `jsonwebtoken`'s `Algorithm` enum has
-no such variant, so a token carrying it fails to parse before any check runs.
+secret). Both are covered by tests. `jsonwebtoken` cannot mint an `alg: none`
+token, so its test assembles the header by hand: `Algorithm` has no such
+variant, so the header fails to parse (`AuthError::MalformedToken`) before any
+check runs.
 
 `sub` is treated as an **opaque** OIDC subject. In a slauth deployment it
 happens to be the Kratos identity UUID and services key their user rows on it,
@@ -283,7 +397,8 @@ that would start or join a fetch is `Jwks`.
 two durations, for tests that need to watch a set expire or a floor close
 without sleeping. The defaults are the contract: a zero interval turns all
 rate limiting off, and `Verifier::new` always builds its cache with the
-defaults.
+defaults. `Verifier::for_issuer` takes an optional TTL (`with_ttl`'s
+semantics) and leaves the refetch interval at its default.
 
 The cache is an **instance** holding an **injected, shared** `reqwest::Client`.
 The original was a process-global `OnceLock` that built and discarded a fresh
@@ -308,10 +423,12 @@ Nor do they echo the JWKS URL, and neither does any type's `Debug`.
 query string, and a JWKS URL is configuration that can carry a credential.
 `SlauthConfig`, `JwksCache` and `Verifier` print it in `Debug` as
 `scheme://host[:port]/path` (userinfo, query and fragment dropped; so is
-`pat_validate_url`'s), so `tracing::info!(?config)` is safe. A canary test
-pins both: a URL with a token in the query and userinfo in the authority,
-checked in the error's `Display`/`Debug`, in the line the `http` feature logs
-for the 500, and in each type's `Debug`.
+`pat_validate_url`'s), so `tracing::info!(?config)` is safe. The issuer
+(`SlauthConfig`'s and `ClaimChecks`') prints exactly as configured unless it
+is a URL carrying one of those parts, when it is redacted the same way. A
+canary test pins both: a URL with a token in the query and userinfo in the
+authority, checked in the error's `Display`/`Debug`, in the line the `http`
+feature logs for the 500, and in each type's `Debug`.
 
 With the `http` feature:
 
@@ -488,7 +605,10 @@ Mock::given(method("GET")).and(path("/jwks"))
 ```
 
 `TestClaims` defaults to a token that verifies; each setter takes it one step
-away (`.email("")`, `.without_email()`, `.subject("")`, `.expires_in(-3600)`).
+away (`.email("")`, `.without_email()`, `.subject("")`, `.expires_in(-3600)`,
+`.without_audience()`, `.not_before_in(30)`). No `nbf` is minted unless
+`.not_before_in` asks for one; a token for an issuer that sends no `aud` is
+`TestClaims::new(issuer, "").without_audience()`.
 `.claim(name, value)` adds any other claim — `.claim("scope", json!("a b"))`,
 `.claim("scp", json!(["a"]))`, `.claim("client_id", json!("c"))` — and is
 applied last, so it also replaces one of the builder's own (an `aud` array,
