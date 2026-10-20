@@ -362,6 +362,22 @@ for a consumer's pin.
   consumer's graph (reqwest, hyper); `futures-executor` stays out of an
   auth-only consumer's.
 
+### Security
+
+- `Cargo.lock`: rustls-webpki 0.103.15 → 0.103.16 (RUSTSEC-2026-0382) and
+  webpki-root-certs 1.0.9 → 1.0.10 (RUSTSEC-2026-0383), so `cargo audit` and
+  `cargo deny check advisories` are clean again. All three advisories of this
+  family (RUSTSEC-2026-0381, -0382, -0383) are the same defect: certificate
+  paths through the distrusted emSign intermediates, whose private keys are
+  now well known, were accepted. Lock only, no manifest change, no source
+  change. rustls-webpki is compiled wherever rustls is (`stridelabs-http`'s
+  `proxy`, `stridelabs-redis`'s `rediss://`); webpki-root-certs is
+  rustls-platform-verifier's wasm32-only dependency, which a Linux or macOS
+  build does not compile; webpki-roots (RUSTSEC-2026-0381) is not in this
+  workspace's lock at all. A consumer's own `Cargo.lock` decides what it builds, so it bumps
+  rustls-webpki (and webpki-roots / webpki-root-certs, where it has them)
+  there.
+
 ### Dependencies
 
 - `flate2` 1.1.10 (`default-features = false`, `rust_backend` +
