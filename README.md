@@ -140,8 +140,13 @@ dependency, so after adding the block:
    the crate graph" when it did not.
 
 `scripts/downstream-check.sh` is the automated form: it does both against this
-checkout for tapper, slauth, limen or spendwise-rs, then proves with `cargo
-metadata` that every `stridelabs-*` package is this checkout's own crate.
+checkout for tapper, slauth, limen, imgmcp, spendwise-rs or slaudio, then proves
+with `cargo metadata` that every `stridelabs-*` package is this checkout's own
+crate. It finds each consumer's checkout next to this one or under
+`~/projects` (`DOWNSTREAM_PROJECTS` and `DOWNSTREAM_<NAME>_REPO` override), and
+keeps its archives and target dirs under `~/.cache/stridelabs-downstream`
+(`DOWNSTREAM_SCRATCH` overrides); the script's header lists each consumer's
+services and variables.
 
 ### Feature topology (all eight crates)
 

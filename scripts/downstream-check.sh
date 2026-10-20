@@ -4,10 +4,10 @@
 #
 #   scripts/downstream-check.sh [--dry-run] <consumer[,consumer...]|all> <ref> [extra cargo flags]
 #
-# consumer  tapper | slauth | limen | spendwise   (limen is also checked in CI,
-#           by the `downstream-limen` job; the other three are private repos
-#           whose test output must not land in a public Actions log, so they
-#           are checked only here)
+# consumer  tapper | slauth | limen | imgmcp | spendwise | slaudio
+#           (limen is also checked in CI, by the `downstream-limen` job; the
+#           others are private repos whose test output must not land in a public
+#           Actions log, so they are checked only here)
 # ref       any ref the consumer's repo resolves (branch, tag, SHA, origin/main).
 #           With several consumers the same ref is looked up in each repo;
 #           DOWNSTREAM_<NAME>_REF overrides it for one of them.
@@ -58,11 +58,12 @@
 #     included) state are read again; they are checked once more at the end, and
 #     the run fails if the library moved while the consumers were tested.
 #
-# Exit status: 0 when every REQUIRED consumer (tapper, slauth, limen) passed;
-# 1 when one failed, or when the run changed or moved the library; 2 when it
-# refused to start (usage, dirty library tree, paths that overlap, missing env
-# or service).
-# spendwise is INFORMATIONAL: its result is printed but never decides the exit.
+# Exit status: 0 when every REQUIRED consumer (tapper, slauth, limen, imgmcp)
+# passed; 1 when one failed, or when the run changed or moved the library; 2
+# when it refused to start (usage, dirty library tree, paths that overlap,
+# missing env or service).
+# spendwise and slaudio are INFORMATIONAL: their results are printed but never
+# decide the exit.
 #
 # Environment (names only; this script never prints a value):
 #   tapper     TAPPER_RS_TEST_DATABASE_URL  a MIGRATED Postgres that is not the dev stack's
@@ -81,10 +82,28 @@
 #              DOWNSTREAM_SPENDWISE_DATABASE_URL). This script does not
 #              provision it.
 #   limen      nothing.
-#   DOWNSTREAM_<NAME>_REPO overrides a consumer's repo path. DOWNSTREAM_LIB
-#   overrides the library path (default: the checkout this script is in),
-#   DOWNSTREAM_SCRATCH the scratch root, DOWNSTREAM_LOCK_TIMEOUT the seconds
-#   to wait for the lock (default 3600).
+#   imgmcp     nothing (its tests are hermetic).
+#   slaudio    its Rust port lives on the `rust-port` branch (main has no
+#              backend-rs), so pass DOWNSTREAM_SLAUDIO_REF=rust-port (or
+#              origin/rust-port) when the ref argument names another branch.
+#              A Postgres server and a Redis: SLAUDIO_TEST_DATABASE_URL and
+#              SLAUDIO_TEST_REDIS_URL, defaulting (in its own tests too) to
+#              localhost:5435 and localhost:6381 (`docker compose up -d
+#              postgres redis` in slaudio). DATABASE_URL and REDIS_URL are never
+#              read. A tz database at 2026c or later in TZDIR (else
+#              /usr/share/zoneinfo).
+#
+# Paths. Nothing here names a machine: every default is relative to the
+# library checkout or to $HOME, and every one can be overridden.
+#   A consumer's repo is the first <root>/<dir> that is a git checkout, for each
+#   root in DOWNSTREAM_PROJECTS (colon-separated; default: the directory the
+#   library checkout sits in, then $HOME/projects). <dir> is the consumer's
+#   name, except spendwise-rs. DOWNSTREAM_<NAME>_REPO overrides one consumer.
+#   DOWNSTREAM_LIB overrides the library path (default: the checkout this
+#   script is in), DOWNSTREAM_SCRATCH the scratch root (default:
+#   ${XDG_CACHE_HOME:-$HOME/.cache}/stridelabs-downstream; the target dirs are
+#   large, so point it at a roomy disk), DOWNSTREAM_LOCK_TIMEOUT the seconds to
+#   wait for the lock (default 3600).
 #
 # Needs git, tar, mise and jq (cargo metadata proves the patch applied).
 # Written for bash 3.2 (macOS /bin/bash) as well as current bash.
@@ -92,15 +111,16 @@
 set -uo pipefail
 
 LIB=${DOWNSTREAM_LIB:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
-SCRATCH=${DOWNSTREAM_SCRATCH:-/Volumes/miniext/scratch-011}
+SCRATCH=${DOWNSTREAM_SCRATCH:-${XDG_CACHE_HOME:-$HOME/.cache}/stridelabs-downstream}
 LIB_URL='https://github.com/charliek/stridelabs-rust.git'
 CRATES='config observability http auth testing mcp redis gcp'
-KNOWN_CONSUMERS='tapper slauth limen spendwise'
+KNOWN_CONSUMERS='tapper slauth limen imgmcp spendwise slaudio'
 
 usage() {
   cat >&2 <<'EOF'
 usage: scripts/downstream-check.sh [--dry-run] <consumer[,consumer...]|all> <ref> [extra cargo flags]
-  consumer: tapper | slauth | limen | spendwise (spendwise is informational)
+  consumer: tapper | slauth | limen | imgmcp | spendwise | slaudio
+            (spendwise and slaudio are informational)
   --dry-run: run every check, print the plan, build nothing
 See the header of this script for the environment each consumer needs.
 EOF
@@ -225,12 +245,33 @@ feature_flags() { # flags...
   done
 }
 
+# The default repo path of a consumer directory: the first <root>/<dir> that is
+# a git checkout (a worktree's .git file counts), for each root in
+# DOWNSTREAM_PROJECTS. With none found it prints the first root's candidate, so
+# preflight names a concrete path and the variable that overrides it.
+default_repo() { # dir
+  local roots root first=''
+  roots=${DOWNSTREAM_PROJECTS:-$(dirname "$LIB"):$HOME/projects}
+  local IFS=:
+  for root in $roots; do
+    [ -n "$root" ] || continue
+    [ -n "$first" ] || first=${root%/}/$1
+    if [ -d "${root%/}/$1/.git" ] || [ -f "${root%/}/$1/.git" ]; then
+      printf '%s' "${root%/}/$1"
+      return
+    fi
+  done
+  printf '%s' "${first:-$1}"
+}
+
 # Sets C_* for one consumer. The clippy and test flags are the ones that
 # consumer's own CI uses, minus --locked (see the header): tapper-rs runs
 # clippy with --all-features (its CI job tapper-rs-check), limen and spendwise
-# test with --all, slauth with plain `cargo test`. The command line's extra
-# flags are appended to both. The repo path is the pinned physical one once the
-# path-safety check has run.
+# test with --all, slauth and imgmcp with plain `cargo test` (imgmcp's clippy
+# with --all-features), slaudio's backend-rs workspace with --workspace
+# --all-features (its CI job). The command line's extra flags are appended to
+# both. The repo path is the pinned physical one once the path-safety check has
+# run.
 load_consumer() {
   local var
   C_NAME=$1
@@ -238,30 +279,43 @@ load_consumer() {
   C_TEST_FLAGS=()
   case $1 in
     tapper)
-      C_REPO=/Volumes/miniext/projects/tapper
+      C_REPO=$(default_repo tapper)
       C_CRATE=tapper-rs
       C_KIND=required
       C_CLIPPY_FLAGS=(--all-targets --all-features)
       ;;
     slauth)
-      C_REPO=/Users/charliek/projects/slauth
+      C_REPO=$(default_repo slauth)
       C_CRATE=backend-rs
       C_KIND=required
       C_CLIPPY_FLAGS=(--all-targets)
       ;;
     limen)
-      C_REPO=/Users/charliek/projects/limen
+      C_REPO=$(default_repo limen)
       C_CRATE=.
       C_KIND=required
       C_CLIPPY_FLAGS=(--all-targets)
       C_TEST_FLAGS=(--all)
       ;;
+    imgmcp)
+      C_REPO=$(default_repo imgmcp)
+      C_CRATE=.
+      C_KIND=required
+      C_CLIPPY_FLAGS=(--all-targets --all-features)
+      ;;
     spendwise)
-      C_REPO=/Users/charliek/projects/spendwise-rs
+      C_REPO=$(default_repo spendwise-rs)
       C_CRATE=backend
       C_KIND=informational
       C_CLIPPY_FLAGS=(--all-targets)
       C_TEST_FLAGS=(--all)
+      ;;
+    slaudio)
+      C_REPO=$(default_repo slaudio)
+      C_CRATE=backend-rs
+      C_KIND=informational
+      C_CLIPPY_FLAGS=(--workspace --all-targets --all-features)
+      C_TEST_FLAGS=(--workspace --all-features)
       ;;
   esac
   C_CLIPPY_FLAGS+=(${EXTRA[@]+"${EXTRA[@]}"})
@@ -401,6 +455,10 @@ preflight() {
   PROBLEMS=()
   [ -d "$C_REPO/.git" ] || [ -f "$C_REPO/.git" ] || problem "$C_REPO is not a git repository (set DOWNSTREAM_${C_UPPER}_REPO)"
   [ -n "$C_SHA" ] || problem "ref '$C_REF' does not resolve in $C_REPO (this script does not fetch)"
+  if [ -n "$C_SHA" ] && ! git -C "$C_REPO" cat-file -e "$C_SHA:${C_CRATE#./}/Cargo.toml" 2>/dev/null &&
+    ! { [ "$C_CRATE" = . ] && git -C "$C_REPO" cat-file -e "$C_SHA:Cargo.toml" 2>/dev/null; }; then
+    problem "ref '$C_REF' of $C_NAME has no $C_CRATE/Cargo.toml (set DOWNSTREAM_${C_UPPER}_REF to a ref that has it)"
+  fi
   case $C_NAME in
     tapper)
       need_env TAPPER_RS_TEST_DATABASE_URL "a migrated Postgres that is not the dev stack's; see tapper's CLAUDE.md, section tapper-rs"
@@ -424,6 +482,36 @@ preflight() {
     spendwise)
       need_default_postgres 5437 "docker compose up -d in spendwise-rs; this script does not provision it"
       ;;
+    slaudio)
+      local hint="docker compose up -d postgres redis in slaudio"
+      if [ -n "${SLAUDIO_TEST_DATABASE_URL:-}" ]; then
+        need_url_tcp "SLAUDIO_TEST_DATABASE_URL's Postgres" "$SLAUDIO_TEST_DATABASE_URL" 5432 "$hint"
+      else
+        need_tcp "the slaudio test Postgres" localhost 5435 "$hint"
+      fi
+      if [ -n "${SLAUDIO_TEST_REDIS_URL:-}" ]; then
+        need_url_tcp "SLAUDIO_TEST_REDIS_URL's Redis" "$SLAUDIO_TEST_REDIS_URL" 6379 "$hint"
+      else
+        need_tcp "the slaudio test Redis" localhost 6381 "$hint"
+      fi
+      need_tzdata 2026c
+      ;;
+  esac
+}
+
+# The tz database the consumer's tests read (TZDIR, else /usr/share/zoneinfo)
+# must be at least the given release. Its version is the first line of
+# tzdata.zi (`# version 2026c`), or +VERSION where tzdata.zi is absent (macOS).
+need_tzdata() { # minimum
+  local dir=${TZDIR:-/usr/share/zoneinfo} v=''
+  if [ -r "$dir/tzdata.zi" ]; then
+    v=$(sed -n '1s/^# version //p' "$dir/tzdata.zi")
+  elif [ -r "$dir/+VERSION" ]; then
+    v=$(tr -d '[:space:]' <"$dir/+VERSION")
+  fi
+  case $v in
+    '' | *[!0-9a-z]*) problem "cannot read the tz database version under $dir (point TZDIR at a tz database)" ;;
+    *) [[ ! $v < $1 ]] || problem "the tz database under $dir is $v; $C_NAME needs $1 or later (point TZDIR at a current copy)" ;;
   esac
 }
 
@@ -450,6 +538,15 @@ build_env() {
       if [ -n "$C_DB_URL" ]; then
         RUN_ENV+=("DATABASE_URL=$C_DB_URL")
       fi
+      ;;
+    imgmcp)
+      # Hermetic tests; keep another service's ambient URLs out regardless.
+      RUN_UNSET+=(-u DATABASE_URL -u REDIS_URL)
+      ;;
+    slaudio)
+      # Its tests read only SLAUDIO_TEST_* (inherited as set, or their own
+      # defaults) and never DATABASE_URL or REDIS_URL; unset those anyway.
+      RUN_UNSET+=(-u DATABASE_URL -u REDIS_URL)
       ;;
   esac
 }
