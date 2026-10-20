@@ -58,7 +58,9 @@ pub enum SsrfError {
     /// The redirect chain was longer than the policy's `max_redirects`.
     #[error("Too many redirects.")]
     TooManyRedirects,
-    /// The response status was not `200 OK`.
+    /// The response status was not one the policy accepts (by default,
+    /// anything but `200 OK`; see `AcceptedStatuses`). Also what
+    /// `fetch_public` makes of a `304 Not Modified` answering a validator.
     #[error("{} fetch failed with HTTP {}.", capitalize(.label), .status.as_u16())]
     HttpStatus {
         /// The policy's label, as given (rendered capitalized).
@@ -67,11 +69,14 @@ pub enum SsrfError {
         status: StatusCode,
     },
     /// The body is over the policy's byte cap — declared by `Content-Length`
-    /// or counted while streaming. Carries the full message: the policy's
-    /// custom text, or `The fetched {label} is too large.`
+    /// or counted while streaming; for a decoded body (feature
+    /// `ssrf-decompress`), over the wire cap or, decoded, over `max_bytes`.
+    /// Carries the full message: the policy's custom text, or `The fetched
+    /// {label} is too large.`
     #[error("{0}")]
     TooLarge(String),
-    /// The wall-clock budget ran out (all hops, resolution included).
+    /// The wall-clock budget ran out (all hops, resolution and any decoding
+    /// included).
     #[error("{} fetch timed out.", capitalize(.label))]
     TimedOut {
         /// The policy's label, as given (rendered capitalized).
@@ -79,8 +84,9 @@ pub enum SsrfError {
     },
     /// Any other transport failure — connect, TLS (a certificate that does
     /// not match the host included), a broken body, a 3xx with no usable
-    /// `Location` — and a response with a `Content-Encoding` other than
-    /// `identity`, which is refused rather than decoded.
+    /// `Location` — and a response with a `Content-Encoding` the policy
+    /// does not decode (by default, anything but `identity`), or a coded body
+    /// that is corrupt or truncated.
     #[error("Could not fetch the {label} URL.")]
     FetchFailed {
         /// The policy's label, as given.

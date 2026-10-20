@@ -11,6 +11,70 @@ for a consumer's pin.
 
 ## [Unreleased]
 
+### Added
+
+- `stridelabs-http` (`ssrf`): the options a feed fetch needs, every one
+  opt-in. A default policy's request is v0.8.0's byte for byte (pinned by a
+  snapshot recorded on the v0.8.0 tree), and `fetch_public` returns the
+  `Fetched` values it returned.
+  - `fetch_public_response(url, &policy)` → `FetchResponse`
+    (`#[non_exhaustive]`; `body`, `content_type`, `status`, `final_url:
+    url::Url`, `headers: HeaderMap`, `redirects`), the answering hop's
+    status, URL and parsed headers. `url::Url` is now public API of `ssrf`,
+    as it was of `proxy`. Its `Debug` is hand-written: the body length, the
+    status, the URL with its query and fragment redacted, header names
+    only, and the redirect count. `final_url` and `headers` are not
+    client-safe. `impl From<FetchResponse> for Fetched`; `fetch_public` is
+    that conversion, and `Fetched` is unchanged.
+  - `FetchPolicy::with_user_agent(HeaderValue)` and
+    `FetchPolicy::with_header(HeaderName, HeaderValue) -> Result<_,
+    ReservedHeader>`. Policy headers are trusted configuration, never
+    secrets: they go on every hop, cross-host redirects included. The
+    reserved names (hop-by-hop and framing, routing and every
+    `x-forwarded-*`, method and route overrides, cloud metadata headers,
+    credentials, the fetch's own `accept`/`accept-encoding`/`user-agent`,
+    and the not-yet-designed `if-match`/`if-unmodified-since`/`if-range`/
+    `range`) are refused, case-insensitively; the list is part of the
+    contract. `If-None-Match` and `If-Modified-Since` replace, every other
+    name appends.
+  - Conditional requests: those two validators go to the first hop only and
+    are dropped on any redirect (RFC 9110 section 15.4). A `304` answering
+    them there is terminal: `FetchResponse { status: 304, body: empty,
+    redirects: 0, final_url: the original }`, never a redirect, whatever
+    the statuses policy says. `fetch_public` reports it as `HttpStatus`. A
+    `304` without a validator, or past the first hop, is a 3xx as before.
+  - `FetchPolicy::with_accepted_statuses(AcceptedStatuses)`
+    (`#[non_exhaustive]`): `OkOnly` (default, `== 200`) or `AnySuccess`
+    (any 2xx).
+  - New feature `ssrf-decompress` (`["ssrf", "dep:flate2"]`):
+    `FetchPolicy::with_decompression(Decompression)` (`#[non_exhaustive]`;
+    `Off` by default, `GzipDeflate`). Under `GzipDeflate` the request sends
+    `Accept-Encoding: gzip, deflate`; a response coded with exactly one of
+    `gzip`, `x-gzip` or `deflate` (identity tokens aside, case-insensitive)
+    is decoded, and anything else coded is refused as before. The wire
+    bytes are capped at `max_bytes + max_bytes / 8 + 4096` (declared and
+    streamed) and the decoded bytes at `max_bytes`; `TooLarge` wins the
+    moment the decoded allowance would be passed (counting output an
+    inflate call writes before it reports corruption, decided before it is
+    stored) and never falls back to raw deflate. Neither body buffer's
+    capacity passes its cap (the decoded body's, `max_bytes`); both are
+    reserved fallibly, and a refused reservation is `FetchFailed`. The
+    decode runs in bounded steps that yield between them, with the fetch's
+    deadline checked before each step and on every answer: past it, any
+    outcome (a body, an empty one, `TooLarge`, a corruption) is
+    `TimedOut`. gzip is framed as CPython's `gzip`
+    module frames it (reserved flag bits and the header CRC unchecked,
+    FNAME and FCOMMENT of any length), every member, skipping zero padding;
+    deflate is zlib, then raw, each required to end. Corrupt or truncated
+    input is `FetchFailed`, never a partial body. Parity with feedparser
+    6.0.12 is a tested subset (a 66-case golden fixture and its generator),
+    with three recorded residues: `GZIP` and a `gzip`-then-`identity`
+    header pair are decoded here, and stacked or unknown codings are
+    refused here where feedparser passes them through.
+  - No `with_*` method can let a fetch reach a non-public address, and
+    `user:pass@` is still `EmbeddedCredentials` everywhere.
+  - CI builds and lints `stridelabs-http:ssrf-decompress` on its own.
+
 ### Changed
 
 - **BREAKING (behaviour, security, for `Verifier`, `JwksCache` and
@@ -79,6 +143,14 @@ for a consumer's pin.
   `sync`) and depends on `futures-util` with `std` only. Both were already in every
   consumer's graph (reqwest, hyper); `futures-executor` stays out of an
   auth-only consumer's.
+
+### Dependencies
+
+- `flate2` 1.1.10 (`default-features = false`, `rust_backend` +
+  `runtime_detection`), new, optional, behind `stridelabs-http`'s
+  `ssrf-decompress` only: with miniz_oxide, adler2, crc32fast and
+  simd-adler32, pure Rust. `zlib-rs` gains a lock-only Cargo.lock entry
+  through flate2's weak `zlib-rs?/std`; nothing compiles it.
 
 ## [0.8.0] - 2026-10-17
 

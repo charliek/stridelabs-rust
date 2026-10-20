@@ -169,7 +169,8 @@ on what.
 | `stridelabs-http` | `cors` | off | `cors_layer`, via `tower-http/cors` |
 | `stridelabs-http` | `openapi` | off | spec canonicalization, `(method, path)` enumeration, committed-spec freshness check, via `utoipa` |
 | `stridelabs-http` | `proxy` | off | reverse-proxy primitives, via `reqwest` (with `rustls`: the aws-lc-rs provider and the OS trust store)/`url`/`bytes`/`futures` |
-| `stridelabs-http` | `ssrf` | off | `fetch_public`, the SSRF-hardened fetch of a URL somebody else chose (public-address policy, DNS pinning, capped body), via the same `reqwest`/`url`/`bytes`/`futures` as `proxy` |
+| `stridelabs-http` | `ssrf` | off | `fetch_public` and `fetch_public_response`, the SSRF-hardened fetch of a URL somebody else chose (public-address policy, DNS pinning, capped body; request headers, statuses, validators, the answering hop's URL and headers), via the same `reqwest`/`url`/`bytes`/`futures` as `proxy` |
+| `stridelabs-http` | `ssrf-decompress` | off | `ssrf` plus opt-in gzip/deflate decoding of a fetched body under a decoded-size cap, via `flate2` (pure Rust, no C toolchain) |
 | `stridelabs-http` | `ssrf-test-support` | off | `ssrf::LoopbackTestServer`, to point a fetch at a local TLS test server — `[dev-dependencies]` only |
 | `stridelabs-http` | `tls` | off | `tls::install_default_provider`, making aws-lc-rs the process's rustls provider, via `rustls` |
 | `stridelabs-auth` | `axum` | off | `bearer_token(&Parts)`, via the `http` types crate |

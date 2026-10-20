@@ -1,7 +1,9 @@
 //! SSRF-hardened outbound fetch (feature `ssrf`).
 //!
 //! Any server-side path that fetches a URL a user, an LLM or an attacker
-//! chose goes through [`fetch_public`]. StrideLabs services run on Cloud Run,
+//! chose goes through [`fetch_public`] (body and content type) or
+//! [`fetch_public_response`] (also the status, the answering hop's URL and
+//! headers, and the redirect count). StrideLabs services run on Cloud Run,
 //! where an SSRF that reaches the metadata server (`169.254.169.254`,
 //! `metadata.google.internal`) or another internal service is the primary
 //! threat. Ported from Python `stridelabs.mcp.ssrf` (stridelabs-mcp 0.4.0):
@@ -18,6 +20,34 @@
 //!     .with_accept(HeaderValue::from_static("image/*"));
 //! let fetched = fetch_public(url, &policy).await?;
 //! println!("{} bytes, {:?}", fetched.body.len(), fetched.content_type);
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! A feed fetch uses more of the options, and the whole response (with
+//! feature `ssrf-decompress`, add
+//! `.with_decompression(Decompression::GzipDeflate)`):
+//!
+//! ```no_run
+//! use std::time::Duration;
+//! use http::{HeaderName, HeaderValue};
+//! use stridelabs_http::ssrf::{
+//!     fetch_public_response, AcceptedStatuses, AllowedSchemes, FetchPolicy,
+//! };
+//!
+//! # async fn example(url: &str) -> Result<(), Box<dyn std::error::Error>> {
+//! let policy = FetchPolicy::new("feed", 10 * 1024 * 1024)
+//!     .with_allowed_schemes(AllowedSchemes::HttpAndHttps)
+//!     .with_timeout(Duration::from_secs(30))
+//!     .with_max_redirects(10)
+//!     .with_accepted_statuses(AcceptedStatuses::AnySuccess)
+//!     .with_user_agent(HeaderValue::from_static("example-feeds/1.0"))
+//!     .with_header(HeaderName::from_static("a-im"), HeaderValue::from_static("feed"))?;
+//! let response = fetch_public_response(url, &policy).await?;
+//! // Resolve the feed's relative links against `final_url`.
+//! let base = &response.final_url;
+//! println!("{} bytes, {} redirects", response.body.len(), response.redirects);
+//! # let _ = base;
 //! # Ok(())
 //! # }
 //! ```
@@ -42,10 +72,16 @@
 //! 5. **Bounded download**: a streamed body with a hard byte cap
 //!    (`Content-Length` is a claim, not a limit) and one wall-clock budget
 //!    for the whole fetch, every hop included.
-//! 6. **No content coding**: every request sends `Accept-Encoding: identity`,
-//!    reqwest's decoders are switched off by name, and a response with any
-//!    `Content-Encoding` other than `identity` is refused as "Could not fetch
-//!    the {label} URL." — see below for why that differs from Python.
+//! 6. **No content coding by default**: every request sends
+//!    `Accept-Encoding: identity`, reqwest's decoders are switched off by
+//!    name, and a response with any `Content-Encoding` other than `identity`
+//!    is refused as "Could not fetch the {label} URL." — see below for why
+//!    that differs from Python, and for the opt-in decoder.
+//! 7. **Statuses**: `200 OK` only by default; [`AcceptedStatuses::AnySuccess`]
+//!    takes any 2xx. Everything else is [`SsrfError::HttpStatus`].
+//!
+//! None of the options ([`FetchPolicy`]'s `with_*` methods) can let a fetch
+//! reach a non-public address.
 //!
 //! The address policy is [`is_public_address`], written from the IANA
 //! special-purpose registries; its docs carry the full table, the source,
@@ -76,24 +112,86 @@
 //!   normalized name, not the address — through reqwest's `rustls` (the
 //!   aws-lc-rs provider and the platform verifier, as `proxy` uses).
 //!
-//! # Compressed responses: refused, never decoded
+//! # Compressed responses: refused, unless the policy decodes
 //!
 //! A deliberate difference from Python, where httpx transparently decodes
-//! gzip and deflate (brotli and zstd when installed). Here nothing is ever
+//! gzip and deflate (brotli and zstd when installed). By default nothing is
 //! decompressed: the request asks for `identity`, and a server that encodes
-//! anyway gets the generic fetch failure. Decoding would hand back bytes the
-//! server did not send under the type it claimed — and, without a decoder,
-//! there is no decompression bomb to bound. reqwest's own decoders are
-//! disabled per client (`no_gzip()` and friends) even though this crate
-//! enables none of their features, because a consumer's graph may, and Cargo
-//! unifies features across it. The cost is a server that encodes even when
-//! asked for `identity`: it cannot be fetched.
+//! anyway gets the generic fetch failure. Decoding hands back bytes the
+//! server did not send under the type it claimed — which is why an image
+//! fetch keeps it off — and, without a decoder, there is no decompression
+//! bomb to bound. reqwest's own decoders are disabled per client
+//! (`no_gzip()` and friends) even though this crate enables none of their
+//! features, because a consumer's graph may, and Cargo unifies features
+//! across it.
+//!
+//! The `ssrf-decompress` feature adds `FetchPolicy::with_decompression`, for
+//! a feed fetcher whose servers compress whatever they are asked for. Under
+//! `Decompression::GzipDeflate`:
+//!
+//! - The request sends `Accept-Encoding: gzip, deflate`.
+//! - A response that is identity-encoded (as above) is read as before, under
+//!   `max_bytes`. Otherwise, identity tokens are dropped across every
+//!   `Content-Encoding` header, and exactly one token must remain, `gzip`,
+//!   `x-gzip` or `deflate` (case-insensitive). Stacked codings, `br`, `zstd`
+//!   and anything else are refused.
+//! - Two caps: the wire bytes, declared and streamed, at `max_bytes +
+//!   max_bytes / 8 + 4096` (saturating), and the decoded bytes at
+//!   `max_bytes`, inclusive. A body over either is [`SsrfError::TooLarge`],
+//!   and the decoded cap wins the moment it is passed — counting the bytes
+//!   an inflate call wrote before it reported corruption, decided before
+//!   they are stored — before any later corruption is looked at. Only the
+//!   deadline comes first: past it, every answer is [`SsrfError::TimedOut`].
+//! - Buffer capacities are capped, not only lengths: at most the wire cap,
+//!   `max_bytes` decoded, one 32 KiB step and the inflater's state (a
+//!   reallocation can briefly hold its previous, smaller buffer too). The
+//!   two body buffers are reserved fallibly: a refused reservation is
+//!   [`SsrfError::FetchFailed`].
+//! - The wire body is read whole, then decoded in **bounded steps** (one
+//!   inflate call of at most 32 KiB out, 64 KiB in, or one gzip member,
+//!   each), yielding to the runtime between steps, so a cancelled fetch
+//!   stops at once. The fetch's deadline is checked before each step and
+//!   on every answer: a decode running past it, or answering after it (a
+//!   body, an empty one, `TooLarge` or a corruption alike), is
+//!   [`SsrfError::TimedOut`] (a step is bounded, not preempted).
+//! - gzip decodes every member, framed as CPython's `gzip` module frames it
+//!   (reserved flag bits and the header CRC unchecked, header strings of any
+//!   length), skipping zero padding between and after them; deflate is
+//!   zlib-wrapped, or raw when the zlib reading fails (as feedparser reads
+//!   it). A corrupt or truncated body is [`SsrfError::FetchFailed`], never a
+//!   partial one.
+//! - [`FetchResponse::headers`] keeps the wire `Content-Encoding` and
+//!   `Content-Length`.
+//!
+//! # Request headers: trusted configuration, never secrets
+//!
+//! [`FetchPolicy::with_user_agent`] and [`FetchPolicy::with_header`] add
+//! request headers, which go on **every** hop, cross-host redirects
+//! included. A redirect chooses those hosts, so a policy header must never
+//! carry a secret. The reserved names ([`FetchPolicy::with_header`] lists
+//! them) keep the fetch's framing, routing, credentials and its own headers
+//! out of a policy's reach; the list protects the fetch, it does not
+//! sanitize an arbitrary header. There is still no way to send credentials:
+//! a URL's `user:pass@` is refused, on the first URL and on a `Location`.
+//!
+//! # Conditional requests
+//!
+//! `If-None-Match` and `If-Modified-Since` set through
+//! [`FetchPolicy::with_header`] go to the first hop only, the URL the fetch
+//! was given, and are dropped on any redirect. A `304` there is the fetch's
+//! answer: [`FetchResponse`] with that status, an empty body, `redirects: 0`
+//! and the original URL, never a redirect (a `Location` is ignored).
+//! [`fetch_public`] reports it as [`SsrfError::HttpStatus`]. Without a
+//! validator, a `304` is a 3xx like any other. Store a validator with the
+//! `final_url` of the response that carried it, and send it only there.
 //!
 //! # Errors
 //!
 //! Every failure is an [`SsrfError`] whose `Display` is safe to show a
 //! client. Transport details are logged at `debug`, with
-//! `reqwest::Error::without_url`, and go nowhere else.
+//! `reqwest::Error::without_url`, and go nowhere else. A successful
+//! [`FetchResponse`] is not client-safe: its URL and headers are the
+//! server's, for the caller alone.
 //!
 //! That covers this crate's own logging only. reqwest, hyper and hyper-util
 //! log through `tracing`/`log` too, and their `DEBUG` and `TRACE` events name
@@ -135,6 +233,8 @@
 //! flat, so each item has one public path.
 
 mod address;
+#[cfg(feature = "ssrf-decompress")]
+mod decode;
 mod error;
 mod fetch;
 mod policy;
@@ -142,9 +242,12 @@ mod target;
 
 pub use address::is_public_address;
 pub use error::SsrfError;
-pub use fetch::{fetch_public, Fetched};
+pub use fetch::{fetch_public, fetch_public_response, FetchResponse, Fetched};
+#[cfg(feature = "ssrf-decompress")]
+pub use policy::Decompression;
 pub use policy::{
-    AllowedSchemes, FetchPolicy, HostResolver, ResolveFuture, SystemResolver, DEFAULT_TIMEOUT,
+    AcceptedStatuses, AllowedSchemes, FetchPolicy, HostResolver, ReservedHeader, ResolveFuture,
+    SystemResolver, DEFAULT_TIMEOUT,
 };
 #[cfg(feature = "ssrf-test-support")]
 pub use policy::{LoopbackTestServer, LoopbackTestServerError};
