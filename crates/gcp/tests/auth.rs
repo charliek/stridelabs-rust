@@ -14,8 +14,8 @@ use common::*;
 use serde_json::{json, Value};
 use stridelabs_gcp::auth::{
     AccessToken, CredentialKind, CredentialSource, GcpAuthError, TokenOptions, TokenProvider,
-    DEFAULT_METADATA_TIMEOUT, GOOGLE_APPLICATION_CREDENTIALS, GOOGLE_CLOUD_QUOTA_PROJECT,
-    MAX_TOKEN_RESPONSE, REFRESH_MARGIN,
+    DEFAULT_METADATA_TIMEOUT, DEFAULT_TOKEN_TIMEOUT, GOOGLE_APPLICATION_CREDENTIALS,
+    GOOGLE_CLOUD_QUOTA_PROJECT, MAX_TOKEN_RESPONSE, REFRESH_MARGIN,
 };
 use wiremock::matchers::{body_string_contains, header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -714,7 +714,105 @@ async fn a_hanging_metadata_server_times_out() {
     }
 }
 
+/// `token_timeout` bounds the whole token-endpoint exchange (here an
+/// `authorized_user` refresh), as `metadata_timeout` bounds the metadata
+/// request above.
+#[tokio::test]
+async fn a_hanging_token_endpoint_times_out_at_the_token_timeout() {
+    assert_eq!(DEFAULT_TOKEN_TIMEOUT, Duration::from_secs(10));
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(USER_TOKEN_PATH))
+        .respond_with(token_body("late", json!(3600)).set_delay(Duration::from_secs(10)))
+        .mount(&server)
+        .await;
+    let provider = user_provider(&authorized_user()).with_options(
+        TokenOptions::default()
+            .default_token_uri(format!("{}{USER_TOKEN_PATH}", server.uri()))
+            .token_timeout(Duration::from_millis(200)),
+    );
+
+    let started = Instant::now();
+    let error = provider.token().await.expect_err("never answers in time");
+
+    assert!(started.elapsed() < Duration::from_secs(3), "bounded");
+    match error {
+        GcpAuthError::Request { reason, endpoint } => {
+            assert_eq!(reason, "timed out");
+            assert!(endpoint.contains(USER_TOKEN_PATH), "{endpoint}");
+        }
+        other => panic!("expected Request, got {other:?}"),
+    }
+}
+
+/// An error status whose body stalls is still cut off at `token_timeout`,
+/// but reports that status, not `Request { "timed out" }`: the error body is
+/// read only to find an OAuth code, and an unreadable one has none.
+#[tokio::test]
+async fn a_token_error_whose_body_stalls_is_its_status_at_the_token_timeout() {
+    let raw = RawServer::start(|_, _| {
+        RawReply::Stall(
+            b"HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: 100\r\n\r\n{\"error\":\"invalid_gr"
+                .to_vec(),
+        )
+    })
+    .await;
+    let provider = user_provider(&authorized_user()).with_options(
+        TokenOptions::default()
+            .default_token_uri(format!("{}{USER_TOKEN_PATH}", raw.base_url))
+            .token_timeout(Duration::from_millis(300)),
+    );
+
+    let started = Instant::now();
+    let error = provider.token().await.expect_err("a 400");
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed >= Duration::from_millis(300),
+        "the body was waited on: {elapsed:?}"
+    );
+    assert!(elapsed < Duration::from_secs(3), "bounded: {elapsed:?}");
+    match error {
+        GcpAuthError::Status { status, detail, .. } => {
+            assert_eq!((status, detail.as_str()), (400, ""));
+        }
+        other => panic!("expected Status, got {other:?}"),
+    }
+    assert_eq!(raw.requests().len(), 1);
+}
+
 // ---- the cache ------------------------------------------------------------
+
+/// `invalidate`'s exported shape, pinned: a synchronous method on a shared
+/// provider, taking the rejected token by reference and saying whether it
+/// evicted. Callable with no runtime at all.
+#[test]
+fn invalidate_is_a_synchronous_eviction_by_token() {
+    let invalidate: fn(&TokenProvider, &AccessToken) -> bool = TokenProvider::invalidate;
+    let provider = TokenProvider::metadata_server(http(), SCOPES);
+    let never_issued = AccessToken {
+        token: "never-issued".into(),
+        quota_project: None,
+    };
+    assert!(!invalidate(&provider, &never_issued), "nothing cached");
+}
+
+/// Through the public API: an evicted token is refreshed on the next call,
+/// and a clone shares the eviction (one cache).
+#[tokio::test]
+async fn an_invalidated_token_is_refreshed_on_the_next_call() {
+    let server = token_server(bearers(&["t1", "t2"])).await;
+    let provider = exact_provider(&server);
+    let clone = provider.clone();
+    let first = provider.token().await.unwrap();
+    assert_eq!(first.token, "t1");
+
+    assert!(clone.invalidate(&first), "evicted through a clone");
+    assert!(!provider.invalidate(&first), "and gone for the original");
+    assert_eq!(provider.token().await.unwrap().token, "t2");
+    assert_eq!(clone.token().await.unwrap().token, "t2");
+    assert_eq!(request_count(&server).await, 2);
+}
 
 /// A metadata server that answers `response`, expecting `requests` calls.
 async fn lifetime_server(response: ResponseTemplate, requests: u64) -> MockServer {

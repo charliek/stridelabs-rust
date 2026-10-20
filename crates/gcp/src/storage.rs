@@ -3,7 +3,9 @@
 //! public object URL.
 //!
 //! Policy-free: no object naming, no bucket from the environment, no retry,
-//! no metadata of its own choosing. The service decides those.
+//! no metadata of its own choosing. The service decides those. The one
+//! replay there is, a `401` refreshed and replayed, is off unless the
+//! service turns it on ([below](self#401-refresh-and-replay-opt-in)).
 //!
 //! ```no_run
 //! # async fn example(http: reqwest::Client) -> Result<(), Box<dyn std::error::Error>> {
@@ -89,6 +91,35 @@
 //! no default credential headers, which reqwest would send to the emulator
 //! too.
 //!
+//! # 401 refresh and replay (opt-in)
+//!
+//! [`GcsClient::with_unauthorized_refresh`]`(true)` makes a `401` what
+//! google-cloud-storage's `AuthorizedSession` makes it: the bearer is evicted
+//! with [`TokenProvider::invalidate`], a token is taken again, and the
+//! request is sent again, up to [`GcsClient::with_max_refresh_attempts`]
+//! times (default 2). A persistent `401` costs three requests and two refreshes at the
+//! default, and is then [`StorageError::Status`]. Off, a `401` is one request
+//! and that error, as it always was.
+//!
+//! - **Only a completed `401`.** Never a `403`, a `5xx` or a transport
+//!   failure: a `401` means the request was not applied (RFC 9110 section
+//!   15.5.2), so replaying an upload, a delete or a create-only
+//!   `ifGenerationMatch=0` upload cannot apply it twice. That reasoning does
+//!   not reach a failure whose outcome is unknown.
+//! - **The same request.** The URL, the headers and the body are rebuilt
+//!   from what the first send used; a multipart body is built once, its
+//!   boundary with it.
+//! - **Inside the operation's bound.** The `401`'s body is read (at most 16
+//!   KiB, and at most 2 s, after which it is dropped with its connection),
+//!   then the refresh and the replay all count against the client's timeout.
+//! - **The same bearer may come back.** On the metadata server a refresh
+//!   re-serves the cached bearer for most of its life, so each replay can be
+//!   one more metadata call and one more GCS request with the same
+//!   credentials. Concurrent operations rejected on one bearer share one
+//!   eviction and one refresh when the refresh mints a different bearer.
+//! - With [`GcsClient::emulator`] and no provider there is no token to
+//!   refresh: a no-op.
+//!
 //! # Limits and errors
 //!
 //! A download reads at most [`DEFAULT_MAX_DOWNLOAD_BYTES`] (32 MiB;
@@ -114,6 +145,7 @@ use reqwest::StatusCode;
 use serde::Serialize;
 
 use crate::auth::{GcpAuthError, TokenProvider};
+use crate::replay::{send_with_refresh, UnauthorizedRefresh};
 use crate::util::{
     describe_reqwest, encode_component, encode_path, google_error, read_error_body, read_limited,
     redact_url, status_suffix, SensitiveMessage,
@@ -316,6 +348,7 @@ pub struct GcsClient {
     base_url: String,
     timeout: Duration,
     max_download_bytes: usize,
+    refresh: UnauthorizedRefresh,
 }
 
 impl fmt::Debug for GcsClient {
@@ -325,6 +358,8 @@ impl fmt::Debug for GcsClient {
             .field("tokens", &self.tokens)
             .field("timeout", &self.timeout)
             .field("max_download_bytes", &self.max_download_bytes)
+            .field("unauthorized_refresh", &self.refresh.enabled)
+            .field("max_refresh_attempts", &self.refresh.max_attempts)
             .finish_non_exhaustive()
     }
 }
@@ -339,6 +374,7 @@ impl GcsClient {
             base_url: DEFAULT_BASE_URL.to_owned(),
             timeout: DEFAULT_TIMEOUT,
             max_download_bytes: DEFAULT_MAX_DOWNLOAD_BYTES,
+            refresh: UnauthorizedRefresh::default(),
         }
     }
 
@@ -359,6 +395,7 @@ impl GcsClient {
             base_url: normalize_base_url(base_url),
             timeout: DEFAULT_TIMEOUT,
             max_download_bytes: DEFAULT_MAX_DOWNLOAD_BYTES,
+            refresh: UnauthorizedRefresh::default(),
         }
     }
 
@@ -384,6 +421,46 @@ impl GcsClient {
     pub fn with_max_download_bytes(mut self, limit: usize) -> GcsClient {
         self.max_download_bytes = limit;
         self
+    }
+
+    /// Refresh the token and replay the request when GCS answers `401`
+    /// (default `false`): see
+    /// [the module docs](self#401-refresh-and-replay-opt-in). With it on,
+    /// each operation replays a `401` up to
+    /// [`GcsClient::max_refresh_attempts`] times, each time after
+    /// [`TokenProvider::invalidate`], with a token from
+    /// [`TokenProvider::token`]. A no-op on an emulator client built with no
+    /// [`TokenProvider`].
+    #[must_use]
+    pub fn with_unauthorized_refresh(mut self, enabled: bool) -> GcsClient {
+        self.refresh.enabled = enabled;
+        self
+    }
+
+    /// How many refresh-and-replay cycles one operation may make after a
+    /// `401` (default 2, google-auth's `DEFAULT_MAX_REFRESH_ATTEMPTS`): a
+    /// persistent `401` costs `attempts + 1` requests and `attempts`
+    /// refreshes, and `0` replays nothing. The operation's timeout bounds
+    /// them all. Effective only with
+    /// [`GcsClient::with_unauthorized_refresh`]`(true)`; the count alone
+    /// never turns it on.
+    #[must_use]
+    pub fn with_max_refresh_attempts(mut self, attempts: u32) -> GcsClient {
+        self.refresh.max_attempts = attempts;
+        self
+    }
+
+    /// Whether a `401` is refreshed and replayed
+    /// ([`GcsClient::with_unauthorized_refresh`]).
+    pub fn unauthorized_refresh(&self) -> bool {
+        self.refresh.enabled
+    }
+
+    /// The configured refresh-and-replay count
+    /// ([`GcsClient::with_max_refresh_attempts`]), whether or not
+    /// [`GcsClient::unauthorized_refresh`] is on.
+    pub fn max_refresh_attempts(&self) -> u32 {
+        self.refresh.max_attempts
     }
 
     /// The base URL requests go to.
@@ -415,13 +492,14 @@ impl GcsClient {
             encode_component(bucket),
             encode_component(object)
         );
-        let request = self
-            .http
-            .post(url)
-            .header(reqwest::header::CONTENT_TYPE, content_type)
-            .body(bytes);
+        let build = || {
+            self.http
+                .post(&url)
+                .header(reqwest::header::CONTENT_TYPE, content_type)
+                .body(bytes.clone())
+        };
         self.bounded(OP, async {
-            let response = self.send(OP, request).await?;
+            let response = self.send(OP, build).await?;
             if !response.status().is_success() {
                 return Err(status_error(OP, response).await);
             }
@@ -485,7 +563,11 @@ impl GcsClient {
             });
         }
 
+        // Built once, boundary and all: every send of this upload (a 401's
+        // replay included) carries these bytes.
         let (boundary, body) = multipart_body(&metadata, content_type, &bytes, random_boundary);
+        let body = Bytes::from(body);
+        let multipart_type = format!("multipart/related; boundary={boundary}");
         let mut url = format!(
             "{}/upload/storage/v1/b/{}/o?uploadType=multipart",
             self.base_url,
@@ -495,16 +577,14 @@ impl GcsClient {
             // An i64 in decimal: nothing to encode.
             let _ = write!(url, "&ifGenerationMatch={generation}");
         }
-        let request = self
-            .http
-            .post(url)
-            .header(
-                reqwest::header::CONTENT_TYPE,
-                format!("multipart/related; boundary={boundary}"),
-            )
-            .body(body);
+        let build = || {
+            self.http
+                .post(&url)
+                .header(reqwest::header::CONTENT_TYPE, &multipart_type)
+                .body(body.clone())
+        };
         self.bounded(OP, async {
-            let response = self.send(OP, request).await?;
+            let response = self.send(OP, build).await?;
             if !response.status().is_success() {
                 return Err(status_error(OP, response).await);
             }
@@ -535,9 +615,9 @@ impl GcsClient {
             encode_component(bucket),
             encode_component(object)
         );
-        let request = self.http.get(url);
+        let build = || self.http.get(&url);
         self.bounded(OP, async {
-            let response = self.send(OP, request).await?;
+            let response = self.send(OP, build).await?;
             let status = response.status();
             if status == StatusCode::NOT_FOUND {
                 return Ok(None);
@@ -587,9 +667,9 @@ impl GcsClient {
             encode_component(bucket),
             encode_component(object)
         );
-        let request = self.http.delete(url);
+        let build = || self.http.delete(&url);
         self.bounded(OP, async {
-            let response = self.send(OP, request).await?;
+            let response = self.send(OP, build).await?;
             let status = response.status();
             if status == StatusCode::NOT_FOUND {
                 return Ok(false);
@@ -616,20 +696,26 @@ impl GcsClient {
             }))
     }
 
+    /// Send the request `build` makes (once per send, with the opt-in `401`
+    /// refresh), authorized when there is a token provider.
     async fn send(
         &self,
         operation: &'static str,
-        request: reqwest::RequestBuilder,
+        build: impl Fn() -> reqwest::RequestBuilder,
     ) -> Result<reqwest::Response, StorageError> {
-        let request = match &self.tokens {
-            Some(tokens) => tokens
-                .token()
+        let sent = match &self.tokens {
+            Some(tokens) => {
+                let auth = |source| StorageError::Auth { operation, source };
+                let first = tokens.token().await.map_err(auth)?;
+                send_with_refresh(tokens, first, self.refresh, operation, |token| {
+                    token.authorize(build())
+                })
                 .await
-                .map_err(|source| StorageError::Auth { operation, source })?
-                .authorize(request),
-            None => request,
+                .map_err(auth)?
+            }
+            None => build().send().await,
         };
-        request.send().await.map_err(|error| StorageError::Request {
+        sent.map_err(|error| StorageError::Request {
             operation,
             reason: describe_reqwest(error),
         })

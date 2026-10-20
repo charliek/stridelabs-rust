@@ -69,6 +69,12 @@
 //!   the runtime drops (even before its first poll), clears its slot: its
 //!   waiters get [`GcpAuthError::RefreshAborted`] and the next call starts
 //!   afresh.
+//! - [`TokenProvider::invalidate`] evicts a token a Google API answered `401`
+//!   to, matched by its bearer, so the next call refreshes. Callers whose
+//!   rejections of one bearer overlap cost one eviction and one refresh when
+//!   that refresh mints a different, cacheable bearer. A refresh already in
+//!   flight when its bearer was evicted, that returns that bearer, does not
+//!   cache it: its waiters get it, and the next call asks the source.
 //!
 //! # The consumer's client
 //!
@@ -387,6 +393,12 @@ struct Cache {
     /// finishes, panics or is dropped with the runtime.
     in_flight: Option<InFlight>,
     next_attempt: u64,
+    /// Bumped by every [`TokenProvider::invalidate`] that evicts. An attempt
+    /// records it when it starts, so its install can tell whether an
+    /// eviction happened while it was in flight.
+    epoch: u64,
+    /// The bearer the last evicting `invalidate` dropped.
+    rejected: Option<String>,
 }
 
 struct InFlight {
@@ -406,6 +418,30 @@ impl Cache {
             .as_ref()
             .filter(|cached| now < cached.refresh_at)
             .map(|cached| cached.token.clone())
+    }
+
+    /// Drop the cached token if its bearer is `bearer`, and remember the
+    /// eviction; whether it was.
+    fn evict(&mut self, bearer: &str) -> bool {
+        let Some(evicted) = self.token.take_if(|cached| cached.token.token == bearer) else {
+            return false;
+        };
+        self.epoch = self.epoch.wrapping_add(1);
+        self.rejected = Some(evicted.token.token);
+        true
+    }
+
+    /// Cache what an attempt that started at `epoch` fetched, unless an
+    /// eviction happened since it started and it returned the bearer that
+    /// eviction rejected; whether it cached. (Epochs only grow, so "since" is
+    /// `!=`.)
+    fn install(&mut self, epoch: u64, fetched: Cached) -> bool {
+        let rejected =
+            epoch != self.epoch && self.rejected.as_deref() == Some(fetched.token.token.as_str());
+        if !rejected {
+            self.token = Some(fetched);
+        }
+        !rejected
     }
 
     /// Clear the in-flight slot if it still holds attempt `id`.
@@ -630,21 +666,90 @@ impl TokenProvider {
                         id,
                         attempt: attempt.clone(),
                     });
-                    (attempt, Some((id, sender)))
+                    (attempt, Some((id, cache.epoch, sender)))
                 }
             }
         };
-        if let Some((id, sender)) = start {
+        if let Some((id, epoch, sender)) = start {
             // The guard exists before the task does, so even a task dropped
             // before its first poll clears the slot it reserved.
             let guard = SlotGuard {
                 inner: Arc::clone(&self.inner),
                 id,
+                epoch,
                 sender: Some(sender),
             };
             tokio::spawn(refresh(guard).instrument(tracing::Span::current()));
         }
         attempt.await
+    }
+
+    /// Forget `rejected` if it is the token the cache holds, so the next
+    /// [`TokenProvider::token`] refreshes: what a caller does when a Google
+    /// API answered `401` to a bearer this provider handed out, before it
+    /// takes a new token and replays. Returns whether it evicted.
+    ///
+    /// Synchronous, and it needs no runtime: it only takes the cache's lock.
+    /// It never starts, cancels or duplicates a refresh; the next `token()`
+    /// does that, or joins the one in flight.
+    ///
+    /// - **Matched by bearer string.** Any [`AccessToken`] carrying the cached
+    ///   bearer evicts it, whichever provider produced it (two
+    ///   metadata-server providers with the same scopes hold the same
+    ///   bearer). Any other is a no-op that returns `false`: a token already
+    ///   replaced, evicted, or never cached here (a clone's `with_*`
+    ///   successor has a cache of its own).
+    /// - **One refresh per wave**, narrowly. Callers whose rejections of one
+    ///   bearer overlap a single refresh cost one eviction and that one
+    ///   refresh, and all get its token, *when* it succeeds with a different
+    ///   bearer that lives longer than [`REFRESH_MARGIN`] (so it is cached).
+    ///   A later caller still holding the old bearer finds the new one
+    ///   cached: its `invalidate` is a no-op and its `token()` refreshes
+    ///   nothing. After a **failed** refresh the next call starts another,
+    ///   and the evicted token is never served again (failures are not
+    ///   cached).
+    /// - **No re-install.** A refresh already in flight when its bearer was
+    ///   evicted, that returns that same bearer, hands it to its waiters (it
+    ///   is what the source has) but does not cache it: the next `token()`
+    ///   asks the source again. A refresh that *starts* after the eviction
+    ///   caches whatever it gets.
+    /// - **The same bearer can come back.** Google's metadata server serves
+    ///   its own cached token until about five minutes before it expires, so
+    ///   a refresh there returns the bearer that was just rejected. A replay
+    ///   then adds requests without obtaining different credentials, though
+    ///   a transient server-side rejection can still recover. Bound your
+    ///   replays: never loop on `401`, and never replay a `403`.
+    ///
+    /// Logged at `debug` with the source and kind, never the bearer.
+    ///
+    /// ```no_run
+    /// # async fn example(http: reqwest::Client, tokens: stridelabs_gcp::TokenProvider)
+    /// # -> Result<(), Box<dyn std::error::Error>> {
+    /// let url = "https://fcm.googleapis.com/v1/projects/my-project/messages:send";
+    /// let token = tokens.token().await?;
+    /// let mut response = token.authorize(http.post(url)).send().await?;
+    /// if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+    ///     if tokens.invalidate(&token) {
+    ///         tracing::warn!("access token rejected; evicted it");
+    ///     }
+    ///     // Replay once, with whatever token the cache now gives.
+    ///     let token = tokens.token().await?;
+    ///     response = token.authorize(http.post(url)).send().await?;
+    /// }
+    /// response.error_for_status()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn invalidate(&self, rejected: &AccessToken) -> bool {
+        let evicted = self.inner.cache().evict(&rejected.token);
+        if evicted {
+            tracing::debug!(
+                source = %self.inner.origin,
+                kind = %self.inner.source.kind(),
+                "evicted a rejected GCP access token"
+            );
+        }
+        evicted
     }
 
     /// Test seam: move this provider's clock forward.
@@ -742,11 +847,14 @@ async fn refresh(guard: SlotGuard) {
 struct SlotGuard {
     inner: Arc<Inner>,
     id: u64,
+    /// The cache's eviction epoch when this attempt reserved its slot.
+    epoch: u64,
     sender: Option<oneshot::Sender<Result<AccessToken, GcpAuthError>>>,
 }
 
 impl SlotGuard {
-    /// Cache a success (per the lifetime rules) and clear the slot in one
+    /// Cache a success (per the lifetime rules, and unless it is a bearer
+    /// evicted while this attempt was in flight) and clear the slot in one
     /// critical section, then hand the outcome to the waiters.
     fn complete(mut self, result: Result<Fetched, GcpAuthError>, started: Instant) {
         let outcome = {
@@ -757,10 +865,17 @@ impl SlotGuard {
                     token: fetched.token,
                     quota_project: inner.quota_project.clone(),
                 };
-                cache.token = Some(Cached {
+                let cached = Cached {
                     token: token.clone(),
                     refresh_at: started + fetched.lifetime.saturating_sub(REFRESH_MARGIN),
-                });
+                };
+                if !cache.install(self.epoch, cached) {
+                    tracing::debug!(
+                        source = %inner.origin,
+                        kind = %inner.source.kind(),
+                        "a refresh returned the token evicted while it ran; not cached"
+                    );
+                }
                 tracing::debug!(
                     source = %inner.origin,
                     kind = %inner.source.kind(),

@@ -72,16 +72,35 @@
 //! decode error. `inlineData.data` is the exception: bytes that are not
 //! base64 are a malformed response, and [`VertexError::Decode`].
 //!
+//! # 401 refresh and replay (opt-in)
+//!
+//! [`VertexClient::with_unauthorized_refresh`]`(true)` replays a `401` as
+//! google-auth's `AuthorizedSession` does: the bearer is evicted with
+//! [`TokenProvider::invalidate`], a token is taken again, and the call is
+//! sent again with the **same JSON bytes** (serialized once, after the
+//! first token, as before), up to
+//! [`VertexClient::with_max_refresh_attempts`] times (default 2). A
+//! persistent `401` costs three requests and two refreshes at the default,
+//! and is then [`VertexError::Status`]. Off, a `401` is one request and that
+//! error, as it always was. Only a completed `401` is replayed (it means the
+//! call was not applied), never a `403`, a `5xx` or a transport failure. The
+//! `401`'s body is read for at most 2 s, and everything counts against
+//! [`VertexClient::with_timeout`]. On the metadata server a refresh can
+//! return the same bearer, so a replay may add requests without different
+//! credentials.
+//!
 //! What a block or an empty answer *says* to an end user, the timeout, and
 //! the models are the service's business, not this module's.
 
 use std::fmt;
 use std::time::Duration;
 
+use bytes::Bytes;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 
-use crate::auth::{GcpAuthError, TokenProvider};
+use crate::auth::{AccessToken, GcpAuthError, TokenProvider};
+use crate::replay::{send_with_refresh, UnauthorizedRefresh};
 use crate::util::{
     describe_reqwest, google_error, json_failure, read_error_body, read_limited, redact_url,
     status_suffix, SensitiveMessage,
@@ -636,6 +655,7 @@ pub struct VertexClient {
     base_url: Option<String>,
     timeout: Option<Duration>,
     max_response_bytes: usize,
+    refresh: UnauthorizedRefresh,
 }
 
 impl fmt::Debug for VertexClient {
@@ -647,6 +667,8 @@ impl fmt::Debug for VertexClient {
             .field("base_url", &self.base_url.as_deref().map(redact_url))
             .field("timeout", &self.timeout)
             .field("max_response_bytes", &self.max_response_bytes)
+            .field("unauthorized_refresh", &self.refresh.enabled)
+            .field("max_refresh_attempts", &self.refresh.max_attempts)
             .field("tokens", &self.tokens)
             .finish_non_exhaustive()
     }
@@ -682,6 +704,7 @@ impl VertexClient {
             base_url: None,
             timeout: None,
             max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
+            refresh: UnauthorizedRefresh::default(),
         })
     }
 
@@ -714,6 +737,45 @@ impl VertexClient {
     pub fn with_max_response_bytes(mut self, limit: usize) -> VertexClient {
         self.max_response_bytes = limit;
         self
+    }
+
+    /// Refresh the token and replay the call when Vertex answers `401`
+    /// (default `false`): see
+    /// [the module docs](self#401-refresh-and-replay-opt-in). With it on, a
+    /// call replays a `401` up to [`VertexClient::max_refresh_attempts`]
+    /// times, each time after [`TokenProvider::invalidate`], with a token
+    /// from [`TokenProvider::token`] and the same JSON bytes.
+    #[must_use]
+    pub fn with_unauthorized_refresh(mut self, enabled: bool) -> VertexClient {
+        self.refresh.enabled = enabled;
+        self
+    }
+
+    /// How many refresh-and-replay cycles one call may make after a `401`
+    /// (default 2, google-auth's `DEFAULT_MAX_REFRESH_ATTEMPTS`): a
+    /// persistent `401` costs `attempts + 1` requests and `attempts`
+    /// refreshes, and `0` replays nothing. Only
+    /// [`VertexClient::with_timeout`] bounds them all (there is no timeout
+    /// by default). Effective only with
+    /// [`VertexClient::with_unauthorized_refresh`]`(true)`; the count alone
+    /// never turns it on.
+    #[must_use]
+    pub fn with_max_refresh_attempts(mut self, attempts: u32) -> VertexClient {
+        self.refresh.max_attempts = attempts;
+        self
+    }
+
+    /// Whether a `401` is refreshed and replayed
+    /// ([`VertexClient::with_unauthorized_refresh`]).
+    pub fn unauthorized_refresh(&self) -> bool {
+        self.refresh.enabled
+    }
+
+    /// The configured refresh-and-replay count
+    /// ([`VertexClient::with_max_refresh_attempts`]), whether or not
+    /// [`VertexClient::unauthorized_refresh`] is on.
+    pub fn max_refresh_attempts(&self) -> u32 {
+        self.refresh.max_attempts
     }
 
     /// The `:generateContent` URL for `model`.
@@ -758,18 +820,52 @@ impl VertexClient {
         }
     }
 
-    async fn call(
+    /// Generic over the body only so a unit test can watch when (and how
+    /// often) it is serialized.
+    async fn call<T: Serialize + ?Sized>(
         &self,
         endpoint: String,
-        request: &GenerateContentRequest,
+        request: &T,
     ) -> Result<GenerateContentResponse, VertexError> {
-        let token = self.tokens.token().await?;
-        let response = token
-            .authorize(self.http.post(endpoint))
-            .json(request)
-            .send()
-            .await
-            .map_err(|error| VertexError::Request(describe_reqwest(error)))?;
+        // The token first, then the body, in v0.8.0's order (`json` encoded
+        // the request when it was set on a builder that already carried the
+        // token): a call that gets no token never encodes its request, an
+        // image's base64 included, and its `Auth` error comes before any
+        // encoding cost.
+        let first = self.tokens.token().await?;
+        let authorized = |token: &AccessToken| token.authorize(self.http.post(&endpoint));
+        // Then the request, still before the body: a builder that cannot
+        // become a request (an unparsable base URL, a quota project that is
+        // not a header value) made `json` encode nothing in v0.8.0, and its
+        // send reported that builder error. A throwaway build finds the same
+        // error before anything is encoded.
+        if let Err(error) = authorized(&first).build() {
+            return Err(VertexError::Request(describe_reqwest(error)));
+        }
+        // What `RequestBuilder::json` sent (the same bytes and `Content-Type`,
+        // after the authorization headers), serialized once so a replay
+        // resends these bytes. Strings and maps only, so it cannot fail; if it
+        // did, it would be the builder error `json` reported.
+        let body = Bytes::from(
+            serde_json::to_vec(request)
+                .map_err(|_| VertexError::Request("invalid request".to_owned()))?,
+        );
+        let sent = send_with_refresh(
+            &self.tokens,
+            first,
+            self.refresh,
+            "generateContent",
+            |token| {
+                authorized(token)
+                    .header(reqwest::header::CONTENT_TYPE, "application/json")
+                    .body(body.clone())
+            },
+        )
+        .await?;
+        // Freed before the response is read, as reqwest freed `json`'s body:
+        // an image request's base64 must not be held through a 64 MiB answer.
+        drop(body);
+        let response = sent.map_err(|error| VertexError::Request(describe_reqwest(error)))?;
         let status = response.status();
         if !status.is_success() {
             let error = google_error(&read_error_body(response).await);
@@ -1279,5 +1375,179 @@ mod tests {
         ] {
             assert!(!is_block_reason(reason), "{reason}");
         }
+    }
+
+    /// A body that counts how often it is serialized: the request JSON
+    /// `generateContent` would send, written by hand.
+    struct Counted(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl Serialize for Counted {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            json!({"contents": [{"role": "user", "parts": [{"text": "x"}]}]}).serialize(serializer)
+        }
+    }
+
+    /// A metadata server answering `tokens` in order (the last repeated),
+    /// a Vertex stand-in answering `statuses` in order (the last repeated),
+    /// and a client on both with the refresh on.
+    async fn counting_rig(
+        tokens: Vec<wiremock::ResponseTemplate>,
+        statuses: Vec<u16>,
+    ) -> (wiremock::MockServer, VertexClient) {
+        counting_rig_with(tokens, statuses, |tokens| tokens).await
+    }
+
+    /// [`counting_rig`], its token provider adjusted by `provider`.
+    async fn counting_rig_with(
+        tokens: Vec<wiremock::ResponseTemplate>,
+        statuses: Vec<u16>,
+        provider: impl FnOnce(TokenProvider) -> TokenProvider,
+    ) -> (wiremock::MockServer, VertexClient) {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let seen = std::sync::atomic::AtomicUsize::new(0);
+        Mock::given(method("GET"))
+            .and(path_regex("/token$"))
+            .respond_with(move |_: &Request| {
+                let n = seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokens.get(n).or(tokens.last()).cloned().unwrap()
+            })
+            .mount(&server)
+            .await;
+        let answered = std::sync::atomic::AtomicUsize::new(0);
+        Mock::given(method("POST"))
+            .and(path_regex(":generateContent$"))
+            .respond_with(move |_: &Request| {
+                let n = answered.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let status = *statuses.get(n).or(statuses.last()).unwrap();
+                ResponseTemplate::new(status).set_body_json(json!({}))
+            })
+            .mount(&server)
+            .await;
+        let tokens = provider(
+            TokenProvider::metadata_server(reqwest::Client::new(), &[])
+                .with_options(crate::auth::TokenOptions::default().metadata_base_url(server.uri())),
+        );
+        let vertex = VertexClient::new(reqwest::Client::new(), tokens, "test-project", "global")
+            .unwrap()
+            .with_base_url(server.uri())
+            .with_unauthorized_refresh(true);
+        (server, vertex)
+    }
+
+    fn bearer(token: &str) -> wiremock::ResponseTemplate {
+        wiremock::ResponseTemplate::new(200)
+            .set_body_json(json!({"access_token": token, "expires_in": 3600}))
+    }
+
+    /// v0.8.0's order: the token first. A call whose token fetch fails is
+    /// `Auth` without its request ever being encoded, and sends nothing.
+    #[tokio::test]
+    async fn a_failed_token_fetch_never_serializes_the_request() {
+        let (server, vertex) =
+            counting_rig(vec![wiremock::ResponseTemplate::new(500)], vec![200]).await;
+        let serialized = std::sync::Arc::default();
+        let endpoint = vertex.endpoint("m").unwrap();
+
+        let result = vertex
+            .call(endpoint, &Counted(std::sync::Arc::clone(&serialized)))
+            .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(VertexError::Auth(GcpAuthError::Status { status: 500, .. }))
+            ),
+            "{result:?}"
+        );
+        assert_eq!(
+            serialized.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "never encoded"
+        );
+        let requests = server.received_requests().await.unwrap();
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.method.as_str() == "GET"),
+            "no POST"
+        );
+    }
+
+    /// v0.8.0's order, past the token: a builder that cannot become a
+    /// request poisoned `json`, which then encoded nothing. Here too: a
+    /// quota project that is not a header value, or an unparsable base URL,
+    /// is the same `Request("invalid request")` with nothing encoded and
+    /// nothing sent.
+    #[tokio::test]
+    async fn a_request_that_cannot_be_built_is_never_serialized() {
+        let poisoned_header = counting_rig_with(vec![bearer("t1")], vec![200], |tokens| {
+            tokens.with_quota_project(Some("bad\nproject".into()))
+        })
+        .await;
+        let (server, vertex) = counting_rig(vec![bearer("t1")], vec![200]).await;
+        let poisoned_url = (server, vertex.with_base_url("not a url"));
+
+        for (case, (server, vertex)) in [
+            ("quota project", poisoned_header),
+            ("base URL", poisoned_url),
+        ] {
+            let serialized = std::sync::Arc::default();
+            let endpoint = vertex.endpoint("m").unwrap();
+
+            let result = vertex
+                .call(endpoint, &Counted(std::sync::Arc::clone(&serialized)))
+                .await;
+
+            assert!(
+                matches!(&result, Err(VertexError::Request(reason)) if reason == "invalid request"),
+                "{case}: {result:?}"
+            );
+            assert_eq!(
+                serialized.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "{case}: never encoded"
+            );
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(
+                requests
+                    .iter()
+                    .map(|request| request.method.as_str())
+                    .collect::<Vec<_>>(),
+                ["GET"],
+                "{case}: the token, and nothing sent"
+            );
+        }
+    }
+
+    /// Serialized once per call, after the first token, however many
+    /// replays follow: two 401s and a 200 are three sends of one encoding.
+    #[tokio::test]
+    async fn a_replayed_call_serializes_its_request_once() {
+        let (server, vertex) = counting_rig(
+            vec![bearer("t1"), bearer("t2"), bearer("t3")],
+            vec![401, 401, 200],
+        )
+        .await;
+        let serialized = std::sync::Arc::default();
+        let endpoint = vertex.endpoint("m").unwrap();
+
+        vertex
+            .call(endpoint, &Counted(std::sync::Arc::clone(&serialized)))
+            .await
+            .unwrap();
+
+        assert_eq!(serialized.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let posts = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|request| request.method.as_str() == "POST")
+            .count();
+        assert_eq!(posts, 3, "three sends");
     }
 }

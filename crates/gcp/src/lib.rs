@@ -37,6 +37,7 @@ pub mod storage;
 #[cfg(feature = "vertex")]
 pub mod vertex;
 
+mod replay;
 mod util;
 
 pub use auth::{AccessToken, CredentialKind, CredentialSource, GcpAuthError, TokenProvider};

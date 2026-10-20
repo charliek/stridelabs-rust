@@ -74,6 +74,45 @@ for a consumer's pin.
   - No `with_*` method can let a fetch reach a non-public address, and
     `user:pass@` is still `EmbeddedCredentials` everywhere.
   - CI builds and lints `stridelabs-http:ssrf-decompress` on its own.
+- `stridelabs-gcp`: `TokenProvider::invalidate(&self, rejected:
+  &AccessToken) -> bool`, which evicts a token a Google API answered `401`
+  to so that the next `token()` refreshes. It is synchronous, needs no
+  runtime, and never starts, cancels or duplicates a refresh.
+  - Matched by bearer string: any `AccessToken` with the cached bearer
+    evicts it, and anything else returns `false` and changes nothing.
+  - Callers whose rejections of one bearer overlap one refresh cost one
+    eviction and that refresh, when it mints a different, cacheable bearer.
+    A later caller holding the old bearer finds the new one cached and
+    refreshes nothing. After a failed refresh the next call starts another,
+    and the evicted token is never served again.
+  - No re-install: a refresh already in flight when its bearer was evicted,
+    that returns that same bearer (the metadata server re-serving its
+    cached token), hands it to its waiters without caching it.
+  - Logged at `debug` with the source and kind, never the bearer.
+  - A new test pins that `TokenOptions::token_timeout` bounds the
+    token-endpoint exchange; there is no API change there.
+- `stridelabs-gcp`: an opt-in `401` refresh and replay on `GcsClient` and
+  `VertexClient`, google-auth's `AuthorizedSession` loop. Each client gains
+  `with_unauthorized_refresh(bool)` (default `false`),
+  `with_max_refresh_attempts(u32)` (default 2, effective only when
+  enabled), `unauthorized_refresh()` and `max_refresh_attempts()`.
+  - Enabled, a completed `401` has its body read and dropped (at most
+    16 KiB and 2 s, then the connection is dropped). Its bearer is
+    invalidated, a token is taken again and the same request is sent again,
+    up to the count per operation. A persistent `401` costs N + 1 requests
+    and N refreshes (3 and 2 by default), and `0` replays nothing.
+  - Never on a `403`, a `5xx` or a transport failure. Every replay runs
+    inside the operation's timeout. A multipart upload's body and boundary
+    are built once, and Vertex's JSON is serialized once (after the first
+    token, as in v0.8.0, so a call that gets no token never encodes it), so
+    every send of one call carries the same bytes.
+  - On the metadata server a refresh can return the same bearer, so a
+    replay can add requests without different credentials: one reason it is
+    off by default.
+  - Off, every request is v0.8.0's byte for byte, pinned by a raw-socket
+    test whose expectations were recorded on the v0.8.0 tree. A `401` is
+    still one request and `Status`.
+  - Both clients' `Debug` prints the toggle and the count.
 
 ### Changed
 

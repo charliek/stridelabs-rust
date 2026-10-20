@@ -12,14 +12,22 @@
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
 use serde_json::{json, Value};
 use stridelabs_gcp::auth::{AdcEnvironment, TokenOptions, TokenProvider};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+mod log_capture;
+// Like the rest of this module, unused in some test binaries.
+#[allow(unused_imports)]
+pub use log_capture::LogCapture;
 
 pub const CLIENT_SECRET: &str = "CANARY-CLIENT-SECRET";
 pub const REFRESH_TOKEN: &str = "CANARY-REFRESH-TOKEN";
@@ -174,4 +182,310 @@ pub async fn mount_metadata_token(server: &MockServer, token: &str) {
 /// The form body of a received request, as a map.
 pub fn form(body: &[u8]) -> HashMap<String, String> {
     url::form_urlencoded::parse(body).into_owned().collect()
+}
+
+// --- the 401 refresh: exact counts -----------------------------------------
+
+/// A client that never retries on its own (reqwest 0.13 retries some
+/// protocol failures by default), so every request a test counts is one the
+/// code under test sent.
+pub fn never_retrying() -> reqwest::Client {
+    reqwest::Client::builder()
+        .retry(reqwest::retry::never())
+        .build()
+        .unwrap()
+}
+
+/// Answers its n-th request with `answers[n]`, and every one past the end
+/// with the last.
+pub struct Sequence {
+    answers: Vec<ResponseTemplate>,
+    seen: AtomicUsize,
+}
+
+impl Sequence {
+    pub fn new(answers: Vec<ResponseTemplate>) -> Sequence {
+        assert!(!answers.is_empty(), "a sequence needs an answer");
+        Sequence {
+            answers,
+            seen: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl Respond for Sequence {
+    fn respond(&self, _: &Request) -> ResponseTemplate {
+        let n = self.seen.fetch_add(1, Ordering::SeqCst);
+        self.answers
+            .get(n)
+            .or(self.answers.last())
+            .cloned()
+            .unwrap()
+    }
+}
+
+/// Plain responses of these statuses, in order.
+pub fn statuses(codes: &[u16]) -> Vec<ResponseTemplate> {
+    codes
+        .iter()
+        .map(|&code| ResponseTemplate::new(code))
+        .collect()
+}
+
+/// A metadata server of its own whose n-th token request answers `answers[n]`
+/// (the last repeated), so its request count is the refresh count.
+pub async fn token_server(answers: Vec<ResponseTemplate>) -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(METADATA_TOKEN_PATH))
+        .respond_with(Sequence::new(answers))
+        .mount(&server)
+        .await;
+    server
+}
+
+/// One-hour tokens with these bearers, in order.
+pub fn bearers(names: &[&str]) -> Vec<ResponseTemplate> {
+    names
+        .iter()
+        .map(|name| token_body(name, json!(3600)))
+        .collect()
+}
+
+/// A metadata-server provider on `server` that never retries.
+pub fn exact_provider(server: &MockServer) -> TokenProvider {
+    routed(
+        TokenProvider::metadata_server(never_retrying(), &[]),
+        server,
+    )
+}
+
+/// Distinct bearers, minted in this order.
+pub const BEARERS: [&str; 5] = ["t1", "t2", "t3", "t4", "t5"];
+
+/// The refresh count's contract, the same for every client: (N, the API's
+/// answers in order, the status the call fails with if it fails, requests
+/// sent). A persistent 401 costs N + 1 requests and N refreshes, and 401 then
+/// 200 within the budget succeeds.
+pub const REFRESH_CASES: [(u32, &[u16], Option<u16>, usize); 6] = [
+    (0, &[401, 200], Some(401), 1),
+    (1, &[401, 200], None, 2),
+    (1, &[401, 401, 200], Some(401), 2),
+    (2, &[401, 401, 200], None, 3),
+    (2, &[401], Some(401), 3),
+    (2, &[200], None, 1),
+];
+
+/// How many requests `server` received.
+pub async fn request_count(server: &MockServer) -> usize {
+    server.received_requests().await.unwrap().len()
+}
+
+pub fn header_of(request: &Request, name: &str) -> Option<String> {
+    request
+        .headers
+        .get(name)
+        .map(|value| value.to_str().unwrap().to_owned())
+}
+
+/// The bearer each request to `server` carried, in order (`-` for none).
+pub async fn bearers_sent(server: &MockServer) -> Vec<String> {
+    server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|request| {
+            header_of(request, "authorization").map_or("-".to_owned(), |value| {
+                value.trim_start_matches("Bearer ").to_owned()
+            })
+        })
+        .collect()
+}
+
+// --- a scripted HTTP/1.1 server on a raw socket ---------------------------------
+
+/// How a [`RawServer`] answers one request.
+#[derive(Clone)]
+pub enum RawReply {
+    /// These bytes, a whole response; the connection stays open for more.
+    Full(Vec<u8>),
+    /// These bytes, the start of a response that never finishes: the
+    /// connection is then held, unanswered, until the client closes it.
+    Stall(Vec<u8>),
+    /// These bytes, a whole response, sent only once every party of the
+    /// barrier has arrived: a deterministic "nobody is answered until all N
+    /// requests are in". A barrier that never fills (30 s) closes the
+    /// connection unanswered, so a broken test fails rather than hangs.
+    AfterBarrier(Arc<tokio::sync::Barrier>, Vec<u8>),
+}
+
+/// An HTTP/1.1 server that records every request's raw bytes (head and
+/// `Content-Length` body) and answers the n-th, `request`, with
+/// `script(n, request)`. What wiremock cannot do: show the exact bytes on
+/// the wire, stall a body after its headers, and hold answers on a barrier
+/// (a wiremock responder is synchronous, on the server's one thread).
+pub struct RawServer {
+    pub base_url: String,
+    state: Arc<RawState>,
+}
+
+/// What the accept loop and every connection share.
+struct RawState {
+    requests: Mutex<Vec<Vec<u8>>>,
+    accepted: AtomicUsize,
+    stalled_closed: AtomicBool,
+    script: Box<Script>,
+}
+
+/// How a [`RawServer`] picks its answer: from the request's index and bytes.
+type Script = dyn Fn(usize, &[u8]) -> RawReply + Send + Sync;
+
+impl RawServer {
+    pub async fn start(
+        script: impl Fn(usize, &[u8]) -> RawReply + Send + Sync + 'static,
+    ) -> RawServer {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let state = Arc::new(RawState {
+            requests: Mutex::default(),
+            accepted: AtomicUsize::new(0),
+            stalled_closed: AtomicBool::new(false),
+            script: Box::new(script),
+        });
+        let accepting = Arc::clone(&state);
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                accepting.accepted.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(serve(socket, Arc::clone(&accepting)));
+            }
+        });
+        RawServer { base_url, state }
+    }
+
+    /// Every request so far, raw, in arrival order.
+    pub fn requests(&self) -> Vec<Vec<u8>> {
+        self.state.requests.lock().unwrap().clone()
+    }
+
+    /// Connections accepted so far.
+    pub fn accepted(&self) -> usize {
+        self.state.accepted.load(Ordering::SeqCst)
+    }
+
+    /// Whether the client closed a connection whose response was stalled.
+    pub fn stalled_connection_closed(&self) -> bool {
+        self.state.stalled_closed.load(Ordering::SeqCst)
+    }
+}
+
+/// Read what `socket` has next onto `buffer`; `false` once the client hung
+/// up (EOF or an error).
+async fn read_more(socket: &mut tokio::net::TcpStream, buffer: &mut Vec<u8>) -> bool {
+    let mut chunk = [0u8; 4096];
+    match socket.read(&mut chunk).await {
+        Ok(0) | Err(_) => false,
+        Ok(read) => {
+            buffer.extend_from_slice(&chunk[..read]);
+            true
+        }
+    }
+}
+
+async fn serve(mut socket: tokio::net::TcpStream, state: Arc<RawState>) {
+    let mut buffer = Vec::new();
+    loop {
+        let head_end = loop {
+            if let Some(at) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+                break at + 4;
+            }
+            if !read_more(&mut socket, &mut buffer).await {
+                return;
+            }
+        };
+        let head = String::from_utf8_lossy(&buffer[..head_end]).to_ascii_lowercase();
+        let length = head
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length:"))
+            .map_or(0, |value| value.trim().parse::<usize>().unwrap());
+        while buffer.len() < head_end + length {
+            if !read_more(&mut socket, &mut buffer).await {
+                return;
+            }
+        }
+        let request: Vec<u8> = buffer.drain(..head_end + length).collect();
+        let reply = {
+            let mut requests = state.requests.lock().unwrap();
+            let reply = (state.script)(requests.len(), &request);
+            requests.push(request);
+            reply
+        };
+        match reply {
+            RawReply::Full(bytes) => {
+                if socket.write_all(&bytes).await.is_err() {
+                    return;
+                }
+            }
+            RawReply::Stall(bytes) => {
+                let _ = socket.write_all(&bytes).await;
+                // Held until the client hangs up, bounded so a broken test
+                // fails rather than hangs.
+                let hung_up = tokio::time::timeout(Duration::from_secs(60), async {
+                    while read_more(&mut socket, &mut buffer).await {}
+                })
+                .await;
+                if hung_up.is_ok() {
+                    state.stalled_closed.store(true, Ordering::SeqCst);
+                }
+                return;
+            }
+            RawReply::AfterBarrier(barrier, bytes) => {
+                if tokio::time::timeout(Duration::from_secs(30), barrier.wait())
+                    .await
+                    .is_err()
+                    || socket.write_all(&bytes).await.is_err()
+                {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Whether `haystack` contains `needle`, byte for byte.
+pub fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+/// `raw` with every `from` replaced by `to`, byte for byte.
+pub fn replace_bytes(raw: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(at) = rest.windows(from.len()).position(|window| window == from) {
+        out.extend_from_slice(&rest[..at]);
+        out.extend_from_slice(to);
+        rest = &rest[at + from.len()..];
+    }
+    out.extend_from_slice(rest);
+    out
+}
+
+/// `raw` with the server's `host:port` written `HOST`.
+pub fn normalized(raw: &[u8], base_url: &str) -> Vec<u8> {
+    replace_bytes(
+        raw,
+        base_url.trim_start_matches("http://").as_bytes(),
+        b"HOST",
+    )
+}
+
+/// `bytes` as the inside of a Rust byte-string literal.
+pub fn escaped(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .flat_map(|byte| std::ascii::escape_default(*byte))
+        .map(char::from)
+        .collect()
 }

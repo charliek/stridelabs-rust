@@ -128,6 +128,20 @@ type), `from_service_account_json`, `from_authorized_user_json` and
 URL, the default token URI and the two timeouts. `with_quota_project`
 replaces the quota project.
 
+The two timeouts each bound one whole token request: connecting, sending
+and reading the body. `metadata_timeout` (3 s, `DEFAULT_METADATA_TIMEOUT`)
+covers the metadata server, and `token_timeout` (10 s,
+`DEFAULT_TOKEN_TIMEOUT`) covers the token-endpoint exchange of a
+`service_account` or `authorized_user` credential. What the refresh then
+fails with depends on where the time ran out, and nothing is cached either
+way:
+
+- no response in time, or a success (2xx) whose body is not read in time:
+  `GcpAuthError::Request { reason: "timed out", .. }`;
+- an error status whose body stalls: that status,
+  `GcpAuthError::Status { status, detail: "", .. }`. The body read is cut
+  off at the timeout and the unread body contributes no error code.
+
 ### Quota project
 
 `AccessToken { token, quota_project }`. The quota project is the file's
@@ -170,6 +184,46 @@ env var, so it has none until you call `with_quota_project`.
 - A token response is read up to 64 KiB (`MAX_TOKEN_RESPONSE`); anything
   larger is `InvalidResponse`. An error body is read only as far as its
   first 16 KiB.
+- **`invalidate(&rejected) -> bool`** evicts the cached token when a Google
+  API answered `401` to it, so the next `token()` refreshes. It is
+  synchronous and needs no runtime: it takes the cache lock, and it never
+  starts, cancels or duplicates a refresh.
+  - **Matched by bearer string.** Any `AccessToken` carrying the cached
+    bearer evicts it, whichever provider produced it. Anything else
+    (a token already replaced or evicted, or never cached here) is a no-op
+    that returns `false`.
+  - **One refresh per wave, narrowly.** Callers whose rejections of one
+    bearer overlap a single refresh cost one eviction and that one refresh,
+    and all get its token, when it succeeds with a different bearer that
+    lives longer than `REFRESH_MARGIN`. A later caller still holding the old
+    bearer finds the new one cached: its `invalidate` is a no-op and its
+    `token()` refreshes nothing. After a failed refresh the next call starts
+    another; the evicted token is never served again.
+  - **No re-install.** A refresh already in flight when its bearer was
+    evicted, that returns that same bearer, hands it to its waiters (it is
+    what the source has) but does not cache it, so the next `token()` asks
+    the source again. A refresh that starts after the eviction caches
+    whatever it gets.
+  - **The same bearer can come back.** Google's metadata server caches a
+    token until about five minutes before it expires, so a refresh there
+    returns the bearer just rejected. A replay then adds requests without
+    obtaining different credentials (a transient server-side rejection can
+    still recover). Replay a bounded number of times, only on `401`, never
+    on `403`.
+  - It logs at `debug` with the source and kind, never the bearer.
+
+  ```rust
+  let token = tokens.token().await?;
+  let mut response = token.authorize(http.post(url)).send().await?;
+  if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+      tokens.invalidate(&token);
+      let token = tokens.token().await?; // replay once
+      response = token.authorize(http.post(url)).send().await?;
+  }
+  ```
+
+  `GcsClient` and `VertexClient` do this themselves when asked to: see
+  "401 refresh and replay" below.
 
 ### Errors never echo a secret
 
@@ -307,6 +361,50 @@ gcs.upload_with(bucket, &object, bytes, "image/png", &options).await?;
 - Timeout, token, emulator base URL and sanitized errors are `upload`'s.
   The body is built in memory: one copy of the bytes.
 
+### 401 refresh and replay (opt-in)
+
+```rust
+let gcs = GcsClient::new(http.clone(), tokens.clone())
+    .with_unauthorized_refresh(true)  // default false
+    .with_max_refresh_attempts(2);    // the default; effective only when enabled
+```
+
+With `with_unauthorized_refresh(true)`, a `401` is handled the way
+google-cloud-storage's `AuthorizedSession` handles it. The client
+invalidates the bearer it sent (`TokenProvider::invalidate`), takes a token
+again, and sends the same request again, up to `max_refresh_attempts` times
+per operation. Without it, a `401` is one request and
+`StorageError::Status { status: 401, .. }`, exactly as in v0.8.0, and
+setting a count alone does not turn it on.
+
+| `max_refresh_attempts` | persistent `401` | `401` → `200` |
+|---|---|---|
+| `0` | 1 request, no refresh | `Status{401}` |
+| `1` | 2 requests, 1 refresh | succeeds in 2 |
+| `2` (default, google-auth's `DEFAULT_MAX_REFRESH_ATTEMPTS`) | 3 requests, 2 refreshes | succeeds in 2 |
+
+- **Only a completed `401`.** Never a `403`, a `5xx` or a transport
+  failure. A `401` means the request was not applied (RFC 9110 §15.5.2), so
+  replaying an upload, a delete or a create-only (`ifGenerationMatch=0`)
+  upload cannot apply it twice. That reasoning does not extend to a failure
+  whose outcome is unknown.
+- **The same request.** The URL, headers and body are rebuilt from what the
+  first send used, and only the bearer changes. A multipart body is built
+  once, boundary and all.
+- **Bounded.** The `401`'s body is read for at most 16 KiB and 2 s. Past
+  that it is dropped along with its connection, so a slow body cannot use up
+  the budget. The refreshes and replays all count against the operation's
+  timeout.
+- **Concurrent operations** rejected on one bearer share one eviction and
+  one refresh, provided the refresh mints a different bearer.
+- **The same bearer may come back.** On the metadata server (ADC on Cloud
+  Run or GCE), a refresh re-serves the cached bearer for most of its life.
+  Each replay can then cost one more metadata call and one more GCS request
+  with the same credentials. That is why the replay is opt-in.
+- With `GcsClient::emulator(.., None)` there is no token to refresh, so the
+  setting is a no-op.
+- `Debug` prints the toggle and the count.
+
 ## `vertex` (feature `vertex`)
 
 ```rust
@@ -358,6 +456,12 @@ match first_inline_image(&vertex.generate_content(model, &request).await?) {
 - **Timeout.** There is none by default, because how long an image may take
   is the service's decision. `with_timeout` bounds the token, the request
   and the body read together.
+- **401 refresh and replay (opt-in).** `with_unauthorized_refresh(true)` and
+  `with_max_refresh_attempts(n)` (default 2) behave as on `GcsClient`.
+  The JSON body is serialized once, after the first token as in v0.8.0
+  (a call that gets no token never encodes it), so a replay sends the same
+  bytes. With
+  the option off, a `401` is one request and `VertexError::Status`.
 - **Limits.** A response is read up to 64 MiB
   (`DEFAULT_MAX_RESPONSE_BYTES`; `with_max_response_bytes` changes it). That
   covers a 10 MiB image, which is about 13.4 MiB as base64, plus JSON. Past
@@ -380,7 +484,8 @@ match first_inline_image(&vertex.generate_content(model, &request).await?) {
 
 ## Not included
 
-There is no retry or backoff, no resumable upload, no object metadata
+There is no retry or backoff (the one replay is the opt-in `401` refresh
+above), no resumable upload, no object metadata
 calls beyond what `upload_with` sets at creation (no read-back, no patch),
 no service-account impersonation and no workload-identity federation (the
 `external_account` family). There is no Windows
