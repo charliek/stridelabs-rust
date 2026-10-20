@@ -1,0 +1,21 @@
+# FetchPolicy::new("image", 1024)
+GET /a.png HTTP/1.1
+accept-encoding: identity
+accept: */*
+host: images.test:{port}
+
+# .with_accept("image/*")
+GET /a.png HTTP/1.1
+accept-encoding: identity
+accept: image/*
+host: images.test:{port}
+
+# .with_max_redirects(1): the first hop, then the second
+GET /start HTTP/1.1
+accept-encoding: identity
+accept: */*
+host: images.test:{port}
+GET /next HTTP/1.1
+accept-encoding: identity
+accept: */*
+host: images.test:{port}

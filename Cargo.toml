@@ -147,7 +147,27 @@ uuid = { version = "1", features = ["v4", "serde"] }
 time = { version = "0.3", features = ["serde"] }
 bytes = "1"
 futures = "0.3"
+# stridelabs-auth's JWKS cache hands one fetch's outcome to every waiter
+# (`Shared`, `BoxFuture`). `std` only: `futures`' default features bring
+# `futures-executor`, which no auth-only consumer should compile. Already in
+# every graph (reqwest, hyper).
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 url = "2"
+# stridelabs-http's `ssrf-decompress`: gzip and deflate decoding of a fetched
+# body. Pure Rust, no C toolchain: `rust_backend` is miniz_oxide (which, like
+# adler2, forbids `unsafe`), with crc32fast and simd-adler32 (SIMD `unsafe`).
+# `runtime_detection` is the default feature set's CPU detection for those
+# checksums, kept with the defaults off; through its weak `zlib-rs?/std` it
+# also leaves a lock-only `zlib-rs` entry in Cargo.lock, which nothing
+# compiles (no feature here turns flate2's `zlib-rs` backend on). The decoder
+# drives `Decompress` and `Crc` itself and requires the stream's end
+# explicitly, so it leans on none of flate2's readers; 1.1.10 is the version
+# it is proven on (its readers, used only by tests, report a truncated
+# deflate stream as an error from 1.1.10 on).
+flate2 = { version = "1.1.10", default-features = false, features = [
+    "rust_backend",
+    "runtime_detection",
+] }
 # stridelabs-gcp: GCS object names are percent-encoded into a path segment or
 # query value, `/` included. Already in every graph through `url` and reqwest.
 percent-encoding = "2"

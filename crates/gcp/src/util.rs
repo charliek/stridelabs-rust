@@ -3,6 +3,8 @@
 //! a name goes into a URL.
 
 use std::fmt;
+use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use serde_json::Value;
@@ -40,6 +42,76 @@ pub(crate) fn encode_path(value: &str) -> String {
     utf8_percent_encode(value, PATH).to_string()
 }
 
+/// What kind of failure a `reqwest::Error` is: the one thing an error may say
+/// about it ([`Category::label`]), and, decided here beside the label rather
+/// than read back out of it, whether a request that failed this way before
+/// any response is worth sending again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Category {
+    TimedOut,
+    ConnectionFailed,
+    RedirectRefused,
+    Body,
+    Decode,
+    InvalidRequest,
+    Request,
+    Other,
+}
+
+impl Category {
+    /// The first of reqwest's predicates `error` meets, in a fixed order.
+    pub(crate) fn of(error: &reqwest::Error) -> Category {
+        if error.is_timeout() {
+            Category::TimedOut
+        } else if error.is_connect() {
+            Category::ConnectionFailed
+        } else if error.is_redirect() {
+            Category::RedirectRefused
+        } else if error.is_body() {
+            Category::Body
+        } else if error.is_decode() {
+            Category::Decode
+        } else if error.is_builder() {
+            Category::InvalidRequest
+        } else if error.is_request() {
+            Category::Request
+        } else {
+            Category::Other
+        }
+    }
+
+    /// The fixed text an error carries for it (the `reason` of the crate's
+    /// `Request` variants).
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Category::TimedOut => "timed out",
+            Category::ConnectionFailed => "connection failed",
+            Category::RedirectRefused => "redirect refused",
+            Category::Body => "body error",
+            Category::Decode => "decode error",
+            Category::InvalidRequest => "invalid request",
+            Category::Request => "request error",
+            Category::Other => "request failed",
+        }
+    }
+
+    /// Whether a request that failed this way **before any response** could
+    /// succeed if sent again: it timed out, never connected, or broke in
+    /// flight (`request error`: the connection closed or was reset before a
+    /// response) — google-cloud-storage's `ConnectionError`, `Timeout` and
+    /// `ProtocolError` (`retry.py:31-49`). A refused redirect, a request
+    /// that cannot be built and a failure reqwest does not name are not. A
+    /// failure while reading a body after the headers is another matter:
+    /// that is an interrupted transfer, transient whatever its category (the
+    /// reader decides: `Failed::transient`).
+    pub(crate) fn transient_before_response(self) -> bool {
+        matches!(
+            self,
+            Category::TimedOut | Category::ConnectionFailed | Category::Request
+        )
+    }
+}
+
 /// A failed request, as a fixed category — never its text.
 ///
 /// `reqwest::Error`'s `Display` ends `for url (…)`, query string included,
@@ -50,24 +122,131 @@ pub(crate) fn encode_path(value: &str) -> String {
 /// credential. So no part of the error is formatted; the category (parcel's
 /// `redact()` shape) is what an operator gets.
 pub(crate) fn describe_reqwest(error: reqwest::Error) -> String {
-    let category = if error.is_timeout() {
-        "timed out"
-    } else if error.is_connect() {
-        "connection failed"
-    } else if error.is_redirect() {
-        "redirect refused"
-    } else if error.is_body() {
-        "body error"
-    } else if error.is_decode() {
-        "decode error"
-    } else if error.is_builder() {
-        "invalid request"
-    } else if error.is_request() {
-        "request error"
-    } else {
-        "request failed"
-    };
-    category.to_owned()
+    Category::of(&error).label().to_owned()
+}
+
+/// An error, and whether sending the request again could succeed — decided
+/// where the failure happened, by the code that saw it, and carried beside
+/// the error. Nothing classifies an error by reading its text back.
+#[derive(Clone, Debug)]
+pub(crate) struct Failed<E> {
+    pub(crate) error: E,
+    pub(crate) transient: bool,
+}
+
+impl<E> Failed<E> {
+    /// A failure another attempt cannot fix.
+    pub(crate) fn permanent(error: E) -> Failed<E> {
+        Failed {
+            error,
+            transient: false,
+        }
+    }
+
+    /// A failure another attempt might not meet.
+    pub(crate) fn transient(error: E) -> Failed<E> {
+        Failed {
+            error,
+            transient: true,
+        }
+    }
+
+    /// A transport failure before any response: transient as its category
+    /// says ([`Category::transient_before_response`]).
+    pub(crate) fn before_response(category: Category, error: E) -> Failed<E> {
+        Failed {
+            error,
+            transient: category.transient_before_response(),
+        }
+    }
+
+    /// A non-2xx answer: transient for [`is_transient_status`]'s statuses.
+    pub(crate) fn status(status: u16, error: E) -> Failed<E> {
+        Failed {
+            error,
+            transient: is_transient_status(status),
+        }
+    }
+
+    /// The same failure as another error: its class goes with it.
+    pub(crate) fn map<F>(self, convert: impl FnOnce(E) -> F) -> Failed<F> {
+        Failed {
+            error: convert(self.error),
+            transient: self.transient,
+        }
+    }
+}
+
+/// The statuses google-cloud-storage retries (`retry.py:52-59`): 408, 429,
+/// 500, 502, 503 and 504. Every other status, 501 and 505 included, is the
+/// server's answer about the request itself.
+pub(crate) fn is_transient_status(status: u16) -> bool {
+    matches!(status, 408 | 429 | 500 | 502 | 503 | 504)
+}
+
+/// A status line not yet heard, in the atomics below.
+const NONE_HEARD: u16 = 0;
+
+/// What one attempt has already heard, which the timeout cutting it off
+/// must not throw away: the status line of the answer it is reading, and
+/// that of the token refresh it is waiting on.
+///
+/// Once a status line is in, its class is final. An error body that stalls
+/// until the attempt's timeout ends it as `Timeout` (v0.8.0's error there),
+/// but transient only if that status is: a `412` or a `401` whose body never
+/// arrives is not retried, a `503`'s is. A cut-off attempt that heard
+/// nothing (no response yet, or a 2xx body being read) is transient, as any
+/// timeout. Atomics, so an operation's future stays `Send`.
+#[derive(Default)]
+pub(crate) struct Heard {
+    /// The status of the response the attempt is reading, while it is.
+    status: AtomicU16,
+    /// The status line the token endpoint of the refresh being waited on
+    /// answered: shared with that refresh, which sets it.
+    token: Mutex<Option<Arc<AtomicU16>>>,
+}
+
+impl Heard {
+    /// A non-2xx response is in, with this status: it decides the attempt,
+    /// whatever its body does.
+    pub(crate) fn status(&self, status: u16) {
+        self.status.store(status, Ordering::Release);
+    }
+
+    /// The request is sent again (a `401`'s replay): what the attempt heard
+    /// is no longer its answer.
+    pub(crate) fn resending(&self) {
+        self.status.store(NONE_HEARD, Ordering::Release);
+    }
+
+    /// The attempt waits on the token refresh whose status line `line`
+    /// will hold.
+    pub(crate) fn waiting_on(&self, line: &Arc<AtomicU16>) {
+        *self.token.lock().unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(line));
+    }
+
+    /// Whether an attempt cut off now could succeed if made again: by the
+    /// status of the answer it was reading, else by the status line of the
+    /// token refresh it was waiting on, else yes.
+    pub(crate) fn cut_off_is_transient(&self) -> bool {
+        let heard =
+            |line: &AtomicU16| Some(line.load(Ordering::Acquire)).filter(|&s| s != NONE_HEARD);
+        let token = self
+            .token
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_deref()
+            .and_then(heard);
+        heard(&self.status)
+            .or(token)
+            .is_none_or(is_transient_status)
+    }
+}
+
+/// A token refresh's status line, unset: what [`Heard::waiting_on`] reads,
+/// written by the refresh once its token endpoint answers non-2xx.
+pub(crate) fn status_line() -> Arc<AtomicU16> {
+    Arc::new(AtomicU16::new(NONE_HEARD))
 }
 
 /// A JSON parse failure as its category and position only. serde_json's
@@ -261,6 +440,43 @@ pub(crate) fn redact_url(raw: &str) -> String {
         .unwrap_or_else(|| "<unparseable URL>".to_owned())
 }
 
+/// Raw sockets for the modules' own tests: what wiremock cannot send (a body
+/// cut short, a chunked body, nothing at all).
+#[cfg(test)]
+pub(crate) mod test_server {
+    use std::net::SocketAddr;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A server that reads one request's head, answers it with `response`
+    /// and closes.
+    pub(crate) async fn answer_once(response: Vec<u8>) -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                match socket.read(&mut buffer).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(read) => request.extend_from_slice(&buffer[..read]),
+                }
+            }
+            // The client may hang up once it has read enough.
+            let _ = socket.write_all(&response).await;
+            let _ = socket.shutdown().await;
+        });
+        address
+    }
+
+    /// An address nothing listens on: a port just released.
+    pub(crate) fn closed_port() -> SocketAddr {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use wiremock::matchers::any;
@@ -387,30 +603,15 @@ mod tests {
     /// no `Content-Length`, so `read_limited` cannot refuse up front and
     /// must count as it reads. wiremock always sends a length.
     async fn chunked(chunks: Vec<Vec<u8>>) -> reqwest::Response {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = Vec::new();
-            let mut buffer = [0u8; 1024];
-            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
-                let read = socket.read(&mut buffer).await.unwrap();
-                request.extend_from_slice(&buffer[..read]);
-            }
-            let mut response =
-                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
-                    .to_vec();
-            for chunk in chunks {
-                response.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
-                response.extend_from_slice(&chunk);
-                response.extend_from_slice(b"\r\n");
-            }
-            response.extend_from_slice(b"0\r\n\r\n");
-            // The client may hang up once it has read enough.
-            let _ = socket.write_all(&response).await;
-        });
+        let mut response =
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n".to_vec();
+        for chunk in chunks {
+            response.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+            response.extend_from_slice(&chunk);
+            response.extend_from_slice(b"\r\n");
+        }
+        response.extend_from_slice(b"0\r\n\r\n");
+        let address = test_server::answer_once(response).await;
         let response = reqwest::get(format!("http://{address}/")).await.unwrap();
         assert!(
             response.content_length().is_none(),
@@ -503,6 +704,92 @@ mod tests {
 
         let error = client.get(server.uri()).send().await.unwrap_err();
         assert_eq!(describe_reqwest(error), "redirect refused");
+    }
+
+    /// Every category, its fixed text and its class before a response: the
+    /// labels are public strings (they are what `Request { reason }` says),
+    /// and the class sits beside them, never derived from them.
+    #[test]
+    fn every_category_has_its_label_and_its_class() {
+        for (category, label, transient) in [
+            (Category::TimedOut, "timed out", true),
+            (Category::ConnectionFailed, "connection failed", true),
+            (Category::RedirectRefused, "redirect refused", false),
+            (Category::Body, "body error", false),
+            (Category::Decode, "decode error", false),
+            (Category::InvalidRequest, "invalid request", false),
+            (Category::Request, "request error", true),
+            (Category::Other, "request failed", false),
+        ] {
+            assert_eq!(
+                (category.label(), category.transient_before_response()),
+                (label, transient),
+                "{category:?}"
+            );
+            assert_eq!(
+                Failed::before_response(category, ()).transient,
+                transient,
+                "{category:?}"
+            );
+        }
+    }
+
+    /// The status table, over every status code: google-cloud-storage's six
+    /// (`retry.py:52-59`) and nothing else.
+    #[test]
+    fn exactly_six_statuses_are_transient() {
+        let transient: Vec<u16> = (100..=599).filter(|&s| is_transient_status(s)).collect();
+        assert_eq!(transient, [408, 429, 500, 502, 503, 504]);
+        let failed = |status| Failed::status(status, ()).transient;
+        assert!(failed(503) && !failed(501) && !failed(401) && !failed(412));
+        assert!(Failed::transient(()).transient && !Failed::permanent(()).transient);
+    }
+
+    /// What a cut-off attempt is classified by: the status of the answer it
+    /// was reading, else that of the token refresh it was waiting on, else
+    /// transient; a replay sent forgets the answer it replaced.
+    #[test]
+    fn a_cut_off_attempt_is_classified_by_the_status_it_heard() {
+        let heard = Heard::default();
+        assert!(heard.cut_off_is_transient(), "nothing heard");
+        let line = status_line();
+        heard.waiting_on(&line);
+        assert!(heard.cut_off_is_transient(), "a refresh not answered yet");
+        line.store(400, Ordering::Release);
+        assert!(!heard.cut_off_is_transient(), "its token endpoint said 400");
+        line.store(503, Ordering::Release);
+        assert!(heard.cut_off_is_transient(), "its token endpoint said 503");
+
+        // The answer being read comes first.
+        heard.status(401);
+        assert!(!heard.cut_off_is_transient(), "a 401 being drained");
+        heard.resending();
+        assert!(heard.cut_off_is_transient(), "the replay is out; 503 again");
+        for (status, transient) in [(412, false), (409, false), (429, true), (504, true)] {
+            let heard = Heard::default();
+            heard.status(status);
+            assert_eq!(heard.cut_off_is_transient(), transient, "{status}");
+        }
+    }
+
+    /// The categories a real failure lands in, at the two places a request
+    /// can fail: a refused connection before any response, and a body cut
+    /// off after the headers (reqwest 0.13 wraps every body-frame failure as
+    /// a decode error, `response.rs:316`). The labels are what errors say.
+    #[tokio::test]
+    async fn a_refused_connection_and_a_cut_body_land_in_their_categories() {
+        let closed = test_server::closed_port();
+        let error = reqwest::get(format!("http://{closed}/")).await.unwrap_err();
+        assert_eq!(Category::of(&error), Category::ConnectionFailed);
+
+        let address = test_server::answer_once(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nonly ten b".to_vec(),
+        )
+        .await;
+        let response = reqwest::get(format!("http://{address}/")).await.unwrap();
+        let error = read_limited(response, 1024).await.err().expect("cut short");
+        assert_eq!(Category::of(&error), Category::Decode);
+        assert_eq!(describe_reqwest(error), "decode error");
     }
 
     #[tokio::test]

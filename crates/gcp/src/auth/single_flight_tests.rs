@@ -21,6 +21,10 @@ use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 use super::*;
 
+#[path = "../../tests/common/log_capture.rs"]
+mod log_capture;
+use log_capture::LogCapture;
+
 const TOKEN_PATH: &str = "/computeMetadata/v1/instance/service-accounts/default/token";
 
 /// How long [`until`] waits for a condition.
@@ -395,4 +399,316 @@ async fn a_token_crossing_its_refresh_deadline_is_refreshed_exactly_once() {
         "now cached"
     );
     assert_eq!(endpoint.requests(), 2);
+}
+
+// --- invalidate -----------------------------------------------------------
+
+/// A token this provider never handed out, whatever its string.
+fn foreign(bearer: &str) -> AccessToken {
+    AccessToken {
+        token: bearer.to_owned(),
+        quota_project: None,
+    }
+}
+
+fn cached_bearer(provider: &TokenProvider) -> Option<String> {
+    provider
+        .inner
+        .cache()
+        .token
+        .as_ref()
+        .map(|cached| cached.token.token.clone())
+}
+
+/// The wave a revoked credential produces: 16 calls each holding the same
+/// rejected bearer, each running `invalidate` then `token`. Whatever the
+/// interleaving, one evicts, one refresh runs, and every call ends with the
+/// new token. The endpoint answers only once all 16 are waiting, so they
+/// share one attempt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_wave_of_rejections_of_one_token_costs_exactly_one_refresh() {
+    let endpoint = Endpoint::start(vec![token("t1", 3600), token("t2", 3600)]).await;
+    let provider = endpoint.provider();
+    endpoint.release();
+    let rejected = provider.token().await.unwrap();
+    assert_eq!(rejected.token, "t1");
+
+    let mut calls = JoinSet::new();
+    for _ in 0..16 {
+        let (provider, rejected) = (provider.clone(), rejected.clone());
+        calls.spawn(async move {
+            let evicted = provider.invalidate(&rejected);
+            (evicted, provider.token().await)
+        });
+    }
+    until("16 waiters on one forced refresh", || {
+        provider.waiters() == 16
+    })
+    .await;
+    endpoint.release();
+
+    let mut evictions = 0;
+    while let Some(result) = calls.join_next().await {
+        let (evicted, token) = result.unwrap();
+        evictions += usize::from(evicted);
+        assert_eq!(token.unwrap().token, "t2");
+    }
+    assert_eq!(evictions, 1, "exactly one call found the token to evict");
+    assert_eq!(endpoint.requests(), 2, "one forced refresh");
+    assert_eq!(provider.token().await.unwrap().token, "t2", "and cached");
+    assert_eq!(endpoint.requests(), 2);
+}
+
+/// A token its refresh deadline already replaced is stale: a 401 that comes
+/// back for it now must not throw away its successor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn invalidating_a_token_its_deadline_replaced_is_a_no_op() {
+    let endpoint = Endpoint::start(vec![token("t1", 3600), token("t2", 3600)]).await;
+    let provider = endpoint.provider();
+    endpoint.release();
+    let stale = provider.token().await.unwrap();
+
+    provider.advance_clock(Duration::from_secs(3600));
+    endpoint.release();
+    assert_eq!(provider.token().await.unwrap().token, "t2", "refreshed");
+
+    assert!(!provider.invalidate(&stale), "t1 is gone: nothing to evict");
+    assert_eq!(cached_bearer(&provider).as_deref(), Some("t2"));
+    assert_eq!(provider.token().await.unwrap().token, "t2", "still cached");
+    assert_eq!(endpoint.requests(), 2, "no third refresh");
+}
+
+/// Two callers rejected on one bearer, the second only after the first's
+/// refresh completed: the second finds the new token cached, so its
+/// invalidation is a no-op and its `token()` refreshes nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_staggered_rejecter_finds_the_new_token_and_refreshes_nothing() {
+    let endpoint = Endpoint::start(vec![token("t1", 3600), token("t2", 3600)]).await;
+    let provider = endpoint.provider();
+    endpoint.release();
+    let first = provider.token().await.unwrap();
+    let second = provider.clone().token().await.unwrap();
+    assert_eq!((first.token.as_str(), second.token.as_str()), ("t1", "t1"));
+
+    assert!(provider.invalidate(&first), "the first rejecter evicts");
+    endpoint.release();
+    assert_eq!(provider.token().await.unwrap().token, "t2");
+    assert!(idle(&provider));
+
+    assert!(!provider.invalidate(&second), "the second finds t2, not t1");
+    assert_eq!(provider.token().await.unwrap().token, "t2");
+    assert_eq!(endpoint.requests(), 2, "one refresh for both");
+}
+
+#[tokio::test]
+async fn invalidating_a_token_the_cache_never_held_is_a_no_op() {
+    let endpoint = Endpoint::start(vec![token("t1", 3600)]).await;
+    let provider = endpoint.provider();
+    assert!(!provider.invalidate(&foreign("t1")), "empty cache");
+    assert_eq!(endpoint.requests(), 0, "and it starts nothing");
+    assert!(idle(&provider));
+
+    endpoint.release();
+    assert_eq!(provider.token().await.unwrap().token, "t1");
+    assert!(!provider.invalidate(&foreign("other")));
+    assert!(
+        !provider.invalidate(&foreign("t1 ")),
+        "the whole bearer, exactly"
+    );
+    assert_eq!(provider.token().await.unwrap().token, "t1");
+    assert_eq!(endpoint.requests(), 1);
+
+    // Matched by bearer, not by provenance: the same bearer from anywhere
+    // (another metadata-server provider holds the same one) evicts it.
+    assert!(provider.invalidate(&foreign("t1")));
+    assert_eq!(cached_bearer(&provider), None);
+}
+
+/// A refresh already in flight is the refresh the rejected caller wants:
+/// invalidating neither cancels it nor starts a second one, and a refresh
+/// that returns a *different* bearer is cached as usual.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn invalidating_during_a_refresh_joins_it() {
+    let endpoint = Endpoint::start(vec![token("t1", 3600), token("t2", 3600)]).await;
+    let provider = endpoint.provider();
+    endpoint.release();
+    let rejected = provider.token().await.unwrap();
+
+    // Past the refresh deadline: the cache still holds t1, but a call
+    // refreshes. Park one on the attempt.
+    provider.advance_clock(Duration::from_secs(3600));
+    let mut first = spawn_callers(&provider, 1);
+    until("the refresh's request", || endpoint.requests() == 2).await;
+    until("its waiter", || provider.waiters() == 1).await;
+
+    assert!(provider.invalidate(&rejected), "t1 was still cached");
+    let mut second = spawn_callers(&provider, 1);
+    until("both on the one attempt", || provider.waiters() == 2).await;
+    endpoint.release();
+
+    for calls in [&mut first, &mut second] {
+        assert_eq!(
+            calls.join_next().await.unwrap().unwrap().unwrap().token,
+            "t2"
+        );
+    }
+    assert_eq!(endpoint.requests(), 2, "no extra attempt");
+    assert_eq!(cached_bearer(&provider).as_deref(), Some("t2"), "cached");
+    assert_eq!(provider.token().await.unwrap().token, "t2");
+    assert_eq!(endpoint.requests(), 2);
+}
+
+/// The evicted token is never served again, not even as a fallback: a
+/// refresh that fails surfaces its error, and the next call tries again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_refresh_after_invalidation_does_not_revive_the_evicted_token() {
+    let endpoint = Endpoint::start(vec![
+        token("t1", 3600),
+        ResponseTemplate::new(503),
+        token("t3", 3600),
+    ])
+    .await;
+    let provider = endpoint.provider();
+    endpoint.release();
+    let rejected = provider.token().await.unwrap();
+
+    assert!(provider.invalidate(&rejected));
+    endpoint.release();
+    assert!(matches!(
+        provider.token().await,
+        Err(GcpAuthError::Status { status: 503, .. })
+    ));
+    assert_eq!(cached_bearer(&provider), None, "nothing revived");
+    endpoint.release();
+    assert_eq!(provider.token().await.unwrap().token, "t3");
+    assert_eq!(endpoint.requests(), 3);
+}
+
+/// The metadata server re-serves its cached bearer, so a refresh that
+/// *starts after* the eviction can return the very bearer just rejected.
+/// That one is cached (it is all the source has), and can be evicted again:
+/// each round costs one refresh, which is what bounds a consumer's replays.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refresh_that_returns_the_same_bearer_can_be_evicted_again() {
+    let endpoint = Endpoint::start(vec![token("t1", 3600), token("t1", 3600)]).await;
+    let provider = endpoint.provider();
+    endpoint.release();
+    let first = provider.token().await.unwrap();
+
+    assert!(provider.invalidate(&first));
+    endpoint.release();
+    let again = provider.token().await.unwrap();
+    assert_eq!(again.token, "t1", "the same bearer");
+    assert_eq!(endpoint.requests(), 2);
+    assert_eq!(cached_bearer(&provider).as_deref(), Some("t1"), "cached");
+
+    assert!(provider.invalidate(&again), "and evictable again");
+    assert_eq!(cached_bearer(&provider), None);
+}
+
+/// Panel 5(a). A refresh that was already in flight when `invalidate`
+/// evicted t1, and that returns t1 (the metadata server re-serving it),
+/// hands t1 to its waiters but never caches it: the next call asks the
+/// source again. Then the same shape with a refresh that returns a new
+/// bearer: that one is cached.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refresh_in_flight_at_an_eviction_never_reinstalls_the_rejected_bearer() {
+    let endpoint = Endpoint::start(vec![
+        token("t1", 3600),
+        token("t1", 3600),
+        token("t2", 3600),
+        token("t3", 3600),
+    ])
+    .await;
+    let provider = endpoint.provider();
+    endpoint.release();
+    let rejected = provider.token().await.unwrap();
+
+    // An attempt in flight (the deadline passed), then the eviction.
+    provider.advance_clock(Duration::from_secs(3600));
+    let mut before = spawn_callers(&provider, 1);
+    until("the refresh's request", || endpoint.requests() == 2).await;
+    until("its waiter", || provider.waiters() == 1).await;
+    assert!(provider.invalidate(&rejected), "t1 was still cached");
+    let mut after = spawn_callers(&provider, 1);
+    until("a caller after the eviction joins it", || {
+        provider.waiters() == 2
+    })
+    .await;
+    endpoint.release();
+
+    for calls in [&mut before, &mut after] {
+        assert_eq!(
+            calls.join_next().await.unwrap().unwrap().unwrap().token,
+            "t1",
+            "its waiters get what the source returned"
+        );
+    }
+    assert!(idle(&provider));
+    assert_eq!(cached_bearer(&provider), None, "but t1 is not re-cached");
+
+    endpoint.release();
+    assert_eq!(
+        provider.token().await.unwrap().token,
+        "t2",
+        "the next call asked the source again"
+    );
+    assert_eq!(endpoint.requests(), 3);
+
+    // The same race, answered with a different bearer: installed as usual.
+    let rejected = provider.token().await.unwrap();
+    provider.advance_clock(Duration::from_secs(3600));
+    let mut in_flight = spawn_callers(&provider, 1);
+    until("the second refresh's request", || endpoint.requests() == 4).await;
+    until("its waiter", || provider.waiters() == 1).await;
+    assert!(provider.invalidate(&rejected), "t2 was still cached");
+    endpoint.release();
+    assert_eq!(
+        in_flight.join_next().await.unwrap().unwrap().unwrap().token,
+        "t3"
+    );
+    assert_eq!(cached_bearer(&provider).as_deref(), Some("t3"), "cached");
+    assert_eq!(provider.token().await.unwrap().token, "t3");
+    assert_eq!(endpoint.requests(), 4);
+}
+
+/// Every log line `invalidate` and the no-re-install path write names the
+/// source and kind and never the bearer. A current-thread runtime, so the
+/// refresh task logs on this thread, into this test's capture.
+#[tokio::test]
+async fn invalidation_never_logs_a_bearer() {
+    let capture = LogCapture::default();
+    let _guard = capture.install();
+    let endpoint = Endpoint::start(vec![
+        token("CANARY-T1", 3600),
+        token("CANARY-T1", 3600),
+        token("CANARY-T2", 3600),
+    ])
+    .await;
+    let provider = endpoint.provider();
+    endpoint.release();
+    let rejected = provider.token().await.unwrap();
+
+    provider.advance_clock(Duration::from_secs(3600));
+    let in_flight = provider.token();
+    tokio::pin!(in_flight);
+    assert!(futures::poll!(&mut in_flight).is_pending());
+    until("the refresh's request", || endpoint.requests() == 2).await;
+    assert!(provider.invalidate(&rejected));
+    endpoint.release();
+    assert_eq!(in_flight.await.unwrap().token, "CANARY-T1");
+    endpoint.release();
+    assert_eq!(provider.token().await.unwrap().token, "CANARY-T2");
+
+    let logs = capture.text();
+    for expected in [
+        "evicted a rejected GCP access token",
+        "a refresh returned the token evicted while it ran; not cached",
+        "refreshed GCP access token",
+        "source=metadata server",
+        "kind=metadata_server",
+    ] {
+        assert!(logs.contains(expected), "{expected:?} not logged: {logs}");
+    }
+    assert!(!logs.contains("CANARY"), "a bearer was logged: {logs}");
 }

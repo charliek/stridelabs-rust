@@ -30,8 +30,11 @@ vertex = []
 workspace = true
 
 [dependencies]
-# `json` for request bodies (`RequestBuilder::json`), `form` for the two
-# token-endpoint grants (`application/x-www-form-urlencoded`). Nothing else,
+# `form` for the two token-endpoint grants
+# (`application/x-www-form-urlencoded`). `json` is no longer used here (Vertex
+# serializes its body itself, once, so a `401` replay resends the same bytes)
+# but stays on as in v0.8.0: turning it off could take `RequestBuilder::json`
+# from a consumer that gets it only through this crate. Nothing else,
 # TLS above all: like stridelabs-auth, this crate never builds a client — every
 # constructor takes the consumer's — so the TLS stack and the process's rustls
 # provider stay the consumer's choice. Its tests talk plain HTTP to wiremock.
@@ -63,7 +66,11 @@ memchr = { workspace = true }
 jsonwebtoken = { workspace = true, optional = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# `test-util` (not part of tokio's `full`) gives `start_paused`: the retry
+# driver's schedule tests run on tokio's paused clock, with synthetic attempts
+# (never a socket). Dev-only, as in stridelabs-http, so no consumer's graph
+# and no `Cargo.lock` line changes.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 wiremock = { workspace = true }
 # Decoding the form bodies the token endpoints receive. Already in the lock
 # (reqwest depends on it).

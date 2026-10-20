@@ -147,6 +147,7 @@ jobs:
             stridelabs-gcp:vertex \
             stridelabs-http:tls \
             stridelabs-http:ssrf \
+            stridelabs-http:ssrf-decompress \
             stridelabs-http:ssrf-test-support \
             stridelabs-redis: \
             stridelabs-testing:redis; do

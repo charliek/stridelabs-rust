@@ -35,7 +35,8 @@
 //! | `cors` | off | `cors::cors_layer`, via `tower-http/cors` |
 //! | `openapi` | off | `openapi` — spec canonicalization, route enumeration and a freshness check, via `utoipa` |
 //! | `proxy` | off | `proxy` — reverse-proxy primitives, plus `AppError::bad_gateway_upstream` (it takes a `reqwest::Error`) — via `reqwest`/`url`/`bytes`/`futures` (and `tokio/time`) |
-//! | `ssrf` | off | `ssrf` — an SSRF-hardened outbound fetch (public-address policy, DNS pinning, capped body), via `reqwest`/`url`/`bytes`/`futures` (and `tokio/time`, `tokio/net`) |
+//! | `ssrf` | off | `ssrf` — an SSRF-hardened outbound fetch (public-address policy, DNS pinning, capped body; request headers, statuses, validators, the answering hop's URL and headers), via `reqwest`/`url`/`bytes`/`futures` (and `tokio/time`, `tokio/net`) |
+//! | `ssrf-decompress` | off | `ssrf` plus opt-in gzip/deflate decoding of a fetched body under a decoded-size cap (`ssrf::Decompression`), via `flate2` (pure Rust) |
 //! | `ssrf-test-support` | off | `ssrf::LoopbackTestServer`, the one way to point a fetch at a local TLS test server — enable from `[dev-dependencies]`, and check the shipped graph for it (`ssrf` docs) |
 //! | `tls` | off | `tls::install_default_provider`, making aws-lc-rs the process's rustls provider, via `rustls` |
 //!

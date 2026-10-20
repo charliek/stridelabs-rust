@@ -6,7 +6,10 @@
 //!   token cache and the quota project as part of the token.
 //! - [`storage`]: a small GCS JSON-API client — media upload, multipart
 //!   upload with object metadata ([`UploadOptions`]), media download,
-//!   delete — and the public object URL.
+//!   delete, a bucket probe — and the public object URL. v0.8.0's behaviour
+//!   by default; Python's names ([`ObjectNamePolicy::Literal`]),
+//!   google-cloud-storage's retry ([`RetryPolicy`]) and the `401` refresh
+//!   are opt-in.
 //! - `vertex` (feature `vertex`): typed `generateContent` request and
 //!   response, the endpoint builder (the `global` host included), a thin
 //!   client, and the inline-image classifier.
@@ -37,8 +40,13 @@ pub mod storage;
 #[cfg(feature = "vertex")]
 pub mod vertex;
 
+mod replay;
+mod retry;
 mod util;
 
 pub use auth::{AccessToken, CredentialKind, CredentialSource, GcpAuthError, TokenProvider};
-pub use storage::{public_url, GcsClient, StorageError, UploadOptions};
+pub use storage::{
+    public_url, public_url_with, validate_bucket_name, GcsClient, ObjectNamePolicy, RetryPolicy,
+    StorageError, UploadOptions,
+};
 pub use util::SensitiveMessage;

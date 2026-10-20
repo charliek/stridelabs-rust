@@ -21,12 +21,17 @@
 //! the client should re-authorize) and [`VerifyError::Unavailable`] (the
 //! service that decides could not be reached: `503`, the client should retry
 //! with the same credential). A JWKS fetch failure is `Unavailable` — never
-//! sign a client out because slauth had a blip. The key set stridelabs-auth
-//! cached before an outage keeps verifying tokens only until it goes stale,
-//! about `JWKS_TTL` (an hour) after its last successful fetch (the exact
-//! bound is in [`stridelabs_auth::jwks`]); from then until slauth answers
-//! again every JWT is `Unavailable`. A long outage is a run of `503`s, never
-//! of `401`s.
+//! sign a client out because slauth had a blip. stridelabs-auth refreshes
+//! its key set ahead of expiry, so a blip near the hour costs nothing while
+//! requests keep arriving in the refresh window; but the set it cached
+//! before an outage verifies tokens only until its TTL, exactly `JWKS_TTL`
+//! (an hour) after its last successful fetch, never past it (see
+//! [`stridelabs_auth::jwks`]). From then until slauth answers again every JWT
+//! is `Unavailable`. Once slauth is back, the cache recovers within what is
+//! left of a fetch still failing, the backoff and one successful fetch
+//! (about 28 s at the defaults), provided requests keep arriving: with none,
+//! the first one to arrive starts that fetch. A long outage is a run of
+//! `503`s, never of `401`s.
 //!
 //! # Errors never echo the credential
 //!

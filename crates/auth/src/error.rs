@@ -38,10 +38,13 @@ pub enum AuthError {
     /// issuer's keys should have signed it. slauth always sets one.
     #[error("token is missing a key id")]
     MissingKid,
-    /// The token's `kid` is not in the issuer's JWKS — after a refetch, or
-    /// after a refetch was suppressed by [`crate::MIN_REFETCH_INTERVAL`] — or
-    /// names only keys unfit for RS256 signatures: not RSA, or an `alg`,
-    /// `use` or `key_ops` that says otherwise (an encryption key, say).
+    /// The token's `kid` is not in a JWKS still inside its TTL — one just
+    /// refetched, or one whose refetch the refetch floor suppressed
+    /// ([`crate::MIN_REFETCH_INTERVAL`] at the defaults; see [`crate::jwks`])
+    /// — or names only keys unfit for RS256 signatures: not RSA, or an `alg`,
+    /// `use` or `key_ops` that says otherwise (an encryption key, say). Only
+    /// a set inside its TTL gives this verdict; without one the answer is
+    /// [`AuthError::Jwks`].
     #[error("token signed by an unknown key")]
     UnknownKid,
     /// Signature, `iss`, `aud`, `exp` or claim-shape check failed. The
@@ -55,11 +58,14 @@ pub enum AuthError {
     /// No `sub` claim, or an empty one.
     #[error("token is missing a subject claim")]
     MissingSubject,
-    /// The issuer's JWKS could not be fetched or parsed. This is the one
-    /// failure here that is the *server's* fault, and the only one that maps
-    /// to a 5xx. The payload names the failure but never the JWKS URL, whose
-    /// query string or userinfo may hold a credential: a `reqwest::Error` is
-    /// rendered `without_url()`.
+    /// The issuer's JWKS could not be fetched or parsed, or the cache holds
+    /// no set inside its TTL and could not get one for this lookup (each
+    /// case is listed on [`crate::JwksCache::jwks_for_kid`]). A set past its
+    /// TTL is never served. This is the one failure here that is the
+    /// *server's* fault, and the only one that maps to a 5xx. The payload
+    /// names the failure but never the JWKS URL, whose query string or
+    /// userinfo may hold a credential: a `reqwest::Error` is rendered
+    /// `without_url()`.
     #[error("JWKS unavailable: {0}")]
     Jwks(String),
 }

@@ -264,7 +264,9 @@ mod tests {
     use wiremock::{MockServer, ResponseTemplate};
 
     use super::*;
-    use crate::mock_issuer::{issuer, jwks_body, jwks_url_of, primary_issuer};
+    use crate::mock_issuer::{
+        issuer, issuer_then, jwks_body, jwks_url_of, primary_body, primary_issuer,
+    };
     use crate::test_support::{TestClaims, TestKey, AUDIENCE, ISSUER, PRIMARY_KID};
 
     fn verify(token: &str) -> Result<VerifiedIdentity, AuthError> {
@@ -691,6 +693,33 @@ mod tests {
         let err = verifier.verify_bearer("not-a-jwt").await.unwrap_err();
 
         assert!(matches!(err, AuthError::MalformedToken), "{err}");
+    }
+
+    /// The defect report's end-to-end repro, through the public entry point:
+    /// warm the cache, let the key set pass its TTL, and have the issuer go
+    /// down. The refetch fails, and so must the token right after it, inside
+    /// the backoff that failure opened (v0.8.0 accepted it there, up to one
+    /// interval past the TTL).
+    #[tokio::test]
+    async fn verify_bearer_refuses_a_token_once_its_key_set_expired_and_cannot_be_refetched() {
+        // The issuer answers once, with its keys, and is down after that:
+        // exactly one failed refetch is expected, not two.
+        let server = issuer_then(primary_body(), ResponseTemplate::new(500)).await;
+        // The defaults, and no lookup in the refresh window: the first lookup
+        // past the TTL is the one that refetches.
+        let verifier = verifier_against(&server);
+        let token = TestKey::primary().mint(&claims().build());
+
+        verifier.verify_bearer(&token).await.expect("warm cache");
+        verifier
+            .inner
+            .jwks
+            .advance_for_test(crate::JWKS_TTL + std::time::Duration::from_secs(1));
+
+        for attempt in ["the refetch that fails", "inside the backoff it opened"] {
+            let err = verifier.verify_bearer(&token).await.unwrap_err();
+            assert!(matches!(err, AuthError::Jwks(_)), "{attempt}: {err}");
+        }
     }
 
     #[tokio::test]

@@ -1,22 +1,29 @@
 //! The guarded fetch: resolve, pin, request, follow (maybe), read capped.
 
+use std::cmp;
+use std::collections::TryReserveError;
 use std::error::Error as StdError;
+use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use http::header::{
-    ACCEPT, ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, LOCATION,
+    ACCEPT, ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, LOCATION, USER_AGENT,
 };
-use http::{HeaderMap, HeaderValue, StatusCode};
+use http::{HeaderMap, StatusCode};
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
+use tokio::time::Instant;
 use url::Url;
 
+#[cfg(feature = "ssrf-decompress")]
+use super::decode;
 use super::error::SsrfError;
-use super::policy::FetchPolicy;
+use super::policy::{self, FetchPolicy, HeaderNames};
 use super::target::{self, Target, TargetHost};
 
-/// The capped body of a successful (`200 OK`) fetch.
+/// The capped body of a successful fetch: `200 OK`, or any status the
+/// policy accepts ([`AcceptedStatuses`](super::AcceptedStatuses)).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Fetched {
     /// The body, at most the policy's `max_bytes`.
@@ -28,7 +35,104 @@ pub struct Fetched {
     pub content_type: Option<String>,
 }
 
+/// Everything [`fetch_public_response`] learned from the hop that answered.
+///
+/// `#[non_exhaustive]`, so it can grow. Its `PartialEq`/`Eq` are part of
+/// that promise: every field a later version adds will be `Eq` too.
+///
+/// **`final_url` and `headers` are not client-safe**, unlike
+/// [`SsrfError`]: they can name the redirect target, carry `Set-Cookie`, and
+/// reveal what a server said about itself. They are for the server-side
+/// caller; do not echo them to whoever chose the URL. `Debug` prints neither
+/// a header value nor the URL's query or fragment.
+#[derive(Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct FetchResponse {
+    /// The body, at most the policy's `max_bytes`: decoded when the policy
+    /// decodes and the response was coded (feature `ssrf-decompress`), and
+    /// empty for a `304 Not Modified`.
+    pub body: Bytes,
+    /// The response's `Content-Type`, verbatim, if it sent a readable one
+    /// (as in [`Fetched`]).
+    pub content_type: Option<String>,
+    /// The status: one the policy accepts, or `304` for a not-modified
+    /// answer to a validator on the first hop.
+    pub status: StatusCode,
+    /// The URL of the hop that answered, as requested: normalized (the
+    /// IDNA, lower-cased host the fetch pinned, no trailing dot, the default
+    /// port elided, WHATWG path rules) and never with userinfo, which the
+    /// fetch refuses. Resolve a relative link in the body against this.
+    pub final_url: Url,
+    /// That hop's response headers, as hyper parsed them (not
+    /// byte-verbatim). On a decoded body, `Content-Length` and
+    /// `Content-Encoding` here describe the bytes on the wire, not
+    /// [`FetchResponse::body`].
+    pub headers: HeaderMap,
+    /// How many redirects were followed to reach that hop.
+    pub redirects: u32,
+}
+
+impl fmt::Debug for FetchResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FetchResponse")
+            .field("body", &format_args!("<{} bytes>", self.body.len()))
+            .field("status", &self.status)
+            .field("final_url", &RedactedUrl(&self.final_url))
+            .field("headers", &HeaderNames(&self.headers))
+            .field("redirects", &self.redirects)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A URL with its query and fragment replaced by markers (there is no
+/// userinfo to redact: the fetch refuses it).
+struct RedactedUrl<'a>(&'a Url);
+
+impl fmt::Debug for RedactedUrl<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let url = self.0;
+        f.write_str(&url[..url::Position::AfterPath])?;
+        if url.query().is_some() {
+            f.write_str("?<redacted>")?;
+        }
+        if url.fragment().is_some() {
+            f.write_str("#<redacted>")?;
+        }
+        Ok(())
+    }
+}
+
+impl From<FetchResponse> for Fetched {
+    /// The body and content type. Everything else is dropped, which is the
+    /// point of the simple form.
+    fn from(response: FetchResponse) -> Self {
+        Fetched {
+            body: response.body,
+            content_type: response.content_type,
+        }
+    }
+}
+
 /// Fetch `url` under the full SSRF policy and return the capped body.
+///
+/// [`fetch_public_response`], reduced to body and content type: what an
+/// image fetch needs. Every step and every error is that function's. The one
+/// difference is a `304 Not Modified` answering a validator (possible only
+/// for a policy with one, [`FetchPolicy::with_header`]): a [`Fetched`]
+/// cannot say "not modified", so it is [`SsrfError::HttpStatus`] here.
+pub async fn fetch_public(url: &str, policy: &FetchPolicy) -> Result<Fetched, SsrfError> {
+    let response = fetch_public_response(url, policy).await?;
+    if response.status == StatusCode::NOT_MODIFIED {
+        return Err(SsrfError::HttpStatus {
+            label: policy.label.clone(),
+            status: response.status,
+        });
+    }
+    Ok(response.into())
+}
+
+/// Fetch `url` under the full SSRF policy and return the answering hop's
+/// body, status, URL and headers.
 ///
 /// In order — the module docs give the reasoning for each step:
 ///
@@ -41,25 +145,47 @@ pub struct Fetched {
 ///      [`SsrfError::NonPublicResolution`]), preferring IPv4 for the pin; an
 ///      IP literal is its own pin;
 ///    - send one GET through a client built for this hop alone, whose
-///      resolver answers only the normalized name, with the pinned address;
+///      resolver answers only the normalized name, with the pinned address,
+///      carrying the policy's `Accept-Encoding`, `Accept`, `User-Agent` and
+///      extra headers (validators on the first hop only);
+///    - on the first hop of a policy with a validator, a `304` is the
+///      result: an empty body, nothing more read;
 ///    - a 3xx is [`SsrfError::RedirectsNotAllowed`] unless the policy allows
 ///      redirects, in which case its `Location` is joined onto the current
 ///      URL and the target goes back to step 1, up to the policy's
 ///      `max_redirects` ([`SsrfError::TooManyRedirects`]);
-///    - any status but `200` is [`SsrfError::HttpStatus`];
+///    - a status the policy does not accept (by default, any but `200`) is
+///      [`SsrfError::HttpStatus`];
 ///    - a `Content-Encoding` other than `identity` is
-///      [`SsrfError::FetchFailed`]: the request asks for `identity`, and
-///      nothing here ever decompresses;
-///    - a numeric `Content-Length` over `max_bytes` is
-///      [`SsrfError::TooLarge`] before a byte of body is read, and so is a
-///      streamed body the moment it would pass `max_bytes`.
+///      [`SsrfError::FetchFailed`], unless the policy decodes (feature
+///      `ssrf-decompress`) and it is exactly one of `gzip`, `x-gzip` or
+///      `deflate`;
+///    - a numeric `Content-Length` over the cap is [`SsrfError::TooLarge`]
+///      before a byte of body is read, and so is a streamed body the moment
+///      it would pass the cap: `max_bytes` for an unencoded body; for a
+///      coded one, a wire cap of `max_bytes + max_bytes / 8 + 4096`, then
+///      `max_bytes` on the decoded bytes (counting output written before a
+///      corruption is found), decoded in bounded steps that yield, with the
+///      budget checked before each step and on every answer, so a decode
+///      running past it or answering after it is [`SsrfError::TimedOut`],
+///      whatever it came to. No body buffer's capacity passes its cap. A
+///      corrupt or truncated coded body is
+///      [`SsrfError::FetchFailed`], never a partial one.
 ///
 /// Every other failure is [`SsrfError::FetchFailed`]. No error carries an
-/// internal detail; see [`SsrfError`].
-pub async fn fetch_public(url: &str, policy: &FetchPolicy) -> Result<Fetched, SsrfError> {
+/// internal detail; see [`SsrfError`]. The response itself is not
+/// client-safe; see [`FetchResponse`].
+pub async fn fetch_public_response(
+    url: &str,
+    policy: &FetchPolicy,
+) -> Result<FetchResponse, SsrfError> {
     // Validation does no I/O, so it sits outside the budget, as in Python.
     let target = target::validate(url, policy)?;
-    match tokio::time::timeout(policy.timeout, follow(target, policy)).await {
+    // The budget's own end, for the decoder's checks between steps; `None`
+    // where `timeout` would not fit an `Instant`, as tokio's own `timeout`
+    // treats it.
+    let deadline = Instant::now().checked_add(policy.timeout);
+    match tokio::time::timeout(policy.timeout, follow(target, policy, deadline)).await {
         Ok(outcome) => outcome,
         Err(_elapsed) => Err(SsrfError::TimedOut {
             label: policy.label.clone(),
@@ -69,16 +195,20 @@ pub async fn fetch_public(url: &str, policy: &FetchPolicy) -> Result<Fetched, Ss
 
 /// What one hop produced.
 enum Hop {
-    Fetched(Fetched),
+    Answer(FetchResponse),
     /// The next URL, joined onto the current one but not yet validated.
     Redirect(Url),
 }
 
-async fn follow(mut target: Target, policy: &FetchPolicy) -> Result<Fetched, SsrfError> {
-    for _hop in 0..=policy.max_redirects {
+async fn follow(
+    mut target: Target,
+    policy: &FetchPolicy,
+    deadline: Option<Instant>,
+) -> Result<FetchResponse, SsrfError> {
+    for hop in 0..=policy.max_redirects {
         let pinned = pin(&target, policy).await?;
-        match request_once(&target, pinned, policy).await? {
-            Hop::Fetched(fetched) => return Ok(fetched),
+        match request_once(&target, pinned, policy, hop, deadline).await? {
+            Hop::Answer(response) => return Ok(response),
             // From scratch — scheme, credentials, metadata names, IP policy —
             // and the next iteration resolves and pins it afresh. A redirect
             // to an internal address is refused here, before any connection.
@@ -219,15 +349,27 @@ async fn request_once(
     target: &Target,
     pinned: IpAddr,
     policy: &FetchPolicy,
+    hop: u32,
+    deadline: Option<Instant>,
 ) -> Result<Hop, SsrfError> {
     let client = hop_client(target, pinned, policy).map_err(|e| transport_failure(e, policy))?;
-    // The bytes as stored, never a compressed form: there is no decoder
-    // here to hand them to, and none is wanted (see `is_identity_encoded`).
+    // `identity` unless the policy decodes: there is no decoder to hand a
+    // compressed body to otherwise (see `is_identity_encoded`).
     let mut request = client
         .get(target.url.clone())
-        .header(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
+        .header(ACCEPT_ENCODING, policy.accept_encoding());
     if let Some(accept) = &policy.accept {
         request = request.header(ACCEPT, accept.clone());
+    }
+    if let Some(user_agent) = &policy.user_agent {
+        request = request.header(USER_AGENT, user_agent.clone());
+    }
+    for (name, value) in &policy.headers {
+        // The validators describe the URL the caller cached, which only the
+        // first hop requests (RFC 9110 section 15.4).
+        if hop == 0 || !policy::is_validator(name) {
+            request = request.header(name, value.clone());
+        }
     }
     let response = request
         .send()
@@ -235,6 +377,12 @@ async fn request_once(
         .map_err(|e| transport_failure(e, policy))?;
 
     let status = response.status();
+    // The answer to the validators this hop sent: terminal, never a
+    // redirect (a Location is ignored), and with no body to read.
+    if status == StatusCode::NOT_MODIFIED && hop == 0 && policy.has_validator() {
+        let headers = response.headers().clone();
+        return Ok(answer(target, hop, status, headers, Bytes::new()));
+    }
     // Every 3xx, as Python's `is_redirect` — a 304 or a 300 is "a redirect"
     // here too, refused or (with no usable Location) a failed fetch.
     if status.is_redirection() {
@@ -257,34 +405,115 @@ async fn request_once(
             .map_err(|_| SsrfError::InvalidUrl)?;
         return Ok(Hop::Redirect(next));
     }
-    if status != StatusCode::OK {
+    if !policy.accepted.accepts(status) {
         return Err(SsrfError::HttpStatus {
             label: policy.label.clone(),
             status,
         });
     }
-    if !is_identity_encoded(response.headers()) {
+    let Some(coding) = classify(response.headers(), policy) else {
         tracing::debug!(label = %policy.label, "refusing a content-encoded response");
         return Err(SsrfError::FetchFailed {
             label: policy.label.clone(),
         });
-    }
-    if declared_too_large(response.headers(), policy.max_bytes) {
+    };
+    let wire_cap = coding.wire_cap(policy.max_bytes);
+    if declared_too_large(response.headers(), wire_cap) {
         return Err(policy.too_large());
     }
 
-    let content_type = response
-        .headers()
-        .get(CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned);
-    let body = read_capped(response.bytes_stream(), policy.max_bytes)
+    let headers = response.headers().clone();
+    let wire = read_capped(response.bytes_stream(), wire_cap)
         .await
         .map_err(|e| match e {
             CapError::TooLarge => policy.too_large(),
+            CapError::OutOfMemory => out_of_memory(policy),
             CapError::Stream(e) => transport_failure(e, policy),
         })?;
-    Ok(Hop::Fetched(Fetched { body, content_type }))
+    let body = coding.decode(Bytes::from(wire), policy, deadline).await?;
+    Ok(answer(target, hop, status, headers, body))
+}
+
+/// The answer of the hop that requested `target`, the `hop`-th: its status
+/// and headers, with `body`.
+fn answer(target: &Target, hop: u32, status: StatusCode, headers: HeaderMap, body: Bytes) -> Hop {
+    let content_type = headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    Hop::Answer(FetchResponse {
+        body,
+        content_type,
+        status,
+        final_url: target.url.clone(),
+        headers,
+        redirects: hop,
+    })
+}
+
+/// How a response's body is read, by its `Content-Encoding`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BodyCoding {
+    /// The resource's own bytes: read under `max_bytes`, returned as read.
+    Identity,
+    /// One coding the policy decodes (feature `ssrf-decompress`).
+    #[cfg(feature = "ssrf-decompress")]
+    Coded(decode::Coding),
+}
+
+impl BodyCoding {
+    /// The cap on bytes read from the wire, declared and streamed.
+    fn wire_cap(self, max_bytes: usize) -> usize {
+        match self {
+            Self::Identity => max_bytes,
+            #[cfg(feature = "ssrf-decompress")]
+            Self::Coded(_) => decode::wire_cap(max_bytes),
+        }
+    }
+
+    async fn decode(
+        self,
+        wire: Bytes,
+        policy: &FetchPolicy,
+        deadline: Option<Instant>,
+    ) -> Result<Bytes, SsrfError> {
+        match self {
+            Self::Identity => {
+                let _ = (policy, deadline);
+                Ok(wire)
+            }
+            #[cfg(feature = "ssrf-decompress")]
+            Self::Coded(coding) => decode::decode(coding, &wire, policy.max_bytes, deadline)
+                .await
+                .map_err(|e| match e {
+                    decode::DecodeError::TooLarge => policy.too_large(),
+                    decode::DecodeError::TimedOut => SsrfError::TimedOut {
+                        label: policy.label.clone(),
+                    },
+                    decode::DecodeError::Corrupt => {
+                        tracing::debug!(label = %policy.label, "refusing a corrupt coded body");
+                        SsrfError::FetchFailed {
+                            label: policy.label.clone(),
+                        }
+                    }
+                    decode::DecodeError::OutOfMemory => out_of_memory(policy),
+                }),
+        }
+    }
+}
+
+/// The body's coding, or `None` to refuse it. An identity-encoded response
+/// is always readable; a coded one only when the policy decodes it.
+pub(super) fn classify(headers: &HeaderMap, policy: &FetchPolicy) -> Option<BodyCoding> {
+    if is_identity_encoded(headers) {
+        return Some(BodyCoding::Identity);
+    }
+    #[cfg(feature = "ssrf-decompress")]
+    if policy.decompression == super::Decompression::GzipDeflate {
+        return decode::classify(headers).map(BodyCoding::Coded);
+    }
+    let _ = policy;
+    None
 }
 
 /// Whether the body is the resource's own bytes: no `Content-Encoding` at
@@ -292,11 +521,13 @@ async fn request_once(
 /// comma-separated codings).
 ///
 /// Anything else is refused rather than decoded — including a server that
-/// compresses although the request asked for `identity`. A deliberate
+/// compresses although the request asked for `identity` — unless the policy
+/// decodes (feature `ssrf-decompress`; see `classify`). A deliberate
 /// difference from Python, whose httpx decodes gzip/deflate (and brotli/zstd
-/// when installed): with no decoder in this crate, a compressed body can
-/// never be mislabelled as the image it claims to be, and there is no
-/// decompression bomb to cap. An empty or unreadable value is not `identity`.
+/// when installed): with no decoder, a compressed body can never be
+/// mislabelled as the image it claims to be, and there is no decompression
+/// bomb to cap (the module docs, "Compressed responses"). An empty or
+/// unreadable value is not `identity`.
 fn is_identity_encoded(headers: &HeaderMap) -> bool {
     headers.get_all(CONTENT_ENCODING).iter().all(|value| {
         value.to_str().is_ok_and(|codings| {
@@ -330,27 +561,65 @@ fn declared_too_large(headers: &HeaderMap, max_bytes: usize) -> bool {
 #[derive(Debug)]
 enum CapError<E> {
     TooLarge,
+    /// The buffer for a body within the cap could not be allocated.
+    OutOfMemory,
     Stream(E),
 }
 
 /// Read `stream` to the end, or stop the moment it would pass `max_bytes`
 /// (exactly `max_bytes` is fine). Counts bytes as they arrive, so a
-/// `Content-Length` that understates the body cannot buy it more room.
-async fn read_capped<S, E>(stream: S, max_bytes: usize) -> Result<Bytes, CapError<E>>
+/// `Content-Length` that understates the body cannot buy it more room. The
+/// buffer's capacity never passes `max_bytes` either ([`reserve_capped`]).
+async fn read_capped<S, E>(stream: S, max_bytes: usize) -> Result<Vec<u8>, CapError<E>>
 where
     S: Stream<Item = Result<Bytes, E>>,
 {
     let mut stream = std::pin::pin!(stream);
-    let mut body = BytesMut::new();
+    let mut body = Vec::new();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(CapError::Stream)?;
         // `body.len() <= max_bytes` holds on entry, so this cannot underflow.
         if chunk.len() > max_bytes - body.len() {
             return Err(CapError::TooLarge);
         }
+        reserve_capped(&mut body, chunk.len(), max_bytes).map_err(|_| CapError::OutOfMemory)?;
         body.extend_from_slice(&chunk);
     }
-    Ok(body.freeze())
+    Ok(body)
+}
+
+/// The smallest growth [`reserve_capped`] makes, so a body of many tiny
+/// chunks is not reallocated for each.
+const MIN_GROWTH: usize = 8 * 1024;
+
+/// Room in `buf` for `additional` more bytes, its capacity growing
+/// geometrically (doubling, by at least [`MIN_GROWTH`]) but never past
+/// `limit`: a capped buffer's allocation is bounded by its cap, where
+/// `Vec`'s own doubling could hold nearly twice the cap. The caller keeps
+/// `buf.len() + additional <= limit`. `Err` when the allocator refuses the
+/// reservation, which the caller reports as a failed fetch.
+pub(super) fn reserve_capped(
+    buf: &mut Vec<u8>,
+    additional: usize,
+    limit: usize,
+) -> Result<(), TryReserveError> {
+    let needed = buf.len().saturating_add(additional);
+    if needed <= buf.capacity() {
+        return Ok(());
+    }
+    let doubled = cmp::max(buf.capacity().saturating_mul(2), MIN_GROWTH);
+    let target = cmp::max(needed, cmp::min(doubled, limit));
+    buf.try_reserve_exact(target - buf.len())
+}
+
+/// A body within the caps whose buffer reservation the allocator refused:
+/// a failed fetch, logged. (Only these fallible reservations; the fetch's
+/// other allocations are ordinary ones.)
+fn out_of_memory(policy: &FetchPolicy) -> SsrfError {
+    tracing::debug!(label = %policy.label, "could not allocate a capped body buffer");
+    SsrfError::FetchFailed {
+        label: policy.label.clone(),
+    }
 }
 
 /// A reqwest failure, reduced to its client-safe message. The detail is
@@ -382,6 +651,7 @@ mod tests {
     use std::time::Duration;
 
     use futures::stream;
+    use http::HeaderValue;
 
     use super::*;
     use crate::ssrf::{fetch_public, AllowedSchemes};
@@ -422,9 +692,144 @@ mod tests {
         send_sync::<FetchPolicy>();
         send_sync::<SsrfError>();
         send_sync::<Fetched>();
+        send_sync::<FetchResponse>();
+        send_sync::<crate::ssrf::ReservedHeader>();
+        send_sync::<crate::ssrf::AcceptedStatuses>();
+        #[cfg(feature = "ssrf-decompress")]
+        send_sync::<crate::ssrf::Decompression>();
         let policy = FetchPolicy::new("image", 1);
         let future = fetch_public("https://images.example.com/a.png", &policy);
         send(&future);
+        let future = fetch_public_response("https://images.example.com/a.png", &policy);
+        send(&future);
+    }
+
+    fn response(url: &str) -> FetchResponse {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("application/rss+xml"),
+        );
+        headers.append(
+            "set-cookie",
+            HeaderValue::from_static("session=secret-cookie-value"),
+        );
+        headers.append(
+            "set-cookie",
+            HeaderValue::from_static("other=second-cookie-value"),
+        );
+        FetchResponse {
+            body: Bytes::from_static(b"<rss/>"),
+            content_type: Some("application/rss+xml".to_owned()),
+            status: StatusCode::OK,
+            final_url: Url::parse(url).unwrap(),
+            headers,
+            redirects: 2,
+        }
+    }
+
+    #[test]
+    fn a_response_converts_to_its_body_and_content_type() {
+        let fetched = Fetched::from(response("https://feeds.example.com/rss"));
+        assert_eq!(
+            fetched,
+            Fetched {
+                body: Bytes::from_static(b"<rss/>"),
+                content_type: Some("application/rss+xml".to_owned()),
+            }
+        );
+    }
+
+    /// No header value and no query or fragment: `final_url` and `headers`
+    /// are not client-safe, and a `Debug` ends up in logs.
+    #[test]
+    fn the_response_debug_never_prints_a_header_value_or_the_query() {
+        let debug = format!(
+            "{:?}",
+            response("https://feeds.example.com/private/rss.xml?token=query-secret#frag-secret")
+        );
+        assert_eq!(
+            debug,
+            "FetchResponse { body: <6 bytes>, status: 200, final_url: \
+             https://feeds.example.com/private/rss.xml?<redacted>#<redacted>, \
+             headers: [\"content-type\", \"set-cookie\", \"set-cookie\"], redirects: 2, .. }"
+        );
+        for secret in [
+            "query-secret",
+            "frag-secret",
+            "secret-cookie-value",
+            "second-cookie-value",
+            "application/rss+xml",
+        ] {
+            assert!(!debug.contains(secret), "{secret} in {debug}");
+        }
+        let plain = format!("{:?}", response("https://feeds.example.com/rss"));
+        assert!(
+            plain.contains("final_url: https://feeds.example.com/rss,"),
+            "{plain}"
+        );
+        let fragment = format!("{:?}", response("https://feeds.example.com/rss#top"));
+        assert!(
+            fragment.contains("final_url: https://feeds.example.com/rss#<redacted>,"),
+            "{fragment}"
+        );
+        let empty_query = format!("{:?}", response("https://feeds.example.com/rss?"));
+        assert!(
+            empty_query.contains("final_url: https://feeds.example.com/rss?<redacted>,"),
+            "{empty_query}"
+        );
+    }
+
+    /// With decoding off (or the feature absent), exactly v0.8.0's check.
+    #[test]
+    fn without_decoding_only_identity_is_readable() {
+        let policy = FetchPolicy::new("image", 1);
+        assert_eq!(
+            classify(&HeaderMap::new(), &policy),
+            Some(BodyCoding::Identity)
+        );
+        assert_eq!(
+            classify(&encoded(&["identity", "Identity"]), &policy),
+            Some(BodyCoding::Identity)
+        );
+        for refused in [
+            &["gzip"][..],
+            &["deflate"][..],
+            &["x-gzip"][..],
+            &["identity", "gzip"][..],
+        ] {
+            assert_eq!(classify(&encoded(refused), &policy), None, "{refused:?}");
+        }
+        assert_eq!(BodyCoding::Identity.wire_cap(1234), 1234);
+    }
+
+    #[cfg(feature = "ssrf-decompress")]
+    #[test]
+    fn with_decoding_a_coded_body_gets_the_wire_cap() {
+        use crate::ssrf::Decompression;
+        let policy = FetchPolicy::new("feed", 1).with_decompression(Decompression::GzipDeflate);
+        // Decoding never refuses what the identity check accepts.
+        for identity in [
+            &[][..],
+            &["identity"][..],
+            &["IDENTITY"][..],
+            &["identity, identity"][..],
+            &[" identity "][..],
+            &["identity", "Identity"][..],
+        ] {
+            assert_eq!(
+                classify(&encoded(identity), &policy),
+                Some(BodyCoding::Identity),
+                "{identity:?}"
+            );
+        }
+        let gzip = classify(&encoded(&["gzip"]), &policy).expect("decoded");
+        assert_eq!(gzip, BodyCoding::Coded(decode::Coding::Gzip));
+        // Identity under a decoding policy keeps `max_bytes`.
+        assert_eq!(BodyCoding::Identity.wire_cap(8000), 8000);
+        assert_eq!(gzip.wire_cap(8000), 8000 + 1000 + 4096);
+        assert_eq!(classify(&encoded(&["br"]), &policy), None);
+        assert_eq!(classify(&encoded(&["gzip, gzip"]), &policy), None);
     }
 
     #[tokio::test]
@@ -711,5 +1116,43 @@ mod tests {
             read_capped(failing, 100).await,
             Err(CapError::Stream(_))
         ));
+    }
+
+    /// Capacity, not only length, is capped: a body of 8 MiB + 1 bytes in
+    /// 1,000-byte chunks, read under exactly that cap, one over it and one
+    /// under it, never leaves the buffer holding more than the cap.
+    /// (`Vec`'s or `BytesMut`'s doubling would end at 16 MiB.)
+    #[tokio::test]
+    async fn the_wire_buffer_never_holds_more_than_the_cap() {
+        let size = (8 << 20) + 1;
+        let sizes = |total: usize| {
+            let mut sizes = vec![1000; total / 1000];
+            sizes.push(total % 1000);
+            sizes
+        };
+        for cap in [size, size + 1, size + 4096] {
+            let body = read_capped(chunks(&sizes(size)), cap).await.unwrap();
+            assert_eq!(body.len(), size);
+            assert!(
+                body.capacity() <= cap,
+                "{cap}: capacity {}",
+                body.capacity()
+            );
+        }
+        assert!(matches!(
+            read_capped(chunks(&sizes(size)), size - 1).await,
+            Err(CapError::TooLarge)
+        ));
+        // Small bodies still grow geometrically, never by a chunk at a time.
+        let mut buf = Vec::new();
+        reserve_capped(&mut buf, 1, 1 << 20).unwrap();
+        assert_eq!(buf.capacity(), MIN_GROWTH);
+        buf.resize(MIN_GROWTH, 0);
+        reserve_capped(&mut buf, 1, 1 << 20).unwrap();
+        assert_eq!(buf.capacity(), 2 * MIN_GROWTH);
+        // And never past the limit, even below the minimum growth.
+        let mut small = Vec::new();
+        reserve_capped(&mut small, 3, 10).unwrap();
+        assert_eq!(small.capacity(), 10);
     }
 }
