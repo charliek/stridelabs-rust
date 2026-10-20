@@ -596,8 +596,8 @@ jobs:
 
   # Does the candidate still build and pass for a real consumer? limen is the
   # one consumer checked here: it is public, so this log is public too, and it
-  # needs no services and no secrets. tapper, slauth and spendwise-rs are
-  # private, and a public Actions log would publish their failing test output,
+  # needs no services and no secrets. tapper, slauth, imgmcp, spendwise-rs and
+  # slaudio are private, and a public Actions log would publish their failing test output,
   # so scripts/downstream-check.sh checks them locally, before a tag.
   #
   # limen is checked out at a pinned commit SHA, never at a branch: a branch
