@@ -144,9 +144,12 @@ checkout for tapper, slauth, limen, imgmcp, spendwise-rs or slaudio, then proves
 with `cargo metadata` that every `stridelabs-*` package is this checkout's own
 crate. It finds each consumer's checkout next to this one or under
 `~/projects` (`DOWNSTREAM_PROJECTS` and `DOWNSTREAM_<NAME>_REPO` override), and
-keeps its archives and target dirs under `~/.cache/stridelabs-downstream`
-(`DOWNSTREAM_SCRATCH` overrides); the script's header lists each consumer's
-services and variables.
+keeps its archives and target dirs under
+`${XDG_CACHE_HOME:-~/.cache}/stridelabs-downstream` (`DOWNSTREAM_SCRATCH`
+overrides); the script's header lists each consumer's services and variables.
+slaudio's Rust port lives on its `rust-port` branch, so pass
+`DOWNSTREAM_SLAUDIO_REF=origin/rust-port` (an `all <ref>` run otherwise reports
+slaudio NOT RUN).
 
 ### Feature topology (all eight crates)
 
