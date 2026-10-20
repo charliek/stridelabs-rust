@@ -577,6 +577,14 @@ tzdata_version() { # [zi-only]
   case $v in [0-9][0-9][0-9][0-9][a-z]) printf '%s' "$v" ;; esac
 }
 
+# True when tz release $1 sorts before $2 (`2025b` < `2026c`), compared
+# bytewise: [[ < ]] collates by the current locale, so pin it to C. Both are
+# already validated as four digits and one lowercase letter by tzdata_version.
+tz_older() ( # a b
+  LC_ALL=C
+  [[ $1 < $2 ]]
+)
+
 # A refusal: the consumer's tests read the host tz database and fail below this
 # release. Only tzdata.zi counts here, because that is the version the
 # consumer's own reader sees (slaudio has no +VERSION fallback).
@@ -585,7 +593,7 @@ require_tzdata() { # minimum
   v=$(tzdata_version zi-only)
   if [ -z "$v" ]; then
     problem "cannot read the tz database version under ${TZDIR:-/usr/share/zoneinfo}; $C_NAME's tests need $1 or later (point TZDIR at a tz database)"
-  elif [[ $v < $1 ]]; then
+  elif tz_older "$v" "$1"; then
     problem "the tz database under ${TZDIR:-/usr/share/zoneinfo} is $v; $C_NAME's tests need $1 or later (point TZDIR at a current copy)"
   fi
 }
@@ -599,7 +607,7 @@ note_tzdata() { # minimum
   v=$(tzdata_version)
   if [ -z "$v" ]; then
     printf '%s: note: cannot read the tz database version under %s\n' "$C_NAME" "${TZDIR:-/usr/share/zoneinfo}" >&2
-  elif [[ $v < $1 ]]; then
+  elif tz_older "$v" "$1"; then
     printf '%s: note: the tz database under %s is %s, older than %s; a tz-dependent test failure may be the host, not the library (point TZDIR at a current copy)\n' "$C_NAME" "${TZDIR:-/usr/share/zoneinfo}" "$v" "$1" >&2
   fi
 }
