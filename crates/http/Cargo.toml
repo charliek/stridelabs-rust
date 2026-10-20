@@ -44,7 +44,9 @@ ssrf = ["dep:reqwest", "dep:url", "dep:bytes", "dep:futures", "tokio/time", "tok
 # fetcher whose servers compress whatever is asked for. A feature of its own
 # so that only a consumer that decodes compiles a decoder (flate2 and its
 # four crates); without it, a coded response is refused as before.
-ssrf-decompress = ["ssrf", "dep:flate2"]
+# `tokio/rt` is the decoder's `task::yield_now` between steps; declarative
+# under the workspace's `full` pin, like `ssrf`'s `time` and `net`.
+ssrf-decompress = ["ssrf", "dep:flate2", "tokio/rt"]
 # Test-only: `ssrf::LoopbackTestServer`, which lets a policy reach named
 # loopback addresses through one private CA — what proving the pinning
 # against a real TLS server takes, and exactly what the strict policy
