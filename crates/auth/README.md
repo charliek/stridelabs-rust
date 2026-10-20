@@ -286,9 +286,10 @@ considered, so a listed-first encryption key cannot hide the signing key.
 
 Pinning the algorithm to RS256 is what rules out the two classic forgeries
 (`alg: none`, and HS256 signed with the issuer's public key as an HMAC
-secret). The HS256 confusion attack is covered by a test; `alg: none` has no
-test because it cannot be constructed — `jsonwebtoken`'s `Algorithm` enum has
-no such variant, so a token carrying it fails to parse before any check runs.
+secret). Both are covered by tests. `jsonwebtoken` cannot mint an `alg: none`
+token, so its test assembles the header by hand: `Algorithm` has no such
+variant, so the header fails to parse (`AuthError::MalformedToken`) before any
+check runs.
 
 `sub` is treated as an **opaque** OIDC subject. In a slauth deployment it
 happens to be the Kratos identity UUID and services key their user rows on it,
