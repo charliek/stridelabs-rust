@@ -99,8 +99,9 @@ for a consumer's pin.
   - Enabled, a completed `401` has its body read and dropped (at most
     16 KiB and 2 s, then the connection is dropped). Its bearer is
     invalidated, a token is taken again and the same request is sent again,
-    up to the count per operation. A persistent `401` costs N + 1 requests
-    and N refreshes (3 and 2 by default), and `0` replays nothing.
+    up to the count per attempt: once per operation, or afresh in each
+    attempt under `GcsClient::with_retry`. A persistent `401` costs N + 1
+    requests and N refreshes (3 and 2 by default), and `0` replays nothing.
   - Never on a `403`, a `5xx` or a transport failure. Every replay runs
     inside the operation's timeout. A multipart upload's body and boundary
     are built once, and Vertex's JSON is serialized once (after the first
@@ -113,6 +114,78 @@ for a consumer's pin.
     test whose expectations were recorded on the v0.8.0 tree. A `401` is
     still one request and `Status`.
   - Both clients' `Debug` prints the toggle and the count.
+- `stridelabs-gcp`: `ObjectNamePolicy` (`#[non_exhaustive]`, `Default` =
+  `Strict`), `GcsClient::with_object_name_policy` / `object_name_policy()`
+  and `public_url_with(bucket, object, policy)`. `Strict` is v0.8.0's name
+  check everywhere, and the free `public_url` stays `Strict`. `Literal` is a
+  transport policy, not validation: uploads send every name (a query value
+  or a JSON string), a download or a delete refuses only `""`, `.` and `..`
+  (no URL path segment can carry them; nothing is sent and no token
+  fetched), `public_url_with(.., Literal)` refuses no object name, and
+  whatever else GCS refuses comes back as its `400`. A `Literal` public URL
+  is exact addressing, not a safe URL: a `..` segment resolves elsewhere in
+  a normalizing client, as Python's string does. Pinned by slaudio's 31
+  golden names from google-cloud-storage 3.6.0
+  (`crates/gcp/tests/fixtures/gcs_object_names.json`, with its
+  provenance): `public_url_with(.., Literal)` is Python's for all 31, deletes
+  go to Python's paths but for the three refused, both uploads send all 31,
+  and `Strict` refuses the same 14 as v0.8.0.
+- `stridelabs-gcp`: an opt-in retry, `GcsClient::with_retry(RetryPolicy)` /
+  `retry_policy()`. `RetryPolicy` (`#[non_exhaustive]`, `Copy`,
+  `PartialEq`; public `initial_delay`, `multiplier`, `max_delay`,
+  `deadline`; `const` `with_*` setters) has `disabled()` (the default: one
+  attempt, as in v0.8.0) and `google_default()` (1 s, ×2, 60 s, 120 s,
+  google-cloud-storage's `DEFAULT_RETRY`).
+  - google-api-core's schedule: a full-jitter draw under a ceiling that
+    grows by the multiplier to `max_delay`, at least 1 ms a wait, until a
+    success, a failure that is not transient, or a wait that would pass the
+    deadline; then that attempt's error is returned unchanged (Python raises
+    `RetryError` instead: a recorded difference). No attempt cap, as in
+    Python; invalid values are normalized at use, never refused, and every
+    nonzero deadline ends the loop.
+  - Transient, decided where each failure happens (never by reading an
+    error's text back): `408`, `429`, `500`, `502`, `503`, `504`; the
+    client's `Timeout`, unless the attempt had already heard a status that
+    is not; a transport failure before the response that timed out, failed
+    to connect or broke in flight; any failure reading a body after the
+    headers (an interrupted transfer); and those classes on the way to the
+    token. Never: a `404`, any other status (`401`, `403`, `412` included),
+    `TooLarge`, the `Invalid*` refusals, other token errors.
+  - A status line, once in, is final. An error body that stalls until the
+    attempt's timeout ends the attempt as `Timeout` (v0.8.0's error there;
+    the default client returns exactly that), classed by the status: a
+    `412` or `401` whose body never arrives is not retried, a `503`'s is.
+    So is a token refresh's: an attempt cut off waiting on a refresh whose
+    token endpoint already answered `400` is not retried, and a `401` being
+    drained by the refresh is the attempt's answer until its replay goes
+    out.
+  - Token failures recover differently from Python's, not only in count:
+    google-auth retries inside its refresh on `408`, `429`, `500`, `503`,
+    `504`, and on any status (a `400` included) whose OAuth `error` is
+    `internal_failure`, `server_error` or `temporarily_unavailable`; this
+    client retries a token failure by status alone, so a token `400
+    {"error":"temporarily_unavailable"}` then a token recovers in Python
+    and fails here.
+  - The error strings are unchanged: an interrupted body is still
+    `Request { reason: "decode error" }`.
+  - Each attempt takes a token, runs the opt-in `401` refresh with a budget
+    of its own (a `401` replayed into a `503` is retried), and is bounded by
+    the client's timeout, which is per attempt under a policy: the loop ends
+    within the deadline plus one attempt.
+  - Documented: library attempts are not wire requests (do not add a
+    reqwest retry for the GCS host); a retried create-only upload whose
+    first response was lost answers `412`, and a retried delete may return
+    `Ok(false)`.
+  - One `debug` line per retry: operation, attempt, `wait_ms`, the status
+    or the transport category. Never a name, a message or a URL.
+- `stridelabs-gcp`: `GcsClient::bucket_reachable(bucket)`, a startup probe
+  (`GET {base}/storage/v1/b/{bucket}/o?maxResults=1`; any 2xx is `Ok(())`,
+  anything else `Status { operation: "list" }`) on the same timeout, retry
+  and refresh, point-in-time evidence that needs `storage.objects.list` (a
+  `403` says nothing about whether the bucket exists); and
+  `validate_bucket_name`, the bucket rule every operation applies, public.
+  `GcsClient`'s `Debug` prints the name policy and the retry policy. All the
+  new items are re-exported from the crate root.
 
 ### Changed
 

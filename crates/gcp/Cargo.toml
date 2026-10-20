@@ -66,7 +66,11 @@ memchr = { workspace = true }
 jsonwebtoken = { workspace = true, optional = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# `test-util` (not part of tokio's `full`) gives `start_paused`: the retry
+# driver's schedule tests run on tokio's paused clock, with synthetic attempts
+# (never a socket). Dev-only, as in stridelabs-http, so no consumer's graph
+# and no `Cargo.lock` line changes.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 wiremock = { workspace = true }
 # Decoding the form bodies the token endpoints receive. Already in the lock
 # (reqwest depends on it).

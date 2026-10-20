@@ -104,6 +104,7 @@ mod user;
 mod single_flight_tests;
 
 use std::fmt;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -119,7 +120,9 @@ pub use adc::{
 pub use error::GcpAuthError;
 pub use metadata::DEFAULT_METADATA_BASE_URL;
 
-use crate::util::{describe_reqwest, is_code, read_error_body, read_limited, redact_url};
+use crate::util::{
+    is_code, read_error_body, read_limited, redact_url, status_line, Category, Failed, Heard,
+};
 
 /// Full access to every Google Cloud API the identity's IAM roles allow —
 /// what Vertex AI requires.
@@ -382,9 +385,11 @@ struct Inner {
 }
 
 /// One refresh attempt, as every waiter sees it: the outcome its task sends,
-/// shareable. A sender dropped unsent (a task that panicked, or was dropped
-/// before or while running) resolves it to [`GcpAuthError::RefreshAborted`].
-type Attempt = Shared<BoxFuture<'static, Result<AccessToken, GcpAuthError>>>;
+/// shareable, a failure with whether it was transient where it happened
+/// (what `GcsClient`'s retry reads). A sender dropped unsent (a task that
+/// panicked, or was dropped before or while running) resolves it to
+/// [`GcpAuthError::RefreshAborted`].
+type Attempt = Shared<BoxFuture<'static, Result<AccessToken, Failed<GcpAuthError>>>>;
 
 #[derive(Default)]
 struct Cache {
@@ -404,6 +409,10 @@ struct Cache {
 struct InFlight {
     id: u64,
     attempt: Attempt,
+    /// The status line its token endpoint answered, once a non-2xx one is
+    /// in (before its body is read): what a waiter cut off by its own
+    /// timeout is classified by.
+    status_line: Arc<AtomicU16>,
 }
 
 struct Cached {
@@ -641,14 +650,34 @@ impl TokenProvider {
     ///
     /// Outside a tokio runtime, when a refresh has to start (`tokio::spawn`).
     pub async fn token(&self) -> Result<AccessToken, GcpAuthError> {
+        self.classified_token(None)
+            .await
+            .map_err(|failed| failed.error)
+    }
+
+    /// [`TokenProvider::token`], its failure carrying whether it was
+    /// transient: decided where it happened (a token endpoint's `503`, a
+    /// connection that failed, a token body cut off), for a caller that
+    /// retries. When the call waits on a refresh, `heard` learns that
+    /// refresh's status line as soon as its token endpoint answers, so a
+    /// caller whose own timeout cuts the wait short still knows whether the
+    /// refresh had already failed for good.
+    pub(crate) async fn classified_token(
+        &self,
+        heard: Option<&Heard>,
+    ) -> Result<AccessToken, Failed<GcpAuthError>> {
         let now = self.inner.now();
-        let (attempt, start) = {
+        let (attempt, line, start) = {
             let mut cache = self.inner.cache();
             if let Some(token) = cache.fresh(now) {
                 return Ok(token);
             }
             match &cache.in_flight {
-                Some(in_flight) => (in_flight.attempt.clone(), None),
+                Some(in_flight) => (
+                    in_flight.attempt.clone(),
+                    Arc::clone(&in_flight.status_line),
+                    None,
+                ),
                 None => {
                     // Reserve the slot under the lock; spawn only after it
                     // is released (below), so nothing that runs a guard's
@@ -659,17 +688,24 @@ impl TokenProvider {
                     cache.next_attempt = id.wrapping_add(1);
                     let (sender, receiver) = oneshot::channel();
                     let attempt = receiver
-                        .map(|sent| sent.unwrap_or(Err(GcpAuthError::RefreshAborted)))
+                        .map(|sent| {
+                            sent.unwrap_or(Err(Failed::permanent(GcpAuthError::RefreshAborted)))
+                        })
                         .boxed()
                         .shared();
+                    let line = status_line();
                     cache.in_flight = Some(InFlight {
                         id,
                         attempt: attempt.clone(),
+                        status_line: Arc::clone(&line),
                     });
-                    (attempt, Some((id, cache.epoch, sender)))
+                    (attempt, line, Some((id, cache.epoch, sender)))
                 }
             }
         };
+        if let Some(heard) = heard {
+            heard.waiting_on(&line);
+        }
         if let Some((id, epoch, sender)) = start {
             // The guard exists before the task does, so even a task dropped
             // before its first poll clears the slot it reserved.
@@ -677,6 +713,7 @@ impl TokenProvider {
                 inner: Arc::clone(&self.inner),
                 id,
                 epoch,
+                status_line: line,
                 sender: Some(sender),
             };
             tokio::spawn(refresh(guard).instrument(tracing::Span::current()));
@@ -829,7 +866,7 @@ impl TokenProvider {
 /// reaches it.
 async fn refresh(guard: SlotGuard) {
     let started = guard.inner.now();
-    let result = guard.inner.fetch().await;
+    let result = guard.inner.fetch(&guard.status_line).await;
     guard.complete(result, started);
 }
 
@@ -849,14 +886,16 @@ struct SlotGuard {
     id: u64,
     /// The cache's eviction epoch when this attempt reserved its slot.
     epoch: u64,
-    sender: Option<oneshot::Sender<Result<AccessToken, GcpAuthError>>>,
+    /// Its token endpoint's status line (see [`InFlight::status_line`]).
+    status_line: Arc<AtomicU16>,
+    sender: Option<oneshot::Sender<Result<AccessToken, Failed<GcpAuthError>>>>,
 }
 
 impl SlotGuard {
     /// Cache a success (per the lifetime rules, and unless it is a bearer
     /// evicted while this attempt was in flight) and clear the slot in one
     /// critical section, then hand the outcome to the waiters.
-    fn complete(mut self, result: Result<Fetched, GcpAuthError>, started: Instant) {
+    fn complete(mut self, result: Result<Fetched, Failed<GcpAuthError>>, started: Instant) {
         let outcome = {
             let inner = &self.inner;
             let mut cache = inner.cache();
@@ -925,7 +964,7 @@ impl Inner {
         }
     }
 
-    async fn fetch(&self) -> Result<Fetched, GcpAuthError> {
+    async fn fetch(&self, status_line: &AtomicU16) -> Result<Fetched, Failed<GcpAuthError>> {
         #[cfg(test)]
         if self
             .panics_left
@@ -940,9 +979,16 @@ impl Inner {
         }
         match &self.source {
             #[cfg(feature = "service-account-key")]
-            Source::ServiceAccount(key) => key.fetch(&self.http, &self.scopes, &self.options).await,
-            Source::AuthorizedUser(user) => user.fetch(&self.http, &self.options).await,
-            Source::Metadata => metadata::fetch(&self.http, &self.scopes, &self.options).await,
+            Source::ServiceAccount(key) => {
+                key.fetch(&self.http, &self.scopes, &self.options, status_line)
+                    .await
+            }
+            Source::AuthorizedUser(user) => {
+                user.fetch(&self.http, &self.options, status_line).await
+            }
+            Source::Metadata => {
+                metadata::fetch(&self.http, &self.scopes, &self.options, status_line).await
+            }
         }
     }
 }
@@ -959,40 +1005,58 @@ pub(crate) struct Fetched {
 
 /// Send a token request and read a token out of the answer. Shared by every
 /// source: they differ in the request, never in the response.
+///
+/// Each failure says, where it happens, whether it was transient (the class
+/// `GcsClient`'s opt-in retry reads; [`TokenProvider::token`] drops it): a
+/// transport failure before the response by its category, an error status
+/// by google-cloud-storage's status set, and a 2xx body that could not be
+/// read always (an interrupted transfer; the only source of a token-path
+/// `decode error`). An unusable 2xx body is not.
+///
+/// A non-2xx status is written to `status_line` the moment it is in, before
+/// its body is read: a waiter whose own deadline ends first is classified by
+/// it (`crate::util::Heard`), so a `400` whose body stalls is as final for
+/// that waiter as for this exchange.
 pub(crate) async fn exchange(
     request: reqwest::RequestBuilder,
     endpoint: &str,
     timeout: Duration,
-) -> Result<Fetched, GcpAuthError> {
+    status_line: &AtomicU16,
+) -> Result<Fetched, Failed<GcpAuthError>> {
     let endpoint = redact_url(endpoint);
-    let request_failed = |error: reqwest::Error| GcpAuthError::Request {
+    let request_failed = |category: Category| GcpAuthError::Request {
         endpoint: endpoint.clone(),
-        reason: describe_reqwest(error),
+        reason: category.label().to_owned(),
     };
     // `RequestBuilder::timeout` covers the body read too.
-    let response = request
-        .timeout(timeout)
-        .send()
-        .await
-        .map_err(request_failed)?;
+    let response = request.timeout(timeout).send().await.map_err(|error| {
+        let category = Category::of(&error);
+        Failed::before_response(category, request_failed(category))
+    })?;
     let status = response.status();
 
     if !status.is_success() {
+        status_line.store(status.as_u16(), Ordering::Release);
         let body = read_error_body(response).await;
-        return Err(GcpAuthError::Status {
-            endpoint,
-            status: status.as_u16(),
-            detail: oauth_error_code(&body),
-        });
+        return Err(Failed::status(
+            status.as_u16(),
+            GcpAuthError::Status {
+                endpoint,
+                status: status.as_u16(),
+                detail: oauth_error_code(&body),
+            },
+        ));
     }
 
-    let unusable = |reason: &str| GcpAuthError::InvalidResponse {
-        endpoint: endpoint.clone(),
-        reason: reason.to_owned(),
+    let unusable = |reason: &str| {
+        Failed::permanent(GcpAuthError::InvalidResponse {
+            endpoint: endpoint.clone(),
+            reason: reason.to_owned(),
+        })
     };
     let body = read_limited(response, MAX_TOKEN_RESPONSE)
         .await
-        .map_err(request_failed)?;
+        .map_err(|error| Failed::transient(request_failed(Category::of(&error))))?;
     if body.truncated {
         return Err(unusable("larger than 64 KiB"));
     }
@@ -1131,5 +1195,91 @@ mod tests {
             assert!(rendered.contains("metadata.test:8080"), "{rendered}");
             assert!(rendered.contains("https://token.test/token"), "{rendered}");
         }
+    }
+
+    /// A token server on a raw socket that answers its one request with
+    /// `response` and closes: what wiremock cannot send (a body cut short).
+    async fn answering(response: &[u8]) -> String {
+        let address = crate::util::test_server::answer_once(response.to_vec()).await;
+        format!("http://{address}/token")
+    }
+
+    /// Where each token-exchange failure is classified, and how: the class
+    /// is set where the failure happens, beside the error, and the error's
+    /// text is v0.8.0's. The token path's only `decode error` is its body
+    /// read, an interrupted transfer, so it is transient; the same label from
+    /// anywhere else is never read back to decide anything.
+    #[tokio::test]
+    async fn the_token_exchange_classifies_each_failure_where_it_happens() {
+        let http = reqwest::Client::builder()
+            .retry(reqwest::retry::never())
+            .build()
+            .unwrap();
+        let exchange_at = |url: String| {
+            let http = http.clone();
+            async move {
+                exchange(
+                    http.get(&url),
+                    &url,
+                    Duration::from_secs(5),
+                    &AtomicU16::new(0),
+                )
+                .await
+            }
+        };
+        let request = |failed: &Failed<GcpAuthError>| match &failed.error {
+            GcpAuthError::Request { reason, .. } => (reason.clone(), failed.transient),
+            other => panic!("{other:?}"),
+        };
+
+        // Before any response: by category.
+        let closed = crate::util::test_server::closed_port();
+        let failed = exchange_at(format!("http://{closed}/token"))
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(request(&failed), ("connection failed".to_owned(), true));
+        let failed = exchange_at("not a url".to_owned()).await.err().unwrap();
+        assert_eq!(request(&failed), ("invalid request".to_owned(), false));
+        let failed = exchange_at(answering(b"").await).await.err().unwrap();
+        assert_eq!(request(&failed), ("request error".to_owned(), true));
+
+        // A 2xx body cut off after the headers: interrupted, transient.
+        let failed = exchange_at(
+            answering(b"HTTP/1.1 200 OK\r\nContent-Length: 64\r\n\r\n{\"access_token\":").await,
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(request(&failed), ("decode error".to_owned(), true));
+
+        // An error status: by google-cloud-storage's status set.
+        for (response, status, transient) in [
+            (&b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n"[..], 503, true),
+            (b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\n\r\n", 429, true),
+            (
+                b"HTTP/1.1 400 Bad Request\r\nContent-Length: 25\r\n\r\n{\"error\":\"invalid_grant\"}",
+                400,
+                false,
+            ),
+            (b"HTTP/1.1 501 Not Implemented\r\nContent-Length: 0\r\n\r\n", 501, false),
+        ] {
+            let failed = exchange_at(answering(response).await).await.err().unwrap();
+            assert!(
+                matches!(failed.error, GcpAuthError::Status { status: s, .. } if s == status),
+                "{:?}",
+                failed.error
+            );
+            assert_eq!(failed.transient, transient, "{status}");
+        }
+
+        // A 2xx that is not a token: permanent.
+        let failed =
+            exchange_at(answering(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n[]").await)
+                .await
+                .err()
+                .unwrap();
+        assert!(matches!(failed.error, GcpAuthError::InvalidResponse { .. }));
+        assert!(!failed.transient);
     }
 }

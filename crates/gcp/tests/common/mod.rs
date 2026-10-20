@@ -318,6 +318,10 @@ pub enum RawReply {
     /// requests are in". A barrier that never fills (30 s) closes the
     /// connection unanswered, so a broken test fails rather than hangs.
     AfterBarrier(Arc<tokio::sync::Barrier>, Vec<u8>),
+    /// These bytes, then the connection is closed: a response cut short
+    /// (headers declaring more body than follows), or, empty, a request
+    /// never answered at all.
+    Cut(Vec<u8>),
 }
 
 /// An HTTP/1.1 server that records every request's raw bytes (head and
@@ -363,6 +367,12 @@ impl RawServer {
         RawServer { base_url, state }
     }
 
+    /// A server that answers its first request with `first` and every later
+    /// one with `then`.
+    pub async fn first_then(first: RawReply, then: RawReply) -> RawServer {
+        RawServer::start(move |n, _| if n == 0 { first.clone() } else { then.clone() }).await
+    }
+
     /// Every request so far, raw, in arrival order.
     pub fn requests(&self) -> Vec<Vec<u8>> {
         self.state.requests.lock().unwrap().clone()
@@ -396,8 +406,8 @@ async fn serve(mut socket: tokio::net::TcpStream, state: Arc<RawState>) {
     let mut buffer = Vec::new();
     loop {
         let head_end = loop {
-            if let Some(at) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
-                break at + 4;
+            if let Some(end) = end_of_head(&buffer) {
+                break end;
             }
             if !read_more(&mut socket, &mut buffer).await {
                 return;
@@ -448,8 +458,62 @@ async fn serve(mut socket: tokio::net::TcpStream, state: Arc<RawState>) {
                     return;
                 }
             }
+            RawReply::Cut(bytes) => {
+                let _ = socket.write_all(&bytes).await;
+                // A FIN, not a reset: the request was read in full, so
+                // nothing unread is left to make the close abortive.
+                let _ = socket.shutdown().await;
+                return;
+            }
         }
     }
+}
+
+/// A whole response with `status` (`400 Bad Request`) and `body`, JSON, its
+/// length declared.
+pub fn raw_json(status: &str, body: &[u8]) -> Vec<u8> {
+    let mut response = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    response.extend_from_slice(body);
+    response
+}
+
+/// A whole `200` with `body`, JSON, its length declared.
+pub fn raw_ok(body: &[u8]) -> Vec<u8> {
+    raw_json("200 OK", body)
+}
+
+/// A `200` that declares `body` but carries only its first `sent` bytes:
+/// with [`RawReply::Cut`], a transfer interrupted after the headers.
+pub fn raw_ok_cut(body: &[u8], sent: usize) -> Vec<u8> {
+    let mut response = raw_ok(body);
+    response.truncate(response.len() - body.len() + sent);
+    response
+}
+
+/// The request line of a raw request (`GET /path?query HTTP/1.1`).
+pub fn request_line(raw: &[u8]) -> String {
+    let end = raw
+        .windows(2)
+        .position(|window| window == b"\r\n")
+        .unwrap_or(raw.len());
+    String::from_utf8(raw[..end].to_vec()).unwrap()
+}
+
+/// The body of a raw request (after its head).
+pub fn request_body(raw: &[u8]) -> &[u8] {
+    &raw[end_of_head(raw).expect("a head")..]
+}
+
+/// Where a raw request's head ends, just past its blank line, once it has
+/// one.
+fn end_of_head(raw: &[u8]) -> Option<usize> {
+    raw.windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|at| at + 4)
 }
 
 /// Whether `haystack` contains `needle`, byte for byte.

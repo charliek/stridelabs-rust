@@ -1,0 +1,287 @@
+{
+  "bucket": "slaudio-gcs-fixture",
+  "cases": [
+    {
+      "name": "stridelabs/someone/my-podcast/20261019-070509-the-episode-title.mp3",
+      "python_delete": {
+        "request": "/storage/v1/b/slaudio-gcs-fixture/o/stridelabs%2Fsomeone%2Fmy-podcast%2F20261019-070509-the-episode-title.mp3?prettyPrint=false"
+      },
+      "python_metadata_name": "\"stridelabs/someone/my-podcast/20261019-070509-the-episode-title.mp3\"",
+      "python_public_url": "https://storage.googleapis.com/slaudio-gcs-fixture/stridelabs/someone/my-podcast/20261019-070509-the-episode-title.mp3",
+      "python_quoted": "stridelabs%2Fsomeone%2Fmy-podcast%2F20261019-070509-the-episode-title.mp3"
+    },
+    {
+      "name": "stridelabs/someone/covers/0123456789abcdef0123456789abcdef.jpg",
+      "python_delete": {
+        "request": "/storage/v1/b/slaudio-gcs-fixture/o/stridelabs%2Fsomeone%2Fcovers%2F0123456789abcdef0123456789abcdef.jpg?prettyPrint=false"
+      },
+      "python_metadata_name": "\"stridelabs/someone/covers/0123456789abcdef0123456789abcdef.jpg\"",
+      "python_public_url": "https://storage.googleapis.com/slaudio-gcs-fixture/stridelabs/someone/covers/0123456789abcdef0123456789abcdef.jpg",
+      "python_quoted": "stridelabs%2Fsomeone%2Fcovers%2F0123456789abcdef0123456789abcdef.jpg"
+    },
+    {
+      "name": "voice-previews/openrouter/kokoro-am-puck-v1.mp3",
+      "python_delete": {
+        "request": "/storage/v1/b/slaudio-gcs-fixture/o/voice-previews%2Fopenrouter%2Fkokoro-am-puck-v1.mp3?prettyPrint=false"
+      },
+      "python_metadata_name": "\"voice-previews/openrouter/kokoro-am-puck-v1.mp3\"",
+      "python_public_url": "https://storage.googleapis.com/slaudio-gcs-fixture/voice-previews/openrouter/kokoro-am-puck-v1.mp3",
+      "python_quoted": "voice-previews%2Fopenrouter%2Fkokoro-am-puck-v1.mp3"
+    },
+    {
+      "name": "stridelabs/alice/news//daily/20261019-070509-title.mp3",
+      "python_delete": {
+        "request": "/storage/v1/b/slaudio-gcs-fixture/o/stridelabs%2Falice%2Fnews%2F%2Fdaily%2F20261019-070509-title.mp3?prettyPrint=false"
+      },
+      "python_metadata_name": "\"stridelabs/alice/news//daily/20261019-070509-title.mp3\"",
+      "python_public_url": "https://storage.googleapis.com/slaudio-gcs-fixture/stridelabs/alice/news//daily/20261019-070509-title.mp3",
+      "python_quoted": "stridelabs%2Falice%2Fnews%2F%2Fdaily%2F20261019-070509-title.mp3"
+    },
+    {
+      "name": "stridelabs/alice/./20261019-070509-title.mp3",
+      "python_delete": {
+        "request": "/storage/v1/b/slaudio-gcs-fixture/o/stridelabs%2Falice%2F.%2F20261019-070509-title.mp3?prettyPrint=false"
+      },
+      "python_metadata_name": "\"stridelabs/alice/./20261019-070509-title.mp3\"",
+      "python_public_url": "https://storage.googleapis.com/slaudio-gcs-fixture/stridelabs/alice/./20261019-070509-title.mp3",
+      "python_quoted": "stridelabs%2Falice%2F.%2F20261019-070509-title.mp3"
+    },
+    {
+      "name": "stridelabs/alice/../20261019-070509-title.mp3",
+      "python_delete": {
+        "request": "/storage/v1/b/slaudio-gcs-fixture/o/stridelabs%2Falice%2F..%2F20261019-070509-title.mp3?prettyPrint=false"
+      },
+      "python_metadata_name": "\"stridelabs/alice/../20261019-070509-title.mp3\"",
+      "python_public_url": "https://storage.googleapis.com/slaudio-gcs-fixture/stridelabs/alice/../20261019-070509-title.mp3",
+      "python_quoted": "stridelabs%2Falice%2F..%2F20261019-070509-title.mp3"
+    },
+    {
+      "name": "/leading.mp3",
+      "python_delete": {
+        "request": "/storage/v1/b/slaudio-gcs-fixture/o/%2Fleading.mp3?prettyPrint=false"
+      },
+      "python_metadata_name": "\"/leading.mp3\"",
+      "python_public_url": "https://storage.googleapis.com/slaudio-gcs-fixture//leading.mp3",
+      "python_quoted": "%2Fleading.mp3"
+    },
+    {
+      "name": "trailing/",
+      "python_delete": {
+        "request": "/storage/v1/b/slaudio-gcs-fixture/o/trailing%2F?prettyPrint=false"
+      },
+      "python_metadata_name": "\"trailing/\"",
+      "python_public_url": "https://storage.googleapis.com/slaudio-gcs-fixture/trailing/",
+      "python_quoted": "trailing%2F"
+    },
+    {
+      "name": "a/./b.mp3",
+      "python_delete": {
+        "request": "/storage/v1/b/slaudio-gcs-fixture/o/a%2F.%2Fb.mp3?prettyPrint=false"
+      },
+      "python_metadata_name": "\"a/./b.mp3\"",
+      "python_public_url": "https://storage.googleapis.com/slaudio-gcs-fixture/a/./b.mp3",
+      "python_quoted": "a%2F.%2Fb.mp3"
+    },
+    {
+      "name": "a/../b.mp3",
+      "python_delete": {
+        "request": "/storage/v1/b/slaudio-gcs-fixture/o/a%2F..%2Fb.mp3?prettyPrint=false"
+      },
+      "python_metadata_name": "\"a/../b.mp3\"",
+      "python_public_url": "https://storage.googleapis.com/slaudio-gcs-fixture/a/../b.mp3",
+      "python_quoted": "a%2F..%2Fb.mp3"
+    },
+    {
+      "name": "./x",
+      "python_delete": {
+        "request": "/storage/v1/b/slaudio-gcs-fixture/o/.%2Fx?prettyPrint=false"
+      },
+      "python_metadata_name": "\"./x\"",
+      "python_public_url": "https://storage.googleapis.com/slaudio-gcs-fixture/./x",
+      "python_quoted": ".%2Fx"
+    },
+    {
+      "name": "../x",
+      "python_delete": {
+        "request": "/storage/v1/b/slaudio-gcs-fixture/o/..%2Fx?prettyPrint=false"
+      },
+      "python_metadata_name": "\"../x\"",
+      "python_public_url": "https://storage.googleapis.com/slaudio-gcs-fixture/../x",
+      "python_quoted": "..%2Fx"
+    },
+    {
+      "name": "x/.",
+      "python_delete": {
+        "request": "/storage/v1/b/slaudio-gcs-fixture/o/x%2F.?prettyPrint=false"
+      },
+      "python_metadata_name": "\"x/.\"",
+      "python_public_url": "https://storage.googleapis.com/slaudio-gcs-fixture/x/.",
+      "python_quoted": "x%2F."
+    },
+    {
+      "name": "x/..",
+      "python_delete": {
+        "request": "/storage/v1/b/slaudio-gcs-fixture/o/x%2F..?prettyPrint=false"
+      },
+      "python_metadata_name": "\"x/..\"",
+      "python_public_url": "https://storage.googleapis.com/slaudio-gcs-fixture/x/..",
+      "python_quoted": "x%2F.."
+    },
+    {
+      "name": "...",
+      "python_delete": {
+        "request": "/storage/v1/b/slaudio-gcs-fixture/o/...?prettyPrint=false"
+      },
+      "python_metadata_name": "\"...\"",
+      "python_public_url": "https://storage.googleapis.com/slaudio-gcs-fixture/...",
+      "python_quoted": "..."
+    },
+    {
+      "name": "a b/c~d_e-f.g",
+      "python_delete": {
+        "request": "/storage/v1/b/slaudio-gcs-fixture/o/a%20b%2Fc~d_e-f.g?prettyPrint=false"
+      },
+      "python_metadata_name": "\"a b/c~d_e-f.g\"",
+      "python_public_url": "https://storage.googleapis.com/slaudio-gcs-fixture/a%20b/c~d_e-f.g",
+      "python_quoted": "a%20b%2Fc~d_e-f.g"
+    },
+    {
+      "name": "a b.mp3",
+      "python_delete": {
+        "request": "/storage/v1/b/slaudio-gcs-fixture/o/a%20b.mp3?prettyPrint=false"
+      },
+      "python_metadata_name": "\"a b.mp3\"",
+      "python_public_url": "https://storage.googleapis.com/slaudio-gcs-fixture/a%20b.mp3",
+      "python_quoted": "a%20b.mp3"
+    },
+    {
+      "name": "a+b.mp3",
+      "python_delete": {
+        "request": "/storage/v1/b/slaudio-gcs-fixture/o/a%2Bb.mp3?prettyPrint=false"
+      },
+      "python_metadata_name": "\"a+b.mp3\"",
+      "python_public_url": "https://storage.googleapis.com/slaudio-gcs-fixture/a%2Bb.mp3",
+      "python_quoted": "a%2Bb.mp3"
+    },
+    {
+      "name": "what?.mp3",
+      "python_delete": {
+        "request": "/storage/v1/b/slaudio-gcs-fixture/o/what%3F.mp3?prettyPrint=false"
+      },
+      "python_metadata_name": "\"what?.mp3\"",
+      "python_public_url": "https://storage.googleapis.com/slaudio-gcs-fixture/what%3F.mp3",
+      "python_quoted": "what%3F.mp3"
+    },
+    {
+      "name": "hash#tag.mp3",
+      "python_delete": {
+        "request": "/storage/v1/b/slaudio-gcs-fixture/o/hash%23tag.mp3?prettyPrint=false"
+      },
+      "python_metadata_name": "\"hash#tag.mp3\"",
+      "python_public_url": "https://storage.googleapis.com/slaudio-gcs-fixture/hash%23tag.mp3",
+      "python_quoted": "hash%23tag.mp3"
+    },
+    {
+      "name": "100%.mp3",
+      "python_delete": {
+        "request": "/storage/v1/b/slaudio-gcs-fixture/o/100%25.mp3?prettyPrint=false"
+      },
+      "python_metadata_name": "\"100%.mp3\"",
+      "python_public_url": "https://storage.googleapis.com/slaudio-gcs-fixture/100%25.mp3",
+      "python_quoted": "100%25.mp3"
+    },
+    {
+      "name": "a%2Fb.mp3",
+      "python_delete": {
+        "request": "/storage/v1/b/slaudio-gcs-fixture/o/a%252Fb.mp3?prettyPrint=false"
+      },
+      "python_metadata_name": "\"a%2Fb.mp3\"",
+      "python_public_url": "https://storage.googleapis.com/slaudio-gcs-fixture/a%252Fb.mp3",
+      "python_quoted": "a%252Fb.mp3"
+    },
+    {
+      "name": "%2e%2e",
+      "python_delete": {
+        "request": "/storage/v1/b/slaudio-gcs-fixture/o/%252e%252e?prettyPrint=false"
+      },
+      "python_metadata_name": "\"%2e%2e\"",
+      "python_public_url": "https://storage.googleapis.com/slaudio-gcs-fixture/%252e%252e",
+      "python_quoted": "%252e%252e"
+    },
+    {
+      "name": "x+y%z&=;,@!$'()*:",
+      "python_delete": {
+        "request": "/storage/v1/b/slaudio-gcs-fixture/o/x%2By%25z%26%3D%3B%2C%40%21%24%27%28%29%2A%3A?prettyPrint=false"
+      },
+      "python_metadata_name": "\"x+y%z&=;,@!$'()*:\"",
+      "python_public_url": "https://storage.googleapis.com/slaudio-gcs-fixture/x%2By%25z%26%3D%3B%2C%40%21%24%27%28%29%2A%3A",
+      "python_quoted": "x%2By%25z%26%3D%3B%2C%40%21%24%27%28%29%2A%3A"
+    },
+    {
+      "name": "\\|^`{}[]\"<>#?",
+      "python_delete": {
+        "request": "/storage/v1/b/slaudio-gcs-fixture/o/%5C%7C%5E%60%7B%7D%5B%5D%22%3C%3E%23%3F?prettyPrint=false"
+      },
+      "python_metadata_name": "\"\\\\|^`{}[]\\\"<>#?\"",
+      "python_public_url": "https://storage.googleapis.com/slaudio-gcs-fixture/%5C%7C%5E%60%7B%7D%5B%5D%22%3C%3E%23%3F",
+      "python_quoted": "%5C%7C%5E%60%7B%7D%5B%5D%22%3C%3E%23%3F"
+    },
+    {
+      "name": "café/üß-☃-😀.mp3",
+      "python_delete": {
+        "request": "/storage/v1/b/slaudio-gcs-fixture/o/caf%C3%A9%2F%C3%BC%C3%9F-%E2%98%83-%F0%9F%98%80.mp3?prettyPrint=false"
+      },
+      "python_metadata_name": "\"caf\\u00e9/\\u00fc\\u00df-\\u2603-\\ud83d\\ude00.mp3\"",
+      "python_public_url": "https://storage.googleapis.com/slaudio-gcs-fixture/caf%C3%A9/%C3%BC%C3%9F-%E2%98%83-%F0%9F%98%80.mp3",
+      "python_quoted": "caf%C3%A9%2F%C3%BC%C3%9F-%E2%98%83-%F0%9F%98%80.mp3"
+    },
+    {
+      "name": "café ☃ 🦉.mp3",
+      "python_delete": {
+        "request": "/storage/v1/b/slaudio-gcs-fixture/o/caf%C3%A9%20%E2%98%83%20%F0%9F%A6%89.mp3?prettyPrint=false"
+      },
+      "python_metadata_name": "\"caf\\u00e9 \\u2603 \\ud83e\\udd89.mp3\"",
+      "python_public_url": "https://storage.googleapis.com/slaudio-gcs-fixture/caf%C3%A9%20%E2%98%83%20%F0%9F%A6%89.mp3",
+      "python_quoted": "caf%C3%A9%20%E2%98%83%20%F0%9F%A6%89.mp3"
+    },
+    {
+      "name": "nul\u0000 tab\t cr-lf\r\n del",
+      "python_delete": {
+        "request": "/storage/v1/b/slaudio-gcs-fixture/o/nul%00%20tab%09%20cr-lf%0D%0A%20del%7F?prettyPrint=false"
+      },
+      "python_metadata_name": "\"nul\\u0000 tab\\t cr-lf\\r\\n del\\u007f\"",
+      "python_public_url": "https://storage.googleapis.com/slaudio-gcs-fixture/nul%00%20tab%09%20cr-lf%0D%0A%20del%7F",
+      "python_quoted": "nul%00%20tab%09%20cr-lf%0D%0A%20del%7F"
+    },
+    {
+      "name": ".",
+      "python_delete": {
+        "request": "/storage/v1/b/slaudio-gcs-fixture/o/?prettyPrint=false"
+      },
+      "python_metadata_name": "\".\"",
+      "python_public_url": "https://storage.googleapis.com/slaudio-gcs-fixture/.",
+      "python_quoted": "."
+    },
+    {
+      "name": "..",
+      "python_delete": {
+        "request": "/storage/v1/b/slaudio-gcs-fixture/?prettyPrint=false"
+      },
+      "python_metadata_name": "\"..\"",
+      "python_public_url": "https://storage.googleapis.com/slaudio-gcs-fixture/..",
+      "python_quoted": ".."
+    },
+    {
+      "name": "",
+      "python_delete": {
+        "refused": "ValueError: Cannot determine path without a blob name."
+      },
+      "python_metadata_name": "\"\"",
+      "python_public_url": "https://storage.googleapis.com/slaudio-gcs-fixture/",
+      "python_quoted": ""
+    }
+  ],
+  "generated_by": "backend-rs/scripts/fixtures/gen_dispatch.py (make -C backend-rs fixtures)",
+  "google_cloud_storage_version": "3.6.0",
+  "requests_version": "2.32.5"
+}

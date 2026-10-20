@@ -103,7 +103,7 @@ use crate::auth::{AccessToken, GcpAuthError, TokenProvider};
 use crate::replay::{send_with_refresh, UnauthorizedRefresh};
 use crate::util::{
     describe_reqwest, google_error, json_failure, read_error_body, read_limited, redact_url,
-    status_suffix, SensitiveMessage,
+    status_suffix, Heard, SensitiveMessage,
 };
 
 /// The API version google-genai uses for Vertex.
@@ -855,13 +855,16 @@ impl VertexClient {
             first,
             self.refresh,
             "generateContent",
+            // Nothing retries a Vertex call, so nothing reads what it heard.
+            &Heard::default(),
             |token| {
                 authorized(token)
                     .header(reqwest::header::CONTENT_TYPE, "application/json")
                     .body(body.clone())
             },
         )
-        .await?;
+        .await
+        .map_err(|failed| failed.error)?;
         // Freed before the response is read, as reqwest freed `json`'s body:
         // an image request's base64 must not be held through a 64 MiB answer.
         drop(body);

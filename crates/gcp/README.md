@@ -269,18 +269,31 @@ let url = public_url(bucket, "user/20261017-120000-ab12cd34.png")?;
 | `upload_with(bucket, object, Bytes, content_type, &UploadOptions)` | default options: `upload`'s request, byte for byte; otherwise `POST {base}/upload/storage/v1/b/{bucket}/o?uploadType=multipart[&ifGenerationMatch=N]` (below) | `()`; any non-2xx is an error, a failed precondition's 412 included |
 | `download(bucket, object)` | `GET {base}/storage/v1/b/{bucket}/o/{object}?alt=media` | `Some((bytes, content_type))`, or `None` on 404 |
 | `delete(bucket, object)` | `DELETE {base}/storage/v1/b/{bucket}/o/{object}` | `true` if deleted, `false` on 404 |
+| `bucket_reachable(bucket)` | `GET {base}/storage/v1/b/{bucket}/o?maxResults=1` | `()` on any 2xx; anything else, a 404 included, is `Status { operation: "list" }` |
 | `public_url(bucket, object)` | (none) | `Ok("https://storage.googleapis.com/{bucket}/{object}")`, with the object's `/` kept |
+| `public_url_with(bucket, object, ObjectNamePolicy)` | (none) | `public_url` under a name policy (below) |
+| `validate_bucket_name(bucket)` | (none) | `Ok(())`, or the `InvalidBucketName` every operation would return |
+
+Every default is v0.8.0's, on the wire and in results: `Strict` names, one
+attempt per operation, no `401` replay. Python's behaviour is opt-in, one
+piece at a time: `with_object_name_policy(ObjectNamePolicy::Literal)`,
+`with_retry(RetryPolicy::google_default())` and
+`with_unauthorized_refresh(true)` (sections below).
 
 - **Names are checked first**, before any token or request, and by
   `public_url` too:
   - A bucket must follow GCS's rules: 3 to 222 characters of `a-z 0-9 - _ .`,
     starting and ending with a letter or digit, with no `..`. Anything else
-    is `StorageError::InvalidBucketName`.
-  - An object must be non-empty, must not start or end with `/`, and must
-    have no empty, `.` or `..` segment (`u/../victim.png`, `./a`, `a//b`,
-    `/a`). Anything else is `StorageError::InvalidObjectName`. Such names are
-    legal to GCS, but their public URL becomes a different path as soon as a
-    client normalizes it.
+    is `StorageError::InvalidBucketName`. `validate_bucket_name` is that
+    rule, public. The rules only GCS can judge (reserved words, IP shapes,
+    63-character labels) are left to GCS, so a service wanting a stricter
+    startup check (imgmcp has one) keeps its own.
+  - An object, under the default `ObjectNamePolicy::Strict`, must be
+    non-empty, must not start or end with `/`, and must have no empty, `.`
+    or `..` segment (`u/../victim.png`, `./a`, `a//b`, `/a`). Anything else
+    is `StorageError::InvalidObjectName`. Such names are legal to GCS, but
+    their public URL becomes a different path as soon as a client
+    normalizes it. `ObjectNamePolicy::Literal` sends them (below).
 - **Encoding.** The bucket and object go in as one path segment or query
   value. Everything but RFC 3986 unreserved characters is percent-encoded,
   including `/`, so `a/b c.png` becomes `a%2Fb%20c.png`. A raw `/` would
@@ -294,14 +307,14 @@ let url = public_url(bucket, "user/20261017-120000-ab12cd34.png")?;
   (parcel's rule). `with_base_url` changes the base and keeps the auth.
 - **Timeout.** Each operation (token, request and body read) is bounded by
   60 s, which `with_timeout` changes. When it elapses the result is
-  `StorageError::Timeout`.
+  `StorageError::Timeout`. Under a retry policy the bound is per attempt.
 - **Limits.** A download is read up to 32 MiB
   (`DEFAULT_MAX_DOWNLOAD_BYTES`; `with_max_download_bytes` changes it). Past
   the cap, reading stops and the result is `StorageError::TooLarge`. An
   error body is read only as far as its first 16 KiB.
 - **Errors.** `StorageError::{InvalidBucketName, InvalidObjectName, Auth,
   Request, Timeout, TooLarge, Status, InvalidArgument}` names the
-  operation.
+  operation (`upload`, `download`, `delete` or `list`).
   - **`Display` and `Debug` are safe for routine logs.** They carry the HTTP
     status and, from Google's JSON envelope, `error.status` when it matches
     `[A-Za-z0-9_.-]{1,64}` (for example `GCS upload answered HTTP 403
@@ -356,10 +369,175 @@ gcs.upload_with(bucket, &object, bytes, "image/png", &options).await?;
   `upload_with` is `upload` itself and takes exactly the content types
   `upload` takes (reqwest checks those).
 - **A failed precondition is a 412**, `StorageError::Status` like any
-  other non-2xx answer: no retry, and no fallback upload that would
-  overwrite.
+  other non-2xx answer: never retried (under a retry policy too), and no
+  fallback upload that would overwrite.
 - Timeout, token, emulator base URL and sanitized errors are `upload`'s.
   The body is built in memory: one copy of the bytes.
+
+### Object name policy
+
+```rust
+use stridelabs_gcp::storage::{public_url_with, ObjectNamePolicy};
+
+let gcs = GcsClient::new(http.clone(), tokens.clone())
+    .with_object_name_policy(ObjectNamePolicy::Literal); // default Strict
+let url = public_url_with(bucket, &object, ObjectNamePolicy::Literal)?; // Python's Blob.public_url
+```
+
+`ObjectNamePolicy` (`#[non_exhaustive]`, `Default` = `Strict`) says which
+object names a client sends and what `public_url_with` accepts:
+
+| | `upload`, `upload_with` | `download`, `delete` | `public_url_with` |
+|---|---|---|---|
+| `Strict` (v0.8.0) | refuses an empty name, a leading or trailing `/`, an empty, `.` or `..` segment | the same | the same |
+| `Literal` | sends every name | refuses only `""`, `.` and `..` | refuses no name |
+
+- **`Literal` is a transport policy, not validation.** It sends names as
+  google-cloud-storage sends them. On an upload the name is a query value
+  (`name=`) or a JSON string, which nothing normalizes. On a download or a
+  delete it is a URL path segment, and the whole names `""`, `.` and `..`
+  cannot be one (`/o/.` goes out as `/o/`, and `/o/..` as the bucket
+  itself), so they are refused before a token or a request. Refusing them
+  on a download too stops `download("..")` returning the bucket's metadata
+  as an object's bytes. Everything else is GCS's call: CR or LF, a
+  `.well-known/acme-challenge/` prefix, a name past the length limit come
+  back as GCS's `400`, `StorageError::Status`.
+- **Encoding is unchanged:** google-cloud-storage's `_quote`. A literal
+  `%2e%2e` goes out as `%252e%252e`, never as a dot segment. slaudio's 31
+  golden names (`tests/fixtures/gcs_object_names.json`, generated with
+  google-cloud-storage 3.6.0) pin it: `public_url_with(.., Literal)` equals
+  Python's `Blob.public_url` for all 31, a delete goes to Python's path for
+  all but `""`, `.` and `..`, and both uploads send all 31 names. `Strict`
+  refuses the same 14 of them as v0.8.0, with nothing sent.
+- **A `Literal` public URL is exact addressing, not a safe URL.** A name
+  with an empty, `.` or `..` segment is written as given, and a normalizing
+  client (a browser, most HTTP stacks) resolves it to a different path,
+  for a user-influenced name possibly in another user's prefix, as Python's
+  string does. Uploads and deletes stay exact: no write goes elsewhere.
+  Validate user-influenced names yourself if they can be hostile.
+- The free `public_url` is always `Strict`.
+
+### Retry (opt-in)
+
+```rust
+use stridelabs_gcp::storage::RetryPolicy;
+
+let gcs = GcsClient::new(http.clone(), tokens.clone())
+    .with_retry(RetryPolicy::google_default()); // default RetryPolicy::disabled()
+```
+
+`RetryPolicy` (`#[non_exhaustive]`, `Copy`, `PartialEq`) is
+google-cloud-storage's `DEFAULT_RETRY` as a value, with public fields
+`initial_delay`, `multiplier`, `max_delay` and `deadline`, `const` `with_*`
+setters, `google_default()` (1 s, ×2, 60 s, 120 s;
+`google/api_core/retry/retry_base.py:43-46`) and `disabled()` (`Default`:
+that schedule with a zero deadline). Without a policy every operation is one
+attempt, as in v0.8.0.
+
+- **The schedule** is google-api-core's: after a transient failure, wait a
+  uniform draw under the current ceiling (at least 1 ms), the first ceiling
+  `min(initial_delay, max_delay)` and each next one the last times the
+  multiplier, capped at `max_delay`. The operation gives up when the wait
+  would end past `deadline` from the first attempt's start, and returns
+  that attempt's error unchanged. An attempt already running is never cut
+  off. Each retry logs one `debug` line with the operation, the attempt,
+  `wait_ms` and the status or transport category, never a name, a message
+  or a URL.
+- **Transient**, decided where the failure happens (never by reading an
+  error's text back), as google-cloud-storage's predicate
+  (`google/cloud/storage/retry.py:31-76`) decides it:
+  - the statuses `408`, `429`, `500`, `502`, `503` and `504`;
+  - the client's own `StorageError::Timeout`, unless the attempt had
+    already heard a status that is not transient (next item but one);
+  - a transport failure before the response that timed out, failed to
+    connect or broke in flight (`timed out`, `connection failed`,
+    `request error`);
+  - any failure reading a body after the headers: an interrupted transfer
+    (Python's `ChunkedEncodingError`, `IncompleteRead`). reqwest 0.13
+    reports one as a decode error (`async_impl/response.rs:316`), so the
+    error still says `decode error`, as in v0.8.0: only its class is new;
+  - the same classes on the way to the token (`StorageError::Auth`): the
+    token endpoint's status, its transport, an interrupted token body.
+- **Never retried:** a `404` (an answer: `None`, `false`, or the probe's
+  `Status`); every other status, `401`, `403`, `412`, `501` and `505`
+  included; a refused redirect, a request that cannot be built, an unknown
+  transport failure (`request failed`); `TooLarge`; every `Invalid*`
+  refusal; every other token error (`invalid_grant`, an unusable token
+  body, a failed signature, a refresh that aborted).
+- **A status line, once in, is final.** The status is noted the moment
+  the response's head arrives, before its body is read. An error body that
+  stalls until the attempt's timeout still ends the attempt as
+  `StorageError::Timeout` (v0.8.0's error there, because the body read is
+  inside the bound, and the default client still returns exactly that),
+  but its retry class is the status's: a `412` or a `401` whose body never
+  arrives is not retried, while a `503`'s is. The token endpoint's status
+  is final the same way: an attempt whose timeout cuts off its wait on a
+  refresh that already got a `400` is not retried. A `401` that the
+  refresh is draining is the attempt's answer until its replay goes out,
+  so cutting it off does not lead to a retry either.
+- **Each attempt is whole.** It takes a token, runs the `401` refresh
+  (below) with a budget of its own, and rebuilds the same request, a
+  multipart body built once for the whole operation.
+- **Invalid values are normalized, never refused.** A zero `deadline` is
+  exactly one attempt. A `multiplier` that is NaN or below 1 is 1; `+∞`, or
+  a product past `max_delay`, is `max_delay`. `initial_delay > max_delay`
+  starts at `max_delay`. Zero delays are allowed, and every wait is still
+  at least 1 ms (so a run of instant failures makes at most
+  `deadline / 1 ms + 1` attempts). A `Duration::MAX` deadline makes the
+  deadline the only bound: the operation retries until it succeeds or
+  meets a failure that is not transient.
+- **Bounds, stated exactly.** `with_timeout` bounds each attempt, so the
+  retry loop takes at most the deadline plus one attempt (≤ 120 + 60 =
+  180 s at the defaults), under normal timer behaviour. That is not a bound
+  on the whole method: a multipart body is built before the first attempt.
+  There is no attempt cap, as in Python. At zero latency the defaults make
+  at least 7 attempts (every draw at its ceiling); 200,000 runs of the
+  driver gave a median of 9, a p99 of 13 and a maximum of 17, a tail and
+  not a cap. Real attempts take time and make fewer: two 60 s timeouts
+  around one 1 s wait already end the loop at 2.
+- **Library attempts are not wire requests.** The consumer's reqwest
+  client may retry some protocol failures itself (reqwest 0.13's default
+  retry policy) and apply its own `ClientBuilder::timeout` inside each
+  attempt. Do not also configure a reqwest retry for the GCS host: the
+  attempts would multiply. (reqwest's retry has no backoff, which is why
+  this one lives here.)
+- **Caveats when a response is lost** after GCS applied the request:
+  - a retried create-only upload (`ifGenerationMatch=0`) answers `412`;
+  - a retried delete may return `Ok(false)`;
+  - a retried plain upload simply writes the object again.
+- **`401` belongs to the refresh below**, not to the retry: without
+  `with_unauthorized_refresh` a `401` is returned at once.
+- **Deliberate differences from Python.**
+  - At the deadline Python raises `RetryError("Timeout of 120.0s
+    exceeded", last)` (`retry_base.py:156-163`); this returns the last
+    attempt's error itself. No variant says "retries exhausted" (one could
+    come later, additively).
+  - **Token failures: the recoverable sets differ, not just the counts.**
+    google-auth retries a token request inside its refresh, 3 attempts
+    (`google/oauth2/_client.py:74-111, :190-214`), on `408`, `429`, `500`,
+    `503` and `504` (`google/auth/transport/__init__.py:29-35`). It also
+    retries on any status, a `400` included, whose OAuth `error` or
+    `error_description` is `internal_failure`, `server_error` or
+    `temporarily_unavailable`. google-cloud-storage then retries an auth
+    `TransportError` by its cause (`retry.py:68-69`). `TokenProvider` never
+    retries. This client retries a transient `StorageError::Auth` at the
+    operation level, by status alone, using google-cloud-storage's set. So
+    a token endpoint that answers `400 {"error":"temporarily_unavailable"}`
+    (or `server_error`) and then a token recovers in Python and fails here,
+    and a token `502` without a retryable OAuth error is retried here but
+    not by google-auth, which does not retry `502` by status alone.
+
+### `bucket_reachable`: a startup probe
+
+`gcs.bucket_reachable(bucket).await?` lists at most one object
+(`GET {base}/storage/v1/b/{bucket}/o?maxResults=1`) through the same
+timeout, retry and refresh as every operation. Any 2xx is `Ok(())`; anything
+else, a `404` included, is `StorageError::Status { operation: "list", .. }`.
+It is point-in-time evidence only: the bucket can disappear, or the grant
+go, a moment after it succeeds. The identity needs `storage.objects.list`.
+A `403` says nothing about whether the bucket exists: Google documents
+that `forbidden` and `insufficientPermissions` can answer for a resource
+that does not exist.
 
 ### 401 refresh and replay (opt-in)
 
@@ -373,7 +551,8 @@ With `with_unauthorized_refresh(true)`, a `401` is handled the way
 google-cloud-storage's `AuthorizedSession` handles it. The client
 invalidates the bearer it sent (`TokenProvider::invalidate`), takes a token
 again, and sends the same request again, up to `max_refresh_attempts` times
-per operation. Without it, a `401` is one request and
+per attempt: once per operation without a retry policy, and afresh in each
+retry attempt with one. Without it, a `401` is one request and
 `StorageError::Status { status: 401, .. }`, exactly as in v0.8.0, and
 setting a count alone does not turn it on.
 
@@ -394,7 +573,12 @@ setting a count alone does not turn it on.
 - **Bounded.** The `401`'s body is read for at most 16 KiB and 2 s. Past
   that it is dropped along with its connection, so a slow body cannot use up
   the budget. The refreshes and replays all count against the operation's
-  timeout.
+  timeout (the attempt's, under a retry policy).
+- **Under a retry policy** each attempt has its own budget, and the
+  attempt's final response classifies it: a `401` refreshed and replayed
+  into a `503` is a transient `503`, retried. So an operation can make up
+  to (attempts × `max_refresh_attempts`) serial refreshes; on a same-bearer
+  source each is one more metadata call.
 - **Concurrent operations** rejected on one bearer share one eviction and
   one refresh, provided the refresh mints a different bearer.
 - **The same bearer may come back.** On the metadata server (ADC on Cloud
@@ -484,8 +668,9 @@ match first_inline_image(&vertex.generate_content(model, &request).await?) {
 
 ## Not included
 
-There is no retry or backoff (the one replay is the opt-in `401` refresh
-above), no resumable upload, no object metadata
+There is no retry or backoff by default (the retry and the `401` refresh
+above are opt-in, and `VertexClient` has only the refresh), no resumable
+upload, no object listing beyond `bucket_reachable`'s probe, no object metadata
 calls beyond what `upload_with` sets at creation (no read-back, no patch),
 no service-account impersonation and no workload-identity federation (the
 `external_account` family). There is no Windows
