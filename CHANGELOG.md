@@ -13,6 +13,22 @@ for a consumer's pin.
 
 ### Added
 
+- `stridelabs-redis`: `RedisHandle::eval::<T>(script, keys, args, replay)`
+  and `RedisHandle::ping()` (lumen plan 001 S1, for a voice relay's Lua
+  lease and budget scripts and a readiness probe).
+  - `eval` sends a raw `EVAL` (no `EVALSHA`, no redis-rs `script` feature,
+    no `sha1_smol`) under a `Replay` the caller chooses: `Never` for any
+    script that writes, including a lease acquire or takeover;
+    `OnceOnFreshConnection` only for reads and writes whose re-execution is
+    harmless (a script whose reply was lost after it ran IS run again).
+    `T: EvalReply` is sealed and covers `i64` and `Vec<i64>`; decoding is
+    strict (`{1,false,3}` is refused) and an error names the reply's shape,
+    never its contents. Arguments are `EvalArg`s (text or integers via
+    `.into()`) whose `Debug` names the kind and a text's length, never the
+    value.
+  - `ping` sends `PING` and is `Ok(())` only on the `PONG` status; after an
+    I/O failure on a cached connection it is retried once on a fresh one.
+
 - `stridelabs-auth`: verifying another issuer's tokens under claim rules the
   consumer chooses (lumen plan 001 S1: WorkOS access tokens, which carry no
   `aud` and whose `iss` names the client).
@@ -240,6 +256,32 @@ for a consumer's pin.
   new items are re-exported from the crate root.
 
 ### Changed
+
+- `stridelabs-redis`: `Replay` (`Never`, `OnceOnFreshConnection`) is public,
+  re-exported at the crate root, `#[non_exhaustive]`, with no `Default`; the
+  built-in commands keep their policies.
+- `stridelabs-redis` (error **text** only; no signature change): every
+  `RedisError` payload is now a fixed summary the crate composes. None
+  carries redis-rs's or the server's text any more, because both can echo
+  passwords, keys, tokens and user ids (e.g. `unknown command 'EVAL', with
+  args beginning with: …`, or a refused handshake echoing `HELLO 3 AUTH
+  <user> <password>`).
+  - `Command`: an error reply's code when Redis defines it (`ERR`,
+    `WRONGTYPE`, `NOSCRIPT`, `BUSY`, `READONLY`, `OOM`, …) plus a fixed
+    description of its class that says whether the command ran; any other
+    code shows as undefined; a reply that did not convert shows as
+    "incompatible type".
+  - `Connect` and `Io`: the failure's class (timed out, connection refused,
+    closed or reset, an I/O error's kind, not well-formed RESP,
+    authentication failed, or an error reply's code). A refused handshake
+    is still `Connect`.
+  - `InvalidUrl`: only the name of the URL check that failed (redis-rs's
+    "Invalid protocol version" appended the URL's `protocol` value).
+  - The crate's own log lines use the same summaries. Reproduce with
+    `redis-cli` to see the server's words; code that matched on payload
+    text should match on the variant instead. A TLS or DNS failure now
+    reads as an I/O error kind rather than rustls's or the resolver's
+    message.
 
 - `stridelabs-observability`: `thiserror` is a non-optional dependency (it
   was enabled only by `prometheus`) and `tracing-log` a normal one (it was a

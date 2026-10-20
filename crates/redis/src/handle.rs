@@ -53,10 +53,12 @@ pub const DEFAULT_RESPONSE_TIMEOUT: Duration = Duration::from_millis(500);
 /// The two timeouts a [`RedisHandle`] dials and talks with.
 ///
 /// The defaults (1 s and 500 ms, the same values redis-rs 1.x itself defaults
-/// to) bound the worst case of one call: a fixed-window hit takes at most a
-/// dial plus one response timeout (1.5 s), and an idempotent `GET` / `SET EX`
-/// that is retried after a cached connection died at most one response
-/// timeout, a dial and another response timeout (2 s).
+/// to) bound the worst case of one call: a fixed-window hit (or an `eval`
+/// under [`Replay::Never`]) takes at most a dial plus one response timeout
+/// (1.5 s), and an idempotent `GET` / `SET EX` / `PING` (or an `eval` under
+/// [`Replay::OnceOnFreshConnection`]) that is retried after a cached
+/// connection died at most one response timeout, a dial and another
+/// response timeout (2 s).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct RedisOptions {
@@ -112,17 +114,45 @@ pub struct RedisHandle {
     shared: Arc<SharedState>,
 }
 
-/// Whether a failed command may be sent again on a fresh connection. See the
-/// crate docs' replay policy.
+/// Whether a command that got no valid reply may be sent again, once, on a
+/// fresh connection.
+///
+/// Every built-in command fixes its own ([`RedisHandle::fixed_window_hit`]
+/// `Never`; [`RedisHandle::get`], [`RedisHandle::set_ex`] and
+/// [`RedisHandle::ping`] `OnceOnFreshConnection`); [`RedisHandle::eval`]
+/// runs a script only its caller understands, so the caller chooses — see
+/// the crate docs' replay policy. There is deliberately no `Default`: the
+/// question is whether running the command twice is harmless, and only the
+/// code that wrote the command can answer it. When in doubt, `Never`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Replay {
-    /// A mutating command (the fixed-window `INCR`): Redis may have run it
-    /// before the reply was lost, so the error goes to the caller.
+#[non_exhaustive]
+pub enum Replay {
+    /// Sent **at most once**. When no valid reply is read the caller gets
+    /// [`RedisError::Io`] — the command may or may not have run, and may
+    /// still run later — and nothing is sent again. That outcome stays
+    /// unknown: a later read shows the current state, not what became of
+    /// this attempt, so it is no reason to resend; act as if the command
+    /// may have run. For anything a second run would change: an `INCR`, a
+    /// lease acquire or takeover, **any script that writes**.
     Never,
-    /// An idempotent command (`GET`, `SET … EX`): sending it twice leaves
-    /// Redis as sending it once would, so ONE retry is allowed — and only
-    /// after an I/O-level failure on a connection that was already cached,
-    /// the one kind that can have gone stale while idle.
+    /// Sent once more, on a fresh connection, after an I/O-level failure (a
+    /// dead socket, a reply that missed the response timeout) on a
+    /// connection that was **already cached** — the kind that can go stale
+    /// while idle — and in no other case: a connection the call dialled
+    /// itself is never retried on, a malformed reply earns no retry, and an
+    /// error Redis answered ([`RedisError::Command`]) is final.
+    ///
+    /// **A command whose reply was lost after it ran IS sent again.** The
+    /// handle cannot tell a request that never arrived from a reply that
+    /// never came back, so the first attempt may well have executed — and
+    /// can even land after the retry — and other clients' commands can run
+    /// between the two. Only for a command whose second execution is
+    /// harmless under all of that: a read, or a write that is idempotent in
+    /// its value AND its TTL effects on a key no other writer races (a
+    /// replayed `SET … PX` restarts the TTL; a replayed lease claim
+    /// overwrites a holder that took the lease in between). The caller gets
+    /// the retry's reply, which can differ from what the first attempt
+    /// answered.
     OnceOnFreshConnection,
 }
 
@@ -159,11 +189,14 @@ enum Slot {
     },
 }
 
-type DialOutcome = Result<MultiplexedConnection, redis::RedisError>;
+/// A dial's outcome, its failure already [`RedisError::Connect`]: made where
+/// the dial ends, so redis-rs's text — a refused handshake echoes the
+/// `AUTH`/`HELLO` it was sent — never travels further than that.
+type DialOutcome = Result<MultiplexedConnection, RedisError>;
 
 /// One dial's outcome, awaitable by every caller that joined it. Both halves
 /// of [`DialOutcome`] are `Clone` (a multiplexed connection is a handle to one
-/// socket; redis 1.x's error derives `Clone`), which [`Shared`] requires. It
+/// socket; [`RedisError`] derives `Clone`), which [`Shared`] requires. It
 /// is only the receiving end of the dial task's channel, so the slot holding
 /// it is not a reference cycle.
 type SharedDial = Shared<BoxFuture<'static, DialOutcome>>;
@@ -185,11 +218,16 @@ struct Lease {
 /// conversion here rather than through `Cmd::query_async` is what keeps a
 /// conversion failure apart from a malformed reply: redis-rs 1.7.1 reports
 /// both as `ErrorKind::Parse`. See [`crate::error`].)
+///
+/// Every `Command` error any command produces is made here or by a shape
+/// check after it, so this is where the server's text — which can quote the
+/// command's keys, arguments and script — is dropped for a fixed summary
+/// (see [`crate::error`]).
 fn decode<T: redis::FromRedisValue>(reply: redis::Value) -> Result<T, RedisError> {
     let reply = reply
         .extract_error()
-        .map_err(|error| RedisError::Command(error.to_string()))?;
-    T::from_redis_value(reply).map_err(|error| RedisError::Command(error.to_string()))
+        .map_err(|error| RedisError::error_reply(&error))?;
+    T::from_redis_value(reply).map_err(|error| RedisError::unconvertible(&error))
 }
 
 /// `lock`, recovering from poison. No critical section here can leave the
@@ -239,8 +277,7 @@ impl RedisHandle {
                 "the response timeout must be non-zero",
             ));
         }
-        let client =
-            redis::Client::open(url).map_err(|error| RedisError::InvalidUrl(error.to_string()))?;
+        let client = redis::Client::open(url).map_err(|error| RedisError::invalid_url(&error))?;
         if let redis::ConnectionAddr::TcpTls { insecure: true, .. } =
             client.get_connection_info().addr()
         {
@@ -292,7 +329,7 @@ impl RedisHandle {
         // is what an idle timeout at the server, or a platform's connection
         // reset, costs), and the caller sees `Ok` if the retry lands.
         tracing::warn!(
-            %error,
+            error = %crate::error::describe(&error),
             "the cached Redis connection failed; retrying an idempotent command once on a fresh one"
         );
         drop(lease);
@@ -373,9 +410,7 @@ impl SharedState {
         if let Some(task) = task {
             drop(tokio::spawn(task));
         }
-        let connection = dial
-            .await
-            .map_err(|error| RedisError::Connect(error.to_string()))?;
+        let connection = dial.await?;
         Ok(Lease {
             generation,
             connection,
@@ -401,14 +436,16 @@ impl SharedState {
         let task = async move {
             let outcome = client
                 .get_multiplexed_async_connection_with_config(&config)
-                .await;
+                .await
+                .map_err(|error| RedisError::connect(&error));
             settlement.settle(outcome);
         };
         let dial = async move {
             outcome.await.unwrap_or_else(|_closed| {
-                Err(redis::RedisError::from(std::io::Error::other(
-                    "the dial task ended without an outcome (its runtime shut down, or it panicked)",
-                )))
+                Err(RedisError::Connect(
+                    "the dial task ended without an outcome (its runtime shut down, or it panicked)"
+                        .to_owned(),
+                ))
             })
         }
         .boxed()
@@ -432,7 +469,10 @@ impl SharedState {
         let result = connection.req_packed_command(command).await;
         if let Err(error) = &result {
             if self.discard(lease.generation) {
-                tracing::debug!(%error, "dropped the cached Redis connection; the next command redials");
+                tracing::debug!(
+                    error = %crate::error::describe(error),
+                    "dropped the cached Redis connection; the next command redials"
+                );
             }
         }
         result
@@ -601,12 +641,137 @@ mod tests {
     /// RESP2, database 0, no password and `CLIENT SETINFO` skipped leave
     /// redis-rs's setup pipeline empty, so a TCP accept is a connection.
     fn handshake_free_handle(address: std::net::SocketAddr, options: RedisOptions) -> RedisHandle {
-        let info = format!("redis://{address}/0")
-            .into_connection_info()
-            .expect("a loopback Redis URL");
+        setinfo_free_handle(&format!("redis://{address}/0"), options)
+    }
+
+    /// A handle on `url` with `CLIENT SETINFO` skipped, so its setup
+    /// pipeline is exactly what the URL asks for: `HELLO 3 AUTH …` for
+    /// `?protocol=resp3` with credentials, `AUTH …` for credentials alone,
+    /// `SELECT n` for a database other than 0 — one command, one reply.
+    fn setinfo_free_handle(url: &str, options: RedisOptions) -> RedisHandle {
+        let info = url.into_connection_info().expect("a loopback Redis URL");
         let settings = info.redis_settings().clone().set_skip_set_lib_name();
         let client = redis::Client::open(info.set_redis_settings(settings)).expect("a client");
         RedisHandle::from_client(client, options)
+    }
+
+    /// `error` rendered every way a consumer could: `Display`, `Debug` (plain
+    /// and alternate) and the payload itself, plain and quoted — none may
+    /// contain `canary`.
+    fn assert_canary_nowhere(error: &RedisError, canary: &str) {
+        let payload = match error {
+            RedisError::InvalidUrl(payload)
+            | RedisError::Connect(payload)
+            | RedisError::Io(payload)
+            | RedisError::Command(payload) => payload.clone(),
+            RedisError::InvalidArgument(reason) => (*reason).to_owned(),
+        };
+        for rendered in [
+            error.to_string(),
+            format!("{error:?}"),
+            format!("{error:#?}"),
+            format!("{payload:?}"),
+            payload,
+        ] {
+            assert!(!rendered.contains(canary), "{canary} in {rendered}");
+        }
+    }
+
+    /// Every request a [`scripted_listener`] has read, as its words.
+    type Heard = Arc<Mutex<Vec<Vec<String>>>>;
+
+    /// A loopback "Redis" that reads whole requests (arrays of bulk
+    /// strings, all redis-rs sends), records each, and answers it with
+    /// `answer(words)` — a server that can accept one command and refuse
+    /// the next.
+    async fn scripted_listener(answer: fn(&[String]) -> String) -> (std::net::SocketAddr, Heard) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a loopback port");
+        let address = listener.local_addr().expect("the bound address");
+        let heard = Heard::default();
+        let recorded = Arc::clone(&heard);
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let recorded = Arc::clone(&recorded);
+                tokio::spawn(async move {
+                    let mut buffered = Vec::new();
+                    let mut chunk = vec![0_u8; 64 * 1024];
+                    while let Ok(read) = socket.read(&mut chunk).await {
+                        if read == 0 {
+                            return;
+                        }
+                        buffered.extend_from_slice(&chunk[..read]);
+                        while let Some((words, length)) = parse_request(&buffered) {
+                            buffered.drain(..length);
+                            let reply = answer(&words);
+                            lock_heard(&recorded).push(words);
+                            if socket.write_all(reply.as_bytes()).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        (address, heard)
+    }
+
+    fn lock_heard(heard: &Mutex<Vec<Vec<String>>>) -> MutexGuard<'_, Vec<Vec<String>>> {
+        heard.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The words of the whole request at the start of `buffer`, and its
+    /// length — or `None` until all of it has arrived.
+    fn parse_request(buffer: &[u8]) -> Option<(Vec<String>, usize)> {
+        fn line(buffer: &[u8], at: usize, kind: u8) -> Option<(usize, usize)> {
+            let rest = buffer.get(at..)?;
+            let end = rest.windows(2).position(|window| window == b"\r\n")?;
+            assert_eq!(rest[0], kind, "redis-rs sends arrays of bulk strings");
+            let number = std::str::from_utf8(&rest[1..end]).ok()?.parse().ok()?;
+            Some((number, at + end + 2))
+        }
+        let (count, mut at) = line(buffer, 0, b'*')?;
+        let mut words = Vec::with_capacity(count);
+        for _ in 0..count {
+            let (length, data) = line(buffer, at, b'$')?;
+            at = data + length + 2;
+            let word = buffer.get(data..data + length)?;
+            words.push(String::from_utf8_lossy(word).into_owned());
+            if buffer.len() < at {
+                return None;
+            }
+        }
+        Some((words, at))
+    }
+
+    /// A loopback "Redis" that answers every request it reads with `reply`,
+    /// verbatim, whatever the request was. Against [`handshake_free_handle`]
+    /// the dial sends nothing, so each read is one command — and each
+    /// command gets exactly `reply`.
+    async fn answering_listener(reply: Vec<u8>) -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a loopback port");
+        let address = listener.local_addr().expect("the bound address");
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let reply = reply.clone();
+                tokio::spawn(async move {
+                    let mut request = vec![0_u8; 64 * 1024];
+                    while let Ok(read) = socket.read(&mut request).await {
+                        if read == 0 || socket.write_all(&reply).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        address
     }
 
     fn generation_of(handle: &RedisHandle) -> Option<u64> {
@@ -937,8 +1102,9 @@ mod tests {
 
     /// After a well-formed reply, every failure is `Command`: the value is
     /// not what the caller asked for, but Redis answered. (A server error
-    /// reply reaches `decode` the same way, as a `Value::ServerError`; the
-    /// live suite drives that one, as no public constructor builds it.)
+    /// reply reaches `decode` the same way, as a `Value::ServerError`;
+    /// `no_command_error_shows_the_servers_text` and the live suite drive
+    /// that one through a server.)
     #[test]
     fn a_well_formed_reply_of_the_wrong_type_is_a_command_error() {
         let error = decode::<u64>(redis::Value::BulkString(b"not a number".to_vec()))
@@ -952,5 +1118,313 @@ mod tests {
 
         assert_eq!(decode::<u64>(redis::Value::Int(7)).unwrap(), 7);
         assert_eq!(decode::<Option<String>>(redis::Value::Nil).unwrap(), None);
+    }
+
+    /// `PING` against a port nothing listens on is [`RedisError::Connect`]
+    /// (never sent), well inside the dial timeout: a refused connect is
+    /// reported, not waited out.
+    #[tokio::test]
+    async fn ping_against_a_closed_port_fails_within_the_dial_timeout() {
+        let closed = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|listener| listener.local_addr())
+            .expect("a loopback port, closed again when its listener drops");
+        let options = RedisOptions::default().with_dial_timeout(Duration::from_secs(2));
+        let handle = RedisHandle::open_with(&format!("redis://{closed}/0"), options).unwrap();
+
+        let started = Instant::now();
+        let error = handle.ping().await.expect_err("nothing listens there");
+        let elapsed = started.elapsed();
+
+        assert!(matches!(error, RedisError::Connect(_)), "{error:?}");
+        assert!(!error.is_outcome_unknown());
+        assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+        assert!(format!("{handle:?}").contains(r#"connection: "none""#));
+    }
+
+    /// A server that accepts and never answers: `PING`'s dial ends at the
+    /// dial timeout.
+    #[tokio::test]
+    async fn ping_is_bounded_by_the_dial_timeout() {
+        let (address, accepted) = silent_listener().await;
+        let options = RedisOptions::default().with_dial_timeout(Duration::from_millis(200));
+        let handle = RedisHandle::open_with(&format!("redis://{address}/0"), options).unwrap();
+
+        let started = Instant::now();
+        let error = handle.ping().await.expect_err("the server never answers");
+        let elapsed = started.elapsed();
+
+        assert!(matches!(error, RedisError::Connect(_)), "{error:?}");
+        assert!(error.to_string().contains("timed out"), "{error}");
+        assert!(elapsed >= Duration::from_millis(200), "{elapsed:?}");
+        assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
+        await_accepts(&accepted, 1).await;
+    }
+
+    /// Connected, `PING` waits for its reply no longer than the response
+    /// timeout. The connection was dialled by this call, so the failure
+    /// earns no retry: one dial, one wait, and an outcome-unknown `Io`.
+    #[tokio::test]
+    async fn ping_is_bounded_by_the_response_timeout() {
+        let (address, accepted) = silent_listener().await;
+        let options = RedisOptions::default().with_response_timeout(Duration::from_millis(200));
+        let handle = handshake_free_handle(address, options);
+
+        let started = Instant::now();
+        let error = handle.ping().await.expect_err("PING is never answered");
+        let elapsed = started.elapsed();
+
+        assert!(matches!(error, RedisError::Io(_)), "{error:?}");
+        assert!(error.is_outcome_unknown());
+        assert!(elapsed >= Duration::from_millis(200), "{elapsed:?}");
+        assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
+        assert_eq!(lock(&handle.shared.slot).dials, 1, "not retried");
+        await_accepts(&accepted, 1).await;
+    }
+
+    /// `PING` is `Ok(())` only on the `PONG` status. Any other well-formed
+    /// answer — another status, `PONG` as a bulk string, a number, an error
+    /// reply — is a `Command` error (Redis answered), and the connection it
+    /// came over stays cached.
+    #[tokio::test]
+    async fn ping_is_ok_only_on_a_pong_status() {
+        let address = answering_listener(b"+PONG\r\n".to_vec()).await;
+        let handle = handshake_free_handle(address, RedisOptions::default());
+        handle.ping().await.expect("the PONG status");
+
+        for (reply, expected) in [
+            (
+                &b"+NOTPONG\r\n"[..],
+                "PING was answered with a status, not PONG",
+            ),
+            (
+                b"$4\r\nPONG\r\n",
+                "PING was answered with a string, not PONG",
+            ),
+            (b":1\r\n", "PING was answered with an integer, not PONG"),
+            (
+                b"-LOADING Redis is loading\r\n",
+                "the server answered LOADING",
+            ),
+        ] {
+            let address = answering_listener(reply.to_vec()).await;
+            let handle = handshake_free_handle(address, RedisOptions::default());
+            let error = handle.ping().await.expect_err(expected);
+            assert!(matches!(error, RedisError::Command(_)), "{error:?}");
+            assert!(error.to_string().contains(expected), "{error}");
+            assert_eq!(generation_of(&handle), Some(1), "{expected}: still cached");
+        }
+    }
+
+    /// **No command's error carries the server's text.** Every `Command`
+    /// error comes through `decode`, so an error reply quoting what it was
+    /// sent (Redis's `unknown command … with args beginning with:`), one
+    /// whose code a script chose, and a value redis-rs's conversion quotes
+    /// are all summarised — in `Display`, `Debug` and the payload alike, for
+    /// `eval`, the fixed window, `GET`, `SET EX` and `PING`.
+    #[tokio::test]
+    async fn no_command_error_carries_the_servers_text() {
+        const CANARY: &str = "user_01CANARYVALUE";
+
+        fn assert_withheld(error: &RedisError, summary: &str) {
+            assert!(matches!(error, RedisError::Command(_)), "{error:?}");
+            assert_canary_nowhere(error, CANARY);
+            assert!(error.to_string().contains(summary), "{summary}: {error}");
+        }
+
+        let error_replies = [
+            (
+                format!(
+                    "-ERR unknown command 'EVAL', with args beginning with: 'return 1' '1' '{CANARY}'\r\n"
+                ),
+                "the server answered ERR",
+            ),
+            (
+                format!("-{CANARY} raised by a script\r\n"),
+                "whose code Redis does not define",
+            ),
+        ];
+        for (reply, summary) in error_replies {
+            let address = answering_listener(reply.into_bytes()).await;
+            let handle = handshake_free_handle(address, RedisOptions::default());
+            let errors = [
+                handle
+                    .eval::<i64>("return 1", &["k"], &["a".into()], Replay::Never)
+                    .await
+                    .map(drop),
+                handle.fixed_window_hit("k", 60).await.map(drop),
+                handle.get("k").await.map(drop),
+                handle.set_ex("k", "v", 60).await.map(drop),
+                handle.ping().await,
+            ];
+            for error in errors {
+                assert_withheld(&error.expect_err("an error reply"), summary);
+            }
+            assert_eq!(generation_of(&handle), Some(1), "error replies keep it");
+        }
+
+        let address =
+            answering_listener(format!("${}\r\n{CANARY}\r\n", CANARY.len()).into_bytes()).await;
+        let handle = handshake_free_handle(address, RedisOptions::default());
+        let error = handle
+            .fixed_window_hit("k", 60)
+            .await
+            .expect_err("text is not a count");
+        assert_withheld(&error, "incompatible type");
+    }
+
+    /// **A refused handshake never carries what the dial sent.** A server
+    /// that does not know `HELLO` (or `AUTH`) echoes it — credentials
+    /// included — and a refused `SELECT` comes back with the server's
+    /// detail; each dial fails as `Connect` naming only the class.
+    #[tokio::test]
+    async fn a_refused_handshake_never_carries_the_credentials() {
+        const CANARY: &str = "CANARYPASSWORD";
+
+        let cases = [
+            (
+                "alice:CANARYPASSWORD@",
+                "/0?protocol=resp3",
+                format!("-ERR unknown command 'HELLO', with args beginning with: '3' 'AUTH' 'alice' '{CANARY}' \r\n"),
+                "the server answered ERR",
+            ),
+            (
+                "alice:CANARYPASSWORD@",
+                "/0",
+                format!("-ERR unknown command 'AUTH', with args beginning with: 'alice' '{CANARY}' \r\n"),
+                "authentication failed",
+            ),
+            (
+                "",
+                "/7",
+                format!("-ERR {CANARY}\r\n"),
+                "the server answered ERR",
+            ),
+        ];
+        for (userinfo, path, reply, summary) in cases {
+            let address = answering_listener(reply.into_bytes()).await;
+            let handle = setinfo_free_handle(
+                &format!("redis://{userinfo}{address}{path}"),
+                RedisOptions::default(),
+            );
+            let error = handle.ping().await.expect_err("the handshake is refused");
+            assert!(matches!(error, RedisError::Connect(_)), "{path}: {error:?}");
+            assert_canary_nowhere(&error, CANARY);
+            assert!(error.to_string().contains(summary), "{path}: {error}");
+            assert_eq!(generation_of(&handle), None, "nothing cached");
+        }
+    }
+
+    /// **A `SELECT` refused after a SUCCESSFUL authentication carries
+    /// neither the credentials nor its argument.** The URL carries a canary
+    /// user and password and a canary database; the scripted server accepts
+    /// `AUTH` (RESP2) or `HELLO 3 AUTH` (RESP3), then answers `SELECT` with
+    /// Redis's unknown-command diagnostic, which echoes the database it was
+    /// sent. The dial fails as `Connect` naming only the class.
+    #[tokio::test]
+    async fn a_select_refused_after_authentication_carries_no_credentials() {
+        const USER: &str = "CANARYUSER";
+        const PASSWORD: &str = "CANARYPASSWORD";
+        const DATABASE: &str = "7346";
+
+        fn answer(words: &[String]) -> String {
+            match words[0].as_str() {
+                "AUTH" => "+OK\r\n".to_owned(),
+                "HELLO" => "%1\r\n$6\r\nserver\r\n$5\r\nredis\r\n".to_owned(),
+                "SELECT" => format!(
+                    "-ERR unknown command 'SELECT', with args beginning with: '{}' \r\n",
+                    words[1]
+                ),
+                other => panic!("the handshake sent {other}"),
+            }
+        }
+
+        let credentials = |hello: &[&str]| -> Vec<Vec<String>> {
+            let select = vec!["SELECT".to_owned(), DATABASE.to_owned()];
+            let auth = hello.iter().map(|word| (*word).to_owned()).collect();
+            vec![auth, select]
+        };
+        for (query, expected) in [
+            ("", credentials(&["AUTH", USER, PASSWORD])),
+            (
+                "?protocol=resp3",
+                credentials(&["HELLO", "3", "AUTH", USER, PASSWORD]),
+            ),
+        ] {
+            let (address, heard) = scripted_listener(answer).await;
+            let handle = setinfo_free_handle(
+                &format!("redis://{USER}:{PASSWORD}@{address}/{DATABASE}{query}"),
+                RedisOptions::default(),
+            );
+            let error = handle.ping().await.expect_err("SELECT is refused");
+            assert!(
+                matches!(error, RedisError::Connect(_)),
+                "{query}: {error:?}"
+            );
+            for canary in [USER, PASSWORD, DATABASE] {
+                assert_canary_nowhere(&error, canary);
+            }
+            assert!(
+                error.to_string().contains("the server answered ERR"),
+                "{query}: {error}"
+            );
+            assert_eq!(
+                *lock_heard(&heard),
+                expected,
+                "{query}: authenticated with the canaries, then refused SELECT"
+            );
+            assert_eq!(generation_of(&handle), None, "nothing cached");
+        }
+    }
+
+    /// A URL redis-rs refuses names the check that failed, from a fixed
+    /// list — never the URL: its "Invalid protocol version" appends the
+    /// URL's own `protocol` value.
+    #[test]
+    fn a_url_refusal_names_the_check_never_the_url() {
+        const CANARY: &str = "CANARYQUERY";
+
+        for (url, check) in [
+            (
+                format!("redis://localhost:6379/0?protocol={CANARY}"),
+                "Invalid protocol version",
+            ),
+            (
+                format!("redis://:{CANARY}@localhost:6379/{CANARY}"),
+                "Invalid database number",
+            ),
+            (format!("{CANARY}://localhost"), "Redis URL did not parse"),
+        ] {
+            let error = RedisHandle::open(&url).expect_err(&url);
+            assert!(matches!(error, RedisError::InvalidUrl(_)), "{error:?}");
+            assert_canary_nowhere(&error, CANARY);
+            assert_eq!(error.to_string(), format!("invalid Redis URL: {check}"));
+        }
+    }
+
+    /// `eval` runs under the caller's [`Replay`]. Its connection is a CACHED
+    /// one whose reply never comes (the response timeout ends each wait):
+    /// `Never` gives up after that one attempt, with no second dial;
+    /// `OnceOnFreshConnection` dials once more and sends it again (and that
+    /// is never answered either). The live suite shows the same against a
+    /// real Redis, and what each choice does to a script's effects.
+    #[tokio::test]
+    async fn eval_runs_under_the_callers_replay() {
+        for (replay, dials) in [(Replay::Never, 1), (Replay::OnceOnFreshConnection, 2)] {
+            let (address, accepted) = silent_listener().await;
+            let options = RedisOptions::default().with_response_timeout(Duration::from_millis(100));
+            let handle = handshake_free_handle(address, options);
+            let lease = handle.shared.lease().await.expect("a handshake-free dial");
+            assert_eq!((lease.generation, lease.cached), (1, false));
+            drop(lease);
+
+            let error = handle
+                .eval::<i64>("return 1", &[], &[], replay)
+                .await
+                .expect_err("never answered");
+
+            assert!(matches!(error, RedisError::Io(_)), "{replay:?}: {error:?}");
+            assert_eq!(lock(&handle.shared.slot).dials, dials, "{replay:?}");
+            await_accepts(&accepted, usize::try_from(dials).unwrap()).await;
+        }
     }
 }

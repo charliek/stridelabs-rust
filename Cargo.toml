@@ -113,9 +113,10 @@ sqlx = { version = "0.9", default-features = false, features = [
 # Redis (stridelabs-redis's lazy handle, stridelabs-testing's `require_redis`).
 # `default-features = false` drops `acl`, `streams`, `geospatial`, `script` and
 # `num-bigint`, none of which either crate uses. `script` exists for `Script`'s
-# EVALSHA caching (and pulls in `sha1_smol`); the one script here, the fixed
-# window, goes out as a raw `EVAL` through `redis::cmd`, which needs nothing
-# from it. `tokio-comp` is the async runtime glue.
+# EVALSHA caching (and pulls in `sha1_smol`); the scripts here, the fixed
+# window and whatever a caller hands `RedisHandle::eval`, go out as a raw
+# `EVAL` through `redis::cmd`, which needs nothing from it. `tokio-comp` is
+# the async runtime glue.
 #
 # Deliberately NO TLS feature at this level, for the reqwest reason above:
 # whatever is listed here reaches every member's graph, and so every

@@ -10,7 +10,7 @@ mod support;
 use std::time::{Duration, Instant};
 
 use redis::aio::MultiplexedConnection;
-use stridelabs_redis::{RedisError, RedisHandle, MAX_TTL_SECS};
+use stridelabs_redis::{RedisError, RedisHandle, Replay, MAX_TTL_SECS};
 use stridelabs_testing::{require_redis, RedisServer};
 use support::{unique_key, Proxy, Replies};
 
@@ -47,6 +47,47 @@ async fn raw(server: &RedisServer, args: &[&str]) {
         .query_async::<()>(&mut connection)
         .await
         .unwrap_or_else(|error| panic!("{args:?}: {error}"));
+}
+
+/// Every way a consumer could render `error`: `Display`, `Debug` (plain and
+/// alternate), and the payload itself, plain and quoted.
+fn renderings(error: &RedisError) -> Vec<String> {
+    let payload = match error {
+        RedisError::InvalidUrl(payload)
+        | RedisError::Connect(payload)
+        | RedisError::Io(payload)
+        | RedisError::Command(payload) => payload.clone(),
+        RedisError::InvalidArgument(reason) => (*reason).to_owned(),
+        other => panic!("a variant this suite does not know: {other:?}"),
+    };
+    vec![
+        error.to_string(),
+        format!("{error:?}"),
+        format!("{error:#?}"),
+        format!("{payload:?}"),
+        payload,
+    ]
+}
+
+/// Redis's own error text for `command`, as redis-rs reports it on the
+/// probe's own connection — unfiltered: what proves a diagnostic really
+/// quotes its input before a test shows the handle's error does not.
+async fn raw_error_text(server: &RedisServer, command: &redis::Cmd) -> String {
+    match command
+        .query_async::<redis::Value>(&mut server.connection())
+        .await
+    {
+        Err(error) => error.to_string(),
+        Ok(redis::Value::ServerError(error)) => error.to_string(),
+        Ok(other) => panic!("not an error reply: {other:?}"),
+    }
+}
+
+/// `EVAL script 0 arg` on the probe's own connection.
+fn raw_eval(script: &str, arg: &str) -> redis::Cmd {
+    let mut eval = redis::cmd("EVAL");
+    eval.arg(script).arg(0).arg(arg);
+    eval
 }
 
 /// A handle through a fresh proxy, its connection already dialled and cached
@@ -598,4 +639,430 @@ async fn a_set_ex_value_expires() {
     assert!(handle.get(&key).await.unwrap().is_some());
     tokio::time::sleep(Duration::from_millis(1_100)).await;
     assert_eq!(handle.get(&key).await.unwrap(), None);
+}
+
+// ── EVAL and PING ───────────────────────────────────────────────────────────
+
+/// Writes `ARGV[i]` to `KEYS[i]` for every key, so the keys' order can be
+/// read back, and answers `{#KEYS, #ARGV, tonumber(ARGV[#KEYS + 1]), …}`.
+const ECHO_SCRIPT: &str = "
+for i = 1, #KEYS do
+    redis.call('SET', KEYS[i], ARGV[i], 'EX', 60)
+end
+local answer = {#KEYS, #ARGV}
+for i = #KEYS + 1, #ARGV do
+    answer[#answer + 1] = tonumber(ARGV[i])
+end
+return answer
+";
+
+/// One run, counted: `INCR KEYS[1]` (expiring in a minute) and the count —
+/// the shape of a script a second run would change.
+const COUNT_SCRIPT: &str = "
+local count = redis.call('INCR', KEYS[1])
+redis.call('EXPIRE', KEYS[1], 60)
+return count
+";
+
+/// Keys and arguments arrive in order, text and integers alike, and the
+/// reply reads as an array of integers or a single one.
+#[tokio::test]
+async fn eval_passes_keys_and_args_in_order_and_reads_integers() {
+    let server = server().await;
+    let handle = RedisHandle::open(server.url()).unwrap();
+    let prefix = unique_key("eval-order");
+    let keys = ["a", "b", "c"].map(|name| format!("{prefix}:{name}"));
+    let key_refs = keys.each_ref().map(String::as_str);
+
+    let answer: Vec<i64> = handle
+        .eval(
+            ECHO_SCRIPT,
+            &key_refs,
+            &[
+                "first".into(),
+                "second".into(),
+                "third".into(),
+                7_i64.into(),
+                (-3_i64).into(),
+                (1_u64 << 40).into(),
+            ],
+            Replay::Never,
+        )
+        .await
+        .expect("the echo script");
+    assert_eq!(answer, [3, 6, 7, -3, 1 << 40]);
+    for (key, value) in keys.iter().zip(["first", "second", "third"]) {
+        assert_eq!(raw_get(&server, key).await.as_deref(), Some(value), "{key}");
+    }
+
+    let doubled: i64 = handle
+        .eval(
+            "return tonumber(ARGV[1]) * 2",
+            &[],
+            &[21_u32.into()],
+            Replay::OnceOnFreshConnection,
+        )
+        .await
+        .expect("a single integer");
+    assert_eq!(doubled, 42);
+
+    let empty: Vec<i64> = handle
+        .eval("return {}", &[], &[], Replay::Never)
+        .await
+        .expect("an empty table");
+    assert!(empty.is_empty(), "{empty:?}");
+
+    raw(&server, &["DEL", &keys[0], &keys[1], &keys[2]]).await;
+}
+
+/// A script's error — its own `error_reply`, a Lua runtime error, an error
+/// from a `redis.call` — and a reply of the wrong shape are `Command` errors
+/// (Redis answered): final, not retried even under `OnceOnFreshConnection`,
+/// the connection kept. The error names the code (`ERR`) and carries
+/// neither the script, its key, its argument, nor Redis's own text — in no
+/// rendering, the payload included.
+#[tokio::test]
+async fn a_script_error_is_a_command_error_without_the_script_or_its_values() {
+    let server = server().await;
+    let (proxy, handle) = warm_handle(&server).await;
+    let key = unique_key("eval-error");
+    raw(&server, &["SET", &key, "not a number", "EX", "60"]).await;
+    let secret = "user_01SECRETARGUMENT";
+
+    let marked = |body: &str| format!("local marker = 'SCRIPT-BODY-MARKER'\n{body}");
+    let failures = [
+        (
+            marked("return redis.error_reply('ERR refused by the script')"),
+            "refused by the script",
+        ),
+        (
+            marked("return tonumber(ARGV[2]) + 1"),
+            "arithmetic on a nil",
+        ),
+        (
+            marked("return redis.call('INCR', KEYS[1])"),
+            "not an integer",
+        ),
+    ];
+    for (script, expected) in &failures {
+        let error = handle
+            .eval::<i64>(
+                script,
+                &[&key],
+                &[secret.into()],
+                Replay::OnceOnFreshConnection,
+            )
+            .await
+            .expect_err(expected);
+        assert!(matches!(error, RedisError::Command(_)), "{error:?}");
+        assert!(!error.is_outcome_unknown());
+        for rendered in renderings(&error) {
+            assert!(rendered.contains("the server answered ERR"), "{rendered}");
+            for leaked in ["SCRIPT-BODY-MARKER", secret, key.as_str(), expected] {
+                assert!(!rendered.contains(leaked), "{leaked} in {rendered}");
+            }
+        }
+    }
+
+    let error = handle
+        .eval::<Vec<i64>>(
+            &marked("return ARGV[1]"),
+            &[],
+            &[secret.into()],
+            Replay::Never,
+        )
+        .await
+        .expect_err("a string is not an array");
+    assert!(matches!(error, RedisError::Command(_)), "{error:?}");
+    for rendered in renderings(&error) {
+        assert!(!rendered.contains(secret), "{rendered}");
+    }
+
+    let one: i64 = handle
+        .eval("return 1", &[], &[], Replay::Never)
+        .await
+        .expect("the connection still works");
+    assert_eq!(one, 1);
+    assert_eq!(proxy.accepted(), 1, "a script error is no reason to redial");
+    raw(&server, &["DEL", &key]).await;
+}
+
+/// **Redis's diagnostics that quote their input never reach the error.**
+/// Each script below makes Redis's own error text carry a canary — shown
+/// first on the probe's own connection: an argument raised as the error's
+/// code, after a code Redis defines, in a Lua runtime error, inside an
+/// array; and the script's own source, which a compile error quotes. The
+/// handle's error carries none of it, in any rendering or its payload.
+#[tokio::test]
+async fn server_diagnostics_quoting_the_input_are_withheld() {
+    let server = server().await;
+    let handle = RedisHandle::open(server.url()).unwrap();
+    let canary = "user_01CANARYARGUMENT";
+    let body = "SOURCE_CANARY";
+    let raised = format!("{canary} raised by the script");
+
+    let cases: [(String, &str, &str, &str); 5] = [
+        (
+            "return redis.error_reply(ARGV[1])".to_owned(),
+            raised.as_str(),
+            canary,
+            "whose code Redis does not define",
+        ),
+        (
+            "return redis.error_reply('ERR ' .. ARGV[1])".to_owned(),
+            canary,
+            canary,
+            "the server answered ERR",
+        ),
+        (
+            "error(ARGV[1])".to_owned(),
+            canary,
+            canary,
+            "the server answered ERR",
+        ),
+        (
+            "return {1, redis.error_reply('WRONGTYPE ' .. ARGV[1])}".to_owned(),
+            canary,
+            canary,
+            "the server answered WRONGTYPE",
+        ),
+        (
+            format!("return {body} {body}_TWO"),
+            canary,
+            body,
+            "the server answered ERR",
+        ),
+    ];
+    for (script, arg, leaked, summary) in &cases {
+        let error = handle
+            .eval::<Vec<i64>>(script, &[], &[(*arg).into()], Replay::Never)
+            .await
+            .expect_err(script);
+        assert!(matches!(error, RedisError::Command(_)), "{error:?}");
+        let text = raw_error_text(&server, &raw_eval(script, arg)).await;
+        assert!(text.contains(leaked), "{script}: Redis quoted it: {text}");
+        for rendered in renderings(&error) {
+            assert!(!rendered.contains(leaked), "{script}: {rendered}");
+            assert!(rendered.contains(summary), "{script}: {rendered}");
+        }
+    }
+}
+
+/// **A server with `EVAL` renamed or disabled echoes the whole command** —
+/// `unknown command 'EVAX', with args beginning with: '<script>' '1' '<key>'
+/// '<token>'` — and none of it reaches the error, in any rendering or its
+/// payload. The proxy renames this one request on its way in, so the
+/// shared server is untouched; nothing ran, and the connection stays
+/// cached. (Redis echoes about 128 characters of arguments, so the canaries
+/// are short.)
+#[tokio::test]
+async fn a_renamed_eval_echoing_its_arguments_is_withheld() {
+    let server = server().await;
+    let (proxy, handle) = warm_handle(&server).await;
+    let key = unique_key("K-CANARY");
+    let token = "T-CANARY";
+    let script = "return 1 --S-CANARY";
+
+    proxy.rewrite_next_request(b"$4\r\nEVAL\r\n", b"$4\r\nEVAX\r\n");
+    let error = handle
+        .eval::<i64>(script, &[&key], &[token.into()], Replay::Never)
+        .await
+        .expect_err("EVAX is not a command");
+    assert!(matches!(error, RedisError::Command(_)), "{error:?}");
+    assert!(!error.is_outcome_unknown());
+
+    let mut renamed = redis::cmd("EVAX");
+    renamed.arg(script).arg(1).arg(&key).arg(token);
+    let text = raw_error_text(&server, &renamed).await;
+    assert!(text.contains("unknown command 'EVAX'"), "{text}");
+    for leaked in ["S-CANARY", "K-CANARY", token] {
+        assert!(text.contains(leaked), "Redis echoed {leaked}: {text}");
+        for rendered in renderings(&error) {
+            assert!(!rendered.contains(leaked), "{leaked} in {rendered}");
+            assert!(rendered.contains("the server answered ERR"), "{rendered}");
+        }
+    }
+
+    let one: i64 = handle
+        .eval(script, &[&key], &[token.into()], Replay::Never)
+        .await
+        .expect("the rename was one-shot");
+    assert_eq!(one, 1);
+    assert_eq!(proxy.accepted(), 1, "an error reply is no reason to redial");
+}
+
+/// **A server refusing the handshake echoes the credentials.** Under
+/// `?protocol=resp3` redis-rs dials with `HELLO 3 AUTH <user> <password>`;
+/// a server with `HELLO` renamed or disabled answers `unknown command …,
+/// with args beginning with: '3' 'AUTH' 'alice' '<password>'` (shown first
+/// on the probe's own connection). The dial fails as `Connect` carrying
+/// none of it, in any rendering or its payload. The proxy renames the
+/// handshake's `HELLO` on its way in, so the shared server is untouched.
+#[tokio::test]
+async fn a_refused_handshake_echoing_the_password_is_withheld() {
+    let server = server().await;
+    let proxy = Proxy::start(server.url()).await;
+    let password = "P-CANARY";
+    let mut url = url::Url::parse(&proxy.url()).expect("the proxy URL");
+    url.set_username("alice").expect("a user");
+    url.set_password(Some(password)).expect("a password");
+    url.set_query(Some("protocol=resp3"));
+
+    let mut renamed = redis::cmd("HELXO");
+    renamed.arg(3).arg("AUTH").arg("alice").arg(password);
+    let text = raw_error_text(&server, &renamed).await;
+    assert!(text.contains(password), "Redis echoes the password: {text}");
+
+    proxy.rewrite_next_request(b"$5\r\nHELLO\r\n", b"$5\r\nHELXO\r\n");
+    let handle = RedisHandle::open(url.as_str()).expect("a RESP3 URL");
+    let error = handle.ping().await.expect_err("the handshake is refused");
+    assert!(matches!(error, RedisError::Connect(_)), "{error:?}");
+    assert!(!error.is_outcome_unknown());
+    for rendered in renderings(&error) {
+        assert!(!rendered.contains(password), "{rendered}");
+        assert!(rendered.contains("the server answered ERR"), "{rendered}");
+    }
+    proxy.assert_accepted(1).await;
+}
+
+/// Only a Lua `nil` ends a table: `{1, nil, 3}` arrives as `[1]`. A `false`
+/// is a nil ELEMENT — `{1, false, 3}` arrives as `[1, nil, 3]` — which
+/// `Vec<i64>` refuses, naming where.
+#[tokio::test]
+async fn a_false_in_a_table_is_a_nil_element_and_only_nil_ends_it() {
+    let server = server().await;
+    let handle = RedisHandle::open(server.url()).unwrap();
+
+    let error = handle
+        .eval::<Vec<i64>>("return {1, false, 3}", &[], &[], Replay::Never)
+        .await
+        .expect_err("a nil element is not an integer");
+    assert!(matches!(error, RedisError::Command(_)), "{error:?}");
+    assert!(error.to_string().contains("nil at index 1"), "{error}");
+
+    let ended: Vec<i64> = handle
+        .eval("return {1, nil, 3}", &[], &[], Replay::Never)
+        .await
+        .expect("nil ends the table");
+    assert_eq!(ended, [1]);
+}
+
+/// **`Replay::Never` on a dead cached connection**: the script is not sent
+/// again — the call fails, and the counter shows it never ran — and the
+/// next call redials.
+#[tokio::test]
+async fn eval_under_replay_never_is_not_resent_on_a_fresh_connection() {
+    let server = server().await;
+    let (proxy, handle) = warm_handle(&server).await;
+    let key = unique_key("eval-never");
+
+    proxy.kill_connections().await;
+    let error = handle
+        .eval::<i64>(COUNT_SCRIPT, &[&key], &[], Replay::Never)
+        .await
+        .expect_err("the cached connection is dead");
+    assert!(matches!(error, RedisError::Io(_)), "{error:?}");
+    assert!(error.is_outcome_unknown());
+    assert_eq!(proxy.accepted(), 1, "no fresh connection to re-send it on");
+    assert_eq!(raw_get(&server, &key).await, None, "so it never ran");
+
+    let count: i64 = handle
+        .eval(COUNT_SCRIPT, &[&key], &[], Replay::Never)
+        .await
+        .expect("the next call redials");
+    assert_eq!(count, 1);
+    proxy.assert_accepted(2).await;
+    raw(&server, &["DEL", &key]).await;
+}
+
+/// **`Replay::OnceOnFreshConnection` on a dead cached connection**: sent once
+/// more on a fresh connection, and the caller sees only the answer.
+#[tokio::test]
+async fn eval_under_replay_once_is_retried_on_a_fresh_connection() {
+    let server = server().await;
+    let (proxy, handle) = warm_handle(&server).await;
+    let key = unique_key("eval-once");
+
+    proxy.kill_connections().await;
+    let count: i64 = handle
+        .eval(COUNT_SCRIPT, &[&key], &[], Replay::OnceOnFreshConnection)
+        .await
+        .expect("retried on a fresh connection");
+    assert_eq!(count, 1);
+    proxy.assert_accepted(2).await;
+    assert_eq!(
+        raw_get(&server, &key).await.as_deref(),
+        Some("1"),
+        "the attempt on the dead connection never ran; the retry did"
+    );
+    raw(&server, &["DEL", &key]).await;
+}
+
+/// **Why the choice is the caller's.** The script RUNS and its reply is lost:
+/// under `Never` it ran once and the caller is told the outcome is unknown;
+/// under `OnceOnFreshConnection` it runs a second time, and the caller gets
+/// the retry's answer — harmless only for a script written to be replayed,
+/// which this counter is not.
+#[tokio::test]
+async fn a_lost_reply_leaves_one_run_under_never_and_two_under_once() {
+    let server = server().await;
+    let (proxy, handle) = warm_handle(&server).await;
+    let (never, once) = (unique_key("lost-never"), unique_key("lost-once"));
+
+    proxy.set_replies(Replies::LoseNext);
+    let error = handle
+        .eval::<i64>(COUNT_SCRIPT, &[&never], &[], Replay::Never)
+        .await
+        .expect_err("the reply was lost");
+    assert!(error.is_outcome_unknown(), "{error:?}");
+    assert_eq!(
+        raw_get(&server, &never).await.as_deref(),
+        Some("1"),
+        "it ran, once"
+    );
+    assert_eq!(proxy.accepted(), 1, "and was not sent again");
+
+    // The lost reply cost that connection; cache a fresh one.
+    handle.ping().await.expect("PONG on a fresh connection");
+    proxy.assert_accepted(2).await;
+
+    proxy.set_replies(Replies::LoseNext);
+    let count: i64 = handle
+        .eval(COUNT_SCRIPT, &[&once], &[], Replay::OnceOnFreshConnection)
+        .await
+        .expect("answered by the retry");
+    assert_eq!(count, 2, "the retry's answer: the script's second run");
+    assert_eq!(
+        raw_get(&server, &once).await.as_deref(),
+        Some("2"),
+        "it ran twice"
+    );
+    proxy.assert_accepted(3).await;
+    raw(&server, &["DEL", &never, &once]).await;
+}
+
+/// `PING` is `Ok(())` on `PONG`; after the cached connection died it is
+/// retried once on a fresh one, so a readiness probe reports whether Redis
+/// can be reached now — and while Redis is down, it fails.
+#[tokio::test]
+async fn ping_answers_and_is_retried_on_a_fresh_connection() {
+    let server = server().await;
+    let (proxy, handle) = warm_handle(&server).await;
+
+    handle.ping().await.expect("PONG");
+    assert_eq!(proxy.accepted(), 1, "on the cached connection");
+
+    proxy.kill_connections().await;
+    handle.ping().await.expect("retried on a fresh connection");
+    proxy.assert_accepted(2).await;
+
+    proxy.set_refusing(true);
+    proxy.kill_connections().await;
+    let error = handle.ping().await.expect_err("Redis is down");
+    assert!(
+        matches!(error, RedisError::Io(_)),
+        "the cached connection: {error:?}"
+    );
+    let error = handle.ping().await.expect_err("still down");
+    assert!(matches!(error, RedisError::Connect(_)), "{error:?}");
 }
