@@ -17,6 +17,12 @@
 //!   and response-echo (including on error responses) just by adding the
 //!   layer, rather than every consumer wiring the plumbing itself.
 //!
+//! [`init_logging_with`] is new: [`init_logging`] plus [`TargetCaps`],
+//! per-target level ceilings checked in addition to the level filter, so
+//! they hold even when `RUST_LOG` replaces the default filter.
+//! [`try_init_logging_with`] is the same, but returns a [`LoggingInitError`]
+//! when it did not install them, for a caller that must not run without them.
+//!
 //! `cloud` is new here rather than extracted: [`cloud::CloudLayer`] writes
 //! Google Cloud Logging structured lines (`severity`, a top-level
 //! `message`, `httpRequest`, request/trace correlation) in the shape Python's
@@ -47,7 +53,9 @@ pub mod prometheus;
 mod test_support;
 
 pub use cloud::{CloudLayer, REQUEST_ID_FIELD, REQUEST_SPAN_NAME, TRACE_FIELD};
-pub use logging::{init_logging, LogFormat};
+pub use logging::{
+    init_logging, init_logging_with, try_init_logging_with, LogFormat, LoggingInitError, TargetCaps,
+};
 pub use request_id::{RequestId, RequestIdLayer, RequestIdService, REQUEST_ID_HEADER};
 pub use request_log::{
     RequestLogConfig, RequestLogLayer, RequestLogService, DEFAULT_REDACTED_QUERY_PARAMS,

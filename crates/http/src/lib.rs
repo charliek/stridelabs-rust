@@ -35,6 +35,7 @@
 //! | `cors` | off | `cors::cors_layer`, via `tower-http/cors` |
 //! | `openapi` | off | `openapi` — spec canonicalization, route enumeration and a freshness check, via `utoipa` |
 //! | `proxy` | off | `proxy` — reverse-proxy primitives, plus `AppError::bad_gateway_upstream` (it takes a `reqwest::Error`) — via `reqwest`/`url`/`bytes`/`futures` (and `tokio/time`) |
+//! | `redact-url` | off | `redact_url` — a URL as `scheme://host[:port]/path`, userinfo, query and fragment dropped, for a log line or a `Debug` impl — via `url` |
 //! | `ssrf` | off | `ssrf` — an SSRF-hardened outbound fetch (public-address policy, DNS pinning, capped body; request headers, statuses, validators, the answering hop's URL and headers), via `reqwest`/`url`/`bytes`/`futures` (and `tokio/time`, `tokio/net`) |
 //! | `ssrf-decompress` | off | `ssrf` plus opt-in gzip/deflate decoding of a fetched body under a decoded-size cap (`ssrf::Decompression`), via `flate2` (pure Rust) |
 //! | `ssrf-test-support` | off | `ssrf::LoopbackTestServer`, the one way to point a fetch at a local TLS test server — enable from `[dev-dependencies]`, and check the shipped graph for it (`ssrf` docs) |
@@ -53,7 +54,10 @@
 //! somebody else chose — and a service that needs one rarely needs the other.
 //! `tls` is the smallest gate (one function), and is gated anyway because
 //! that function is a direct `rustls` dependency, which a service with no
-//! rustls in its graph has no reason to take on.
+//! rustls in its graph has no reason to take on. `redact-url` is one function
+//! too, gated for its `url` dependency (and IDNA tables) alone: it shares
+//! that crate with `proxy` and `ssrf`, but none of their client stack, and
+//! sits at the crate root because it means the same thing in any context.
 //!
 //! `openapi` stays namespaced for the same reason as `proxy` (and pays a
 //! smaller but real gate: `utoipa` drags a proc-macro crate in). It holds
@@ -89,6 +93,9 @@ pub mod openapi;
 #[cfg(feature = "proxy")]
 pub mod proxy;
 
+#[cfg(feature = "redact-url")]
+mod redact;
+
 #[cfg(feature = "ssrf")]
 pub mod ssrf;
 
@@ -102,3 +109,6 @@ pub use shutdown::{shutdown_signal, wait_for_shutdown};
 
 #[cfg(feature = "cors")]
 pub use cors::cors_layer;
+
+#[cfg(feature = "redact-url")]
+pub use redact::redact_url;

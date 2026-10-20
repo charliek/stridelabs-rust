@@ -60,6 +60,15 @@ ssrf-test-support = ["ssrf"]
 # Off by default: one function, but a direct `rustls` dependency, which a
 # service with no rustls in its graph has no reason to take on.
 tls = ["dep:rustls"]
+# Off by default: `redact_url`, a URL rendered for a log line or a `Debug`
+# impl without its userinfo, query or fragment. It must parse the way the
+# client that dials the URL does (`reqwest::Url` is `url::Url`), and `url`,
+# with its IDNA tables, is not in the core's graph. Not folded into `proxy`
+# or `ssrf`, though both already declare `url`: they bring an HTTP client
+# and a TLS stack, which a service that only wants to name its configured
+# URLs safely has no reason to compile. The same optional `url` those two
+# declare, so no crate is added to the lock.
+redact-url = ["dep:url"]
 
 [lints]
 workspace = true
@@ -109,6 +118,7 @@ tracing = { workspace = true }
 # openssl. Not `rustls-no-provider`: that panics at `Client` build unless the
 # consumer installed a provider first.
 reqwest = { workspace = true, features = ["stream", "rustls"], optional = true }
+# `redact-url` turns on this one alone.
 url = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }

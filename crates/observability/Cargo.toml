@@ -14,7 +14,7 @@ default = []
 # Off by default: most consumers don't render `/metrics`, and pulling in the
 # Prometheus exporter + `metrics` facade unconditionally would be dead weight
 # for the ones that don't.
-prometheus = ["dep:metrics", "dep:metrics-exporter-prometheus", "dep:thiserror"]
+prometheus = ["dep:metrics", "dep:metrics-exporter-prometheus"]
 # Lets `RequestLogLayer` fall back to the connection's peer address for
 # `remoteIp`. axum's `ConnectInfo<SocketAddr>` extension is the only place a
 # peer address appears on an `http::Request`, and reading a typed extension
@@ -35,6 +35,12 @@ workspace = true
 [dependencies]
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+# The `log` bridge, which tracing-subscriber's `try_init` installs too, named
+# directly so `try_init_logging_with` can tell a refused bridge from a refused
+# subscriber (`try_init` folds both into one opaque error). Already in every
+# consumer's graph, with these features, through tracing-subscriber's default
+# `tracing-log` feature.
+tracing-log = { workspace = true }
 tower = { workspace = true }
 http = { workspace = true }
 rand = { workspace = true }
@@ -43,8 +49,8 @@ rand = { workspace = true }
 serde_json = { workspace = true }
 metrics = { workspace = true, optional = true }
 metrics-exporter-prometheus = { workspace = true, optional = true }
-# Only the prometheus feature has a fallible surface (recorder installation).
-thiserror = { workspace = true, optional = true }
+# `LoggingInitError`, and the prometheus feature's recorder-installation error.
+thiserror = { workspace = true }
 # Only for the `axum` feature's `ConnectInfo` read (see the feature).
 axum = { workspace = true, optional = true }
 

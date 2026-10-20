@@ -42,6 +42,29 @@ for a consumer's pin.
   - `test_support::TestClaims::without_audience()` and
     `TestClaims::not_before_in(secs)`.
 
+- `stridelabs-observability`: per-target level caps that hold even when
+  `RUST_LOG` is set (lumen plan 001 S1, for a WebSocket relay whose frame
+  logs carry an API key). `TargetCaps` (`new`, `cap(target, Level |
+  LevelFilter)`) are ceilings checked on top of the level filter, so neither
+  `RUST_LOG=trace` nor `RUST_LOG=<target>=trace` can lift a capped target. A
+  cap covers its target and module paths beneath it (not
+  `tungstenite_extra`); a trailing `::` is ignored and an empty target is not
+  a wildcard; every covering cap applies (the strictest wins). Spans and
+  `log`-crate records (through the `tracing-log` bridge) are capped by their
+  real target, and the filter's max-level hint is unchanged.
+  - `init_logging_with(format, default_filter, &TargetCaps)`;
+    `init_logging` is it with no caps, output byte-for-byte unchanged.
+  - `try_init_logging_with(..) -> Result<(), LoggingInitError>` installs the
+    same stack and returns `Ok` only when this call installed both the
+    subscriber and the `log` bridge (`LoggingInitError`, `#[non_exhaustive]`:
+    `AlreadyInitialized`, `SubscriberAlreadySet`, `LogBridgeNotInstalled`).
+    Use it when the caps guard a secret: an earlier subscriber or `log`
+    logger would otherwise leave them silently not in force.
+- `stridelabs-http`: feature `redact-url` (pulls in `url` only: no client, no
+  TLS) with `redact_url(raw) -> String`: `scheme://host[:port]/path`,
+  userinfo, query and fragment dropped, `<unparseable URL>` for anything
+  without a host. The same rule as stridelabs-auth's and stridelabs-gcp's
+  private copies and tapper-rs's `http_tls::redact_url`.
 - `stridelabs-http` (`ssrf`): the options a feed fetch needs, every one
   opt-in. A default policy's request is v0.8.0's byte for byte (pinned by a
   snapshot recorded on the v0.8.0 tree), and `fetch_public` returns the
@@ -217,6 +240,10 @@ for a consumer's pin.
   new items are re-exported from the crate root.
 
 ### Changed
+
+- `stridelabs-observability`: `thiserror` is a non-optional dependency (it
+  was enabled only by `prometheus`) and `tracing-log` a normal one (it was a
+  dev-dependency); neither adds a package to the lock.
 
 - `stridelabs-auth`: `claims_with_jwks`, `verify_with_jwks` and
   `Verifier::new`'s verification run through `claims_with_jwks_checked` with

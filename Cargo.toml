@@ -90,6 +90,9 @@ anyhow = "1"
 # Observability
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+# The `log` → `tracing` bridge. The same version, and features, as
+# tracing-subscriber's default `tracing-log` feature already locks.
+tracing-log = "0.2"
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
 

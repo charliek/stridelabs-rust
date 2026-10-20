@@ -21,6 +21,7 @@ add friction.
 | `ssrf-decompress` | off | `ssrf` plus `FetchPolicy::with_decompression`: opt-in gzip and deflate decoding of a fetched body, capped on its decoded size, via `flate2` 1.1.10+ (`rust_backend`: miniz_oxide, crc32fast, adler2, simd-adler32; pure Rust, no C toolchain). Implies `ssrf`. Off for an image fetch |
 | `ssrf-test-support` | off | `ssrf::LoopbackTestServer` and `FetchPolicy::with_loopback_test_server`: point a fetch at a local TLS test server. Implies `ssrf`. Enable from `[dev-dependencies]` and **check the shipped graph for it** (see "Testing against it" below) |
 | `tls` | off | the `tls` module — `install_default_provider`, which makes aws-lc-rs the process's rustls `CryptoProvider` — via `rustls` 0.23 (`aws_lc_rs` + `std`, no defaults) |
+| `redact-url` | off | `redact_url`: a URL as `scheme://host[:port]/path`, with userinfo, query and fragment dropped, for a log line or a `Debug` impl. Via `url` alone (the same optional dependency `proxy` and `ssrf` use), none of their client stack |
 
 `proxy` is the gate that matters: it pulls in an HTTP *client* and a TLS
 stack. A service that only answers requests should never compile that, which
@@ -65,6 +66,9 @@ stridelabs-http = { git = "https://github.com/charliek/stridelabs-rust.git", tag
 
 # for a service that fetches user-supplied URLs, and installs the rustls provider at startup:
 stridelabs-http = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.8.0", features = ["ssrf", "tls"] }
+
+# to name configured URLs in logs without their credentials:
+stridelabs-http = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.8.0", features = ["redact-url"] }
 
 # for a feed fetcher that decodes gzip and deflate:
 stridelabs-http = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.8.0", features = ["ssrf-decompress", "tls"] }
@@ -716,6 +720,47 @@ redis-rs, the next dependency).
 `tests/tls_provider.rs` is one test in its own process (the provider is
 process-global): the first call installs aws-lc-rs, the second reports
 `AlreadyInstalled` and leaves it, and `ClientConfig::builder()` then uses it.
+
+## `redact-url` feature — a URL for a log line
+
+```rust
+use stridelabs_http::redact_url;
+
+tracing::info!(upstream = %redact_url(&config.upstream_url), "relaying");
+
+assert_eq!(
+    redact_url("https://user:SECRET@api.example.com:8443/v1/feed?token=SECRET#top"),
+    "https://api.example.com:8443/v1/feed",
+);
+```
+
+`redact_url(raw)` renders `raw` as `scheme://host[:port]/path`: the userinfo,
+query and fragment, which is where a URL carries a credential (`user:pass@`,
+`?token=…`), are dropped. It is for a URL a service names on purpose: a log
+field, or a config struct's `Debug`.
+
+- **Parsed as the client parses it.** `url::Url` is what `reqwest::Url` is,
+  so the host shown is the host a client dials, normalised the way the client
+  sees it: scheme and host lowercased, an internationalised host as punycode,
+  IPv6 in canonical form, the scheme's default port dropped, and an
+  `http(s)`/`ws(s)` URL's empty path shown as `/`
+  (`https://auth.example.com:443?token=…` → `https://auth.example.com/`).
+  Other schemes keep an empty path empty
+  (`rediss://default:SECRET@cache.example.com:6379` →
+  `rediss://cache.example.com:6379`).
+- **Unparseable means nothing of the input.** A string that does not parse
+  to a URL with a host renders as the fixed `<unparseable URL>`. That covers
+  a bare `host/path`, a relative reference, `mailto:`, `file:///…` and `""`.
+  Where its credential would start is exactly what cannot be known.
+- **The path is kept.** A credential in the path itself (`/hooks/SECRET`)
+  looks like a route, so a URL like that needs a rule of its own.
+- It does not make a `reqwest::Error` safe to render: that error's `Display`
+  quotes the URL it failed on, query included. Strip it with
+  `.without_url()` first.
+
+The rule is stridelabs-auth's for `SlauthConfig`'s `Debug`. stridelabs-auth
+keeps a crate-private copy because it depends on this crate only behind its
+`http` feature.
 
 ## `ssrf` feature — SSRF-hardened outbound fetch
 

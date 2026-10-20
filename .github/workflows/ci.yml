@@ -146,6 +146,7 @@ jobs:
             stridelabs-gcp:service-account-key \
             stridelabs-gcp:vertex \
             stridelabs-http:tls \
+            stridelabs-http:redact-url \
             stridelabs-http:ssrf \
             stridelabs-http:ssrf-decompress \
             stridelabs-http:ssrf-test-support \
