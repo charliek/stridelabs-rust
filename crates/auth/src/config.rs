@@ -1,5 +1,6 @@
 //! The slauth settings a resource server needs.
 
+use std::borrow::Cow;
 use std::fmt;
 
 use serde::Deserialize;
@@ -13,7 +14,10 @@ use serde::Deserialize;
 /// `Debug` prints the two endpoint URLs without their userinfo, query or
 /// fragment (`scheme://host[:port]/path`): a URL is configuration, and
 /// configuration can carry a credential that a `tracing::info!(?config)`
-/// would otherwise put in the logs.
+/// would otherwise put in the logs. The issuer prints exactly as configured,
+/// which is what debugging a trailing-slash mismatch takes, unless it is a
+/// URL carrying one of those parts (no real `iss` does): then it prints as
+/// the endpoints do.
 ///
 /// Notably absent: `client_id`. That belongs to the *browser* half of the
 /// flow (the PKCE authorization request), which a resource server never
@@ -44,7 +48,7 @@ pub struct SlauthConfig {
 impl fmt::Debug for SlauthConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SlauthConfig")
-            .field("issuer", &self.issuer)
+            .field("issuer", &redact_issuer(&self.issuer))
             .field("jwks_url", &redact_url(&self.jwks_url))
             .field("audience", &self.audience)
             .field(
@@ -76,9 +80,36 @@ pub(crate) fn redact_url(raw: &str) -> String {
         .unwrap_or_else(|| "<unparseable URL>".to_owned())
 }
 
+/// An issuer (an `iss` value) for a `Debug` impl: exactly as configured,
+/// unless it parses as a URL with a host and carries userinfo, a query or a
+/// fragment, which is then rendered as [`redact_url`] renders an endpoint.
+///
+/// Not [`redact_url`] outright: an issuer is compared exactly, and the
+/// parser's normalisation would hide the mismatch someone is reading the
+/// `Debug` to find (`https://auth.example.com` renders as
+/// `https://auth.example.com/`, the very trailing slash in question). No
+/// real `iss` carries a credential, so the exact form is what prints in
+/// practice; one that does gives up its exactness to keep the credential
+/// out of the logs. Anything else (a plain-string issuer, or a URL with no
+/// host to redact around) prints as-is.
+pub(crate) fn redact_issuer(issuer: &str) -> Cow<'_, str> {
+    match reqwest::Url::parse(issuer) {
+        Ok(url)
+            if url.host_str().is_some()
+                && (!url.username().is_empty()
+                    || url.password().is_some()
+                    || url.query().is_some()
+                    || url.fragment().is_some()) =>
+        {
+            Cow::Owned(redact_url(issuer))
+        }
+        _ => Cow::Borrowed(issuer),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::redact_url;
+    use super::{redact_issuer, redact_url};
 
     #[test]
     fn redact_url_keeps_scheme_host_port_and_path_only() {
@@ -136,6 +167,45 @@ mod tests {
         ] {
             let rendered = redact_url(input);
             assert_eq!(rendered, "<unparseable URL>", "{input}");
+        }
+    }
+
+    #[test]
+    fn an_issuer_prints_exactly_unless_it_carries_url_credentials() {
+        for (input, expected) in [
+            // Exact: no slash added, none taken away, nothing normalised.
+            ("https://auth.example.com", "https://auth.example.com"),
+            ("https://auth.example.com/", "https://auth.example.com/"),
+            (
+                "HTTPS://Auth.Example.com:443",
+                "HTTPS://Auth.Example.com:443",
+            ),
+            (
+                "https://api.workos.com/user_management/client_01",
+                "https://api.workos.com/user_management/client_01",
+            ),
+            // Not a URL with a host: there is nothing to redact around.
+            ("slauth", "slauth"),
+            ("", ""),
+            // A credential-bearing part drops, as an endpoint's does.
+            (
+                "https://user:SECRET@auth.example.com/tenant?token=SECRET#SECRET",
+                "https://auth.example.com/tenant",
+            ),
+            (
+                "https://:SECRET@auth.example.com/",
+                "https://auth.example.com/",
+            ),
+            (
+                "https://auth.example.com?token=SECRET",
+                "https://auth.example.com/",
+            ),
+            (
+                "https://auth.example.com/#SECRET",
+                "https://auth.example.com/",
+            ),
+        ] {
+            assert_eq!(redact_issuer(input), expected, "{input}");
         }
     }
 }

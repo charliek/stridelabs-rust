@@ -13,6 +13,35 @@ for a consumer's pin.
 
 ### Added
 
+- `stridelabs-auth`: verifying another issuer's tokens under claim rules the
+  consumer chooses (lumen plan 001 S1: WorkOS access tokens, which carry no
+  `aud` and whose `iss` names the client).
+  - `ClaimChecks::new(issuer, Audience)`: `iss` must match exactly and is
+    required; `exp` is required; `aud` is checked per the `Audience`. The
+    leeway on `exp` and `nbf` is `with_leeway(Duration)` (default
+    `DEFAULT_LEEWAY`, 60 s; whole seconds, capped at a day because
+    jsonwebtoken's `now ± leeway` is unchecked `u64` arithmetic). A present
+    `nbf` is checked by default (`with_nbf_validation(false)` turns it off).
+    Accessors `issuer`, `audience`, `leeway`, `validates_nbf`. Its `Debug`
+    renders an issuer carrying userinfo, a query or a fragment as
+    `scheme://host[:port]/path`.
+  - `Audience` (`#[non_exhaustive]`): `Required(String)` or `NotValidated`.
+    There is no `Default` and no conversion that yields `NotValidated`; it
+    skips the `aud` check and is safe only when the issuer binds the
+    audience some other way.
+  - `Verifier::for_issuer(checks, jwks_url, jwks_ttl: Option<Duration>,
+    http)` builds its own `JwksCache` (`None` means `JWKS_TTL`), so it
+    inherits the cache contract: a key set is never served past its TTL (a
+    test pins it through `for_issuer`). `verify_bearer_claims` applies its
+    rules; `Verifier::claim_checks()` returns them. `config()` is
+    informational: a synthesized `SlauthConfig` whose audience under
+    `NotValidated` is a NUL-prefixed sentinel no issuer mints, so a verifier
+    wrongly rebuilt from it with `Verifier::new` refuses every real token.
+  - `Verifier::claims_with_jwks_checked::<C>(token, &jwks, kid, &checks)`,
+    the network-free form.
+  - `test_support::TestClaims::without_audience()` and
+    `TestClaims::not_before_in(secs)`.
+
 - `stridelabs-http` (`ssrf`): the options a feed fetch needs, every one
   opt-in. A default policy's request is v0.8.0's byte for byte (pinned by a
   snapshot recorded on the v0.8.0 tree), and `fetch_public` returns the
@@ -188,6 +217,14 @@ for a consumer's pin.
   new items are re-exported from the crate root.
 
 ### Changed
+
+- `stridelabs-auth`: `claims_with_jwks`, `verify_with_jwks` and
+  `Verifier::new`'s verification run through `claims_with_jwks_checked` with
+  slauth's rules (`aud` required, 60 s leeway, `nbf` unchecked); no
+  behaviour change (the existing tests and `verifier_new_keeps_slauths_rules`
+  pin it). `SlauthConfig`'s `Debug` now renders an issuer carrying userinfo,
+  a query or a fragment as `scheme://host[:port]/path` (every other issuer
+  prints exactly as before).
 
 - **BREAKING (behaviour, security, for `Verifier`, `JwksCache` and
   `McpVerifier` users): a JWKS lookup never returns a set past its TTL.**

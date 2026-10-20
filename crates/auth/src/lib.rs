@@ -1,6 +1,7 @@
 //! The resource-server half of slauth, the StrideLabs auth service: verify the
-//! RS256 access tokens that slauth (Ory Hydra) issues, and hash the personal
-//! access tokens a service issues for itself.
+//! RS256 access tokens that slauth (Ory Hydra) issues — or, through
+//! [`Verifier::for_issuer`], another issuer's, under claim rules the consumer
+//! chooses — and hash the personal access tokens a service issues for itself.
 //!
 //! A service that adopts this crate holds one [`Verifier`] in its
 //! application state, hands it
@@ -45,6 +46,60 @@
 //! [`Verifier::claims_with_jwks`]) instead: the same key selection,
 //! signature, `exp`, `iss` and `aud` checks, from the same code, with the
 //! claims returned as the caller's own type and their semantics left to it.
+//!
+//! # Another issuer's tokens: [`Verifier::for_issuer`]
+//!
+//! [`Verifier::new`]'s claim rules are slauth's: `aud` required, a 60 s
+//! leeway, `nbf` not checked. [`Verifier::for_issuer`] takes them as a
+//! [`ClaimChecks`] instead: the issuer (compared exactly), an [`Audience`]
+//! (`Required`, or `NotValidated` for an issuer whose tokens carry none), the
+//! leeway on `exp` and `nbf`, and whether `nbf` is checked (by default it
+//! is). Everything else is [`Verifier::new`]'s, from the same code: RS256
+//! only, a `kid` required, the key-fitness rules, and a [`JwksCache`] the
+//! verifier builds itself from the URL it is given, with an optional TTL, so
+//! a key set is never served past it. [`Verifier::claims_with_jwks_checked`]
+//! is the network-free twin, and [`Verifier::claims_with_jwks`] is it with
+//! slauth's rules.
+//!
+//! **[`Audience::NotValidated`] skips the `aud` check, and is safe only when
+//! the issuer binds the audience some other way**, as WorkOS's per-client
+//! `iss` does. Against an issuer shared by several services it accepts a
+//! token minted for any of them.
+//!
+//! ```no_run
+//! # async fn example(http: reqwest::Client) -> Result<(), stridelabs_auth::AuthError> {
+//! use std::time::Duration;
+//!
+//! use stridelabs_auth::{Audience, ClaimChecks, Verifier};
+//!
+//! // WorkOS access tokens carry no `aud`; their `iss` names the client.
+//! let client_id = "client_01H...";
+//! let checks = ClaimChecks::new(
+//!     format!("https://api.workos.com/user_management/{client_id}"),
+//!     Audience::NotValidated,
+//! )
+//! .with_leeway(Duration::ZERO); // `nbf` is checked by default
+//! let verifier = Verifier::for_issuer(
+//!     checks,
+//!     format!("https://api.workos.com/sso/jwks/{client_id}"),
+//!     Some(Duration::from_secs(3600)),
+//!     http,
+//! );
+//!
+//! // No email in a WorkOS access token, so not `verify_bearer`: the
+//! // consumer reads its own claims and owns their rules.
+//! #[derive(serde::Deserialize)]
+//! struct WorkosClaims {
+//!     #[serde(default)]
+//!     sub: String,
+//! }
+//! let claims: WorkosClaims = verifier.verify_bearer_claims("eyJhbGciOi...").await?;
+//! if claims.sub.is_empty() {
+//!     // reject: an empty subject would key every such token onto one user
+//! }
+//! # Ok(())
+//! # }
+//! ```
 //!
 //! Two deliberate hardenings over the original implementation this crate
 //! replaced, both pinned in the plan this crate was written from:
@@ -148,7 +203,7 @@ pub use pat::{GeneratedToken, PatFormat, PatFormatError, MAX_PREFIX_LEN};
 pub use slauth_pat::{
     is_slauth_pat, PatValidationError, PatValidator, PAT_VALIDATION_TIMEOUT, SLAUTH_PAT_PREFIX,
 };
-pub use verify::{Claims, VerifiedIdentity, Verifier};
+pub use verify::{Audience, ClaimChecks, Claims, VerifiedIdentity, Verifier, DEFAULT_LEEWAY};
 
 #[cfg(feature = "axum")]
 pub use bearer::bearer_token;

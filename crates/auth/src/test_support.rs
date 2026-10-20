@@ -141,14 +141,21 @@ pub fn test_jwks_json() -> &'static str {
 /// hour of validity. Each setter takes the token one step away from that.
 /// [`TestClaims::claim`] adds anything else a token for another purpose
 /// carries (`scope`, `scp`, `client_id`, …).
+///
+/// A token from an issuer whose tokens carry no `aud` (WorkOS's) is
+/// `TestClaims::new(issuer, "").without_audience()`, checked with
+/// [`crate::Audience::NotValidated`].
 #[derive(Debug, Clone)]
 pub struct TestClaims {
     issuer: String,
-    audience: String,
+    /// `None`: no `aud` claim at all.
+    audience: Option<String>,
     sub: String,
     email: Option<String>,
     name: Option<String>,
     expires_in_secs: i64,
+    /// `None`: no `nbf` claim, the default.
+    not_before_in_secs: Option<i64>,
     extra: Map<String, Value>,
 }
 
@@ -157,11 +164,12 @@ impl TestClaims {
     pub fn new(issuer: impl Into<String>, audience: impl Into<String>) -> TestClaims {
         TestClaims {
             issuer: issuer.into(),
-            audience: audience.into(),
+            audience: Some(audience.into()),
             sub: "test-subject".to_string(),
             email: Some("user@example.com".to_string()),
             name: Some("Test User".to_string()),
             expires_in_secs: 3600,
+            not_before_in_secs: None,
             extra: Map::new(),
         }
     }
@@ -206,6 +214,21 @@ impl TestClaims {
         self
     }
 
+    /// Omit the `aud` claim entirely, as WorkOS's access tokens do (the
+    /// audience given to [`TestClaims::new`] is then unused).
+    pub fn without_audience(mut self) -> TestClaims {
+        self.audience = None;
+        self
+    }
+
+    /// Add an `nbf` claim this many seconds from now: **positive for a token
+    /// not valid yet**, negative for one valid since then. No `nbf` is minted
+    /// unless this is called.
+    pub fn not_before_in(mut self, secs: i64) -> TestClaims {
+        self.not_before_in_secs = Some(secs);
+        self
+    }
+
     /// Add the claim `name` with `value`, e.g.
     /// `.claim("scope", json!("files:read files:write"))` or
     /// `.claim("scp", json!(["files:read"]))`.
@@ -224,7 +247,6 @@ impl TestClaims {
         let now = unix_now();
         let mut claims = json!({
             "iss": self.issuer,
-            "aud": self.audience,
             "sub": self.sub,
             "iat": now,
             "exp": now + self.expires_in_secs,
@@ -232,6 +254,12 @@ impl TestClaims {
         let object = claims
             .as_object_mut()
             .expect("built from an object literal");
+        if let Some(audience) = &self.audience {
+            object.insert("aud".to_string(), json!(audience));
+        }
+        if let Some(secs) = self.not_before_in_secs {
+            object.insert("nbf".to_string(), json!(now + secs));
+        }
         if let Some(email) = &self.email {
             object.insert("email".to_string(), json!(email));
         }
@@ -340,5 +368,42 @@ mod tests {
         let claims = TestClaims::new(ISSUER, AUDIENCE).expires_in(-60).build();
 
         assert!(claims["exp"].as_i64().expect("exp") < unix_now());
+    }
+
+    #[test]
+    fn without_audience_omits_aud_and_nothing_else() {
+        let claims = TestClaims::new(ISSUER, AUDIENCE).without_audience().build();
+        let mut keys: Vec<&str> = claims
+            .as_object()
+            .expect("claims are an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+
+        assert_eq!(keys, ["email", "exp", "iat", "iss", "name", "sub"]);
+        // `.claim` still adds one back, as it replaces any built-in claim.
+        let readded = TestClaims::new(ISSUER, AUDIENCE)
+            .without_audience()
+            .claim("aud", json!("another"))
+            .build();
+        assert_eq!(readded["aud"], json!("another"));
+    }
+
+    #[test]
+    fn not_before_in_sets_nbf_relative_to_now() {
+        let before = unix_now();
+        let future = TestClaims::new(ISSUER, AUDIENCE).not_before_in(30).build();
+        let past = TestClaims::new(ISSUER, AUDIENCE).not_before_in(-30).build();
+        let after = unix_now();
+
+        // `nbf` and `iat` come from one reading of the clock.
+        let iat = future["iat"].as_i64().expect("iat");
+        assert_eq!(future["nbf"].as_i64().expect("nbf"), iat + 30);
+        assert!((before + 30..=after + 30).contains(&future["nbf"].as_i64().expect("nbf")));
+        assert_eq!(
+            past["nbf"].as_i64().expect("nbf"),
+            past["iat"].as_i64().expect("iat") - 30
+        );
     }
 }
