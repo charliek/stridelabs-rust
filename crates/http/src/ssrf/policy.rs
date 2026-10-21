@@ -9,8 +9,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use http::header::{IF_MODIFIED_SINCE, IF_NONE_MATCH};
-use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
+use http::{HeaderValue, StatusCode};
 
 use super::address::is_public_address;
 use super::error::SsrfError;
@@ -55,10 +54,8 @@ impl AllowedSchemes {
 
 /// Which response statuses a fetch returns a body for.
 ///
-/// A 3xx is never one of them: it is a redirect (or, for a 304 answering a
-/// validator on the first hop, the terminal "not modified"; see
-/// [`FetchPolicy::with_header`]). Every status the policy does not accept is
-/// [`SsrfError::HttpStatus`].
+/// A 3xx is never one of them: it is a redirect. Every status the policy
+/// does not accept is [`SsrfError::HttpStatus`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[non_exhaustive]
 pub enum AcceptedStatuses {
@@ -100,81 +97,6 @@ pub enum Decompression {
     /// cap on the bytes on the wire, within the policy's timeout; anything
     /// else is refused. See the `ssrf` module docs, "Compressed responses".
     GzipDeflate,
-}
-
-/// A request header [`FetchPolicy::with_header`] refused: the fetch owns it,
-/// or it could reroute, reframe or authenticate the request. The name is in
-/// the message (header names are not secret).
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("the {0} request header is managed by the fetch and cannot be set on a policy")]
-pub struct ReservedHeader(HeaderName);
-
-impl ReservedHeader {
-    /// The refused name, as [`HeaderName`] normalizes it (lower case).
-    pub fn name(&self) -> &HeaderName {
-        &self.0
-    }
-}
-
-/// Request headers no policy may set (see [`FetchPolicy::with_header`] for
-/// the classes and why). Lower case, as `HeaderName::as_str` is; every
-/// `x-forwarded-*` name is refused besides these.
-const RESERVED_HEADERS: [&str; 36] = [
-    // Hop-by-hop and framing.
-    "connection",
-    "keep-alive",
-    "proxy-connection",
-    "te",
-    "trailer",
-    "transfer-encoding",
-    "upgrade",
-    "content-length",
-    "content-encoding",
-    "expect",
-    "http2-settings",
-    // Routing.
-    "host",
-    "forwarded",
-    "via",
-    "max-forwards",
-    "x-real-ip",
-    // Method and route overrides.
-    "x-http-method-override",
-    "x-http-method",
-    "x-method-override",
-    "x-original-url",
-    "x-rewrite-url",
-    // Cloud metadata.
-    "metadata-flavor",
-    "x-google-metadata-request",
-    "metadata",
-    "x-aws-ec2-metadata-token",
-    "x-aws-ec2-metadata-token-ttl-seconds",
-    // Credentials.
-    "authorization",
-    "proxy-authorization",
-    "cookie",
-    // Owned by the fetch: `with_accept`, the decompression option,
-    // `with_user_agent`.
-    "accept",
-    "accept-encoding",
-    "user-agent",
-    // Not yet designed: preconditions and ranges have no semantics here yet
-    // (a 412 or a 206 would be read as any other status).
-    "if-match",
-    "if-unmodified-since",
-    "if-range",
-    "range",
-];
-
-fn is_reserved(name: &HeaderName) -> bool {
-    let name = name.as_str();
-    RESERVED_HEADERS.contains(&name) || name.starts_with("x-forwarded-")
-}
-
-/// The two validators: sent on the first hop only, one value each.
-pub(super) fn is_validator(name: &HeaderName) -> bool {
-    name == IF_NONE_MATCH || name == IF_MODIFIED_SINCE
 }
 
 /// The future a [`HostResolver`] returns.
@@ -241,11 +163,11 @@ impl HostResolver for SystemResolver {
 /// What one guarded fetch is allowed to do.
 ///
 /// [`FetchPolicy::new`] is the strict policy: https only, no redirects, a
-/// 10 s budget, `200 OK` only, no extra request headers, no content coding,
-/// the system resolver, and the public-address policy with no exceptions.
-/// The `with_*` methods label, tune or widen it (more schemes, redirects,
-/// statuses, headers), but **none of them can let a fetch reach a non-public
-/// address**. The only way to do that is the `ssrf-test-support` feature's
+/// 10 s budget, `200 OK` only, no `Accept` or `User-Agent`, no content
+/// coding, the system resolver, and the public-address policy with no
+/// exceptions. The `with_*` methods label, tune or widen it (more schemes,
+/// redirects, statuses), but **none of them can let a fetch reach a
+/// non-public address**. The only way to do that is the `ssrf-test-support` feature's
 /// `with_loopback_test_server`, which does not exist in a build without that
 /// feature, and with it admits only the loopback addresses its caller names.
 ///
@@ -272,8 +194,6 @@ pub struct FetchPolicy {
     pub(super) max_redirects: u32,
     pub(super) accept: Option<HeaderValue>,
     pub(super) user_agent: Option<HeaderValue>,
-    /// `with_header`'s headers, none of them reserved.
-    pub(super) headers: HeaderMap,
     pub(super) accepted: AcceptedStatuses,
     #[cfg(feature = "ssrf-decompress")]
     pub(super) decompression: Decompression,
@@ -296,7 +216,6 @@ impl FetchPolicy {
             max_redirects: 0,
             accept: None,
             user_agent: None,
-            headers: HeaderMap::new(),
             accepted: AcceptedStatuses::default(),
             #[cfg(feature = "ssrf-decompress")]
             decompression: Decompression::default(),
@@ -348,81 +267,12 @@ impl FetchPolicy {
     }
 
     /// The `User-Agent` header to send on every hop (default: none),
-    /// replacing any earlier one. Like [`FetchPolicy::with_header`]'s
-    /// headers, it is trusted configuration and never a secret.
+    /// replacing any earlier one. It goes to every host a redirect leads
+    /// to: trusted configuration, never a secret.
     #[must_use]
     pub fn with_user_agent(mut self, user_agent: HeaderValue) -> Self {
         self.user_agent = Some(user_agent);
         self
-    }
-
-    /// One more request header (default: none), or [`ReservedHeader`] when
-    /// the fetch owns the name or the name could change where the request
-    /// goes, how it is framed or whose it is.
-    ///
-    /// **Policy headers are trusted configuration, never secrets.** Except
-    /// the two validators below, they go on every hop, cross-host redirects
-    /// included, to hosts a redirect chooses: an `X-Api-Key`, a token or a
-    /// `Referer` naming something private would leak. The reserved list
-    /// protects the fetch's framing and routing; it does not sanitize an
-    /// arbitrary header.
-    ///
-    /// - **Typed values**, so a CR or LF cannot be injected: such a
-    ///   [`HeaderValue`] fails to build before it reaches a policy.
-    /// - **Singletons replace**: `If-None-Match` and `If-Modified-Since`
-    ///   hold one value each (an `If-None-Match` value may itself list
-    ///   several entity tags). Every other name appends, and repeats go out
-    ///   as separate header lines.
-    /// - **Validators** (`If-None-Match`, `If-Modified-Since`) are sent on
-    ///   the first hop only, to the URL the fetch was given, and dropped on
-    ///   any redirect: a redirect's target is another resource, and the
-    ///   cached validator does not describe it (RFC 9110 section 15.4). A
-    ///   `304 Not Modified` answering them on that first hop is the
-    ///   fetch's result: no body, never a redirect, whatever
-    ///   [`AcceptedStatuses`] says. A `304` on a later hop was not asked for,
-    ///   and is a 3xx like any other. Store a validator with the URL it came
-    ///   from — the `final_url` of the response that carried it — and send it
-    ///   only to that URL.
-    ///
-    /// Reserved, case-insensitively (the list is part of the contract;
-    /// adding a name is a documented behaviour change):
-    ///
-    /// | Class | Names |
-    /// |---|---|
-    /// | Hop-by-hop and framing | `connection`, `keep-alive`, `proxy-connection`, `te`, `trailer`, `transfer-encoding`, `upgrade`, `content-length`, `content-encoding` (a GET has no body to code), `expect`, `http2-settings` |
-    /// | Routing | `host`, `forwarded`, `via`, `max-forwards`, `x-real-ip`, every `x-forwarded-*` |
-    /// | Method and route overrides | `x-http-method-override`, `x-http-method`, `x-method-override`, `x-original-url`, `x-rewrite-url` |
-    /// | Cloud metadata | `metadata-flavor`, `x-google-metadata-request`, `metadata`, `x-aws-ec2-metadata-token`, `x-aws-ec2-metadata-token-ttl-seconds` |
-    /// | Credentials | `authorization`, `proxy-authorization`, `cookie` |
-    /// | Owned by the fetch | `accept` ([`FetchPolicy::with_accept`]), `accept-encoding` (the decompression option), `user-agent` ([`FetchPolicy::with_user_agent`]) |
-    /// | Not yet designed | `if-match`, `if-unmodified-since`, `if-range`, `range` |
-    ///
-    /// ```
-    /// use http::{HeaderName, HeaderValue};
-    /// use stridelabs_http::ssrf::FetchPolicy;
-    ///
-    /// let policy = FetchPolicy::new("feed", 10 * 1024 * 1024)
-    ///     .with_header(HeaderName::from_static("a-im"), HeaderValue::from_static("feed"))?;
-    /// let refused = policy
-    ///     .clone()
-    ///     .with_header(HeaderName::from_static("authorization"), HeaderValue::from_static("x"));
-    /// assert_eq!(refused.unwrap_err().name(), "authorization");
-    /// # Ok::<(), stridelabs_http::ssrf::ReservedHeader>(())
-    /// ```
-    pub fn with_header(
-        mut self,
-        name: HeaderName,
-        value: HeaderValue,
-    ) -> Result<Self, ReservedHeader> {
-        if is_reserved(&name) {
-            return Err(ReservedHeader(name));
-        }
-        if is_validator(&name) {
-            self.headers.insert(name, value);
-        } else {
-            self.headers.append(name, value);
-        }
-        Ok(self)
     }
 
     /// Which statuses return a body (default [`AcceptedStatuses::OkOnly`]).
@@ -445,12 +295,6 @@ impl FetchPolicy {
     pub fn with_resolver(mut self, resolver: impl HostResolver + 'static) -> Self {
         self.resolver = Arc::new(resolver);
         self
-    }
-
-    /// Whether the policy carries a validator, which is what makes a `304`
-    /// on the first hop the fetch's answer rather than a redirect.
-    pub(super) fn has_validator(&self) -> bool {
-        self.headers.keys().any(is_validator)
     }
 
     /// The `Accept-Encoding` this policy sends.
@@ -506,27 +350,12 @@ impl fmt::Debug for FetchPolicy {
             .field("max_redirects", &self.max_redirects)
             .field("accept", &self.accept)
             .field("user_agent", &self.user_agent)
-            // Names only: a header's value is the caller's, and this output
-            // ends up in logs.
-            .field("headers", &HeaderNames(&self.headers))
             .field("accepted_statuses", &self.accepted);
         #[cfg(feature = "ssrf-decompress")]
         s.field("decompression", &self.decompression);
         #[cfg(feature = "ssrf-test-support")]
         s.field("test_server", &self.test_server);
         s.finish_non_exhaustive()
-    }
-}
-
-/// A `HeaderMap`'s names, one per value, for a `Debug` that must not print
-/// the values.
-pub(super) struct HeaderNames<'a>(pub(super) &'a HeaderMap);
-
-impl fmt::Debug for HeaderNames<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_list()
-            .entries(self.0.iter().map(|(name, _)| name.as_str()))
-            .finish()
     }
 }
 
@@ -658,19 +487,13 @@ mod tests {
         assert_eq!(policy.max_redirects, 0);
         assert!(policy.accept.is_none());
         assert!(policy.user_agent.is_none());
-        assert!(policy.headers.is_empty());
         assert_eq!(policy.accepted, AcceptedStatuses::OkOnly);
         #[cfg(feature = "ssrf-decompress")]
         assert_eq!(policy.decompression, Decompression::Off);
         assert_eq!(policy.accept_encoding(), "identity");
-        assert!(!policy.has_validator());
         assert!(!policy.permits("127.0.0.1".parse().unwrap()));
         assert!(!policy.permits("169.254.169.254".parse().unwrap()));
         assert!(policy.permits("93.184.216.34".parse().unwrap()));
-    }
-
-    fn name(name: &str) -> HeaderName {
-        HeaderName::from_bytes(name.as_bytes()).expect("a valid header name")
     }
 
     fn value(value: &'static str) -> HeaderValue {
@@ -678,178 +501,13 @@ mod tests {
     }
 
     #[test]
-    fn every_reserved_name_is_refused_in_any_case() {
-        let forwarded = [
-            "x-forwarded-for",
-            "x-forwarded-host",
-            "x-forwarded-proto",
-            "x-forwarded-port",
-            "x-forwarded-prefix",
-        ];
-        // Title-Case, as a caller might write it.
-        fn title_case(name: &str) -> String {
-            name.split('-')
-                .map(|part| {
-                    let mut chars = part.chars();
-                    chars.next().map_or_else(String::new, |c| {
-                        c.to_ascii_uppercase().to_string() + chars.as_str()
-                    })
-                })
-                .collect::<Vec<_>>()
-                .join("-")
-        }
-        for reserved in RESERVED_HEADERS.iter().chain(&forwarded) {
-            for spelling in [
-                reserved.to_string(),
-                reserved.to_ascii_uppercase(),
-                title_case(reserved),
-            ] {
-                let err = FetchPolicy::new("feed", 1)
-                    .with_header(name(&spelling), value("x"))
-                    .expect_err(&spelling);
-                assert_eq!(err.name().as_str(), *reserved, "{spelling}");
-                assert_eq!(
-                    err.to_string(),
-                    format!("the {reserved} request header is managed by the fetch and cannot be set on a policy")
-                );
-            }
-        }
-    }
-
-    /// The pinned table, class by class: a name dropped from the list (or a
-    /// class forgotten) fails here, not in production.
-    #[test]
-    fn the_reserved_list_is_the_documented_one() {
-        let documented = [
-            "connection",
-            "keep-alive",
-            "proxy-connection",
-            "te",
-            "trailer",
-            "transfer-encoding",
-            "upgrade",
-            "content-length",
-            "content-encoding",
-            "expect",
-            "http2-settings",
-            "host",
-            "forwarded",
-            "via",
-            "max-forwards",
-            "x-real-ip",
-            "x-http-method-override",
-            "x-http-method",
-            "x-method-override",
-            "x-original-url",
-            "x-rewrite-url",
-            "metadata-flavor",
-            "x-google-metadata-request",
-            "metadata",
-            "x-aws-ec2-metadata-token",
-            "x-aws-ec2-metadata-token-ttl-seconds",
-            "authorization",
-            "proxy-authorization",
-            "cookie",
-            "accept",
-            "accept-encoding",
-            "user-agent",
-            "if-match",
-            "if-unmodified-since",
-            "if-range",
-            "range",
-        ];
-        let mut listed = RESERVED_HEADERS.to_vec();
-        listed.sort_unstable();
-        let mut expected = documented.to_vec();
-        expected.sort_unstable();
-        assert_eq!(listed, expected);
-    }
-
-    #[test]
-    fn unreserved_names_are_accepted() {
-        for allowed in [
-            "a-im",
-            "if-none-match",
-            "if-modified-since",
-            "x-custom",
-            "x-forwarded",
-            "x-request-id",
-            "referer",
-            "accept-language",
-        ] {
-            let policy = FetchPolicy::new("feed", 1)
-                .with_header(name(allowed), value("v"))
-                .unwrap_or_else(|e| panic!("{allowed}: {e}"));
-            assert_eq!(policy.headers.get(allowed).unwrap(), "v");
-        }
-    }
-
-    #[test]
-    fn validators_replace_and_every_other_header_appends() {
-        let policy = FetchPolicy::new("feed", 1)
-            .with_header(name("a-im"), value("feed"))
-            .and_then(|p| p.with_header(name("If-None-Match"), value("\"one\"")))
-            .and_then(|p| p.with_header(name("x-custom"), value("1")))
-            .and_then(|p| p.with_header(name("if-none-match"), value("\"two\", \"three\"")))
-            .and_then(|p| p.with_header(name("x-custom"), value("2")))
-            .and_then(|p| {
-                p.with_header(
-                    name("if-modified-since"),
-                    value("Mon, 19 Oct 2026 00:00:00 GMT"),
-                )
-            })
-            .and_then(|p| {
-                p.with_header(
-                    name("if-modified-since"),
-                    value("Tue, 20 Oct 2026 00:00:00 GMT"),
-                )
-            })
-            .expect("all allowed");
-        let all = |n: &str| -> Vec<&str> {
-            policy
-                .headers
-                .get_all(n)
-                .iter()
-                .map(|v| v.to_str().unwrap())
-                .collect()
-        };
-        assert_eq!(all("if-none-match"), ["\"two\", \"three\""]);
-        assert_eq!(all("if-modified-since"), ["Tue, 20 Oct 2026 00:00:00 GMT"]);
-        assert_eq!(all("x-custom"), ["1", "2"]);
-        assert_eq!(all("a-im"), ["feed"]);
-        assert!(policy.has_validator());
-        assert!(FetchPolicy::new("feed", 1)
-            .with_header(name("if-modified-since"), value("x"))
-            .unwrap()
-            .has_validator());
-    }
-
-    /// The values are typed: a CR or LF never reaches a policy, for either
-    /// validator or any other header.
-    #[test]
-    fn a_header_injection_fails_before_it_reaches_a_policy() {
-        for attempt in [
-            "\"etag\"\r\nAuthorization: Basic eA==",
-            "Mon, 19 Oct 2026\r\nHost: evil.test",
-            "a\nb",
-            "a\rb",
-            "a\0b",
-        ] {
-            assert!(HeaderValue::from_str(attempt).is_err(), "{attempt:?}");
-        }
-        assert!(HeaderName::from_bytes(b"x-custom\r\nhost").is_err());
-    }
-
-    #[test]
     fn the_user_agent_replaces() {
         let policy = FetchPolicy::new("feed", 1)
             .with_user_agent(value("first/1"))
-            .with_user_agent(value(
-                "feedparser/6.0.12 +https://github.com/kurtmckee/feedparser/",
-            ));
+            .with_user_agent(value("example-feeds/2.0 (+https://feeds.example.com/bot)"));
         assert_eq!(
             policy.user_agent.as_ref().unwrap(),
-            "feedparser/6.0.12 +https://github.com/kurtmckee/feedparser/"
+            "example-feeds/2.0 (+https://feeds.example.com/bot)"
         );
     }
 
@@ -889,29 +547,23 @@ mod tests {
     }
 
     /// Debug keeps v0.8.0's fields as they were (the Accept value
-    /// included), prints the fixed User-Agent, and prints an extra header's
-    /// name, never its value.
+    /// included), and prints the fixed User-Agent and the statuses.
     #[test]
-    fn the_policy_debug_prints_header_names_never_their_values() {
+    fn the_policy_debug_prints_its_options() {
         let policy = FetchPolicy::new("feed", 5)
             .with_accept(value("application/rss+xml"))
-            .with_user_agent(value("feedparser/6.0.12"))
-            .with_header(name("x-custom"), value("value-one-of-a-kind"))
-            .and_then(|p| p.with_header(name("if-none-match"), value("\"etag-one-of-a-kind\"")))
-            .unwrap()
+            .with_user_agent(value("example-feeds/2.0"))
             .with_accepted_statuses(AcceptedStatuses::AnySuccess);
         let debug = format!("{policy:?}");
         for expected in [
             "label: \"feed\"",
             "max_bytes: 5",
             "accept: Some(\"application/rss+xml\")",
-            "user_agent: Some(\"feedparser/6.0.12\")",
-            "headers: [\"x-custom\", \"if-none-match\"]",
+            "user_agent: Some(\"example-feeds/2.0\")",
             "accepted_statuses: AnySuccess",
         ] {
             assert!(debug.contains(expected), "{expected} not in {debug}");
         }
-        assert!(!debug.contains("one-of-a-kind"), "{debug}");
     }
 
     #[test]

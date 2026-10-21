@@ -1325,36 +1325,16 @@ async fn fetch_public_returns_v080s_fetched_values() {
     }
 }
 
-// --- the feed options: headers, validators, statuses, the answering hop -----
+// --- the feed options: headers, statuses, the answering hop ----------------
 
-const FEED_UA: &str = "feedparser/6.0.12 +https://github.com/kurtmckee/feedparser/";
+const FEED_UA: &str = "example-feeds/1.0 (+https://feeds.example.com/bot)";
 
-fn header(name: &str) -> http::HeaderName {
-    http::HeaderName::from_bytes(name.as_bytes()).expect("a header name")
-}
-
-/// The feed fetch's policy shape: UA, A-IM, two custom headers, any 2xx.
+/// The feed fetch's policy shape: Accept, User-Agent, any 2xx.
 fn feed_policy(ca: &TestCa, resolver: impl HostResolver + 'static) -> FetchPolicy {
     policy(ca, resolver)
         .with_accept(HeaderValue::from_static("application/rss+xml"))
         .with_user_agent(HeaderValue::from_static(FEED_UA))
-        .with_header(header("a-im"), HeaderValue::from_static("feed"))
-        .and_then(|p| p.with_header(header("x-custom"), HeaderValue::from_static("one")))
-        .and_then(|p| p.with_header(header("x-custom"), HeaderValue::from_static("two")))
-        .expect("none reserved")
         .with_accepted_statuses(AcceptedStatuses::AnySuccess)
-}
-
-fn with_validators(policy: FetchPolicy) -> FetchPolicy {
-    policy
-        .with_header(header("if-none-match"), HeaderValue::from_static("\"v1\""))
-        .and_then(|p| {
-            p.with_header(
-                header("if-modified-since"),
-                HeaderValue::from_static("Mon, 19 Oct 2026 00:00:00 GMT"),
-            )
-        })
-        .expect("validators are allowed")
 }
 
 /// A server for `images.test` and `cdn.test` whose responder learns its own
@@ -1371,7 +1351,7 @@ async fn two_name_server(
 }
 
 #[tokio::test]
-async fn the_policy_headers_go_on_every_hop_including_a_cross_host_redirect() {
+async fn the_accept_and_user_agent_go_on_every_hop_including_a_cross_host_redirect() {
     let ca = TestCa::new();
     let server = two_name_server(&ca, |seen, port| match seen.path.as_str() {
         "/start" => redirect("302 Found", "/same-host"),
@@ -1394,7 +1374,7 @@ async fn the_policy_headers_go_on_every_hop_including_a_cross_host_redirect() {
     assert_eq!(snis, ["images.test", "images.test", "cdn.test"]);
     for hop in &seen {
         // The whole header set, in order, as sent: the fetch's own, then
-        // the policy's (a repeat as a separate line), then the Host.
+        // the Host.
         let sent: Vec<(&str, &str)> = hop
             .headers
             .iter()
@@ -1407,9 +1387,6 @@ async fn the_policy_headers_go_on_every_hop_including_a_cross_host_redirect() {
                 ("accept-encoding", "identity"),
                 ("accept", "application/rss+xml"),
                 ("user-agent", FEED_UA),
-                ("a-im", "feed"),
-                ("x-custom", "one"),
-                ("x-custom", "two"),
                 ("host", host.as_str()),
             ],
             "{}",
@@ -1418,131 +1395,6 @@ async fn the_policy_headers_go_on_every_hop_including_a_cross_host_redirect() {
     }
     assert_eq!(response.redirects, 2);
     assert_eq!(response.body.as_ref(), PNG);
-}
-
-#[tokio::test]
-async fn validators_go_to_the_first_hop_only() {
-    let ca = TestCa::new();
-    let server = two_name_server(&ca, |seen, port| match seen.path.as_str() {
-        "/start" => redirect("301 Moved Permanently", "/moved"),
-        "/moved" => redirect("302 Found", &format!("https://cdn.test:{port}/end")),
-        _ => ok_png(),
-    })
-    .await;
-    let (dns, _) = loopback_dns();
-    let policy = with_validators(feed_policy(&ca, dns)).with_max_redirects(2);
-
-    fetch_public_response(&server.url("images.test", "/start"), &policy)
-        .await
-        .expect("fetched");
-
-    let seen = server.seen();
-    assert_eq!(seen.len(), 3);
-    assert_eq!(seen[0].header("if-none-match"), Some("\"v1\""));
-    assert_eq!(
-        seen[0].header("if-modified-since"),
-        Some("Mon, 19 Oct 2026 00:00:00 GMT")
-    );
-    // Neither on a same-origin path redirect nor on a cross-origin one;
-    // everything else still goes.
-    for hop in &seen[1..] {
-        assert_eq!(hop.header("if-none-match"), None, "{}", hop.path);
-        assert_eq!(hop.header("if-modified-since"), None, "{}", hop.path);
-        assert_eq!(hop.header("a-im"), Some("feed"), "{}", hop.path);
-    }
-}
-
-#[tokio::test]
-async fn a_304_answering_the_first_hops_validators_is_terminal() {
-    let ca = TestCa::new();
-    let server = TlsServer::start(&ca, &["images.test"], |_| {
-        Reply::Send(response(
-            "304 Not Modified",
-            // A Location on a 304 is ignored; nothing follows it.
-            &[("etag", "\"v1\""), ("location", "/elsewhere")],
-            b"",
-        ))
-    })
-    .await;
-    let url = server.url("IMAGES.test.", "/feed?page=1");
-    let normalized = server.url("images.test", "/feed?page=1");
-    // Whatever the statuses and redirects, and with no Content-Length.
-    for statuses in [AcceptedStatuses::OkOnly, AcceptedStatuses::AnySuccess] {
-        let (dns, _) = loopback_dns();
-        let policy = with_validators(policy(&ca, dns))
-            .with_accepted_statuses(statuses)
-            .with_max_redirects(5);
-        let response = fetch_public_response(&url, &policy)
-            .await
-            .expect("a 304 is an answer");
-        assert_eq!(response.status, http::StatusCode::NOT_MODIFIED);
-        assert!(response.body.is_empty());
-        assert_eq!(response.final_url.as_str(), normalized);
-        assert_eq!(response.redirects, 0);
-        assert_eq!(response.headers.get("etag").unwrap(), "\"v1\"");
-        assert_eq!(response.headers.get("location").unwrap(), "/elsewhere");
-    }
-    assert_eq!(
-        server.seen().len(),
-        2,
-        "one request each, never the Location"
-    );
-
-    // `fetch_public` cannot say "not modified": HttpStatus.
-    let (dns, _) = loopback_dns();
-    let err = fetch_public(&url, &with_validators(policy(&ca, dns)))
-        .await
-        .unwrap_err();
-    assert_eq!(err.to_string(), "Image fetch failed with HTTP 304.");
-
-    // Without a validator a 304 is still a 3xx, followed when allowed.
-    let (dns, _) = loopback_dns();
-    let err = fetch_public_response(&url, &policy(&ca, dns))
-        .await
-        .unwrap_err();
-    assert_eq!(err, SsrfError::RedirectsNotAllowed);
-}
-
-#[tokio::test]
-async fn a_304_without_a_validator_or_past_the_first_hop_is_a_redirect() {
-    let ca = TestCa::new();
-    let server = TlsServer::start(&ca, &["images.test"], |seen| match seen.path.as_str() {
-        "/start" => redirect("302 Found", "/next"),
-        "/next" | "/plain" => redirect("304 Not Modified", "/final"),
-        _ => ok_png(),
-    })
-    .await;
-    // Hop 1's 304 was not asked for: no validator went there.
-    let (dns, _) = loopback_dns();
-    let policy_ = with_validators(policy(&ca, dns)).with_max_redirects(2);
-    let response = fetch_public_response(&server.url("images.test", "/start"), &policy_)
-        .await
-        .expect("followed");
-    assert_eq!(response.status, http::StatusCode::OK);
-    assert_eq!(response.redirects, 2);
-    assert_eq!(response.final_url.path(), "/final");
-    let (dns, _) = loopback_dns();
-    let err = fetch_public_response(
-        &server.url("images.test", "/start"),
-        &with_validators(policy(&ca, dns)).with_max_redirects(1),
-    )
-    .await
-    .unwrap_err();
-    assert_eq!(err, SsrfError::TooManyRedirects);
-    // No validator at all: hop 0's 304 is a redirect, as in v0.8.0.
-    let (dns, _) = loopback_dns();
-    let response = fetch_public_response(
-        &server.url("images.test", "/plain"),
-        &policy(&ca, dns).with_max_redirects(1),
-    )
-    .await
-    .expect("followed");
-    assert_eq!(response.final_url.path(), "/final");
-    let paths: Vec<_> = server.seen().into_iter().map(|s| s.path).collect();
-    assert_eq!(
-        paths,
-        ["/start", "/next", "/final", "/start", "/next", "/plain", "/final"]
-    );
 }
 
 #[tokio::test]
@@ -1672,7 +1524,7 @@ async fn embedded_credentials_are_still_refused_under_the_feed_options() {
     })
     .await;
     let (dns, _) = loopback_dns();
-    let policy = with_validators(feed_policy(&ca, dns))
+    let policy = feed_policy(&ca, dns)
         .with_allowed_schemes(AllowedSchemes::HttpAndHttps)
         .with_max_redirects(3);
     for url in [
@@ -1699,7 +1551,6 @@ mod decompress {
 
     use flate2::write::{DeflateEncoder, GzEncoder, ZlibEncoder};
     use flate2::Compression;
-    use serde_json::Value;
     use stridelabs_http::ssrf::Decompression;
 
     use super::*;
@@ -1942,117 +1793,6 @@ mod decompress {
             .await
             .unwrap_err();
         assert_eq!(err.to_string(), "Could not fetch the feed URL.");
-    }
-
-    /// The bytes an inflate call writes before it reports corruption count
-    /// against the cap over the wire too: the review's gzip body (a stored
-    /// block producing "xx", then an invalid block type) is too large under
-    /// a 1-byte cap, and a failed fetch under a 2-byte one.
-    #[tokio::test]
-    async fn output_before_corruption_is_too_large_under_a_smaller_cap() {
-        let ca = TestCa::new();
-        let wire = vec![
-            0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0x00, 0x02, 0x00, 0xfd,
-            0xff, 0x78, 0x78, 0x07,
-        ];
-        let server = TlsServer::start(&ca, &["images.test"], coded("gzip", wire)).await;
-        let url = server.url("images.test", "/a");
-        let err = fetch_public_response(&url, &decoding(&ca, 1))
-            .await
-            .unwrap_err();
-        assert_eq!(err.to_string(), "The fetched feed is too large.");
-        let err = fetch_public_response(&url, &decoding(&ca, 2))
-            .await
-            .unwrap_err();
-        assert_eq!(err.to_string(), "Could not fetch the feed URL.");
-    }
-
-    // The feedparser fixture, end to end: each case's headers and bytes
-    // served over TLS and fetched through the whole decoding fetch.
-
-    fn bytes_of(segments: &Value) -> Vec<u8> {
-        let mut out = Vec::new();
-        for segment in segments.as_array().expect("a segment list") {
-            match segment {
-                Value::String(hex) => {
-                    assert!(hex.len() % 2 == 0, "{hex}");
-                    for i in (0..hex.len()).step_by(2) {
-                        out.push(u8::from_str_radix(&hex[i..i + 2], 16).unwrap());
-                    }
-                }
-                Value::Array(run) => out.extend(std::iter::repeat_n(
-                    u8::try_from(run[0].as_u64().unwrap()).unwrap(),
-                    usize::try_from(run[1].as_u64().unwrap()).unwrap(),
-                )),
-                other => panic!("not a segment: {other}"),
-            }
-        }
-        out
-    }
-
-    #[tokio::test]
-    async fn every_feedparser_case_has_its_recorded_outcome_end_to_end() {
-        let fixture: Value =
-            serde_json::from_str(include_str!("fixtures/feedparser_decode.json")).unwrap();
-        let ca = TestCa::new();
-        let mut checked = 0;
-        for case in fixture["cases"].as_array().unwrap() {
-            let name = case["name"].as_str().unwrap().to_owned();
-            let headers: Vec<(String, String)> = case["headers"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|pair| {
-                    (
-                        pair[0].as_str().unwrap().to_owned(),
-                        pair[1].as_str().unwrap().to_owned(),
-                    )
-                })
-                .collect();
-            let wire = bytes_of(&case["wire"]);
-            let payload = (!case["payload"].is_null()).then(|| bytes_of(&case["payload"]));
-            let python_accepts = case["python"]["outcome"] == "ok";
-            // What feedparser's answer means for the Rust fetch: decode to
-            // the payload, or refuse. The residues are the recorded ones.
-            let expected = match (case["residue"].as_str(), python_accepts) {
-                (None, true) => payload.clone(),
-                (None, false) => None,
-                (Some("stacked-or-unknown"), true) => None,
-                (Some("case" | "last-header"), true) => payload.clone(),
-                other => panic!("{name}: unexpected {other:?}"),
-            };
-            let body = wire.clone();
-            let server = TlsServer::start(&ca, &["images.test"], move |_| {
-                let length = body.len().to_string();
-                let mut all: Vec<(&str, &str)> = headers
-                    .iter()
-                    .map(|(n, v)| (n.as_str(), v.as_str()))
-                    .collect();
-                all.push(("content-type", "application/rss+xml"));
-                all.push(("content-length", &length));
-                Reply::Send(response("200 OK", &all, &body))
-            })
-            .await;
-            let result = fetch_public_response(
-                &server.url("images.test", "/feed"),
-                &decoding(&ca, 10 << 20),
-            )
-            .await;
-            match (&expected, result) {
-                (Some(bytes), Ok(response)) => {
-                    assert_eq!(response.body.as_ref(), bytes.as_slice(), "{name}")
-                }
-                (None, Err(err)) => {
-                    assert_eq!(err.to_string(), "Could not fetch the feed URL.", "{name}")
-                }
-                (expected, got) => panic!(
-                    "{name}: expected {:?}, got {got:?}",
-                    expected.as_ref().map(Vec::len)
-                ),
-            }
-            checked += 1;
-        }
-        assert!(checked >= 40, "{checked} cases");
     }
 }
 

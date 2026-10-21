@@ -17,7 +17,7 @@ add friction.
 | `cors` | off | `cors_layer`, via `tower-http/cors` |
 | `openapi` | off | the `openapi` module — spec canonicalization, `(method, path)` enumeration, committed-spec freshness check — via `utoipa` |
 | `proxy` | off | the `proxy` module — and `AppError::bad_gateway_upstream`, which takes a `reqwest::Error` — via `reqwest` 0.13 (with its `rustls` TLS feature)/`url`/`bytes`/`futures` (and `tokio/time`) |
-| `ssrf` | off | the `ssrf` module — `fetch_public` and `fetch_public_response`, an SSRF-hardened fetch of a URL somebody else chose (public-address policy, DNS pinning, capped body, request headers, statuses, validators) — via the same `reqwest`/`url`/`bytes`/`futures` as `proxy` (and `tokio/time`, `tokio/net`) |
+| `ssrf` | off | the `ssrf` module — `fetch_public` and `fetch_public_response`, an SSRF-hardened fetch of a URL somebody else chose (public-address policy, DNS pinning, capped body, a `User-Agent`, accepted statuses, the answering hop) — via the same `reqwest`/`url`/`bytes`/`futures` as `proxy` (and `tokio/time`, `tokio/net`) |
 | `ssrf-decompress` | off | `ssrf` plus `FetchPolicy::with_decompression`: opt-in gzip and deflate decoding of a fetched body, capped on its decoded size, via `flate2` 1.1.10+ (`rust_backend`: miniz_oxide, crc32fast, adler2, simd-adler32; pure Rust, no C toolchain). Implies `ssrf`. Off for an image fetch |
 | `ssrf-test-support` | off | `ssrf::LoopbackTestServer` and `FetchPolicy::with_loopback_test_server`: point a fetch at a local TLS test server. Implies `ssrf`. Enable from `[dev-dependencies]` and **check the shipped graph for it** (see "Testing against it" below) |
 | `tls` | off | the `tls` module — `install_default_provider`, which makes aws-lc-rs the process's rustls `CryptoProvider` — via `rustls` 0.23 (`aws_lc_rs` + `std`, no defaults) |
@@ -802,16 +802,15 @@ async fn fetch_image(url: &str) -> Result<bytes::Bytes, SsrfError> {
 
 | Item | What it does |
 |---|---|
-| `fetch_public(&str, &FetchPolicy)` → `Result<Fetched, SsrfError>` | The whole guarded fetch: body and content type (a `304` answering a validator is `HttpStatus`, since a `Fetched` cannot say "not modified") |
+| `fetch_public(&str, &FetchPolicy)` → `Result<Fetched, SsrfError>` | The whole guarded fetch: body and content type |
 | `fetch_public_response(&str, &FetchPolicy)` → `Result<FetchResponse, SsrfError>` | The same fetch, answering with the hop that answered: `body`, `content_type`, `status`, `final_url` (`url::Url`), `headers`, `redirects`. `#[non_exhaustive]`; `From<FetchResponse> for Fetched` |
-| `FetchPolicy::new(label, max_bytes)` | The strict policy: https only, no redirects, 10 s, `200` only, no extra headers, `identity` only, system DNS, public addresses only |
+| `FetchPolicy::new(label, max_bytes)` | The strict policy: https only, no redirects, 10 s, `200` only, no `Accept` or `User-Agent`, `identity` only, system DNS, public addresses only |
 | `.with_allowed_schemes(AllowedSchemes)` | `HttpsOnly` (default) or `HttpAndHttps` (feeds) |
 | `.with_scheme_error` / `.with_too_large_error` | Replace those two messages |
 | `.with_timeout(Duration)` | The wall-clock budget for everything — DNS, connects, TLS, body, decoding, every hop |
 | `.with_max_redirects(u32)` | Follow up to this many (default 0), each hop validated and pinned afresh |
 | `.with_accept(HeaderValue)` | The `Accept` header to send |
 | `.with_user_agent(HeaderValue)` | The `User-Agent` to send on every hop (default none) |
-| `.with_header(HeaderName, HeaderValue)` → `Result<_, ReservedHeader>` | One more request header; reserved names refused (below) |
 | `.with_accepted_statuses(AcceptedStatuses)` | `OkOnly` (default, `== 200`) or `AnySuccess` (any 2xx) |
 | `.with_decompression(Decompression)` | Feature `ssrf-decompress`: `Off` (default) or `GzipDeflate` |
 | `.with_resolver(impl HostResolver)` | The DNS seam: `SystemResolver` by default, or any `Fn(String, u16) -> impl Future<Output = io::Result<Vec<IpAddr>>>` |
@@ -878,32 +877,26 @@ with feature `ssrf-decompress` and `.with_decompression(Decompression::GzipDefla
   budget — and decoded, at `max_bytes`, inclusive. Either is `TooLarge`.
 - **Precedence:** first the deadline: once it has passed, the answer is
   `TimedOut`, whatever the decode came to (a body, `TooLarge`, a
-  corruption). Then `TooLarge`, the moment the decoded allowance would be
-  passed — counting every byte an inflate call wrote, including the bytes
-  written by the call that then reports corruption, and decided before any
-  of them is stored — and corruption after that point is never reported:
-  not a bad block, not a gzip trailer, not a failed zlib reading, which is
-  never retried as raw once it passed the cap.
-- **Decoded in bounded steps:** the wire body is read whole (feedparser
-  does the same), then decoded one inflate call (at most 32 KiB out), 64 KiB
-  in, or one gzip member a step, with a `yield_now` between steps — so a
-  cancelled fetch stops at once and no blocking thread is left running (the
-  reason it is not `spawn_blocking`). The fetch's deadline is checked before
-  every step and again on every answer the decode gives, an empty body's
-  included: a decode still running when the budget runs out, or answering
-  after it, is `TimedOut`. A single step is bounded work, but it is not
-  preempted; the deadline can be overrun by at most the step in progress.
-- **gzip:** framed as CPython 3.13's `gzip` module (which feedparser uses)
-  frames it, every member through the same raw inflater: the magic and
-  method 8; the flag byte's reserved bits ignored; FEXTRA skipped by its
-  length, FNAME and FCOMMENT to their NUL at any length, FHCRC's two bytes
-  read but not checked (CPython discards them); then the data, and the CRC32
-  and ISIZE trailer, both checked. A run of zeros is skipped after each
-  member, and whatever follows must be another member.
-- **deflate:** zlib-wrapped over the whole buffer, then — on any failure of
-  that reading, its output discarded — raw, each required to reach the
-  stream's end; bytes after the end are ignored (feedparser's
-  `zlib.decompress(data)`, then `zlib.decompress(data, -15)`).
+  corruption).
+- **Decoded in bounded steps:** the wire body is read whole, then decoded
+  with flate2's readers in steps of at most 16 KiB in and 32 KiB out, with a
+  `yield_now` between steps — so a cancelled fetch stops at once and no
+  blocking thread is left running (the reason it is not `spawn_blocking`).
+  A body of thousands of tiny gzip members is many short steps, never one
+  long one. The fetch's deadline is checked before every step and again on
+  every answer the decode gives, an empty body's included: a decode still
+  running when the budget runs out, or answering after it, is `TimedOut`. A
+  single step is bounded work, but it is not preempted; the deadline can be
+  overrun by at most the step in progress. A step asks for at most one byte
+  past what the decoded cap leaves, so passing the cap is `TooLarge` within
+  that step, and nothing past the cap is stored.
+- **gzip:** every member, back to back (flate2's `MultiGzDecoder`), each
+  header and CRC32/ISIZE trailer checked. Anything after a member that is
+  not another member, zero padding included, is corrupt.
+- **deflate:** zlib-wrapped (`ZlibDecoder`), or raw deflate
+  (`DeflateDecoder`) when the body does not start with a zlib header: a
+  server that labels raw deflate `deflate`, which browsers accept too. Each
+  must reach the stream's end; bytes after the end are ignored.
 - **Never a partial body:** corrupt or truncated input is `FetchFailed`. An
   empty wire body is an empty body, with no decode.
 - **The headers describe the wire:** `FetchResponse::headers` keeps the
@@ -912,36 +905,18 @@ with feature `ssrf-decompress` and `.with_decompression(Decompression::GzipDefla
   buffer grows by doubling, clamped to its cap, and output past the cap is
   refused before anything is reserved for it). At most: the wire buffer's
   cap (`max_bytes + max_bytes / 8 + 4096`), the decoded body's `max_bytes`,
-  one 32 KiB step buffer, and the inflater's state (its 32 KiB window and
-  tables) — a little over `2.125 × max_bytes` in all. While a buffer grows,
-  the reallocation can briefly hold its previous, smaller allocation too.
-  An identity body holds one buffer of at most `max_bytes`. The two body
-  buffers (wire and decoded) are reserved fallibly, and a refused
+  one 32 KiB step buffer, the inflater's state (its 32 KiB window and
+  tables), and, for gzip, the current member's header fields, which flate2
+  keeps while it decodes that member (its extra field, file name and
+  comment, each at most 64 KiB: about 192 KiB) — a little over
+  `2.125 × max_bytes` plus about a quarter of a MiB in all. While a buffer
+  grows, the reallocation can briefly hold its previous, smaller allocation
+  too. An identity body holds one buffer of at most `max_bytes`. The two
+  body buffers (wire and decoded) are reserved fallibly, and a refused
   reservation is `FetchFailed`; the fetch is not otherwise allocation-safe
-  (the step buffer, the inflater's state and the fetch's other small
-  allocations are ordinary ones, which abort on failure as anywhere in
-  Rust).
-
-**feedparser parity is a tested subset.** `tests/fixtures/feedparser_decode.json`
-records what feedparser 6.0.12's `feedparser.http.get` (Python 3.13.15) made
-of 66 bodies — gzip single, multi-member, padded, junk-trailed, truncated,
-with a bad trailer or header CRC, reserved flag bits, FEXTRA, a 200,000-byte
-FNAME or a 100,000-byte FCOMMENT, a bad method, output written before an
-invalid block; `x-gzip`, `GZIP`; zlib, raw, trailing junk, truncated, a zlib
-reading that fails after thousands of bytes, output before an invalid
-block; empty bodies; stacked, unknown and repeated codings —
-served from an in-process `http.server` by
-`tests/fixtures/gen_feedparser_decode.py` (run by hand with slaudio's
-virtualenv, not in CI). The decoder unit test and an end-to-end test over
-TLS assert equal bytes wherever both decode and the same accept-or-refuse
-everywhere else, except these recorded residues, each asserted to diverge
-exactly so:
-
-| Residue | feedparser | Here |
-|---|---|---|
-| `GZIP`, `DEFLATE` | case-sensitive `'gzip' in`: passed through coded | decoded |
-| `gzip` then `identity` in two headers | the last header only: passed through coded | decoded |
-| Stacked (`gzip, gzip`) or unknown (`br`, `zstd`) codings | passed through (its XML parse then fails) | refused |
+  (the step buffer, the inflater's state, the gzip header fields and the
+  fetch's other small allocations are ordinary ones, which abort on failure
+  as anywhere in Rust).
 
 ### The address policy
 
@@ -997,11 +972,11 @@ Here that is structural:
 - All answers must be public; IPv4 is preferred for the pin. IP-literal hosts
   skip DNS and are judged directly. The port is the URL's.
 
-### Feed options: headers, validators, statuses, the answering hop
+### Feed options: the user agent, statuses, the answering hop
 
 ```rust
 use std::time::Duration;
-use http::{HeaderName, HeaderValue};
+use http::HeaderValue;
 use stridelabs_http::ssrf::{
     fetch_public_response, AcceptedStatuses, AllowedSchemes, Decompression, FetchPolicy,
 };
@@ -1013,7 +988,6 @@ async fn fetch_feed(url: &str) -> Result<(), Box<dyn std::error::Error>> {
         .with_max_redirects(10)
         .with_accepted_statuses(AcceptedStatuses::AnySuccess)
         .with_user_agent(HeaderValue::from_static("example-feeds/1.0"))
-        .with_header(HeaderName::from_static("a-im"), HeaderValue::from_static("feed"))?
         .with_decompression(Decompression::GzipDeflate); // feature `ssrf-decompress`
     let response = fetch_public_response(url, &policy).await?;
     // response.status, .final_url, .headers, .redirects, .body
@@ -1021,37 +995,9 @@ async fn fetch_feed(url: &str) -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-- **Policy headers are trusted configuration, never secrets.** The
-  `User-Agent` and every `with_header` header (but the validators) go on
-  every hop, cross-host redirects included, to hosts a redirect chooses. An
-  `X-Api-Key` or a `Referer` naming something private would leak.
-- **Typed values**: a CR or LF cannot be injected (`HeaderValue` refuses to
-  build it). `If-None-Match` and `If-Modified-Since` replace; every other
-  name appends, and repeats go out as separate lines.
-- **Reserved names** are refused with `ReservedHeader` (its `name()`; the
-  message is "the {name} request header is managed by the fetch and cannot
-  be set on a policy"), case-insensitively. The list is part of the
-  contract; adding a name is a documented behaviour change:
-
-  | Class | Names |
-  |---|---|
-  | Hop-by-hop and framing | `connection`, `keep-alive`, `proxy-connection`, `te`, `trailer`, `transfer-encoding`, `upgrade`, `content-length`, `content-encoding` (request), `expect`, `http2-settings` |
-  | Routing | `host`, `forwarded`, `via`, `max-forwards`, `x-real-ip`, every `x-forwarded-*` |
-  | Method and route overrides | `x-http-method-override`, `x-http-method`, `x-method-override`, `x-original-url`, `x-rewrite-url` |
-  | Cloud metadata | `metadata-flavor`, `x-google-metadata-request`, `metadata`, `x-aws-ec2-metadata-token`, `x-aws-ec2-metadata-token-ttl-seconds` |
-  | Credentials | `authorization`, `proxy-authorization`, `cookie` |
-  | Owned by the fetch | `accept` (`with_accept`), `accept-encoding` (the decompression option), `user-agent` (`with_user_agent`) |
-  | Not yet designed | `if-match`, `if-unmodified-since`, `if-range`, `range` |
-
-- **Validators go to the first hop only.** `If-None-Match` and
-  `If-Modified-Since` describe the URL the caller cached, so they are sent
-  to the URL the fetch was given and dropped on any redirect (RFC 9110
-  §15.4). A `304` there is the answer — `status: 304`, an empty body,
-  `redirects: 0`, the original `final_url` — never a redirect, whatever the
-  statuses policy says (a `Location` is ignored). A `304` on a later hop was
-  not asked for and is a 3xx like any other; without a validator nothing
-  changes. Store a validator with the `final_url` of the response that
-  carried it, and send it only there.
+- **The `User-Agent` is trusted configuration, never a secret.** It goes
+  on every hop, cross-host redirects included, to hosts a redirect chooses,
+  as `Accept` does. There is no other way to add a request header.
 - **Statuses:** `OkOnly` is `== 200`; `AnySuccess` is any 2xx, and a `204`
   or `206` returns its body, possibly empty. Everything else is
   `HttpStatus`.
@@ -1063,8 +1009,7 @@ async fn fetch_feed(url: &str) -> Result<(), Box<dyn std::error::Error>> {
   are not client-safe**: they can name the redirect target and carry
   `Set-Cookie`. `FetchResponse`'s `Debug` prints the body length, the
   status, the URL with its query and fragment redacted, the header names and
-  the redirect count; `Fetched`'s prints the body length alone; the
-  policy's prints an extra header's name, never its value.
+  the redirect count; `Fetched`'s prints the body length alone.
 - **Basic auth stays out:** `user:pass@` is `EmbeddedCredentials` on the
   first URL and on every `Location`, under every option.
 - **A default policy is v0.8.0's, byte for byte**: `tests/ssrf_pinning.rs`
@@ -1123,11 +1068,10 @@ re-pinned it to a second server on `[::1]` — the body cap over the wire, the
 across a chain of individually short hops, and — in a child process born with
 `HTTPS_PROXY` set, with a positive control — that an environment proxy is
 never used. It also proves the feed options on the wire: the default
-request's snapshot, policy headers on every hop of a cross-host chain,
-validators on the first hop only, the `304` rules, the status policies, the
-answering hop's URL, headers and redirect count, ten redirects followed and
-the eleventh refused, and (with `ssrf-decompress`) every coding, both caps,
-and every feedparser fixture case end to end.
+request's snapshot, the `Accept` and `User-Agent` on every hop of a
+cross-host chain, the status policies, the answering hop's URL, headers and
+redirect count, ten redirects followed and the eleventh refused, and (with
+`ssrf-decompress`) every coding, both caps, and a corrupt body refused.
 
 ### Differences from Python
 

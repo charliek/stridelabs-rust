@@ -30,7 +30,7 @@
 //!
 //! ```no_run
 //! use std::time::Duration;
-//! use http::{HeaderName, HeaderValue};
+//! use http::HeaderValue;
 //! use stridelabs_http::ssrf::{
 //!     fetch_public_response, AcceptedStatuses, AllowedSchemes, FetchPolicy,
 //! };
@@ -41,8 +41,7 @@
 //!     .with_timeout(Duration::from_secs(30))
 //!     .with_max_redirects(10)
 //!     .with_accepted_statuses(AcceptedStatuses::AnySuccess)
-//!     .with_user_agent(HeaderValue::from_static("example-feeds/1.0"))
-//!     .with_header(HeaderName::from_static("a-im"), HeaderValue::from_static("feed"))?;
+//!     .with_user_agent(HeaderValue::from_static("example-feeds/1.0"));
 //! let response = fetch_public_response(url, &policy).await?;
 //! // Resolve the feed's relative links against `final_url`.
 //! let base = &response.final_url;
@@ -137,53 +136,41 @@
 //!   and anything else are refused.
 //! - Two caps: the wire bytes, declared and streamed, at `max_bytes +
 //!   max_bytes / 8 + 4096` (saturating), and the decoded bytes at
-//!   `max_bytes`, inclusive. A body over either is [`SsrfError::TooLarge`],
-//!   and the decoded cap wins the moment it is passed — counting the bytes
-//!   an inflate call wrote before it reported corruption, decided before
-//!   they are stored — before any later corruption is looked at. Only the
-//!   deadline comes first: past it, every answer is [`SsrfError::TimedOut`].
+//!   `max_bytes`, inclusive. A body over either is [`SsrfError::TooLarge`].
+//!   The deadline comes first: past it, every answer is
+//!   [`SsrfError::TimedOut`].
 //! - Buffer capacities are capped, not only lengths: at most the wire cap,
-//!   `max_bytes` decoded, one 32 KiB step and the inflater's state (a
-//!   reallocation can briefly hold its previous, smaller buffer too). The
+//!   `max_bytes` decoded, one 32 KiB step, the inflater's state and, for
+//!   gzip, the current member's header fields flate2 keeps (extra, file name
+//!   and comment, at most 64 KiB each); a reallocation can briefly hold its
+//!   previous, smaller buffer too. The
 //!   two body buffers are reserved fallibly: a refused reservation is
 //!   [`SsrfError::FetchFailed`].
-//! - The wire body is read whole, then decoded in **bounded steps** (one
-//!   inflate call of at most 32 KiB out, 64 KiB in, or one gzip member,
-//!   each), yielding to the runtime between steps, so a cancelled fetch
-//!   stops at once. The fetch's deadline is checked before each step and
-//!   on every answer: a decode running past it, or answering after it (a
-//!   body, an empty one, `TooLarge` or a corruption alike), is
-//!   [`SsrfError::TimedOut`] (a step is bounded, not preempted).
-//! - gzip decodes every member, framed as CPython's `gzip` module frames it
-//!   (reserved flag bits and the header CRC unchecked, header strings of any
-//!   length), skipping zero padding between and after them; deflate is
-//!   zlib-wrapped, or raw when the zlib reading fails (as feedparser reads
-//!   it). A corrupt or truncated body is [`SsrfError::FetchFailed`], never a
-//!   partial one.
+//! - The wire body is read whole, then decoded with flate2 in **bounded
+//!   steps** (at most 16 KiB in and 32 KiB out each), yielding to the
+//!   runtime between steps, so a cancelled fetch stops at once. The fetch's
+//!   deadline is checked before each step and on every answer: a decode
+//!   running past it, or answering after it (a body, an empty one,
+//!   `TooLarge` or a corruption alike), is [`SsrfError::TimedOut`] (a step
+//!   is bounded, not preempted). A body of thousands of tiny gzip members is
+//!   as bounded as any other.
+//! - gzip decodes every member, back to back (anything else after a member,
+//!   zero padding included, is corrupt); deflate is zlib-wrapped, or raw
+//!   deflate when the body does not start with a zlib header (a server that
+//!   labels raw deflate `deflate`, which browsers accept too). An empty body
+//!   is an empty body. A corrupt or truncated one is
+//!   [`SsrfError::FetchFailed`], never a partial one.
 //! - [`FetchResponse::headers`] keeps the wire `Content-Encoding` and
 //!   `Content-Length`.
 //!
-//! # Request headers: trusted configuration, never secrets
+//! # Request headers
 //!
-//! [`FetchPolicy::with_user_agent`] and [`FetchPolicy::with_header`] add
-//! request headers, which go on **every** hop, cross-host redirects
-//! included. A redirect chooses those hosts, so a policy header must never
-//! carry a secret. The reserved names ([`FetchPolicy::with_header`] lists
-//! them) keep the fetch's framing, routing, credentials and its own headers
-//! out of a policy's reach; the list protects the fetch, it does not
-//! sanitize an arbitrary header. There is still no way to send credentials:
-//! a URL's `user:pass@` is refused, on the first URL and on a `Location`.
-//!
-//! # Conditional requests
-//!
-//! `If-None-Match` and `If-Modified-Since` set through
-//! [`FetchPolicy::with_header`] go to the first hop only, the URL the fetch
-//! was given, and are dropped on any redirect. A `304` there is the fetch's
-//! answer: [`FetchResponse`] with that status, an empty body, `redirects: 0`
-//! and the original URL, never a redirect (a `Location` is ignored).
-//! [`fetch_public`] reports it as [`SsrfError::HttpStatus`]. Without a
-//! validator, a `304` is a 3xx like any other. Store a validator with the
-//! `final_url` of the response that carried it, and send it only there.
+//! The fetch sends `Accept-Encoding`, and the policy's `Accept`
+//! ([`FetchPolicy::with_accept`]) and `User-Agent`
+//! ([`FetchPolicy::with_user_agent`]), on **every** hop, cross-host
+//! redirects included: trusted configuration, never a secret. There is no
+//! other way to add a header, and no way to send credentials: a URL's
+//! `user:pass@` is refused, on the first URL and on a `Location`.
 //!
 //! # Errors
 //!
@@ -246,8 +233,8 @@ pub use fetch::{fetch_public, fetch_public_response, FetchResponse, Fetched};
 #[cfg(feature = "ssrf-decompress")]
 pub use policy::Decompression;
 pub use policy::{
-    AcceptedStatuses, AllowedSchemes, FetchPolicy, HostResolver, ReservedHeader, ResolveFuture,
-    SystemResolver, DEFAULT_TIMEOUT,
+    AcceptedStatuses, AllowedSchemes, FetchPolicy, HostResolver, ResolveFuture, SystemResolver,
+    DEFAULT_TIMEOUT,
 };
 #[cfg(feature = "ssrf-test-support")]
 pub use policy::{LoopbackTestServer, LoopbackTestServerError};
