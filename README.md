@@ -140,7 +140,7 @@ dependency, so after adding the block:
    the crate graph" when it did not.
 
 `scripts/downstream-check.sh` is the automated form: it does both against this
-checkout for tapper, slauth, limen, imgmcp, spendwise-rs or slaudio, then proves
+checkout for tapper, slauth, limen, imgmcp, spendwise-rs, slaudio or lumen, then proves
 with `cargo metadata` that every `stridelabs-*` package is this checkout's own
 crate. It finds each consumer's checkout next to this one or under
 `~/projects` (`DOWNSTREAM_PROJECTS` and `DOWNSTREAM_<NAME>_REPO` override), and
@@ -149,7 +149,9 @@ keeps its archives and target dirs under
 overrides); the script's header lists each consumer's services and variables.
 slaudio's Rust port lives on its `rust-port` branch, so pass
 `DOWNSTREAM_SLAUDIO_REF=origin/rust-port` (an `all <ref>` run otherwise reports
-slaudio NOT RUN).
+slaudio NOT RUN). lumen (informational) is not given a ref automatically: pass `origin/main`
+or set `DOWNSTREAM_LUMEN_REF`. Its tests read `LUMEN_RS_TEST_DATABASE_URL`, `LUMEN_RS_TEST_REDIS_URL` and `LUMEN_RS_TEST_GCS_URL` (default `http://localhost:54443`, lumen's own
+fake-gcs; never tapper's 4443).
 
 ### Feature topology (all eight crates)
 

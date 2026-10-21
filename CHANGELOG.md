@@ -13,6 +13,13 @@ for a consumer's pin.
 
 ### Added
 
+- `scripts/downstream-check.sh`: an informational `lumen` consumer (the
+  `lumen-rs` workspace on lumen's `main`; pass `origin/main` or set
+  `DOWNSTREAM_LUMEN_REF`). It never decides the exit. Its preflight needs
+  Postgres, Redis (DB other than 0) and fake-gcs-server; the test URLs are
+  `LUMEN_RS_TEST_DATABASE_URL` / `_REDIS_URL` / `_GCS_URL`, passed explicitly
+  (defaults: lumen's compose) with the service's own settings unset.
+
 - `stridelabs-redis`: `RedisHandle::eval::<T>(script, keys, args, replay)`
   and `RedisHandle::ping()` (lumen plan 001 S1, for a voice relay's Lua
   lease and budget scripts and a readiness probe).
