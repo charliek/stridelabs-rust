@@ -24,7 +24,7 @@
 //!
 //! | Feature | Default | Adds |
 //! |---|---|---|
-//! | `postgres` | off | `postgres::require_postgres`, via `sqlx`/`url` |
+//! | `postgres` | off | `postgres::require_postgres` and `postgres::require_postgres_at`, via `sqlx`/`url` |
 //! | `redis` | off | `redis::require_redis` and its `RedisServer`, via `redis`/`url` |
 //!
 //! `postgres` is gated because `sqlx`'s Postgres driver drags in a real
@@ -63,7 +63,7 @@ mod redact;
 #[cfg(feature = "redis")]
 pub use crate::redis::{require_redis, RedisServer};
 #[cfg(feature = "postgres")]
-pub use postgres::require_postgres;
+pub use postgres::{require_postgres, require_postgres_at};
 
 pub use oneshot::{body_json, get, post_json, req};
 pub use wiremock::serve_json;

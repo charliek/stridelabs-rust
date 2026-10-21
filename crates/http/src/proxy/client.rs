@@ -63,6 +63,14 @@ impl UpstreamClient {
     /// asked for, resolved against the proxy's network position rather than
     /// the client's.
     ///
+    /// The client **never decodes a body** either: reqwest's gzip, brotli,
+    /// zstd and deflate decoding are each switched off, so a coded response
+    /// is relayed byte for byte under its own `Content-Encoding`, and no
+    /// request asks for a coding the client did not. They are off by
+    /// default only while no crate in the build turns on reqwest's feature
+    /// of the same name, and a feature turned on anywhere in a consumer's
+    /// graph is on for every client in it.
+    ///
     /// `tcp_nodelay` is on: proxied traffic is overwhelmingly small
     /// request/response pairs, where Nagle's algorithm only adds latency.
     pub fn build(
@@ -72,6 +80,11 @@ impl UpstreamClient {
         let mut builder = Client::builder()
             // A proxy relays redirects to the client; it must not follow them.
             .redirect(reqwest::redirect::Policy::none())
+            // Nor decode what it relays, whatever features the graph unifies.
+            .no_gzip()
+            .no_brotli()
+            .no_zstd()
+            .no_deflate()
             .tcp_nodelay(true);
 
         if !verify_certificates {
@@ -162,6 +175,98 @@ mod tests {
             server.received_requests().await.unwrap().len(),
             1,
             "the proxy must not have fetched the redirect target itself"
+        );
+    }
+
+    /// What [`GZIPPED`] decodes to.
+    const PLAIN: &[u8] = b"relayed as sent, never decoded\n";
+
+    /// [`PLAIN`], gzip-coded.
+    const GZIPPED: &[u8] =
+        b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\x03\x2b\x4a\xcd\x49\xac\x4c\x4d\x51\x48\x2c\
+          \x56\x28\x4e\xcd\x2b\xd1\x51\xc8\x4b\x2d\x4b\x2d\x52\x48\x49\x4d\xce\x4f\x49\x4d\
+          \xe1\x02\x00\xd6\x98\xa9\x31\x1f\x00\x00\x00";
+
+    /// An upstream serving [`GZIPPED`] at `/gzip`, labelled as gzip.
+    async fn gzip_upstream() -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/gzip"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-encoding", "gzip")
+                    .set_body_raw(GZIPPED.to_vec(), "text/plain"),
+            )
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// What makes the relay test below mean something: this crate's test
+    /// build turns on reqwest's gzip decoder (a dev-dependency), as any
+    /// crate in a consumer's graph can, so a plain client asks for gzip and
+    /// decodes the fixture to [`PLAIN`], dropping its `Content-Encoding`.
+    /// If the dev-dependency goes, this fails first.
+    #[tokio::test]
+    async fn a_plain_client_in_this_build_decodes_gzip() {
+        let server = gzip_upstream().await;
+        let res = reqwest::Client::new()
+            .get(format!("{}/gzip", server.uri()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            res.headers().get("content-encoding"),
+            None,
+            "a decoding client drops the coding"
+        );
+        assert_eq!(
+            res.bytes().await.unwrap().as_ref(),
+            PLAIN,
+            "decoded (reqwest's `gzip` decoder is not in this test build)"
+        );
+        let requests = server.received_requests().await.unwrap();
+        let accepted = requests[0]
+            .headers
+            .get("accept-encoding")
+            .and_then(|value| value.to_str().ok());
+        assert!(
+            accepted.is_some_and(|value| value.contains("gzip")),
+            "a decoding client asks for gzip: {accepted:?}"
+        );
+    }
+
+    /// A proxy relays bytes. In the same build, where a plain client decodes
+    /// (above), a gzip-coded upstream body comes back through
+    /// `UpstreamClient` exactly as sent, under its `Content-Encoding`, and the
+    /// request asks for no coding: what `build`'s `no_*` calls hold. (gzip
+    /// stands for all four: reqwest switches each decoder the same way.)
+    #[tokio::test]
+    async fn a_coded_upstream_body_is_relayed_byte_for_byte() {
+        let server = gzip_upstream().await;
+        let res = UpstreamClient::build(true, None)
+            .unwrap()
+            .inner()
+            .get(format!("{}/gzip", server.uri()))
+            .send()
+            .await
+            .unwrap();
+        let encoding = res.headers().get("content-encoding").cloned();
+        assert_eq!(
+            res.bytes().await.unwrap().as_ref(),
+            GZIPPED,
+            "relayed byte for byte"
+        );
+        assert_eq!(
+            encoding.as_ref().map(|value| value.as_bytes()),
+            Some(&b"gzip"[..]),
+            "the coding is the client's to undo"
+        );
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests[0].headers.get("accept-encoding"),
+            None,
+            "the proxy asked for a coding"
         );
     }
 }

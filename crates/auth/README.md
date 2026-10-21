@@ -345,6 +345,13 @@ monotonic clock.
   service depends on. Inside the floor the answer is `AuthError::UnknownKid`
   from memory. Only a set inside its TTL gives that verdict: without one the
   error is `Jwks`, not a 401 blaming the caller's token for an outage.
+- **The body is capped.** A fetch reads at most `jwks::MAX_JWKS_BYTES`
+  (1 MiB; an issuer's set is a few keys of under 2 KiB each), chunk by
+  chunk and inside `FETCH_TIMEOUT`. A larger body, a valid key set
+  included, is a failed fetch (`AuthError::Jwks`), handled as any other is,
+  and never buffered whole: the read stops at the chunk that would pass the
+  cap. When your client decodes (a reqwest decoder feature in your graph),
+  the cap counts decoded bytes, not bytes on the wire.
 
 The **refetch floor** `F` is `min(MIN_REFETCH_INTERVAL, max(ttl, 1 s))`. A
 TTL below the interval lowers it, so a TTL of 1 s or more is refetched at

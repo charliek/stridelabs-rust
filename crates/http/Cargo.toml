@@ -177,6 +177,21 @@ tokio = { workspace = true, features = [
 # dev-dependencies cannot be feature-gated. It costs consumers nothing — dev
 # deps never enter a downstream graph.
 wiremock = { workspace = true }
+# reqwest's gzip decoder, in test builds only. The `proxy` tests prove that
+# `UpstreamClient` relays a coded body byte for byte, which proves nothing
+# unless there is a decoder to switch off: a consumer's graph gets one the
+# same way, from any crate that turns it on, and feature unification turns
+# it on for every client in it. gzip alone (pure Rust, through flate2) runs
+# the same suppression path as brotli, zstd and deflate, without their
+# crates. A test asserts that a plain client really decodes, so dropping
+# this line fails loudly instead of leaving that test vacuous. Dev-only, so
+# `cargo build` and every consumer's graph keep reqwest without it (`cargo
+# tree -e normal` is unchanged). `cargo test --workspace` does unify it into
+# every member's test build: the `ssrf` client's `no_*` calls are tested
+# under it too, and stridelabs-gcp's v0.8.0 wire pins inject a client with
+# the decoders switched off, since `Accept-Encoding` is the injected
+# client's.
+reqwest = { workspace = true, features = ["gzip"] }
 # The `proxy::upstream` leak tests install a capturing subscriber and assert on
 # the bytes it wrote — that no upstream URL or query string is among them.
 # Nothing short of a real subscriber can prove that: `tracing` on its own

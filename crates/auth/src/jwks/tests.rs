@@ -24,7 +24,7 @@ use super::*;
 use crate::mock_issuer::{
     issuer, issuer_then, jwks_body, jwks_url_of, primary_body, primary_issuer,
 };
-use crate::test_support::{TestKey, PRIMARY_KID, SECONDARY_KID};
+use crate::test_support::{test_jwks_json, TestKey, PRIMARY_KID, SECONDARY_KID};
 
 const fn secs(n: u64) -> Duration {
     Duration::from_secs(n)
@@ -1819,6 +1819,147 @@ async fn an_unreachable_endpoint_is_a_jwks_error() {
         "fetch failed",
         "port 1",
     );
+}
+
+// --- the body cap -------------------------------------------------------------
+
+const OVER_THE_CAP: &str = "response body is over 1048576 bytes";
+
+/// The primary test key's JWKS, padded with trailing whitespace (still one
+/// valid JSON document) to exactly `len` bytes.
+fn jwks_padded_to(len: usize) -> Vec<u8> {
+    let mut body = test_jwks_json().as_bytes().to_vec();
+    assert!(body.len() <= len, "the test JWKS fits in {len} bytes");
+    body.resize(len, b' ');
+    body
+}
+
+/// An issuer that answers every `GET` with a chunked `200` (no
+/// `Content-Length`, so no up-front size to refuse), writing one HTTP chunk
+/// per piece, `gap` apart. When the pieces run out it ends the body; an
+/// endless iterator keeps writing until the client hangs up.
+async fn drip_issuer(
+    pieces: impl Iterator<Item = Vec<u8>> + Send + 'static,
+    gap: Duration,
+) -> String {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind a drip issuer");
+    let url = format!(
+        "http://{}/jwks",
+        listener.local_addr().expect("listener address")
+    );
+    tokio::spawn(async move {
+        let Ok((mut stream, _)) = listener.accept().await else {
+            return;
+        };
+        let mut request = Vec::new();
+        let mut buf = [0u8; 1024];
+        while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+            match stream.read(&mut buf).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => request.extend_from_slice(&buf[..n]),
+            }
+        }
+        let head = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                    transfer-encoding: chunked\r\n\r\n";
+        if stream.write_all(head.as_bytes()).await.is_err() {
+            return;
+        }
+        for piece in pieces {
+            let mut chunk = format!("{:x}\r\n", piece.len()).into_bytes();
+            chunk.extend_from_slice(&piece);
+            chunk.extend_from_slice(b"\r\n");
+            // The client hanging up is the end of an endless body.
+            if stream.write_all(&chunk).await.is_err() {
+                return;
+            }
+            tokio::time::sleep(gap).await;
+        }
+        let _ = stream.write_all(b"0\r\n\r\n").await;
+    });
+    url
+}
+
+/// The cap is on the whole body: exactly `MAX_JWKS_BYTES` is a set, one
+/// byte more is a failed fetch, as any other failed refresh is.
+#[tokio::test]
+async fn a_body_of_exactly_the_cap_is_read_and_one_byte_more_is_refused() {
+    let at_cap = issuer(
+        ResponseTemplate::new(200).set_body_raw(jwks_padded_to(MAX_JWKS_BYTES), "application/json"),
+        1,
+    )
+    .await;
+    let set = cache(&at_cap, Tuning::default())
+        .jwks_for_kid(PRIMARY_KID)
+        .await
+        .expect("a body of exactly the cap is a set");
+    assert!(set.find(PRIMARY_KID).is_some());
+
+    let over = issuer(
+        ResponseTemplate::new(200)
+            .set_body_raw(jwks_padded_to(MAX_JWKS_BYTES + 1), "application/json"),
+        1,
+    )
+    .await;
+    let cache = cache(&over, Tuning::default());
+    assert_jwks(
+        cache.jwks_for_kid(PRIMARY_KID).await,
+        OVER_THE_CAP,
+        "one byte over the cap",
+    );
+    cache.assert_one_failed_attempt("one byte over the cap");
+}
+
+/// A body that arrives slowly, in many chunks, is read whole as long as it
+/// stays under the cap and inside the fetch timeout: the cap counts every
+/// chunk, and only the timeout bounds the time.
+#[tokio::test]
+async fn a_slow_drip_under_the_cap_is_read_whole_inside_the_fetch_timeout() {
+    // 16 chunks of 64 KiB, 20 ms apart: about 0.3 s, against a 10 s timeout.
+    let body = jwks_padded_to(MAX_JWKS_BYTES);
+    let pieces: Vec<Vec<u8>> = body.chunks(64 * 1024).map(<[u8]>::to_vec).collect();
+    assert_eq!(pieces.len(), 16);
+    let url = drip_issuer(pieces.into_iter(), millis(20)).await;
+
+    let set = cache_at(url, Tuning::default())
+        .jwks_for_kid(PRIMARY_KID)
+        .await
+        .expect("a dripped body under the cap is a set");
+    assert!(set.find(PRIMARY_KID).is_some());
+}
+
+/// A body that never ends is refused once it passes the cap, not read until
+/// the fetch timeout: the read stops at the chunk that would cross it, so
+/// the attempt ends with the cap's error, long before the timeout's.
+#[tokio::test]
+async fn an_endless_drip_is_refused_at_the_cap_not_at_the_timeout() {
+    // 64 KiB every 10 ms: the cap is passed after about 0.17 s.
+    let opening = std::iter::once(b"{\"keys\": [".to_vec());
+    let spaces = std::iter::repeat_with(|| vec![b' '; 64 * 1024]);
+    let url = drip_issuer(opening.chain(spaces), millis(10)).await;
+    let fetch_timeout = secs(5);
+    let cache = cache_at(
+        url,
+        Tuning {
+            fetch_timeout,
+            first_join_wait: fetch_timeout + secs(1),
+            ..Tuning::default()
+        },
+    );
+
+    let started = Instant::now();
+    let result = cache.jwks_for_kid(PRIMARY_KID).await;
+    let took = started.elapsed();
+
+    assert_jwks(result, OVER_THE_CAP, "an endless body");
+    assert!(
+        took < fetch_timeout,
+        "refused at the cap in {took:?}, before the {fetch_timeout:?} timeout"
+    );
+    cache.assert_one_failed_attempt("an endless body");
 }
 
 // --- the URL canary ----------------------------------------------------------

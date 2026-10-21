@@ -90,6 +90,9 @@ impl fmt::Debug for RedisServer {
 /// seconds each, this panics with a message naming:
 ///
 /// - the URL it tried, with the password replaced by `***`,
+/// - what failed, by redis-rs's error kind and, for an I/O failure, its
+///   class (`Io (connection refused)`), never redis-rs's message, which can
+///   quote the credentials the handshake sent,
 /// - the `REDIS_URL` env var, so a misconfigured environment is obvious,
 /// - the command to start the local server (`docker compose up -d redis`, or
 ///   `make up` in a repo with that Makefile target).
@@ -149,7 +152,8 @@ fn connection_failure_message(url: &str, err: &::redis::RedisError) -> String {
         "\n\
         could not connect to Redis at {redacted}\n\
         \n\
-        error: {err}\n\
+        error: {summary} (redis-rs's message is withheld: it can quote the \
+        credentials the handshake sent)\n\
         \n\
         stridelabs-testing::require_redis never skips a test for a missing \
         Redis — fix the connection instead of ignoring this panic:\n\
@@ -157,8 +161,27 @@ fn connection_failure_message(url: &str, err: &::redis::RedisError) -> String {
         - start the local Redis: `docker compose up -d redis` (or `make up`)\n\
         - or point {var} at a Redis server that is actually reachable\n",
         redacted = redact_password(url, &REDIS_URL_SHAPE),
+        summary = failure_summary(err),
         var = REDIS_URL_VAR,
     )
+}
+
+/// What failed, from the error's kind alone and never its text: a Redis
+/// older than 6 answers `HELLO 3 AUTH <user> <password>` with an error that
+/// quotes those arguments, and redis-rs passes that text on. The server is
+/// the redacted URL the message already names. `ErrorKind`'s `Debug` is a
+/// variant name.
+fn failure_summary(err: &::redis::RedisError) -> String {
+    let class = if err.is_timeout() {
+        "timed out"
+    } else if err.is_connection_refusal() {
+        "connection refused"
+    } else if err.is_connection_dropped() {
+        "the connection was closed or reset"
+    } else {
+        return format!("{:?}", err.kind());
+    };
+    format!("{:?} ({class})", err.kind())
 }
 
 #[cfg(test)]
@@ -247,6 +270,10 @@ mod tests {
 
         assert!(!message.contains("hunter2"), "{message}");
         assert!(message.contains("redis://:***@127.0.0.1:1/0"), "{message}");
+        assert!(
+            message.contains("error: Io (connection refused)"),
+            "{message}"
+        );
         assert!(message.contains("REDIS_URL"), "{message}");
         assert!(message.contains("docker compose up -d redis"), "{message}");
         assert!(message.contains("make up"), "{message}");
@@ -269,6 +296,94 @@ mod tests {
             .cloned()
             .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
             .unwrap_or_else(|| "<non-string panic payload>".to_string())
+    }
+
+    /// What a Redis older than 6 answers a `HELLO` with: an error that
+    /// quotes the command's arguments, credentials included. redis-rs
+    /// recognises only the newer, backquoted form of it, and passes this one
+    /// on as the server's error, text and all.
+    const PRE_HELLO_REPLY: &[u8] = b"-ERR unknown command 'HELLO', with args beginning with: \
+                                     '3' 'AUTH' 'default' 'hunter2' \r\n";
+
+    /// A server on loopback that answers the first thing it is sent (the
+    /// handshake pipeline: `HELLO` and two ignored `CLIENT SETINFO`s) with
+    /// [`PRE_HELLO_REPLY`] and two `+OK`s, then holds the connection until
+    /// the client drops it. Its `host:port`.
+    fn pre_hello_redis() -> String {
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a fake Redis");
+        let address = listener.local_addr().expect("fake Redis address");
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut buf = [0u8; 4096];
+            if !matches!(stream.read(&mut buf), Ok(n) if n > 0) {
+                return;
+            }
+            let mut reply = PRE_HELLO_REPLY.to_vec();
+            reply.extend_from_slice(b"+OK\r\n+OK\r\n");
+            if stream.write_all(&reply).is_err() {
+                return;
+            }
+            while matches!(stream.read(&mut buf), Ok(n) if n > 0) {}
+        });
+        address.to_string()
+    }
+
+    /// The kind, and an I/O failure's class, whatever text the error holds.
+    #[test]
+    fn the_summary_is_the_kind_and_the_io_class_never_the_text() {
+        use std::io;
+
+        let io_error =
+            |kind: io::ErrorKind| ::redis::RedisError::from(io::Error::new(kind, "hunter2"));
+        let server_error = ::redis::parse_redis_value(PRE_HELLO_REPLY)
+            .expect("well-formed RESP")
+            .extract_error()
+            .expect_err("an error reply");
+        let cases = [
+            (
+                io_error(io::ErrorKind::ConnectionRefused),
+                "Io (connection refused)",
+            ),
+            (io_error(io::ErrorKind::TimedOut), "Io (timed out)"),
+            (
+                io_error(io::ErrorKind::ConnectionReset),
+                "Io (the connection was closed or reset)",
+            ),
+            (io_error(io::ErrorKind::Other), "Io"),
+            (server_error, "Server(ResponseError)"),
+        ];
+        for (error, expected) in cases {
+            assert!(error.to_string().contains("hunter2"), "the raw text has it");
+            assert_eq!(failure_summary(&error), expected);
+        }
+    }
+
+    /// The panic names what failed by its kind, never by redis-rs's text:
+    /// a refused RESP3 handshake whose error reply quotes the password must
+    /// not put it in the panic, and the URL it tried stays redacted.
+    #[test]
+    fn a_handshake_error_quoting_the_password_is_summarized_not_echoed() {
+        let address = pre_hello_redis();
+        let message = panic_message_for(&format!(
+            "redis://default:hunter2@{address}/0?protocol=resp3"
+        ));
+
+        assert!(!message.contains("hunter2"), "{message}");
+        assert!(!message.contains("unknown command"), "{message}");
+        assert!(
+            message.contains(&format!(
+                "could not connect to Redis at redis://default:***@{address}/0"
+            )),
+            "{message}"
+        );
+        assert!(
+            message.contains("error: Server(ResponseError)"),
+            "{message}"
+        );
     }
 
     #[test]

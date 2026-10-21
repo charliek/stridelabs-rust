@@ -15,7 +15,7 @@ each server helper:
 
 | Feature | Default | Adds |
 |---|---|---|
-| `postgres` | off | [`require_postgres`], via `sqlx`'s Postgres driver + `url` |
+| `postgres` | off | [`require_postgres`] and [`require_postgres_at`], via `sqlx`'s Postgres driver + `url` |
 | `redis` | off | [`require_redis`] and its `RedisServer`, via redis-rs (`tokio-comp`, no TLS) + `url` |
 
 `postgres` is gated because `sqlx`'s driver pulls in a real network stack — a
@@ -69,10 +69,20 @@ let pool = require_postgres("postgres://postgres:localdev@localhost:5438/myapp_t
 ```
 
 `require_postgres(default_url)` reads `DATABASE_URL` from the environment; if
-it's unset, it connects to `default_url` instead. Either way, if the
-connection can't be established within 2 seconds, **it panics** — naming the
-URL it tried (password redacted), the `DATABASE_URL` env var, and the command
-to bring the database up (`docker compose up -d`, or `make up`).
+it's unset or **empty**, it connects to `default_url` instead (empty counts as
+unset, as it does for `require_redis`). Either way, if the connection can't be
+established within 2 seconds, **it panics** — naming the URL it tried
+(password redacted), the `DATABASE_URL` env var, and the command to bring the
+database up (`docker compose up -d`, or `make up`).
+
+`DATABASE_URL` wins over the argument, which makes `require_postgres` the
+call for the database a suite *starts* from. A URL a test builds itself —
+that base plus `options=-c search_path=<schema>`, for a schema of its own —
+goes to `require_postgres_at(url)`, which reads no environment and connects
+to exactly the URL it is given (same timeout; its panic says to check the URL
+passed rather than `DATABASE_URL`, which plays no part). Passed to
+`require_postgres` instead, that URL would be silently replaced by a set
+`DATABASE_URL`, search path and all, and every test would share one schema.
 
 This is a direct replacement for the pattern nine of eleven test files in one
 service carried: a `setup()`/`pool_or_skip()` pair that printed a note to
@@ -118,14 +128,15 @@ a decision, recorded here.
 
 ### The env-reading seam
 
-`require_postgres` is a thin, env-reading wrapper around a private
-`require_postgres_at(url)` that takes the URL directly. That split exists so
-this crate's *own* unit tests can exercise the connect/panic path without
-mutating `DATABASE_URL` — `std::env::set_var` in a test races every other
-test in the same binary, which is the same reason `stridelabs-config` routes
-its env helpers through an injectable lookup. Only one test in this crate
-(the happy path) reads `DATABASE_URL` for real, by calling the public
-function.
+`require_postgres` is a thin, env-reading wrapper around
+`require_postgres_at(url)`, which takes the URL directly, and the precedence
+between the two URLs sits in a private function that takes the env lookup as
+a closure. That split lets this crate's *own* unit tests exercise the
+precedence and the connect/panic path without mutating `DATABASE_URL` —
+`std::env::set_var` in a test races every other test in the same binary,
+which is the same reason `stridelabs-config` routes its env helpers through
+an injectable lookup. Only the happy path reads `DATABASE_URL` for real, by
+calling `require_postgres`.
 
 ## `redis` — fail loud, never skip
 
@@ -152,9 +163,13 @@ let ttl: i64 = redis::cmd("TTL")
 `REDIS_URL` from the environment — unset or **empty** falls back to
 `default_url` (empty counts as unset, as `stridelabs-config`'s `env_or` has
 it) — connects and sends `PING`, each within 2 seconds, and otherwise
-**panics** with a message naming the URL it tried (redacted, see below), the
-`REDIS_URL` env var, and the command that starts the server (`docker compose
-up -d redis`, or `make up`). A malformed URL panics the same way.
+**panics** with a message naming the URL it tried (redacted, see below), what
+failed, the `REDIS_URL` env var, and the command that starts the server
+(`docker compose up -d redis`, or `make up`). A malformed URL panics the same
+way. What failed is redis-rs's error *kind*, with an I/O failure's class
+(`Io (connection refused)`, `Server(ResponseError)`), never redis-rs's
+message: a Redis older than 6 answers `HELLO 3 AUTH <user> <password>` with
+an error quoting those arguments, and redis-rs passes that text on.
 
 **Redaction, for both probes.** A URL is rendered only when it parses with
 the expected structure: a `redis` / `rediss` / `valkey` / `valkeys` scheme

@@ -5,7 +5,8 @@
 /// What a well-formed connection URL of one kind looks like, and the env var
 /// it came from (named in the placeholder for one that is not).
 pub(crate) struct UrlShape {
-    /// The variable the URL is read from, e.g. `DATABASE_URL`.
+    /// Where the URL came from, as the placeholder for a malformed one names
+    /// it: the variable it is read from (e.g. `DATABASE_URL`), or the argument.
     pub(crate) env_var: &'static str,
     /// The schemes a URL of this kind may have, e.g. `postgres`.
     pub(crate) schemes: &'static [&'static str],

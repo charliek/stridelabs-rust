@@ -177,7 +177,7 @@ on what.
 | `stridelabs-auth` | `axum` | off | `bearer_token(&Parts)`, via the `http` types crate |
 | `stridelabs-auth` | `http` | off | `From<AuthError> for stridelabs_http::AppError` |
 | `stridelabs-auth` | `test-support` | off | offline JWT minting against two committed throwaway keypairs |
-| `stridelabs-testing` | `postgres` | off | `require_postgres`, via `sqlx`'s Postgres driver + `url` |
+| `stridelabs-testing` | `postgres` | off | `require_postgres` and `require_postgres_at`, via `sqlx`'s Postgres driver + `url` |
 | `stridelabs-testing` | `redis` | off | `require_redis`, via redis-rs (no TLS) + `url` |
 | `stridelabs-mcp` | `test-support` | off | MCP access-token minting for a `ProtectedResource` (via `stridelabs-auth/test-support`) and the committed `tools/list` freshness check; with `image-fetch`, also stridelabs-http's `ssrf-test-support` |
 | `stridelabs-mcp` | `cors` | off | `cors_layer()`, the app-wide CORS preset, via `tower-http/cors` |

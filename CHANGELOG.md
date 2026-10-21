@@ -254,6 +254,19 @@ for a consumer's pin.
   `validate_bucket_name`, the bucket rule every operation applies, public.
   `GcsClient`'s `Debug` prints the name policy and the retry policy. All the
   new items are re-exported from the crate root.
+- `stridelabs-testing` (`postgres`): `require_postgres_at(url)`, public and
+  re-exported at the crate root (slaudio plan 025 L1). It connects to
+  exactly `url` and reads no environment, with `require_postgres`'s 2 s
+  timeout and redacted URL; its panic says to check the URL passed, where
+  `require_postgres`'s says to point `DATABASE_URL` elsewhere.
+  `require_postgres` keeps its documented precedence, `DATABASE_URL` over
+  its argument, so it is the call for the database a suite starts from; a
+  URL a test built itself goes to `_at`.
+  parcel's `schema_pool` needs it: the per-test `search_path` URL it passes
+  to `require_postgres` is replaced by a set `DATABASE_URL` (as in CI), so
+  its tests share one schema. Its fix is one line in
+  `crates/parcel-server/tests/common/mod.rs`, with its bump to this release.
+- `stridelabs-auth`: `jwks::MAX_JWKS_BYTES` (1 MiB), the JWKS body cap below.
 
 ### Changed
 
@@ -362,6 +375,64 @@ for a consumer's pin.
   consumer's graph (reqwest, hyper); `futures-executor` stays out of an
   auth-only consumer's.
 
+- `stridelabs-auth` (behaviour, for `Verifier`, `JwksCache` and
+  `McpVerifier` users; slaudio plan 025 L1, as are the four below): **the
+  JWKS body is capped at `jwks::MAX_JWKS_BYTES`, 1 MiB.** Through v0.8.0 it
+  was read with `response.json()`, which buffers whatever the endpoint
+  sends. It is now read chunk by chunk inside `FETCH_TIMEOUT`, and the read
+  stops at the chunk that would pass the cap, so the body it keeps is at
+  most the cap plus one chunk (transport and decoder buffers aside). A
+  larger body is `AuthError::Jwks("response body is over 1048576 bytes")`:
+  a failed fetch, handled as any other (nothing is cached from it, and the
+  retry spacing applies). A body that fails mid-read is `reading the body
+  failed: …` (it was `response was not a valid JWKS: error decoding
+  response body`, which a body that does not parse still reads).
+  - **A valid key set over 1 MiB now fails to load**, where v0.8.0 served
+    it. Real issuers serve a few KiB (slauth's set is two or three RSA keys
+    of under 2 KiB each).
+  - The cap counts the bytes reqwest hands over: the body as sent, or, when
+    the consumer's client decodes (a reqwest `gzip`, `brotli`, `zstd` or
+    `deflate` feature anywhere in its graph), the decoded bytes, not the
+    bytes on the wire.
+- `stridelabs-testing` (`postgres`, behaviour): **an empty `DATABASE_URL`
+  counts as unset**, as an empty `REDIS_URL` already did, so
+  `require_postgres` connects to its argument instead of failing on `""`.
+  parcel and spendwise-rs already filter an empty value in their own
+  `database_url()`, and now agree with the pool they get. slauth's
+  `database_url()` copies the old rule on purpose (its comment says so); it
+  still fails loudly, since it passes the empty value as the argument, but
+  should move to the new rule with its bump.
+- `stridelabs-testing` (`redis`, panic text only): `require_redis`'s panic
+  names what failed by redis-rs's error kind and an I/O failure's class
+  (`Io (connection refused)`, `Server(ResponseError)`), never redis-rs's
+  message. That message can quote the handshake's credentials: a Redis older
+  than 6 answers `HELLO 3 AUTH <user> <password>` with `unknown command
+  'HELLO', with args beginning with: …`, which redis-rs passes on (it
+  recognises only the newer, backquoted form). The URL it tried is still
+  named, redacted. A test pins it against a fake server sending that reply.
+- `stridelabs-http` (`proxy`): **`UpstreamClient::build` switches off
+  reqwest's gzip, brotli, zstd and deflate decoding** (`no_gzip()`,
+  `no_brotli()`, `no_zstd()`, `no_deflate()`), as the `ssrf` client already
+  did. Latent until now: nothing in this workspace's shipped graph enables
+  those reqwest features, but in a consumer whose graph did (any crate
+  turning on reqwest's `gzip`, say), feature unification made the proxy
+  decode coded upstream bodies and send `Accept-Encoding` of its own. limen
+  is the consumer.
+  - The test build now has reqwest's gzip decoder, through a dev-dependency
+    (see Dependencies), which is what a consumer's unification would give
+    it; gzip runs the same suppression path as the other three. In that
+    build one test shows a plain `reqwest::Client` asking for gzip and
+    decoding a gzip fixture to its text; another shows `UpstreamClient`
+    relaying the same fixture byte for byte, under its own
+    `Content-Encoding`, with no `Accept-Encoding` sent. Without the `no_*`
+    calls the second fails in a plain `cargo test --workspace
+    --all-features`, and without the dev-dependency the first does.
+- `stridelabs-http` (`ssrf`, `Debug` text only): `Fetched`'s `Debug` is
+  hand-written and prints `Fetched { body: <N bytes>, .. }`, the body's
+  length and neither its bytes nor the content type, as `FetchResponse`'s
+  does. It derived `Debug`, which printed the body. stridelabs-mcp's
+  `ImageFetcher` (imgmcp) is its user, and logs none.
+
 ### Security
 
 - `Cargo.lock`: rustls-webpki 0.103.15 → 0.103.16 (RUSTSEC-2026-0382) and
@@ -380,6 +451,17 @@ for a consumer's pin.
 
 ### Dependencies
 
+- `stridelabs-http` dev-dependency only: reqwest with its `gzip` feature,
+  for the proxy decoder test above. Cargo.lock gains async-compression,
+  compression-codecs and compression-core (pure Rust; the gzip itself is
+  the flate2 already locked), reached only through that dev edge: `cargo
+  tree -e normal`, for the workspace and for `stridelabs-http`, is
+  unchanged, so no consumer compiles them. `cargo test --workspace`
+  unifies the feature into every member's test build; stridelabs-gcp's
+  v0.8.0 wire pins (`tests/wire_defaults.rs`) now inject a client with the
+  decoders switched off, because the `Accept-Encoding: gzip` a decoding
+  client adds is the client's, not stridelabs-gcp's, and the pins were
+  recorded without one.
 - `flate2` 1.1.10 (`default-features = false`, `rust_backend` +
   `runtime_detection`), new, optional, behind `stridelabs-http`'s
   `ssrf-decompress` only: with miniz_oxide, adler2, crc32fast and
