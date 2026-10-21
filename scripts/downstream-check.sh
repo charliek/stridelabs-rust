@@ -4,10 +4,11 @@
 #
 #   scripts/downstream-check.sh [--dry-run] <consumer[,consumer...]|all> <ref> [extra cargo flags]
 #
-# consumer  tapper | slauth | limen | imgmcp | spendwise | slaudio
+# consumer  tapper | slauth | limen | imgmcp | spendwise | slaudio | lumen
 #           (limen is also checked in CI, by the `downstream-limen` job; the
 #           others are private repos whose test output must not land in a public
-#           Actions log, so they are checked only here)
+#           Actions log, so they are checked only here. `limen` is the public
+#           consumer repo of that name; `lumen` is a different, private one.)
 # ref       any ref the consumer's repo resolves (branch, tag, SHA, origin/main).
 #           With several consumers the same ref is looked up in each repo;
 #           DOWNSTREAM_<NAME>_REF overrides it for one of them.
@@ -62,7 +63,7 @@
 # passed; 1 when one failed, or when the run changed or moved the library; 2
 # when it refused to start (usage, dirty library tree, paths that overlap,
 # missing env or service).
-# spendwise and slaudio are INFORMATIONAL: their results are printed but never
+# spendwise, slaudio and lumen are INFORMATIONAL: their results are printed but never
 # decide the exit.
 #
 # Environment (names only; this script never prints a value):
@@ -99,6 +100,26 @@
 #              Restate server (`docker compose up -d restate`): admin on
 #              localhost:9070 and ingress on localhost:8088, or
 #              SLAUDIO_TEST_RESTATE_ADMIN_URL / _INGRESS_URL.
+#   lumen      its Rust port is the lumen-rs/ workspace (`.` and tools/fakes) on
+#              lumen's `main`. Pass origin/main (or DOWNSTREAM_LUMEN_REF=origin/main):
+#              this script does not fetch, and a local `main` can lag. A Postgres
+#              database and a Redis: LUMEN_RS_TEST_DATABASE_URL and
+#              LUMEN_RS_TEST_REDIS_URL, defaulting here (lumen-rs has no default of its
+#              own: unset, its tests FAIL) to lumen's compose, localhost:55432/lumen_rs_test
+#              and localhost:56379 DB 1 (`docker compose up -d postgres redis` in
+#              lumen). A Redis DB 0 is refused. DATABASE_URL and REDIS_URL are never
+#              read, and the service's own settings (WORKOS_*, GCS_*,
+#              STORAGE_EMULATOR_HOST, LUMEN_HERMETIC, LUMEN_RS_DATABASE_URL, the proxy
+#              variables, the *_API_KEY variables) are unset for the run.
+#              Its GCS suites need lumen's own fake-gcs-server, named by
+#              LUMEN_RS_TEST_GCS_URL (required by the tests, loopback only),
+#              defaulting here to http://localhost:54443 (`docker compose up -d
+#              fake-gcs` in lumen). Never 4443, which is tapper's emulator.
+#              The suites also create and drop scratch databases (lumen_rs_scratch_*)
+#              on the Postgres server, so its user needs CREATEDB. Clippy and test
+#              run lumen's CI flags (--workspace); its separate `--features
+#              dev-login` test run is not repeated here (clippy --all-features does
+#              compile it).
 #
 # Paths. Nothing here names a machine: every default is relative to the
 # library checkout or to $HOME, and every one can be overridden.
@@ -130,13 +151,13 @@ else
 fi
 LIB_URL='https://github.com/charliek/stridelabs-rust.git'
 CRATES='config observability http auth testing mcp redis gcp'
-KNOWN_CONSUMERS='tapper slauth limen imgmcp spendwise slaudio'
+KNOWN_CONSUMERS='tapper slauth limen imgmcp spendwise slaudio lumen'
 
 usage() {
   cat >&2 <<'EOF'
 usage: scripts/downstream-check.sh [--dry-run] <consumer[,consumer...]|all> <ref> [extra cargo flags]
-  consumer: tapper | slauth | limen | imgmcp | spendwise | slaudio
-            (spendwise and slaudio are informational)
+  consumer: tapper | slauth | limen | imgmcp | spendwise | slaudio | lumen
+            (spendwise, slaudio and lumen are informational)
   --dry-run: run every check, print the plan, build nothing
 See the header of this script for the environment each consumer needs.
 EOF
@@ -293,7 +314,9 @@ default_repo() ( # dir
 # clippy with --all-features (its CI job tapper-rs-check), limen and spendwise
 # test with --all, slauth and imgmcp with plain `cargo test` (imgmcp's clippy
 # with --all-features), slaudio's backend-rs workspace with --workspace
-# --all-features (its CI job). The command line's extra flags are appended to
+# --all-features (its CI job), lumen's lumen-rs workspace clippy with
+# --workspace --all-targets --all-features and test with --workspace (its CI
+# job lumen-rs-check). The command line's extra flags are appended to
 # both. The repo path is the pinned physical one once the path-safety check has
 # run.
 load_consumer() {
@@ -340,6 +363,13 @@ load_consumer() {
       C_KIND=informational
       C_CLIPPY_FLAGS=(--workspace --all-targets --all-features)
       C_TEST_FLAGS=(--workspace --all-features)
+      ;;
+    lumen)
+      C_REPO=$(default_repo lumen)
+      C_CRATE=lumen-rs
+      C_KIND=informational
+      C_CLIPPY_FLAGS=(--workspace --all-targets --all-features)
+      C_TEST_FLAGS=(--workspace)
       ;;
   esac
   C_CLIPPY_FLAGS+=(${EXTRA[@]+"${EXTRA[@]}"})
@@ -441,6 +471,31 @@ need_url_tcp() { # label url default-port hint
   a=${a%%[/?]*}
   a=${a##*@}
   case $a in
+    \[*)
+      # A bracketed IPv6 authority: [::1] or [::1]:port. The brackets are
+      # dropped; the TCP check wants the bare address.
+      host=${a#\[}
+      host=${host%%\]*}
+      port=${a#*\]}
+      case $port in
+        '') port=$3 ;;
+        :*) port=${port#:} ;;
+        *)
+          problem "$1: no host and port can be read from its URL ($4)"
+          return
+          ;;
+      esac
+      case $host in '' | *[!0-9A-Fa-f:.]*)
+        problem "$1: no host can be read from its URL ($4)"
+        return
+        ;;
+      esac
+      case $host in *:*) ;; *)
+        problem "$1: no host can be read from its URL ($4)"
+        return
+        ;;
+      esac
+      ;;
     *:*)
       host=${a%%:*}
       port=${a##*:}
@@ -450,13 +505,13 @@ need_url_tcp() { # label url default-port hint
       port=$3
       ;;
   esac
-  case $host in '' | *[!A-Za-z0-9._-]*)
-    problem "$1: no host can be read from its URL"
+  case $host in '' | *[!A-Za-z0-9._:-]*)
+    problem "$1: no host can be read from its URL ($4)"
     return
     ;;
   esac
   case $port in '' | *[!0-9]*)
-    problem "$1: no port can be read from its URL"
+    problem "$1: no port can be read from its URL ($4)"
     return
     ;;
   esac
@@ -476,6 +531,40 @@ need_default_postgres() { # default-port compose-hint
     need_tcp "the $C_NAME test Postgres" localhost "$1" "$2"
   fi
 }
+
+# lumen's test databases: the caller's LUMEN_RS_TEST_* when set, else lumen's
+# own docker compose (lumen-rs has no default, on purpose, so this is it).
+# The defaults carry the compose's dev credentials, public in lumen's repo.
+LUMEN_DEFAULT_DB_URL='postgres://dev:dev@localhost:55432/lumen_rs_test'
+LUMEN_DEFAULT_REDIS_URL='redis://localhost:56379/1'
+LUMEN_DEFAULT_GCS_URL='http://localhost:54443'
+
+# Every environment variable NAME lumen-rs reads, unset for the run so nothing
+# of the host's reaches a test or the binaries the tests spawn. Derived from
+# lumen origin/main (31de3b9) with
+#   git grep -h -o -E '"[A-Z][A-Z0-9_]{2,}"' origin/main -- lumen-rs/src lumen-rs/tests lumen-rs/tools
+# keeping the names used as lookups (lookup/set/trimmed/read/env::var/.env), the
+# LLM_ and TITLE_LLM_ prefixed ones expanded, plus the proxy variables and
+# RUST_LOG/PGOPTIONS. Not listed: the three LUMEN_RS_TEST_*_URL (this script sets
+# them), PATH, HOME, the CARGO_* and SSL_CERT_* variables the toolchain needs.
+LUMEN_UNSET_ENV=(
+  DATABASE_URL REDIS_URL LUMEN_RS_DATABASE_URL
+  ENVIRONMENT BIND_ADDR FORWARDED_ALLOW_IPS SERVICE_KEY_ALLOWED_USERS INTERNAL_SERVICE_KEY MUSE_KEYWORDS
+  LUMEN_HERMETIC LUMEN_FAKES LUMEN_MIGRATIONS_DIR LUMEN_DEV_LOGIN LUMEN_DEV_LOGIN_EMAIL
+  LUMEN_CAPS_CHILD CAPS_CHILD_SESSIONS_DONE
+  LUMEN_RS_UPDATE_SCHEMA_SNAPSHOT LUMEN_RS_GCS_LIVE LUMEN_RS_GCS_REAL_BUCKET LUMEN_RS_LIVE_ENV_FILE
+  GCS_BUCKET GOOGLE_CREDENTIALS STORAGE_EMULATOR_HOST
+  IMAGE_GOOGLE_LOCATION IMAGE_GOOGLE_PROJECT IMAGE_MODEL VERTEX_BASE_URL
+  LLM_PROVIDER LLM_MODEL LLM_BASE_URL LLM_FIREWORKS_API_KEY LLM_GOOGLE_CREDENTIALS
+  TITLE_LLM_PROVIDER TITLE_LLM_MODEL TITLE_LLM_BASE_URL TITLE_LLM_FIREWORKS_API_KEY TITLE_LLM_GOOGLE_CREDENTIALS
+  FIREWORKS_API_KEY INWORLD_API_KEY INWORLD_BASE_URL META_API_KEY META_WS_URL
+  PERPLEXITY_API_KEY PERPLEXITY_BASE_URL OPEN_METEO_BASE_URL
+  VOICE_LIVE_WAV VOICE_LIVE_ACK_TIMEOUT_SECS
+  WORKOS_API_BASE_URL WORKOS_API_KEY WORKOS_CLIENT_ID WORKOS_ISSUER WORKOS_ISSUER_ACK
+  WORKOS_JWKS_CACHE_SECONDS WORKOS_JWKS_URL
+  RUST_LOG PGOPTIONS
+  HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY http_proxy https_proxy all_proxy no_proxy
+)
 
 # Everything a consumer needs before a build is worth starting. Fills PROBLEMS.
 preflight() {
@@ -508,6 +597,17 @@ preflight() {
       ;;
     spendwise)
       need_default_postgres 5437 "docker compose up -d in spendwise-rs; this script does not provision it"
+      ;;
+    lumen)
+      local lhint="docker compose up -d postgres redis in lumen" lredis=${LUMEN_RS_TEST_REDIS_URL:-$LUMEN_DEFAULT_REDIS_URL}
+      need_url_tcp "LUMEN_RS_TEST_DATABASE_URL's Postgres" "${LUMEN_RS_TEST_DATABASE_URL:-$LUMEN_DEFAULT_DB_URL}" 5432 "$lhint"
+      case $(redis_db "$lredis") in
+        invalid) problem "LUMEN_RS_TEST_REDIS_URL's database is not a number; use another number than 0, e.g. .../1" ;;
+        0) problem "LUMEN_RS_TEST_REDIS_URL selects Redis DB 0, which is the dev stack's; use another number, e.g. .../1" ;;
+      esac
+      need_url_tcp "LUMEN_RS_TEST_REDIS_URL's Redis" "$lredis" 6379 "$lhint"
+      lgcs=${LUMEN_RS_TEST_GCS_URL:-$LUMEN_DEFAULT_GCS_URL}
+      need_url_tcp "LUMEN_RS_TEST_GCS_URL's fake-gcs-server" "$lgcs" "$(scheme_port "$lgcs" 80)" "docker compose up -d fake-gcs in lumen"
       ;;
     slaudio)
       local hint="docker compose up -d postgres redis in slaudio"
@@ -616,6 +716,7 @@ note_tzdata() { # minimum
 # keeps its tests off databases that are not theirs. RUN_UNSET holds `-u NAME`
 # pairs for env(1). Sets RUN_ENV and RUN_UNSET.
 build_env() {
+  local v
   RUN_ENV=("CARGO_TARGET_DIR=$SCRATCH/target-$C_NAME")
   RUN_UNSET=()
   case $C_NAME in
@@ -644,6 +745,15 @@ build_env() {
       # Its tests read only SLAUDIO_TEST_* (inherited as set, or their own
       # defaults) and never DATABASE_URL or REDIS_URL; unset those anyway.
       RUN_UNSET+=(-u DATABASE_URL -u REDIS_URL)
+      ;;
+    lumen)
+      # The test URLs are passed explicitly (their defaults live in this script);
+      # none of the service's own settings is inherited, so a production URL or
+      # key in this shell cannot reach a test or the binaries the tests spawn.
+      RUN_ENV+=("LUMEN_RS_TEST_DATABASE_URL=${LUMEN_RS_TEST_DATABASE_URL:-$LUMEN_DEFAULT_DB_URL}"
+        "LUMEN_RS_TEST_REDIS_URL=${LUMEN_RS_TEST_REDIS_URL:-$LUMEN_DEFAULT_REDIS_URL}"
+        "LUMEN_RS_TEST_GCS_URL=${LUMEN_RS_TEST_GCS_URL:-$LUMEN_DEFAULT_GCS_URL}")
+      for v in "${LUMEN_UNSET_ENV[@]}"; do RUN_UNSET+=(-u "$v"); done
       ;;
   esac
 }
