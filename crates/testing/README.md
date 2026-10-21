@@ -79,7 +79,8 @@ database up (`docker compose up -d`, or `make up`).
 call for the database a suite *starts* from. A URL a test builds itself —
 that base plus `options=-c search_path=<schema>`, for a schema of its own —
 goes to `require_postgres_at(url)`, which reads no environment and connects
-to exactly the URL it is given (same timeout, same panic). Passed to
+to exactly the URL it is given (same timeout; its panic says to check the URL
+passed rather than `DATABASE_URL`, which plays no part). Passed to
 `require_postgres` instead, that URL would be silently replaced by a set
 `DATABASE_URL`, search path and all, and every test would share one schema.
 

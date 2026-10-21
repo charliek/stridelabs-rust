@@ -82,7 +82,13 @@ const MAX_CONNECTIONS: u32 = 5;
 ///
 /// This never returns `None` or skips silently — see the crate docs for why.
 pub async fn require_postgres(default_url: &str) -> PgPool {
-    require_postgres_at(&resolve_url(default_url, |var| std::env::var(var).ok())).await
+    require_postgres_from(default_url, |var| std::env::var(var).ok()).await
+}
+
+/// The env-injectable seam behind [`require_postgres`], as `require_redis`
+/// has, so unit tests reach its panic without mutating the environment.
+async fn require_postgres_from(default_url: &str, get: impl Fn(&str) -> Option<String>) -> PgPool {
+    connect(&resolve_url(default_url, get), UrlSource::Environment).await
 }
 
 /// `DATABASE_URL` when set and non-empty, else `default_url`. Empty counts
@@ -118,17 +124,36 @@ fn resolve_url(default_url: &str, get: impl Fn(&str) -> Option<String>) -> Strin
 ///     .execute(&admin)
 ///     .await
 ///     .unwrap();
-/// // A schema of its own. Under `require_postgres`, a set `DATABASE_URL`
-/// // would replace this URL, search_path and all.
-/// let pool = require_postgres_at(&format!("{base}?options=-c%20search_path%3Dt_example")).await;
+/// // A schema of its own, as one more query parameter: the base may carry
+/// // a query already (`?sslmode=disable`). Under `require_postgres`, a set
+/// // `DATABASE_URL` would replace this URL, search_path and all.
+/// let separator = if base.contains('?') { '&' } else { '?' };
+/// let schema_url = format!("{base}{separator}options=-c%20search_path%3Dt_example");
+/// let pool = require_postgres_at(&schema_url).await;
 /// # let _ = pool;
 /// # }
 /// ```
 ///
 /// # Panics
 ///
-/// As [`require_postgres`] does: within 2 seconds, with the URL redacted.
+/// As [`require_postgres`] does, within 2 seconds and with the URL redacted,
+/// except that the message says to check the URL passed: `DATABASE_URL`
+/// plays no part here, so pointing it elsewhere would change nothing.
 pub async fn require_postgres_at(url: &str) -> PgPool {
+    connect(url, UrlSource::Argument).await
+}
+
+/// Where the URL a probe dials came from, which decides what its panic tells
+/// the caller to fix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UrlSource {
+    /// [`require_postgres`]: `DATABASE_URL`, or the default it fell back to.
+    Environment,
+    /// [`require_postgres_at`]: exactly the URL the caller passed.
+    Argument,
+}
+
+async fn connect(url: &str, source: UrlSource) -> PgPool {
     match PgPoolOptions::new()
         .max_connections(MAX_CONNECTIONS)
         .acquire_timeout(CONNECT_TIMEOUT)
@@ -136,25 +161,35 @@ pub async fn require_postgres_at(url: &str) -> PgPool {
         .await
     {
         Ok(pool) => pool,
-        Err(err) => panic!("{}", connection_failure_message(url, &err)),
+        Err(err) => panic!("{}", connection_failure_message(url, &err, source)),
     }
 }
 
-fn connection_failure_message(url: &str, err: &sqlx::Error) -> String {
+fn connection_failure_message(url: &str, err: &sqlx::Error, source: UrlSource) -> String {
+    let (helper, fix) = match source {
+        UrlSource::Environment => (
+            "require_postgres",
+            format!("point {DATABASE_URL_VAR} at a Postgres instance that is actually reachable"),
+        ),
+        UrlSource::Argument => (
+            "require_postgres_at",
+            "check the URL you passed: require_postgres_at connects to exactly that URL \
+             and reads no environment variable"
+                .to_owned(),
+        ),
+    };
     format!(
         "\n\
         could not connect to Postgres at {redacted}\n\
         \n\
         error: {err}\n\
         \n\
-        stridelabs-testing::require_postgres never skips a test for a \
-        missing database — fix the connection instead of ignoring this \
-        panic:\n\
+        stridelabs-testing::{helper} never skips a test for a missing \
+        database — fix the connection instead of ignoring this panic:\n\
         \n\
         - start the local database: `docker compose up -d` (or `make up`)\n\
-        - or point {var} at a Postgres instance that is actually reachable\n",
+        - or {fix}\n",
         redacted = redact_password(url, &DATABASE_URL_SHAPE),
-        var = DATABASE_URL_VAR,
     )
 }
 
@@ -259,29 +294,57 @@ mod tests {
     fn the_panic_message_never_leaks_the_password() {
         // A direct assertion on the message builder, in addition to the
         // dedicated `redact_password` unit tests in `crate::redact`: this is
-        // the exact string `require_postgres_at` panics with, built the same
-        // way a real connection failure would build it.
+        // the exact string each entry point panics with, built the same way
+        // a real connection failure would build it.
         let err = sqlx::Error::Configuration("simulated failure".into());
-        let message = connection_failure_message(
-            "postgres://postgres:hunter2@127.0.0.1:1/stridelabs_test",
-            &err,
-        );
+        for source in [UrlSource::Environment, UrlSource::Argument] {
+            let message = connection_failure_message(
+                "postgres://postgres:hunter2@127.0.0.1:1/stridelabs_test",
+                &err,
+                source,
+            );
 
-        assert!(!message.contains("hunter2"), "{message}");
-        assert!(message.contains("DATABASE_URL"), "{message}");
-        assert!(message.contains("docker compose up -d"), "{message}");
-        assert!(message.contains("make up"), "{message}");
+            assert!(!message.contains("hunter2"), "{source:?}: {message}");
+            assert!(
+                message.contains("docker compose up -d"),
+                "{source:?}: {message}"
+            );
+            assert!(message.contains("make up"), "{source:?}: {message}");
+        }
     }
 
+    /// Each entry point's panic names the fix that reaches it:
+    /// `require_postgres` reads `DATABASE_URL`, so pointing it elsewhere
+    /// helps; `require_postgres_at` reads nothing, so only the URL passed
+    /// can be wrong, and the variable is not mentioned at all.
     #[test]
-    fn an_unreachable_database_panic_carries_no_password_end_to_end() {
-        // Belt and suspenders over the two tests above: actually panic
-        // `require_postgres_at` (via a real failed connection attempt, not a
-        // simulated error) and inspect the live payload, so a future change
-        // that bypasses `connection_failure_message` would still be caught.
-        let url = "postgres://postgres:hunter2@127.0.0.1:1/stridelabs_test";
+    fn each_entry_point_names_the_fix_that_reaches_it() {
+        let err = sqlx::Error::Configuration("simulated failure".into());
+        let url = "postgres://postgres:localdev@127.0.0.1:1/stridelabs_test";
 
-        let result = std::panic::catch_unwind(|| {
+        let from_env = connection_failure_message(url, &err, UrlSource::Environment);
+        assert!(
+            from_env.contains("stridelabs-testing::require_postgres never skips"),
+            "{from_env}"
+        );
+        assert!(from_env.contains("point DATABASE_URL at"), "{from_env}");
+        assert!(!from_env.contains("check the URL you passed"), "{from_env}");
+
+        let from_argument = connection_failure_message(url, &err, UrlSource::Argument);
+        assert!(
+            from_argument.contains("stridelabs-testing::require_postgres_at never skips"),
+            "{from_argument}"
+        );
+        assert!(
+            from_argument.contains("check the URL you passed"),
+            "{from_argument}"
+        );
+        assert!(!from_argument.contains("DATABASE_URL"), "{from_argument}");
+    }
+
+    /// The live panic payload of `future`, driven to its failure.
+    fn live_panic_message(future: impl std::future::Future<Output = PgPool>) -> String {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             // Single-threaded: this drives exactly one future to completion,
             // so the multi-thread scheduler's worker-pool spin-up/teardown
             // would be pure overhead here.
@@ -289,20 +352,47 @@ mod tests {
                 .enable_all()
                 .build()
                 .expect("build a runtime for this sync test");
-            rt.block_on(require_postgres_at(url))
-        });
-
+            rt.block_on(future)
+        }));
         let payload = result.expect_err("connecting to port 1 must fail");
-        let message = payload
+        payload
             .downcast_ref::<String>()
-            .map(String::as_str)
-            .or_else(|| payload.downcast_ref::<&str>().copied())
-            .unwrap_or("<non-string panic payload>");
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_else(|| "<non-string panic payload>".to_string())
+    }
 
-        assert!(!message.contains("hunter2"), "{message}");
+    #[test]
+    fn an_unreachable_database_panic_carries_no_password_end_to_end() {
+        // Belt and suspenders over the tests above: actually panic each
+        // entry point (via a real failed connection attempt, not a simulated
+        // error) and inspect the live payload, so a future change that
+        // bypasses `connection_failure_message` would still be caught.
+        // `require_postgres` goes through its lookup seam, handed a fake
+        // `DATABASE_URL`, so the real environment is never touched.
+        let url = "postgres://postgres:hunter2@127.0.0.1:1/stridelabs_test";
+
+        let from_argument = live_panic_message(require_postgres_at(url));
+        assert!(!from_argument.contains("hunter2"), "{from_argument}");
         assert!(
-            message.contains("could not connect to Postgres"),
-            "{message}"
+            from_argument.contains("could not connect to Postgres"),
+            "{from_argument}"
         );
+        assert!(
+            from_argument.contains("check the URL you passed"),
+            "{from_argument}"
+        );
+
+        let from_env = live_panic_message(require_postgres_from(
+            COMPOSE_URL,
+            lookup(&[("DATABASE_URL", url)]),
+        ));
+        assert!(!from_env.contains("hunter2"), "{from_env}");
+        assert!(
+            from_env
+                .contains("could not connect to Postgres at postgres://postgres:***@127.0.0.1:1/"),
+            "{from_env}"
+        );
+        assert!(from_env.contains("point DATABASE_URL at"), "{from_env}");
     }
 }

@@ -257,9 +257,11 @@ for a consumer's pin.
 - `stridelabs-testing` (`postgres`): `require_postgres_at(url)`, public and
   re-exported at the crate root (slaudio plan 025 L1). It connects to
   exactly `url` and reads no environment, with `require_postgres`'s 2 s
-  timeout and redacted panic. `require_postgres` keeps its documented
-  precedence, `DATABASE_URL` over its argument, so it is the call for the
-  database a suite starts from; a URL a test built itself goes to `_at`.
+  timeout and redacted URL; its panic says to check the URL passed, where
+  `require_postgres`'s says to point `DATABASE_URL` elsewhere.
+  `require_postgres` keeps its documented precedence, `DATABASE_URL` over
+  its argument, so it is the call for the database a suite starts from; a
+  URL a test built itself goes to `_at`.
   parcel's `schema_pool` needs it: the per-test `search_path` URL it passes
   to `require_postgres` is replaced by a set `DATABASE_URL` (as in CI), so
   its tests share one schema. Its fix is one line in
