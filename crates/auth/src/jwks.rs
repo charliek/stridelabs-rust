@@ -148,6 +148,16 @@ pub const MIN_REFETCH_INTERVAL: Duration = Duration::from_secs(30);
 /// most 2 s (module docs, "Concurrency").
 pub const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The largest JWKS body a fetch reads. An issuer's set is a few keys of
+/// under 2 KiB each, so a megabyte is hundreds of them; a valid set over it
+/// fails to load. A larger body is a failed fetch ([`AuthError::Jwks`]), like
+/// any other, and it is never buffered whole: the read stops at the chunk
+/// that would pass the cap, inside [`FETCH_TIMEOUT`], so the body kept is at
+/// most this plus one chunk. It counts the bytes reqwest hands over: decoded
+/// bytes, not wire bytes, when the injected client decodes (a reqwest
+/// decoder feature in the consumer's graph).
+pub const MAX_JWKS_BYTES: usize = 1024 * 1024;
+
 /// How long a lookup waits on a retry, an attempt made after a failure,
 /// before giving up on it while it carries on.
 const RETRY_JOIN_WAIT: Duration = Duration::from_secs(2);
@@ -563,12 +573,13 @@ impl JwksCache {
     /// it waits on one. Errors are [`AuthError::UnknownKid`] (a set inside its
     /// TTL lacks the kid: just refetched, or within the refetch floor of the
     /// last attempt) or [`AuthError::Jwks`]: the endpoint could not be
-    /// reached, answered non-2xx or answered with something that isn't a
-    /// JWKS; or, with no set inside its TTL, a refetch is not allowed yet,
-    /// the fetch this lookup joined outlasted its wait (2 s on a retry,
-    /// [`FETCH_TIMEOUT`] plus 1 s on a first attempt), the set it waited for
-    /// aged past its TTL first, the attempt was aborted, or there is no tokio
-    /// runtime to start or wait on a fetch on.
+    /// reached, answered non-2xx, sent a body over [`MAX_JWKS_BYTES`] or
+    /// answered with something that isn't a JWKS; or, with no set inside its
+    /// TTL, a refetch is not allowed yet, the fetch this lookup joined
+    /// outlasted its wait (2 s on a retry, [`FETCH_TIMEOUT`] plus 1 s on a
+    /// first attempt), the set it waited for aged past its TTL first, the
+    /// attempt was aborted, or there is no tokio runtime to start or wait on
+    /// a fetch on.
     ///
     /// Returned behind an `Arc`: a cache hit costs a refcount bump, not a
     /// copy of the key set.
@@ -903,7 +914,7 @@ impl Inner {
         // `AuthError::Jwks` lands in logs — the `http` feature's 500 logs it
         // in full. A JWKS URL is configuration, and configuration can carry a
         // token. The operator knows which issuer they configured.
-        let response = self
+        let mut response = self
             .http
             .get(&self.jwks_url)
             .timeout(timeout)
@@ -916,11 +927,28 @@ impl Inner {
             return Err(AuthError::Jwks(format!("endpoint returned {status}")));
         }
 
-        response.json::<JwkSet>().await.map_err(|err| {
-            AuthError::Jwks(format!(
-                "response was not a valid JWKS: {}",
-                err.without_url()
-            ))
+        // Read chunk by chunk rather than `response.json()`, which buffers
+        // whatever the endpoint sends: the cap is checked before a chunk is
+        // kept, so a body that passes it is refused having kept at most
+        // `MAX_JWKS_BYTES`, with that one chunk in hand. The request's
+        // timeout covers the body, so a slow drip under the cap still ends
+        // at it.
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|err| {
+            AuthError::Jwks(format!("reading the body failed: {}", err.without_url()))
+        })? {
+            if chunk.len() > MAX_JWKS_BYTES - body.len() {
+                return Err(AuthError::Jwks(format!(
+                    "response body is over {MAX_JWKS_BYTES} bytes"
+                )));
+            }
+            body.extend_from_slice(&chunk);
+        }
+
+        // reqwest's own text for a body that does not parse, kept: serde's
+        // message can quote the body.
+        serde_json::from_slice::<JwkSet>(&body).map_err(|_| {
+            AuthError::Jwks("response was not a valid JWKS: error decoding response body".into())
         })
     }
 }

@@ -60,10 +60,15 @@ const MAX_CONNECTIONS: u32 = 5;
 
 /// Connect to Postgres for a test, or panic with an actionable message.
 ///
-/// Reads `DATABASE_URL` from the environment; if it is unset, connects to
-/// `default_url` instead — pass your compose/CI database's URL there (see
-/// the module docs' `migrated_pool` example). Runs **no migrations**: the
-/// returned pool talks to whatever schema is already there.
+/// Reads `DATABASE_URL` from the environment; if it is unset (or empty),
+/// connects to `default_url` instead — pass your compose/CI database's URL
+/// there (see the module docs' `migrated_pool` example). Runs **no
+/// migrations**: the returned pool talks to whatever schema is already there.
+///
+/// `DATABASE_URL` wins over the argument, so this is for the database a
+/// suite starts from. A URL the test built itself (one carrying a per-test
+/// `search_path`, say) goes to [`require_postgres_at`], which connects to
+/// exactly the URL it is given.
 ///
 /// # Panics
 ///
@@ -77,16 +82,53 @@ const MAX_CONNECTIONS: u32 = 5;
 ///
 /// This never returns `None` or skips silently — see the crate docs for why.
 pub async fn require_postgres(default_url: &str) -> PgPool {
-    let url = std::env::var(DATABASE_URL_VAR).unwrap_or_else(|_| default_url.to_string());
-    require_postgres_at(&url).await
+    require_postgres_at(&resolve_url(default_url, |var| std::env::var(var).ok())).await
 }
 
-/// The env-free seam behind [`require_postgres`], so unit tests can exercise
-/// the connect/panic path with a URL of their own choosing instead of
-/// mutating the real process environment (`std::env::set_var` in a test
-/// races every other test in the binary — the workspace convention this
-/// crate follows everywhere else, see `stridelabs-config`).
-async fn require_postgres_at(url: &str) -> PgPool {
+/// `DATABASE_URL` when set and non-empty, else `default_url`. Empty counts
+/// as unset, as it does for `require_redis` and `stridelabs-config`'s
+/// `env_or`: that is how a variable someone left unfilled arrives from
+/// compose or CI. The lookup is injected so that unit tests never mutate the
+/// real process environment (`std::env::set_var` in a test races every
+/// other test in the binary — the workspace convention, see
+/// `stridelabs-config`).
+fn resolve_url(default_url: &str, get: impl Fn(&str) -> Option<String>) -> String {
+    get(DATABASE_URL_VAR)
+        .filter(|url| !url.is_empty())
+        .unwrap_or_else(|| default_url.to_string())
+}
+
+/// Connect to exactly `url` for a test, or panic with an actionable message.
+///
+/// [`require_postgres`] without the environment: `DATABASE_URL` is not read,
+/// so the pool is on the URL given, with every option it carries. Use it for
+/// a URL a test derived from the one its suite started from, such as a
+/// schema of its own:
+///
+/// ```no_run
+/// # fn suite_database_url() -> String { String::new() }
+/// # async fn example() {
+/// use stridelabs_testing::require_postgres_at;
+///
+/// // The suite's database (`DATABASE_URL` or its compose default), resolved
+/// // once, so that every pool below is on the same server.
+/// let base = suite_database_url();
+/// let admin = require_postgres_at(&base).await;
+/// sqlx::query("CREATE SCHEMA IF NOT EXISTS t_example")
+///     .execute(&admin)
+///     .await
+///     .unwrap();
+/// // A schema of its own. Under `require_postgres`, a set `DATABASE_URL`
+/// // would replace this URL, search_path and all.
+/// let pool = require_postgres_at(&format!("{base}?options=-c%20search_path%3Dt_example")).await;
+/// # let _ = pool;
+/// # }
+/// ```
+///
+/// # Panics
+///
+/// As [`require_postgres`] does: within 2 seconds, with the URL redacted.
+pub async fn require_postgres_at(url: &str) -> PgPool {
     match PgPoolOptions::new()
         .max_connections(MAX_CONNECTIONS)
         .acquire_timeout(CONNECT_TIMEOUT)
@@ -123,10 +165,21 @@ mod tests {
     /// The URL the compose file and CI's Postgres service both serve:
     /// `docker-compose.yml` maps port 5438, `POSTGRES_PASSWORD=localdev`,
     /// `POSTGRES_DB=stridelabs_test`. CI additionally exports this exact
-    /// string as `DATABASE_URL`, so this test exercises the public,
-    /// env-reading entry point rather than the private `_at` seam — the one
-    /// place in this crate's own tests where that's the point.
+    /// string as `DATABASE_URL`, so the first test exercises the public,
+    /// env-reading entry point rather than the `_at` form — the one place in
+    /// this crate's own tests where that's the point.
     const COMPOSE_URL: &str = "postgres://postgres:localdev@localhost:5438/stridelabs_test";
+
+    fn lookup<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        let map: std::collections::HashMap<&str, &str> = pairs.iter().copied().collect();
+        move |key| map.get(key).map(|value| value.to_string())
+    }
+
+    /// The database the tests reach: `DATABASE_URL` (read, never written)
+    /// or the compose URL, by `require_postgres`'s own precedence.
+    fn test_database_url() -> String {
+        resolve_url(COMPOSE_URL, |var| std::env::var(var).ok())
+    }
 
     #[tokio::test]
     async fn require_postgres_connects_to_the_compose_database() {
@@ -148,11 +201,48 @@ mod tests {
     #[tokio::test]
     #[should_panic(expected = "built without TLS support")]
     async fn a_url_that_requires_tls_is_refused_not_downgraded() {
-        let base = std::env::var(DATABASE_URL_VAR).unwrap_or_else(|_| COMPOSE_URL.to_string());
-        let mut url = url::Url::parse(&base).expect("parse the test database URL");
+        let mut url = url::Url::parse(&test_database_url()).expect("parse the test database URL");
         url.query_pairs_mut().append_pair("sslmode", "require");
 
         let _ = require_postgres_at(url.as_str()).await;
+    }
+
+    #[test]
+    fn database_url_takes_precedence_over_the_default() {
+        let url = resolve_url(
+            COMPOSE_URL,
+            lookup(&[("DATABASE_URL", "postgres://ci-postgres:5432/ci")]),
+        );
+        assert_eq!(url, "postgres://ci-postgres:5432/ci");
+    }
+
+    /// An empty `DATABASE_URL` is a variable left unfilled, not a URL: the
+    /// default answers, as it does for `require_redis`.
+    #[test]
+    fn an_unset_or_empty_database_url_falls_back_to_the_default() {
+        assert_eq!(resolve_url(COMPOSE_URL, lookup(&[])), COMPOSE_URL);
+        assert_eq!(
+            resolve_url(COMPOSE_URL, lookup(&[("DATABASE_URL", "")])),
+            COMPOSE_URL
+        );
+    }
+
+    /// `require_postgres_at` connects to the URL it is given, options and
+    /// all: a `search_path` a test chose is the pool's. (`require_postgres`
+    /// would have dialled a set `DATABASE_URL` instead, as CI's is, and lost
+    /// it.)
+    #[tokio::test]
+    async fn require_postgres_at_connects_to_exactly_its_url() {
+        let mut url = url::Url::parse(&test_database_url()).expect("parse the test database URL");
+        url.query_pairs_mut()
+            .append_pair("options", "-c search_path=stridelabs_testing_at");
+
+        let pool = require_postgres_at(url.as_str()).await;
+        let search_path: String = sqlx::query_scalar("SHOW search_path")
+            .fetch_one(&pool)
+            .await
+            .expect("read the pool's search_path");
+        assert_eq!(search_path, "stridelabs_testing_at");
     }
 
     #[tokio::test]
@@ -160,7 +250,7 @@ mod tests {
     async fn an_unreachable_database_panics_with_an_actionable_message() {
         // Port 1 on loopback: nothing listens there, and the attempt fails
         // fast without waiting out the full acquire timeout. Passed directly
-        // to the private seam so this test never touches `DATABASE_URL`.
+        // to `require_postgres_at` so this test never reads `DATABASE_URL`.
         let _ =
             require_postgres_at("postgres://postgres:localdev@127.0.0.1:1/stridelabs_test").await;
     }

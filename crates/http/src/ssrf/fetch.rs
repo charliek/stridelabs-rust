@@ -24,7 +24,11 @@ use super::target::{self, Target, TargetHost};
 
 /// The capped body of a successful fetch: `200 OK`, or any status the
 /// policy accepts ([`AcceptedStatuses`](super::AcceptedStatuses)).
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` prints the body's length, never its bytes, and not the content
+/// type (a header value), as [`FetchResponse`]'s does: a `Debug` ends up in
+/// logs, and the body is whatever the URL's server chose to send.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Fetched {
     /// The body, at most the policy's `max_bytes`.
     pub body: Bytes,
@@ -33,6 +37,14 @@ pub struct Fetched {
     /// policy (an image fetcher requires `image/*` and still sniffs the
     /// bytes, because a header is only a claim).
     pub content_type: Option<String>,
+}
+
+impl fmt::Debug for Fetched {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Fetched")
+            .field("body", &format_args!("<{} bytes>", self.body.len()))
+            .finish_non_exhaustive()
+    }
 }
 
 /// Everything [`fetch_public_response`] learned from the hop that answered.
@@ -738,6 +750,23 @@ mod tests {
                 content_type: Some("application/rss+xml".to_owned()),
             }
         );
+    }
+
+    /// The body's length, never its bytes, and no header value: a `Debug`
+    /// ends up in logs, and the body is whatever the server sent.
+    #[test]
+    fn the_fetched_debug_prints_the_body_length_never_its_bytes() {
+        let fetched = Fetched {
+            body: Bytes::from_static(b"body-secret"),
+            content_type: Some("image/x-type-secret".to_owned()),
+        };
+        let debug = format!("{fetched:?}");
+        assert_eq!(debug, "Fetched { body: <11 bytes>, .. }");
+        let pretty = format!("{fetched:#?}");
+        for secret in ["body-secret", "type-secret"] {
+            assert!(!debug.contains(secret), "{secret} in {debug}");
+            assert!(!pretty.contains(secret), "{secret} in {pretty}");
+        }
     }
 
     /// No header value and no query or fragment: `final_url` and `headers`

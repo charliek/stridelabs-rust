@@ -597,7 +597,7 @@ async fn proxy(
 | `UpstreamFailure::log(message)` | That classification as `tracing` fields, at `ERROR` |
 | `AppError::bad_gateway_upstream(&reqwest::Error)` | A `502` with a fixed body, logging the classification (also `_with_context` for a per-call-site log message) |
 
-Seven behaviors are worth knowing about, because each is a bug someone
+Eight behaviors are worth knowing about, because each is a bug someone
 re-introduces every time this layer gets rewritten:
 
 - **Repeated headers stay repeated.** The header copy appends. An
@@ -614,6 +614,16 @@ re-introduces every time this layer gets rewritten:
   3xx is the client's to act on; chasing it returns the client a response
   from a URL it never asked for, fetched from the proxy's network position
   rather than the client's.
+- **Bodies are relayed, never decoded.** `UpstreamClient` switches off each
+  of reqwest's decoders (`no_gzip()`, `no_brotli()`, `no_zstd()`,
+  `no_deflate()`), so a coded upstream body reaches the client byte for byte
+  under its own `Content-Encoding`, and no request asks for a coding the
+  client did not. They are off by default only until some crate in the
+  consumer's graph turns on reqwest's `gzip` (or another decoder) feature,
+  which feature unification then turns on for every client in the binary.
+  This crate's test build turns the gzip one on (a dev-dependency, absent
+  from the shipped graph), so the test that pins the relay runs against a
+  live decoder, next to one showing a plain client does decode.
 - **Bounding a body doesn't cost the client the body.** `buffer_or_stream`
   reads up to `limit` and, the moment it would be exceeded, returns
   `TooLarge` carrying a `Body` of the already-read prefix chained to the rest
@@ -1053,8 +1063,8 @@ async fn fetch_feed(url: &str) -> Result<(), Box<dyn std::error::Error>> {
   are not client-safe**: they can name the redirect target and carry
   `Set-Cookie`. `FetchResponse`'s `Debug` prints the body length, the
   status, the URL with its query and fragment redacted, the header names and
-  the redirect count; the policy's prints an extra header's name, never its
-  value.
+  the redirect count; `Fetched`'s prints the body length alone; the
+  policy's prints an extra header's name, never its value.
 - **Basic auth stays out:** `user:pass@` is `EmbeddedCredentials` on the
   first URL and on every `Location`, under every option.
 - **A default policy is v0.8.0's, byte for byte**: `tests/ssrf_pinning.rs`

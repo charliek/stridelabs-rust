@@ -9,6 +9,12 @@
 //! boundary.
 //!
 //! It uses only v0.8.0's API, so it still compiles there.
+//!
+//! The client it injects has reqwest's decoders switched off
+//! ([`wire_client`]): the requests were recorded with none compiled in, and
+//! this workspace's test build now compiles the gzip one (stridelabs-http's
+//! dev-dependency, for its proxy tests), whose `Accept-Encoding` would be
+//! the injected client's, not this crate's.
 
 mod common;
 
@@ -21,6 +27,20 @@ use wiremock::MockServer;
 
 const ANSWER: &[u8] =
     b"HTTP/1.1 200 OK\r\ncontent-type: image/png\r\ncontent-length: 4\r\n\r\nPNG!";
+
+/// [`never_retrying`] with reqwest's four decoders off, as they were (not
+/// compiled) when the expected requests were recorded. `no_*` exists
+/// whatever reqwest's features, so this compiles on v0.8.0 too.
+fn wire_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .retry(reqwest::retry::never())
+        .no_gzip()
+        .no_brotli()
+        .no_zstd()
+        .no_deflate()
+        .build()
+        .unwrap()
+}
 
 /// What every multipart boundary starts with; 32 random hex digits follow.
 const BOUNDARY_PREFIX: &[u8] = b"stridelabs-gcp-";
@@ -169,7 +189,7 @@ const GCS_EXPECTED: [&[u8]; 4] = [
 async fn a_default_gcs_client_sends_v080s_requests_byte_for_byte() {
     let token_server = MockServer::start().await;
     let raw = RawServer::start(|_, _| RawReply::Full(ANSWER.to_vec())).await;
-    let gcs = GcsClient::new(never_retrying(), tokens(&token_server).await)
+    let gcs = GcsClient::new(wire_client(), tokens(&token_server).await)
         .with_base_url(&raw.base_url)
         .with_timeout(Duration::from_secs(20));
     let media = Bytes::from_static(b"\x89PNG\r\n\x1a\n\0--x\r\n");
@@ -218,7 +238,7 @@ async fn a_default_vertex_client_sends_v080s_request_byte_for_byte() {
     })
     .await;
     let vertex = VertexClient::new(
-        never_retrying(),
+        wire_client(),
         tokens(&token_server).await,
         "test-project",
         "global",
