@@ -17,8 +17,9 @@ unconditional: they are the crate. So is its tokio dependency (`sync`, `rt`,
 `time`) and `futures-util` (`std` only): the JWKS cache runs each fetch on a
 task of its own, spawned on the runtime the lookup is polled on, and bounds
 each lookup's wait on a fetch with a timer on that lookup's runtime.
-**Lookups require a Tokio runtime with the time driver enabled, as reqwest
-does.**
+**A lookup that starts, joins or waits on a fetch requires a Tokio runtime
+with IO and the time driver enabled, as reqwest does; a fresh cache hit needs
+none** (see "The tokio runtime" below).
 
 | Feature | Default | Adds |
 |---|---|---|
@@ -458,7 +459,7 @@ With the `http` feature:
 
 A JWKS failure is *this service's* outage and says nothing about the caller's
 token, so it is a 500 whose detail is logged and not returned. So is a
-refetch the cache suppressed for a never-seen kid. Anyone can mint a token
+never-seen kid whose refetch the cache suppressed. Anyone can mint a token
 with a random kid, so forged kids inside the refetch floor are one logged 500
 each: their detail, `slauth JWKS: … refetch suppressed`, is distinct from a
 fetch failure's, so 5xx alerting can exclude it, and a consumer that cares
