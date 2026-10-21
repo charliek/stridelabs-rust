@@ -59,8 +59,7 @@ pub enum SsrfError {
     #[error("Too many redirects.")]
     TooManyRedirects,
     /// The response status was not one the policy accepts (by default,
-    /// anything but `200 OK`; see `AcceptedStatuses`). Also what
-    /// `fetch_public` makes of a `304 Not Modified` answering a validator.
+    /// anything but `200 OK`; see `AcceptedStatuses`).
     #[error("{} fetch failed with HTTP {}.", capitalize(.label), .status.as_u16())]
     HttpStatus {
         /// The policy's label, as given (rendered capitalized).

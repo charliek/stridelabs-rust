@@ -26,7 +26,12 @@
 //! on the `http` feature and get the [`From`] impl below.
 
 /// Why an access token was not accepted.
+///
+/// `#[non_exhaustive]`: a new failure mode is a new variant, and that must
+/// not break a consumer's `match`. Map with a wildcard arm, and decide there
+/// whether an unknown variant is the server's fault or the token's.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum AuthError {
     /// No `Authorization: Bearer …` header on the request.
     #[error("missing bearer token")]
@@ -39,14 +44,25 @@ pub enum AuthError {
     #[error("token is missing a key id")]
     MissingKid,
     /// The token's `kid` is not in a JWKS still inside its TTL — one just
-    /// refetched, or one whose refetch the refetch floor suppressed
-    /// ([`crate::MIN_REFETCH_INTERVAL`] at the defaults; see [`crate::jwks`])
-    /// — or names only keys unfit for RS256 signatures: not RSA, or an `alg`,
+    /// refetched, or, inside the refetch floor
+    /// ([`crate::MIN_REFETCH_INTERVAL`] at the defaults; see [`crate::jwks`]),
+    /// one that lacks a kid an earlier fetched set held (a retired key) — or
+    /// names only keys unfit for RS256 signatures: not RSA, or an `alg`,
     /// `use` or `key_ops` that says otherwise (an encryption key, say). Only
     /// a set inside its TTL gives this verdict; without one the answer is
     /// [`AuthError::Jwks`].
     #[error("token signed by an unknown key")]
     UnknownKid,
+    /// Inside the refetch floor, the token's `kid` is in no set this cache
+    /// has fetched, and the refetch that could find it was suppressed: the
+    /// issuer may have rotated to a key not fetched yet, or the kid is
+    /// forged. The token is refused either way; unlike
+    /// [`AuthError::UnknownKid`], this is no verdict from the issuer, so the
+    /// house mappings treat it as a temporary server-side condition (a 5xx,
+    /// as for [`AuthError::Jwks`]), and the next lookup past the floor
+    /// refetches.
+    #[error("token signed by a key not seen yet; refetch suppressed")]
+    UnseenKid,
     /// Signature, `iss`, `aud`, `exp` or claim-shape check failed. The
     /// payload is a fixed classification (a fixed phrase per
     /// `jsonwebtoken` error kind), never token-derived text.
@@ -104,7 +120,8 @@ pub(crate) fn invalid_token(err: &jsonwebtoken::errors::Error) -> AuthError {
 /// - [`AuthError::Jwks`] is a **server** failure: this service couldn't reach
 ///   or parse the issuer's key set, which says nothing about the caller's
 ///   token. It becomes `AppError::Internal`, so the detail is logged and the
-///   client gets a 500 with a fixed body.
+///   client gets a 500 with a fixed body. So does [`AuthError::UnseenKid`]:
+///   a refetch this service suppressed is no verdict on the token either.
 /// - Everything else becomes `AppError::Unauthorized` with a **single generic
 ///   message**, deliberately not the specific reason. `AppError`'s contract is
 ///   that a non-`Internal` payload is returned to the client verbatim, and
@@ -118,6 +135,9 @@ impl From<AuthError> for stridelabs_http::AppError {
         match err {
             AuthError::Jwks(detail) => {
                 stridelabs_http::AppError::Internal(anyhow::anyhow!("slauth JWKS: {detail}"))
+            }
+            AuthError::UnseenKid => {
+                stridelabs_http::AppError::Internal(anyhow::anyhow!("slauth JWKS: {err}"))
             }
             _ => stridelabs_http::AppError::Unauthorized("invalid or missing credentials".into()),
         }
@@ -139,6 +159,22 @@ mod http_tests {
         assert!(
             matches!(app, AppError::Internal(_)),
             "a JWKS outage is this service's problem, not the caller's"
+        );
+    }
+
+    /// A suppressed refetch goes where `Jwks` goes: it is no verdict on the
+    /// token, and the client should not be told its key is unknown.
+    #[test]
+    fn an_unseen_kid_is_a_server_error_too() {
+        let app: AppError = AuthError::UnseenKid.into();
+
+        assert_eq!(app.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let AppError::Internal(detail) = app else {
+            panic!("an unseen kid is Internal");
+        };
+        assert_eq!(
+            detail.to_string(),
+            "slauth JWKS: token signed by a key not seen yet; refetch suppressed"
         );
     }
 

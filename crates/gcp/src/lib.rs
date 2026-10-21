@@ -7,9 +7,12 @@
 //! - [`storage`]: a small GCS JSON-API client — media upload, multipart
 //!   upload with object metadata ([`UploadOptions`]), media download,
 //!   delete, a bucket probe — and the public object URL. v0.8.0's behaviour
-//!   by default; Python's names ([`ObjectNamePolicy::Literal`]),
-//!   google-cloud-storage's retry ([`RetryPolicy`]) and the `401` refresh
-//!   are opt-in.
+//!   by default; GCS's literal object addressing
+//!   ([`ObjectNamePolicy::Literal`]) and a retry ([`RetryPolicy`]) are
+//!   opt-in.
+//! - [`retry`]: [`RetryPolicy`], Cloud Storage's documented retry strategy
+//!   (capped exponential backoff, full jitter, a deadline, an optional
+//!   attempt cap).
 //! - `vertex` (feature `vertex`): typed `generateContent` request and
 //!   response, the endpoint builder (the `global` host included), a thin
 //!   client, and the inline-image classifier.
@@ -36,12 +39,11 @@
 //! | `vertex` | off | the `vertex` module. No extra dependency. |
 
 pub mod auth;
+pub mod retry;
 pub mod storage;
 #[cfg(feature = "vertex")]
 pub mod vertex;
 
-mod replay;
-mod retry;
 mod util;
 
 pub use auth::{AccessToken, CredentialKind, CredentialSource, GcpAuthError, TokenProvider};

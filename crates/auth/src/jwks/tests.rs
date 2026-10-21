@@ -93,16 +93,6 @@ async fn an_attempt_taking(cache: &JwksCache, flight: Duration) -> Result<Arc<Jw
     lookup.await
 }
 
-/// The test thread's own wait for a condition another thread or runtime
-/// makes true.
-fn until_blocking(what: &str, condition: impl Fn() -> bool) {
-    let deadline = Instant::now() + POLL_LIMIT;
-    while !condition() {
-        assert!(Instant::now() < deadline, "timed out waiting for {what}");
-        std::thread::sleep(millis(5));
-    }
-}
-
 fn multi_thread_runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -117,14 +107,18 @@ impl JwksCache {
     fn seed(&self) {
         let mut state = self.inner.state();
         let now = self.inner.now();
+        let set = TestKey::primary().jwks();
+        let mut seen = Seen::default();
+        seen.record(&set);
         *state = State {
             cached: Some(Fetched {
-                set: Arc::new(TestKey::primary().jwks()),
+                set: Arc::new(set),
                 fetched_at: now,
                 id: u64::MAX,
             }),
             last_start: Some(now),
             last_end: Some(now),
+            seen,
             ..State::default()
         };
     }
@@ -189,6 +183,15 @@ fn assert_unknown(result: Result<Arc<JwkSet>, AuthError>, context: &str) {
         Err(AuthError::UnknownKid) => {}
         Ok(_) => panic!("{context}: served a set; expected UnknownKid"),
         Err(other) => panic!("{context}: expected UnknownKid, got {other}"),
+    }
+}
+
+#[track_caller]
+fn assert_unseen(result: Result<Arc<JwkSet>, AuthError>, context: &str) {
+    match result {
+        Err(AuthError::UnseenKid) => {}
+        Ok(_) => panic!("{context}: served a set; expected UnseenKid"),
+        Err(other) => panic!("{context}: expected UnseenKid, got {other}"),
     }
 }
 
@@ -371,58 +374,31 @@ fn the_refresh_window_is_a_tenth_of_the_ttl_clamped_and_needs_three_floors() {
 }
 
 #[test]
-fn the_backoffs_double_from_one_second_to_their_caps() {
+fn the_backoff_doubles_from_one_second_to_eight_and_the_floor() {
     let defaults = Tuning::default();
-    let window: Vec<u64> = (0..=8)
-        .map(|n| defaults.window_backoff(n).as_secs())
-        .collect();
-    let expired: Vec<u64> = (0..=8)
-        .map(|n| defaults.expired_backoff(n).as_secs())
-        .collect();
+    let schedule: Vec<u64> = (0..=8).map(|n| defaults.backoff(n).as_secs()).collect();
     assert_eq!(
-        window,
-        [30, 1, 2, 4, 8, 16, 30, 30, 30],
-        "Bw: capped at the floor"
+        schedule,
+        [30, 1, 2, 4, 8, 8, 8, 8, 8],
+        "the floor after a success, then 1 s doubling to 8 s"
     );
-    assert_eq!(expired, [30, 1, 2, 4, 8, 8, 8, 8, 8], "Bx: capped at 8 s");
     for n in [31, 32, 33, 64, u32::MAX] {
-        assert_eq!(defaults.window_backoff(n), secs(30), "Bw({n})");
-        assert_eq!(defaults.expired_backoff(n), secs(8), "Bx({n})");
+        assert_eq!(defaults.backoff(n), secs(8), "B({n})");
     }
 
-    // Both caps are under the floor too.
+    // Never past the floor either.
     let short = Tuning::new(secs(4), MIN_REFETCH_INTERVAL); // floor 4 s
-    assert_eq!(short.window_backoff(4), secs(4));
-    assert_eq!(short.expired_backoff(4), secs(4));
+    assert_eq!(short.backoff(3), secs(4));
+    assert_eq!(short.backoff(4), secs(4));
     // A zero TTL's floor is 1 s; the off switch's is zero.
-    assert_eq!(ZERO_TTL.expired_backoff(0), secs(1));
-    assert_eq!(ZERO_TTL.expired_backoff(3), secs(1));
-    assert_eq!(NO_THROTTLE.expired_backoff(0), Duration::ZERO);
-    assert_eq!(NO_THROTTLE.expired_backoff(u32::MAX), Duration::ZERO);
-
-    // A cap far past 2^31 s is reached by doubling, exactly, and only a step
-    // past what a `Duration` holds saturates (the review's case: 2^32 s at
-    // n = 33, under a 2^40 s floor).
-    let huge = Tuning::new(Duration::MAX, secs(1 << 40));
-    assert_eq!(huge.floor(), secs(1 << 40));
-    assert_eq!(huge.window_backoff(33), secs(1 << 32));
-    assert_eq!(huge.window_backoff(40), secs(1 << 39));
-    for n in [41, 42, 64, 65, u32::MAX] {
-        assert_eq!(huge.window_backoff(n), secs(1 << 40), "Bw({n}) at the cap");
-    }
-    assert_eq!(
-        huge.expired_backoff(33),
-        secs(8),
-        "Bx keeps its own 8 s cap"
-    );
+    assert_eq!(ZERO_TTL.backoff(0), secs(1));
+    assert_eq!(ZERO_TTL.backoff(3), secs(1));
+    assert_eq!(NO_THROTTLE.backoff(0), Duration::ZERO);
+    assert_eq!(NO_THROTTLE.backoff(u32::MAX), Duration::ZERO);
+    // A huge floor keeps the 8 s cap.
     let unbounded = Tuning::new(Duration::MAX, Duration::MAX);
-    assert_eq!(unbounded.window_backoff(64), secs(1 << 63));
-    assert_eq!(
-        unbounded.window_backoff(65),
-        Duration::MAX,
-        "2^64 s saturates"
-    );
-    assert_eq!(unbounded.window_backoff(u32::MAX), Duration::MAX);
+    assert_eq!(unbounded.backoff(0), Duration::MAX);
+    assert_eq!(unbounded.backoff(u32::MAX), secs(8));
 }
 
 // --- decide(), at the exact edges -------------------------------------------
@@ -438,6 +414,8 @@ struct Row {
     since_start: Option<Duration>,
     since_end: Option<Duration>,
     failures: u32,
+    /// The kids earlier fetched sets held.
+    seen: &'static [&'static str],
     expect: &'static str,
 }
 
@@ -449,6 +427,7 @@ const ROW: Row = Row {
     since_start: None,
     since_end: None,
     failures: 0,
+    seen: &[],
     expect: "",
 };
 
@@ -459,6 +438,7 @@ fn kind(decision: &Decision<'_>) -> &'static str {
         Decision::Join(_) => "join",
         Decision::Start => "start",
         Decision::UnknownKid => "unknown-kid",
+        Decision::UnseenKid => "unseen-kid",
         Decision::Suppressed => "suppressed",
         Decision::TooSoon => "too-soon",
     }
@@ -486,6 +466,7 @@ fn run_row(row: &Row) -> &'static str {
         last_start: row.since_start.map(ago),
         last_end: row.since_end.map(ago),
         failures: row.failures,
+        seen: Seen(row.seen.iter().map(|kid| (*kid).to_owned()).collect()),
         ..State::default()
     };
     kind(&decide(&state, row.kid, now, &row.tuning))
@@ -512,22 +493,28 @@ fn decide_follows_its_table_at_every_edge() {
         // The window gate after a success is the floor, from the last end.
         Row { age: Some(r), since_end: Some(f - NANO), expect: "serve", ..ROW },
         Row { age: Some(r), since_end: Some(f), expect: "serve+refresh", ..ROW },
-        // After failures, Bw(n) from the last end: 1 s, then capped at F.
+        // After failures, B(n) from the last end: 1 s, doubling to 8 s.
         Row { age: Some(r), since_end: Some(secs(1) - NANO), failures: 1, expect: "serve", ..ROW },
         Row { age: Some(r), since_end: Some(secs(1)), failures: 1, expect: "serve+refresh", ..ROW },
-        Row { age: Some(r), since_end: Some(secs(16) - NANO), failures: 5, expect: "serve", ..ROW },
-        Row { age: Some(r), since_end: Some(secs(16)), failures: 5, expect: "serve+refresh", ..ROW },
-        Row { age: Some(r), since_end: Some(f - NANO), failures: 6, expect: "serve", ..ROW },
-        Row { age: Some(r), since_end: Some(f), failures: u32::MAX, expect: "serve+refresh", ..ROW },
+        Row { age: Some(r), since_end: Some(secs(8) - NANO), failures: 4, expect: "serve", ..ROW },
+        Row { age: Some(r), since_end: Some(secs(8)), failures: 4, expect: "serve+refresh", ..ROW },
+        Row { age: Some(r), since_end: Some(secs(8) - NANO), failures: 6, expect: "serve", ..ROW },
+        Row { age: Some(r), since_end: Some(secs(8)), failures: u32::MAX, expect: "serve+refresh", ..ROW },
         // Measured from the end, never the start.
         Row { age: Some(r), since_start: long_ago, since_end: Some(secs(1) - NANO), failures: 1, expect: "serve", ..ROW },
         // A set inside its TTL without the kid: join, or the start-to-start
-        // kid gate, which ignores the end and the failures.
+        // kid gate, which ignores the end and the failures. Closed, a kid an
+        // earlier set held is unknown (retired), and one never seen is
+        // unseen.
         Row { age: Some(secs(1)), kid: "other", in_flight: true, expect: "join", ..ROW },
-        Row { age: Some(t - NANO), kid: "other", since_start: Some(f - NANO), expect: "unknown-kid", ..ROW },
+        Row { age: Some(t - NANO), kid: "other", since_start: Some(f - NANO), seen: &["other"], expect: "unknown-kid", ..ROW },
+        Row { age: Some(t - NANO), kid: "other", since_start: Some(f - NANO), seen: &[PRIMARY_KID], expect: "unseen-kid", ..ROW },
+        Row { age: Some(t - NANO), kid: "other", since_start: Some(f - NANO), expect: "unseen-kid", ..ROW },
         Row { age: Some(t - NANO), kid: "other", since_start: Some(f), expect: "start", ..ROW },
+        Row { age: Some(t - NANO), kid: "other", since_start: Some(f), seen: &["other"], expect: "start", ..ROW },
         Row { age: Some(secs(1)), kid: "other", since_start: Some(f), since_end: Some(Duration::ZERO), failures: 3, expect: "start", ..ROW },
-        Row { age: Some(secs(1)), kid: "other", since_start: Some(f - NANO), since_end: long_ago, failures: 3, expect: "unknown-kid", ..ROW },
+        Row { age: Some(secs(1)), kid: "other", since_start: Some(f - NANO), since_end: long_ago, failures: 3, expect: "unseen-kid", ..ROW },
+        Row { age: Some(secs(1)), kid: "other", since_start: Some(f - NANO), since_end: long_ago, failures: 3, seen: &["other"], expect: "unknown-kid", ..ROW },
         // At the TTL, never the set: join, or the expiry gate.
         Row { age: Some(t), in_flight: true, expect: "join", ..ROW },
         Row { age: None, in_flight: true, expect: "join", ..ROW },
@@ -636,8 +623,9 @@ async fn a_kid_still_missing_after_a_refetch_is_unknown() {
 }
 
 /// The first fetch ever succeeds but lacks the kid: the issuer's verdict,
-/// not an outage. The set it brought back answers the same kid inside the
-/// floor that fetch opened, without a second request.
+/// not an outage. Inside the floor that fetch opened, the same kid, never
+/// seen in a fetched set, is answered from memory as a suppressed refetch,
+/// without a second request.
 #[tokio::test]
 async fn a_cold_fetch_without_the_kid_is_unknown_and_opens_the_floor() {
     let server = primary_issuer(1).await;
@@ -649,7 +637,7 @@ async fn a_cold_fetch_without_the_kid_is_unknown_and_opens_the_floor() {
     );
     assert_eq!(requests(&server).await, 1, "the cold lookup dials once");
 
-    assert_unknown(
+    assert_unseen(
         cache.jwks_for_kid("attacker-supplied-kid").await,
         "inside the floor",
     );
@@ -682,7 +670,7 @@ async fn an_unknown_kid_outside_the_floor_refetches_and_picks_up_a_rotated_key()
 }
 
 #[tokio::test]
-async fn an_unknown_kid_inside_the_floor_does_not_refetch() {
+async fn a_never_seen_kid_inside_the_floor_does_not_refetch() {
     // One request total: the lookup for the known key. The ones that follow
     // are answered from memory, without touching the issuer.
     let server = primary_issuer(1).await;
@@ -690,7 +678,7 @@ async fn an_unknown_kid_inside_the_floor_does_not_refetch() {
 
     cache.jwks_for_kid(PRIMARY_KID).await.expect("known key");
     for _ in 0..2 {
-        assert_unknown(
+        assert_unseen(
             cache.jwks_for_kid("attacker-supplied-kid").await,
             "inside the floor",
         );
@@ -778,8 +766,8 @@ async fn a_suppressed_lookup_past_the_ttl_is_an_outage_not_a_verdict() {
         assert_eq!(cache.last_start(), attempt, "not dialed");
     }
 
-    // Inside the TTL: still the issuer's word, the known key served and the
-    // unknown one a verdict.
+    // Inside the TTL: still the issuer's word, the known key served, and
+    // the never-seen one a suppressed refetch.
     cache.seed();
     cache.advance_for_test(secs(45));
     cache.failed_just_now(1);
@@ -788,7 +776,7 @@ async fn a_suppressed_lookup_past_the_ttl_is_an_outage_not_a_verdict() {
         .jwks_for_kid(PRIMARY_KID)
         .await
         .expect("inside the TTL, and holds the key");
-    assert_unknown(
+    assert_unseen(
         cache.jwks_for_kid("attacker-supplied-kid").await,
         "inside the TTL",
     );
@@ -1307,13 +1295,122 @@ async fn a_kid_flood_cannot_turn_lookups_into_fetches() {
     refreshing.settle().await;
     assert_eq!(refreshing.failures(), 1);
     for (result, _) in flood(&refreshing).await {
-        assert_unknown(result, "just after the failed refresh");
+        assert_unseen(result, "just after the failed refresh");
     }
     refreshing.advance_for_test(secs(29));
     for (result, _) in flood(&refreshing).await {
-        assert_unknown(result, "29 s after it");
+        assert_unseen(result, "29 s after it");
     }
     assert_eq!(requests(&server).await, 1, "only the refresh dialed");
+    // Only fetched sets add to the seen kids: the flood added none.
+    assert!(refreshing
+        .inner
+        .state()
+        .seen
+        .0
+        .iter()
+        .all(|kid| !kid.starts_with("attacker-kid-")));
+}
+
+/// The two verdicts inside the floor, through the public entry point: a kid
+/// an earlier fetched set held and the current one lacks (a retired key) is
+/// `UnknownKid`, one no fetched set held is `UnseenKid`, and neither dials.
+/// Once the floor has passed, a never-seen kid refetches, and still absent
+/// after that refetch it is `UnknownKid`.
+#[tokio::test]
+async fn inside_the_floor_a_retired_kid_is_unknown_and_a_never_seen_one_unseen() {
+    // The issuer rotates from the primary key to the secondary, and serves
+    // that for the last two fetches.
+    let server = MockServer::start().await;
+    for (body, times) in [
+        (primary_body(), 1),
+        (jwks_body(TestKey::secondary().jwks_json()), 2),
+    ] {
+        wiremock::Mock::given(wiremock::matchers::path("/jwks"))
+            .respond_with(body)
+            .up_to_n_times(times)
+            .expect(times)
+            .mount(&server)
+            .await;
+    }
+    let cache = cache(&server, BOUNDED);
+
+    cache
+        .jwks_for_kid(PRIMARY_KID)
+        .await
+        .expect("the first key");
+    cache.advance_for_test(secs(31));
+    cache
+        .jwks_for_kid(SECONDARY_KID)
+        .await
+        .expect("the rotated key, refetched");
+    assert_eq!(requests(&server).await, 2);
+
+    // Inside the floor that refetch opened.
+    assert_unknown(cache.jwks_for_kid(PRIMARY_KID).await, "the retired key");
+    assert_unseen(cache.jwks_for_kid("never-seen").await, "a never-seen kid");
+    assert_eq!(requests(&server).await, 2, "both from memory");
+
+    // Past the floor, inside the TTL: a refetch, and the issuer's verdict.
+    cache.advance_for_test(secs(30));
+    assert_unknown(
+        cache.jwks_for_kid("never-seen").await,
+        "absent after a refetch",
+    );
+    assert_eq!(requests(&server).await, 3, "one refetch");
+    // That refetch added nothing: still never seen, inside the new floor.
+    assert_unseen(cache.jwks_for_kid("never-seen").await, "the new floor");
+    assert_unknown(cache.jwks_for_kid(PRIMARY_KID).await, "still retired");
+    assert_eq!(requests(&server).await, 3);
+}
+
+/// A set of `count` copies of the primary key, kids `{prefix}0` and up.
+fn set_of(prefix: &str, count: usize) -> JwkSet {
+    let key = TestKey::primary().jwks().keys.remove(0);
+    JwkSet {
+        keys: (0..count)
+            .map(|i| {
+                let mut key = key.clone();
+                key.common.key_id = Some(format!("{prefix}{i}"));
+                key
+            })
+            .collect(),
+    }
+}
+
+/// The seen kids are bounded: the newest fetched sets' kids are kept, the
+/// oldest forgotten past the cap, a kid fetched again becomes the newest,
+/// and a set larger than the cap keeps its last kids.
+#[test]
+fn the_seen_kids_are_bounded_and_newest_last() {
+    let mut seen = Seen::default();
+    seen.record(&set_of("a", 3));
+    assert!(seen.contains("a0") && seen.contains("a2"));
+    assert!(!seen.contains("b0"));
+
+    // Re-recording a kid moves it to the newest end, with no duplicate.
+    seen.record(&set_of("a", 1));
+    assert_eq!(seen.0.len(), 3);
+    assert_eq!(seen.0.back().map(String::as_str), Some("a0"));
+
+    // Sixty-two more: the cap is reached and the oldest go first.
+    seen.record(&set_of("b", 62));
+    assert_eq!(seen.0.len(), SEEN_KIDS);
+    assert!(!seen.contains("a1"), "the oldest is forgotten");
+    assert!(seen.contains("a2") && seen.contains("a0") && seen.contains("b61"));
+
+    // A set past the cap on its own: its last kids, and the cap holds.
+    seen.record(&set_of("c", 1000));
+    assert_eq!(seen.0.len(), SEEN_KIDS);
+    assert!(seen.contains("c999") && seen.contains("c936"));
+    assert!(!seen.contains("c935") && !seen.contains("b61"));
+
+    // A key with no kid adds nothing.
+    let mut no_kid = set_of("x", 1);
+    no_kid.keys[0].common.key_id = None;
+    let before = seen.0.clone();
+    seen.record(&no_kid);
+    assert_eq!(seen.0, before);
 }
 
 /// (i) A zero TTL caches nothing: two lookups that waited on one fetch both
@@ -1572,7 +1669,7 @@ async fn a_stale_guard_never_clears_or_charges_a_newer_reservation() {
     let reserve = || {
         let mut state = cache.inner.state();
         let now = cache.inner.now();
-        cache.reserve(&mut state, now).expect("on a runtime")
+        cache.reserve(&mut state, now)
     };
     let guard = |id: u64, sender| SlotGuard {
         inner: Arc::clone(&cache.inner),
@@ -1625,81 +1722,24 @@ async fn a_stale_guard_never_clears_or_charges_a_newer_reservation() {
     assert!(state.cached.is_some());
 }
 
-/// (n) Outside a tokio runtime the cache never panics: the set answers in
-/// its refresh window with no refresh reserved, and a lookup that needs a
-/// fetch is refused.
+/// (n) A fresh hit needs no runtime at all: it is answered from memory.
+/// (Starting or joining a fetch needs one, as reqwest does.)
 #[test]
-fn outside_a_runtime_refresh_ahead_is_skipped_and_a_needed_fetch_is_refused() {
+fn outside_a_runtime_a_fresh_hit_still_answers() {
     assert!(
         tokio::runtime::Handle::try_current().is_err(),
         "no runtime here"
     );
     let cache = cache_at(NOTHING_LISTENS, BLIP);
     cache.seed();
-    cache.advance_for_test(secs(75));
+    cache.advance_for_test(secs(30));
 
     match cache.jwks_for_kid(PRIMARY_KID).now_or_never() {
         Some(Ok(set)) => assert!(set.find(PRIMARY_KID).is_some()),
-        Some(Err(err)) => panic!("in the refresh window: {err}"),
-        None => panic!("a refresh-ahead lookup does not wait"),
+        Some(Err(err)) => panic!("a fresh hit: {err}"),
+        None => panic!("a fresh hit does not wait"),
     }
-    assert!(!cache.in_flight());
-    assert_eq!(cache.attempts_reserved(), 0, "no refresh reserved");
-
-    cache.advance_for_test(secs(60));
-    match cache.jwks_for_kid(PRIMARY_KID).now_or_never() {
-        Some(result) => assert_jwks(result, NO_RUNTIME, "past the TTL"),
-        None => panic!("a lookup with no runtime does not wait"),
-    }
-    let state = cache.inner.state();
-    assert!(state.in_flight.is_none());
-    assert_eq!(state.next_id, 0, "nothing reserved");
-    assert_eq!(state.failures, 0, "nothing charged");
-}
-
-/// Fix for the review's first P2: a lookup that would *join* a fetch outside
-/// any tokio runtime is refused at once, as one that would start a fetch is.
-/// It used to build a tokio timer for a retry there, which panics, and to
-/// wait on a first attempt with no bound at all. Both kinds of attempt are
-/// tried, each started by a runtime that keeps running it. (A runtime built
-/// without its time driver is unsupported, as it is for reqwest: the
-/// `# Panics` section of `jwks_for_kid`.)
-#[test]
-fn joining_a_fetch_outside_a_runtime_is_refused_not_a_panic() {
-    let host = multi_thread_runtime();
-    let silent = host.block_on(SilentIssuer::start());
-    for (failures, kind) in [(1, "a retry"), (0, "a first attempt")] {
-        let cache = Arc::new(cache_at(silent.url.clone(), BOUNDED));
-        cache.seed();
-        cache.advance_for_test(secs(61));
-        if failures > 0 {
-            cache.failed_just_now(failures);
-            cache.advance_for_test(secs(1));
-        }
-        let dials = silent.dials();
-        drop(host.spawn({
-            let cache = Arc::clone(&cache);
-            async move { cache.jwks_for_kid(PRIMARY_KID).await }
-        }));
-        until_blocking("the host's fetch to reach the issuer", || {
-            silent.dials() == dials + 1
-        });
-        assert_eq!(
-            cache.inner.state().in_flight.as_ref().map(|f| f.retry),
-            Some(failures > 0),
-            "{kind} is in flight"
-        );
-
-        assert!(
-            tokio::runtime::Handle::try_current().is_err(),
-            "no runtime on this thread"
-        );
-        match cache.jwks_for_kid(PRIMARY_KID).now_or_never() {
-            Some(result) => assert_jwks(result, NO_RUNTIME, kind),
-            None => panic!("{kind}: a lookup with no runtime waited"),
-        }
-        assert!(cache.in_flight(), "{kind}: the host's fetch carries on");
-    }
+    assert_eq!(cache.attempts_reserved(), 0, "nothing reserved");
 }
 
 /// Fix for the review's second P2, in its own sequence: current-thread

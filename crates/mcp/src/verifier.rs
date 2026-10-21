@@ -31,7 +31,10 @@
 //! left of a fetch still failing, the backoff and one successful fetch
 //! (about 28 s at the defaults), provided requests keep arriving: with none,
 //! the first one to arrive starts that fetch. A long outage is a run of
-//! `503`s, never of `401`s.
+//! `503`s, never of `401`s. A token whose `kid` the cache has never seen,
+//! presented inside its refetch floor ([`stridelabs_auth::AuthError::UnseenKid`]:
+//! possibly a rotation not fetched yet), is `Unavailable` too; a retired
+//! key's is `Invalid`, so a client re-authorizes at once.
 //!
 //! # Errors never echo the credential
 //!
@@ -83,13 +86,16 @@ impl VerifyError {
     }
 }
 
-/// [`AuthError::Jwks`] is the server's outage, so it is `Unavailable`;
-/// everything else is a verdict on the token. `AuthError`'s messages are
-/// already redaction-safe (fixed phrases, URL-free), so they are kept.
+/// [`AuthError::Jwks`] is the server's outage, and [`AuthError::UnseenKid`]
+/// a refetch the server suppressed, so both are `Unavailable`; everything
+/// else is a verdict on the token. `AuthError`'s messages are already
+/// redaction-safe (fixed phrases, URL-free), so they are kept.
 impl From<AuthError> for VerifyError {
     fn from(err: AuthError) -> VerifyError {
         match err {
-            AuthError::Jwks(_) => VerifyError::Unavailable(err.to_string().into()),
+            AuthError::Jwks(_) | AuthError::UnseenKid => {
+                VerifyError::Unavailable(err.to_string().into())
+            }
             _ => VerifyError::Invalid(err.to_string().into()),
         }
     }
@@ -493,6 +499,31 @@ mod tests {
 
         assert!(matches!(err, VerifyError::Unavailable(_)), "{err}");
         assert!(!err.to_string().contains(&server.uri()), "{err}");
+    }
+
+    /// The mapping itself: an outage and a suppressed refetch are
+    /// `Unavailable`, a verdict on the token (an unknown or retired key
+    /// included) is `Invalid`.
+    #[test]
+    fn auth_errors_map_to_unavailable_or_invalid() {
+        for err in [
+            AuthError::Jwks("endpoint returned 503".into()),
+            AuthError::UnseenKid,
+        ] {
+            let reason = err.to_string();
+            assert_eq!(
+                VerifyError::from(err),
+                VerifyError::Unavailable(reason.into())
+            );
+        }
+        for err in [
+            AuthError::UnknownKid,
+            AuthError::MissingKid,
+            AuthError::InvalidToken("signature is invalid".into()),
+        ] {
+            let reason = err.to_string();
+            assert_eq!(VerifyError::from(err), VerifyError::Invalid(reason.into()));
+        }
     }
 
     #[tokio::test]

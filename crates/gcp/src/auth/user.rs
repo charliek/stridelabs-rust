@@ -2,7 +2,6 @@
 //! application-default login`), exchanged with its refresh token.
 
 use std::fmt;
-use std::sync::atomic::AtomicU16;
 
 use super::adc::Fields;
 use super::error::GcpAuthError;
@@ -48,7 +47,6 @@ impl AuthorizedUser {
         &self,
         http: &reqwest::Client,
         options: &TokenOptions,
-        status_line: &AtomicU16,
     ) -> Result<Fetched, Failed<GcpAuthError>> {
         let token_uri = &options.default_token_uri;
         let request = http.post(token_uri).form(&[
@@ -57,6 +55,6 @@ impl AuthorizedUser {
             ("client_secret", self.client_secret.as_str()),
             ("refresh_token", self.refresh_token.as_str()),
         ]);
-        exchange(request, token_uri, options.token_timeout, status_line).await
+        exchange(request, token_uri, options.token_timeout).await
     }
 }

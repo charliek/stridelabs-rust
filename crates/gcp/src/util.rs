@@ -3,8 +3,6 @@
 //! a name goes into a URL.
 
 use std::fmt;
-use std::sync::atomic::{AtomicU16, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
 
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use serde_json::Value;
@@ -98,9 +96,8 @@ impl Category {
     /// Whether a request that failed this way **before any response** could
     /// succeed if sent again: it timed out, never connected, or broke in
     /// flight (`request error`: the connection closed or was reset before a
-    /// response) — google-cloud-storage's `ConnectionError`, `Timeout` and
-    /// `ProtocolError` (`retry.py:31-49`). A refused redirect, a request
-    /// that cannot be built and a failure reqwest does not name are not. A
+    /// response). A refused redirect, a request that cannot be built and a
+    /// failure reqwest does not name are not. A
     /// failure while reading a body after the headers is another matter:
     /// that is an interrupted transfer, transient whatever its category (the
     /// reader decides: `Failed::transient`).
@@ -177,76 +174,12 @@ impl<E> Failed<E> {
     }
 }
 
-/// The statuses google-cloud-storage retries (`retry.py:52-59`): 408, 429,
-/// 500, 502, 503 and 504. Every other status, 501 and 505 included, is the
+/// The statuses worth another attempt: 408 (request timeout), 429 (too many
+/// requests), and the 5xx that report a transient server condition, 500,
+/// 502, 503 and 504. Every other status, 501 and 505 included, is the
 /// server's answer about the request itself.
 pub(crate) fn is_transient_status(status: u16) -> bool {
     matches!(status, 408 | 429 | 500 | 502 | 503 | 504)
-}
-
-/// A status line not yet heard, in the atomics below.
-const NONE_HEARD: u16 = 0;
-
-/// What one attempt has already heard, which the timeout cutting it off
-/// must not throw away: the status line of the answer it is reading, and
-/// that of the token refresh it is waiting on.
-///
-/// Once a status line is in, its class is final. An error body that stalls
-/// until the attempt's timeout ends it as `Timeout` (v0.8.0's error there),
-/// but transient only if that status is: a `412` or a `401` whose body never
-/// arrives is not retried, a `503`'s is. A cut-off attempt that heard
-/// nothing (no response yet, or a 2xx body being read) is transient, as any
-/// timeout. Atomics, so an operation's future stays `Send`.
-#[derive(Default)]
-pub(crate) struct Heard {
-    /// The status of the response the attempt is reading, while it is.
-    status: AtomicU16,
-    /// The status line the token endpoint of the refresh being waited on
-    /// answered: shared with that refresh, which sets it.
-    token: Mutex<Option<Arc<AtomicU16>>>,
-}
-
-impl Heard {
-    /// A non-2xx response is in, with this status: it decides the attempt,
-    /// whatever its body does.
-    pub(crate) fn status(&self, status: u16) {
-        self.status.store(status, Ordering::Release);
-    }
-
-    /// The request is sent again (a `401`'s replay): what the attempt heard
-    /// is no longer its answer.
-    pub(crate) fn resending(&self) {
-        self.status.store(NONE_HEARD, Ordering::Release);
-    }
-
-    /// The attempt waits on the token refresh whose status line `line`
-    /// will hold.
-    pub(crate) fn waiting_on(&self, line: &Arc<AtomicU16>) {
-        *self.token.lock().unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(line));
-    }
-
-    /// Whether an attempt cut off now could succeed if made again: by the
-    /// status of the answer it was reading, else by the status line of the
-    /// token refresh it was waiting on, else yes.
-    pub(crate) fn cut_off_is_transient(&self) -> bool {
-        let heard =
-            |line: &AtomicU16| Some(line.load(Ordering::Acquire)).filter(|&s| s != NONE_HEARD);
-        let token = self
-            .token
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .as_deref()
-            .and_then(heard);
-        heard(&self.status)
-            .or(token)
-            .is_none_or(is_transient_status)
-    }
-}
-
-/// A token refresh's status line, unset: what [`Heard::waiting_on`] reads,
-/// written by the refresh once its token endpoint answers non-2xx.
-pub(crate) fn status_line() -> Arc<AtomicU16> {
-    Arc::new(AtomicU16::new(NONE_HEARD))
 }
 
 /// A JSON parse failure as its category and position only. serde_json's
@@ -734,8 +667,8 @@ mod tests {
         }
     }
 
-    /// The status table, over every status code: google-cloud-storage's six
-    /// (`retry.py:52-59`) and nothing else.
+    /// The status table, over every status code: those six and nothing
+    /// else.
     #[test]
     fn exactly_six_statuses_are_transient() {
         let transient: Vec<u16> = (100..=599).filter(|&s| is_transient_status(s)).collect();
@@ -743,33 +676,6 @@ mod tests {
         let failed = |status| Failed::status(status, ()).transient;
         assert!(failed(503) && !failed(501) && !failed(401) && !failed(412));
         assert!(Failed::transient(()).transient && !Failed::permanent(()).transient);
-    }
-
-    /// What a cut-off attempt is classified by: the status of the answer it
-    /// was reading, else that of the token refresh it was waiting on, else
-    /// transient; a replay sent forgets the answer it replaced.
-    #[test]
-    fn a_cut_off_attempt_is_classified_by_the_status_it_heard() {
-        let heard = Heard::default();
-        assert!(heard.cut_off_is_transient(), "nothing heard");
-        let line = status_line();
-        heard.waiting_on(&line);
-        assert!(heard.cut_off_is_transient(), "a refresh not answered yet");
-        line.store(400, Ordering::Release);
-        assert!(!heard.cut_off_is_transient(), "its token endpoint said 400");
-        line.store(503, Ordering::Release);
-        assert!(heard.cut_off_is_transient(), "its token endpoint said 503");
-
-        // The answer being read comes first.
-        heard.status(401);
-        assert!(!heard.cut_off_is_transient(), "a 401 being drained");
-        heard.resending();
-        assert!(heard.cut_off_is_transient(), "the replay is out; 503 again");
-        for (status, transient) in [(412, false), (409, false), (429, true), (504, true)] {
-            let heard = Heard::default();
-            heard.status(status);
-            assert_eq!(heard.cut_off_is_transient(), transient, "{status}");
-        }
     }
 
     /// The categories a real failure lands in, at the two places a request

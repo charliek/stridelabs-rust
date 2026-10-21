@@ -188,9 +188,7 @@ wiremock = { workspace = true }
 # `cargo build` and every consumer's graph keep reqwest without it (`cargo
 # tree -e normal` is unchanged). `cargo test --workspace` does unify it into
 # every member's test build: the `ssrf` client's `no_*` calls are tested
-# under it too, and stridelabs-gcp's v0.8.0 wire pins inject a client with
-# the decoders switched off, since `Accept-Encoding` is the injected
-# client's.
+# under it too.
 reqwest = { workspace = true, features = ["gzip"] }
 # The `proxy::upstream` leak tests install a capturing subscriber and assert on
 # the bytes it wrote — that no upstream URL or query string is among them.

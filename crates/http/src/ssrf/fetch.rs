@@ -19,7 +19,7 @@ use url::Url;
 #[cfg(feature = "ssrf-decompress")]
 use super::decode;
 use super::error::SsrfError;
-use super::policy::{self, FetchPolicy, HeaderNames};
+use super::policy::FetchPolicy;
 use super::target::{self, Target, TargetHost};
 
 /// The capped body of a successful fetch: `200 OK`, or any status the
@@ -55,20 +55,19 @@ impl fmt::Debug for Fetched {
 /// **`final_url` and `headers` are not client-safe**, unlike
 /// [`SsrfError`]: they can name the redirect target, carry `Set-Cookie`, and
 /// reveal what a server said about itself. They are for the server-side
-/// caller; do not echo them to whoever chose the URL. `Debug` prints neither
-/// a header value nor the URL's query or fragment.
+/// caller; do not echo them to whoever chose the URL. `Debug` prints the
+/// body's length, never its bytes, no header value, and the URL as
+/// `scheme://host[:port]/path`, its query and fragment marked redacted.
 #[derive(Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct FetchResponse {
     /// The body, at most the policy's `max_bytes`: decoded when the policy
-    /// decodes and the response was coded (feature `ssrf-decompress`), and
-    /// empty for a `304 Not Modified`.
+    /// decodes and the response was coded (feature `ssrf-decompress`).
     pub body: Bytes,
     /// The response's `Content-Type`, verbatim, if it sent a readable one
     /// (as in [`Fetched`]).
     pub content_type: Option<String>,
-    /// The status: one the policy accepts, or `304` for a not-modified
-    /// answer to a validator on the first hop.
+    /// The status: one the policy accepts.
     pub status: StatusCode,
     /// The URL of the hop that answered, as requested: normalized (the
     /// IDNA, lower-cased host the fetch pinned, no trailing dot, the default
@@ -96,14 +95,31 @@ impl fmt::Debug for FetchResponse {
     }
 }
 
-/// A URL with its query and fragment replaced by markers (there is no
-/// userinfo to redact: the fetch refuses it).
+/// A `HeaderMap`'s names, one per value, for a `Debug` that must not print
+/// the values.
+struct HeaderNames<'a>(&'a HeaderMap);
+
+impl fmt::Debug for HeaderNames<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list()
+            .entries(self.0.iter().map(|(name, _)| name.as_str()))
+            .finish()
+    }
+}
+
+/// A URL as `scheme://host[:port]/path`, its query and fragment replaced by
+/// markers. Userinfo is never printed (the fetch refuses it anyway).
 struct RedactedUrl<'a>(&'a Url);
 
 impl fmt::Debug for RedactedUrl<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let url = self.0;
-        f.write_str(&url[..url::Position::AfterPath])?;
+        write!(
+            f,
+            "{}://{}",
+            url.scheme(),
+            &url[url::Position::BeforeHost..url::Position::AfterPath]
+        )?;
         if url.query().is_some() {
             f.write_str("?<redacted>")?;
         }
@@ -128,19 +144,9 @@ impl From<FetchResponse> for Fetched {
 /// Fetch `url` under the full SSRF policy and return the capped body.
 ///
 /// [`fetch_public_response`], reduced to body and content type: what an
-/// image fetch needs. Every step and every error is that function's. The one
-/// difference is a `304 Not Modified` answering a validator (possible only
-/// for a policy with one, [`FetchPolicy::with_header`]): a [`Fetched`]
-/// cannot say "not modified", so it is [`SsrfError::HttpStatus`] here.
+/// image fetch needs. Every step and every error is that function's.
 pub async fn fetch_public(url: &str, policy: &FetchPolicy) -> Result<Fetched, SsrfError> {
-    let response = fetch_public_response(url, policy).await?;
-    if response.status == StatusCode::NOT_MODIFIED {
-        return Err(SsrfError::HttpStatus {
-            label: policy.label.clone(),
-            status: response.status,
-        });
-    }
-    Ok(response.into())
+    fetch_public_response(url, policy).await.map(Fetched::from)
 }
 
 /// Fetch `url` under the full SSRF policy and return the answering hop's
@@ -158,10 +164,7 @@ pub async fn fetch_public(url: &str, policy: &FetchPolicy) -> Result<Fetched, Ss
 ///      IP literal is its own pin;
 ///    - send one GET through a client built for this hop alone, whose
 ///      resolver answers only the normalized name, with the pinned address,
-///      carrying the policy's `Accept-Encoding`, `Accept`, `User-Agent` and
-///      extra headers (validators on the first hop only);
-///    - on the first hop of a policy with a validator, a `304` is the
-///      result: an empty body, nothing more read;
+///      carrying the policy's `Accept-Encoding`, `Accept` and `User-Agent`;
 ///    - a 3xx is [`SsrfError::RedirectsNotAllowed`] unless the policy allows
 ///      redirects, in which case its `Location` is joined onto the current
 ///      URL and the target goes back to step 1, up to the policy's
@@ -176,12 +179,11 @@ pub async fn fetch_public(url: &str, policy: &FetchPolicy) -> Result<Fetched, Ss
 ///      before a byte of body is read, and so is a streamed body the moment
 ///      it would pass the cap: `max_bytes` for an unencoded body; for a
 ///      coded one, a wire cap of `max_bytes + max_bytes / 8 + 4096`, then
-///      `max_bytes` on the decoded bytes (counting output written before a
-///      corruption is found), decoded in bounded steps that yield, with the
-///      budget checked before each step and on every answer, so a decode
-///      running past it or answering after it is [`SsrfError::TimedOut`],
-///      whatever it came to. No body buffer's capacity passes its cap. A
-///      corrupt or truncated coded body is
+///      `max_bytes` on the decoded bytes, decoded in bounded steps that
+///      yield, with the budget checked before each step and on every
+///      answer, so a decode running past it or answering after it is
+///      [`SsrfError::TimedOut`], whatever it came to. No body buffer's
+///      capacity passes its cap. A corrupt or truncated coded body is
 ///      [`SsrfError::FetchFailed`], never a partial one.
 ///
 /// Every other failure is [`SsrfError::FetchFailed`]. No error carries an
@@ -376,25 +378,12 @@ async fn request_once(
     if let Some(user_agent) = &policy.user_agent {
         request = request.header(USER_AGENT, user_agent.clone());
     }
-    for (name, value) in &policy.headers {
-        // The validators describe the URL the caller cached, which only the
-        // first hop requests (RFC 9110 section 15.4).
-        if hop == 0 || !policy::is_validator(name) {
-            request = request.header(name, value.clone());
-        }
-    }
     let response = request
         .send()
         .await
         .map_err(|e| transport_failure(e, policy))?;
 
     let status = response.status();
-    // The answer to the validators this hop sent: terminal, never a
-    // redirect (a Location is ignored), and with no body to read.
-    if status == StatusCode::NOT_MODIFIED && hop == 0 && policy.has_validator() {
-        let headers = response.headers().clone();
-        return Ok(answer(target, hop, status, headers, Bytes::new()));
-    }
     // Every 3xx, as Python's `is_redirect` — a 304 or a 300 is "a redirect"
     // here too, refused or (with no usable Location) a failed fetch.
     if status.is_redirection() {
@@ -705,7 +694,6 @@ mod tests {
         send_sync::<SsrfError>();
         send_sync::<Fetched>();
         send_sync::<FetchResponse>();
-        send_sync::<crate::ssrf::ReservedHeader>();
         send_sync::<crate::ssrf::AcceptedStatuses>();
         #[cfg(feature = "ssrf-decompress")]
         send_sync::<crate::ssrf::Decompression>();
@@ -807,6 +795,17 @@ mod tests {
             empty_query.contains("final_url: https://feeds.example.com/rss?<redacted>,"),
             "{empty_query}"
         );
+        // Userinfo never reaches a fetched URL, and would not be printed if
+        // it did; a port is kept.
+        let userinfo = format!(
+            "{:?}",
+            response("https://user:pass-secret@feeds.example.com:8443/rss")
+        );
+        assert!(
+            userinfo.contains("final_url: https://feeds.example.com:8443/rss,"),
+            "{userinfo}"
+        );
+        assert!(!userinfo.contains("pass-secret"), "{userinfo}");
     }
 
     /// With decoding off (or the feature absent), exactly v0.8.0's check.
