@@ -47,6 +47,13 @@ const DATABASE_URL_SHAPE: UrlShape = UrlShape {
     schemes: &["postgres", "postgresql"],
 };
 
+/// The same, for [`require_postgres_at`]'s argument: its placeholder names
+/// the URL the caller passed, not a variable the helper never reads.
+const ARGUMENT_URL_SHAPE: UrlShape = UrlShape {
+    env_var: "URL passed to require_postgres_at",
+    schemes: &["postgres", "postgresql"],
+};
+
 /// How long to wait for a connection before giving up. Short on purpose: a
 /// local or CI Postgres that is actually up answers in milliseconds, and a
 /// test suite hanging for the default `sqlx` timeout on a *down* database is
@@ -166,16 +173,18 @@ async fn connect(url: &str, source: UrlSource) -> PgPool {
 }
 
 fn connection_failure_message(url: &str, err: &sqlx::Error, source: UrlSource) -> String {
-    let (helper, fix) = match source {
+    let (helper, fix, shape) = match source {
         UrlSource::Environment => (
             "require_postgres",
             format!("point {DATABASE_URL_VAR} at a Postgres instance that is actually reachable"),
+            &DATABASE_URL_SHAPE,
         ),
         UrlSource::Argument => (
             "require_postgres_at",
             "check the URL you passed: require_postgres_at connects to exactly that URL \
              and reads no environment variable"
                 .to_owned(),
+            &ARGUMENT_URL_SHAPE,
         ),
     };
     format!(
@@ -189,7 +198,7 @@ fn connection_failure_message(url: &str, err: &sqlx::Error, source: UrlSource) -
         \n\
         - start the local database: `docker compose up -d` (or `make up`)\n\
         - or {fix}\n",
-        redacted = redact_password(url, &DATABASE_URL_SHAPE),
+        redacted = redact_password(url, shape),
     )
 }
 
@@ -337,6 +346,25 @@ mod tests {
         );
         assert!(
             from_argument.contains("check the URL you passed"),
+            "{from_argument}"
+        );
+        assert!(!from_argument.contains("DATABASE_URL"), "{from_argument}");
+
+        // A URL too malformed to render is replaced by a placeholder, which
+        // names where it came from: the variable, or the argument.
+        let malformed = "postgres:/postgres:hunter2@127.0.0.1:1/stridelabs_test";
+        let from_env = connection_failure_message(malformed, &err, UrlSource::Environment);
+        assert!(!from_env.contains("hunter2"), "{from_env}");
+        assert!(
+            from_env.contains("<a DATABASE_URL that is not a well-formed URL (not shown)>"),
+            "{from_env}"
+        );
+        let from_argument = connection_failure_message(malformed, &err, UrlSource::Argument);
+        assert!(!from_argument.contains("hunter2"), "{from_argument}");
+        assert!(
+            from_argument.contains(
+                "<a URL passed to require_postgres_at that is not a well-formed URL (not shown)>"
+            ),
             "{from_argument}"
         );
         assert!(!from_argument.contains("DATABASE_URL"), "{from_argument}");
