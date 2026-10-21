@@ -345,6 +345,12 @@ for a consumer's pin.
     `From<AuthError> for VerifyError` maps it to `Unavailable` (a 503 that
     keeps the client's token). So a never-seen kid inside the floor is a
     500 (http) or 503 (mcp) where it was a 401.
+  - **Operational:** anyone can mint a token with a random kid, so a flood
+    of forged kids inside the floor is now one 5xx per request, and under
+    the `http` bridge one logged 500. Its logged detail is
+    `slauth JWKS: … refetch suppressed`, distinct from a fetch failure's,
+    so 5xx alerting can exclude it; rate-limit unauthenticated traffic in
+    the consumer if that volume matters.
 
   **Migration:** a `match` on `AuthError` needs a wildcard arm; send
   `UnseenKid` where `Jwks` goes if you map the error yourself (lumen maps

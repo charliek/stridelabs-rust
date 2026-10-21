@@ -458,7 +458,11 @@ With the `http` feature:
 
 A JWKS failure is *this service's* outage and says nothing about the caller's
 token, so it is a 500 whose detail is logged and not returned. So is a
-refetch the cache suppressed for a never-seen kid. `AuthError` is
+refetch the cache suppressed for a never-seen kid. Anyone can mint a token
+with a random kid, so forged kids inside the refetch floor are one logged 500
+each: their detail, `slauth JWKS: … refetch suppressed`, is distinct from a
+fetch failure's, so 5xx alerting can exclude it, and a consumer that cares
+about the volume rate-limits unauthenticated traffic. `AuthError` is
 `#[non_exhaustive]`: a consumer mapping it itself needs a wildcard arm, and
 should send `UnseenKid` where it sends `Jwks`. Every other
 failure collapses to one generic 401 message: `AppError`'s contract is that a
