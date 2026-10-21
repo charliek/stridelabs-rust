@@ -104,7 +104,6 @@ mod user;
 mod single_flight_tests;
 
 use std::fmt;
-use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -120,9 +119,7 @@ pub use adc::{
 pub use error::GcpAuthError;
 pub use metadata::DEFAULT_METADATA_BASE_URL;
 
-use crate::util::{
-    is_code, read_error_body, read_limited, redact_url, status_line, Category, Failed, Heard,
-};
+use crate::util::{is_code, read_error_body, read_limited, redact_url, Category, Failed};
 
 /// Full access to every Google Cloud API the identity's IAM roles allow —
 /// what Vertex AI requires.
@@ -409,10 +406,6 @@ struct Cache {
 struct InFlight {
     id: u64,
     attempt: Attempt,
-    /// The status line its token endpoint answered, once a non-2xx one is
-    /// in (before its body is read): what a waiter cut off by its own
-    /// timeout is classified by.
-    status_line: Arc<AtomicU16>,
 }
 
 struct Cached {
@@ -650,34 +643,22 @@ impl TokenProvider {
     ///
     /// Outside a tokio runtime, when a refresh has to start (`tokio::spawn`).
     pub async fn token(&self) -> Result<AccessToken, GcpAuthError> {
-        self.classified_token(None)
-            .await
-            .map_err(|failed| failed.error)
+        self.classified_token().await.map_err(|failed| failed.error)
     }
 
     /// [`TokenProvider::token`], its failure carrying whether it was
     /// transient: decided where it happened (a token endpoint's `503`, a
     /// connection that failed, a token body cut off), for a caller that
-    /// retries. When the call waits on a refresh, `heard` learns that
-    /// refresh's status line as soon as its token endpoint answers, so a
-    /// caller whose own timeout cuts the wait short still knows whether the
-    /// refresh had already failed for good.
-    pub(crate) async fn classified_token(
-        &self,
-        heard: Option<&Heard>,
-    ) -> Result<AccessToken, Failed<GcpAuthError>> {
+    /// retries.
+    pub(crate) async fn classified_token(&self) -> Result<AccessToken, Failed<GcpAuthError>> {
         let now = self.inner.now();
-        let (attempt, line, start) = {
+        let (attempt, start) = {
             let mut cache = self.inner.cache();
             if let Some(token) = cache.fresh(now) {
                 return Ok(token);
             }
             match &cache.in_flight {
-                Some(in_flight) => (
-                    in_flight.attempt.clone(),
-                    Arc::clone(&in_flight.status_line),
-                    None,
-                ),
+                Some(in_flight) => (in_flight.attempt.clone(), None),
                 None => {
                     // Reserve the slot under the lock; spawn only after it
                     // is released (below), so nothing that runs a guard's
@@ -693,19 +674,14 @@ impl TokenProvider {
                         })
                         .boxed()
                         .shared();
-                    let line = status_line();
                     cache.in_flight = Some(InFlight {
                         id,
                         attempt: attempt.clone(),
-                        status_line: Arc::clone(&line),
                     });
-                    (attempt, line, Some((id, cache.epoch, sender)))
+                    (attempt, Some((id, cache.epoch, sender)))
                 }
             }
         };
-        if let Some(heard) = heard {
-            heard.waiting_on(&line);
-        }
         if let Some((id, epoch, sender)) = start {
             // The guard exists before the task does, so even a task dropped
             // before its first poll clears the slot it reserved.
@@ -713,7 +689,6 @@ impl TokenProvider {
                 inner: Arc::clone(&self.inner),
                 id,
                 epoch,
-                status_line: line,
                 sender: Some(sender),
             };
             tokio::spawn(refresh(guard).instrument(tracing::Span::current()));
@@ -866,7 +841,7 @@ impl TokenProvider {
 /// reaches it.
 async fn refresh(guard: SlotGuard) {
     let started = guard.inner.now();
-    let result = guard.inner.fetch(&guard.status_line).await;
+    let result = guard.inner.fetch().await;
     guard.complete(result, started);
 }
 
@@ -886,8 +861,6 @@ struct SlotGuard {
     id: u64,
     /// The cache's eviction epoch when this attempt reserved its slot.
     epoch: u64,
-    /// Its token endpoint's status line (see [`InFlight::status_line`]).
-    status_line: Arc<AtomicU16>,
     sender: Option<oneshot::Sender<Result<AccessToken, Failed<GcpAuthError>>>>,
 }
 
@@ -964,7 +937,7 @@ impl Inner {
         }
     }
 
-    async fn fetch(&self, status_line: &AtomicU16) -> Result<Fetched, Failed<GcpAuthError>> {
+    async fn fetch(&self) -> Result<Fetched, Failed<GcpAuthError>> {
         #[cfg(test)]
         if self
             .panics_left
@@ -979,16 +952,9 @@ impl Inner {
         }
         match &self.source {
             #[cfg(feature = "service-account-key")]
-            Source::ServiceAccount(key) => {
-                key.fetch(&self.http, &self.scopes, &self.options, status_line)
-                    .await
-            }
-            Source::AuthorizedUser(user) => {
-                user.fetch(&self.http, &self.options, status_line).await
-            }
-            Source::Metadata => {
-                metadata::fetch(&self.http, &self.scopes, &self.options, status_line).await
-            }
+            Source::ServiceAccount(key) => key.fetch(&self.http, &self.scopes, &self.options).await,
+            Source::AuthorizedUser(user) => user.fetch(&self.http, &self.options).await,
+            Source::Metadata => metadata::fetch(&self.http, &self.scopes, &self.options).await,
         }
     }
 }
@@ -1009,19 +975,13 @@ pub(crate) struct Fetched {
 /// Each failure says, where it happens, whether it was transient (the class
 /// `GcsClient`'s opt-in retry reads; [`TokenProvider::token`] drops it): a
 /// transport failure before the response by its category, an error status
-/// by google-cloud-storage's status set, and a 2xx body that could not be
-/// read always (an interrupted transfer; the only source of a token-path
-/// `decode error`). An unusable 2xx body is not.
-///
-/// A non-2xx status is written to `status_line` the moment it is in, before
-/// its body is read: a waiter whose own deadline ends first is classified by
-/// it (`crate::util::Heard`), so a `400` whose body stalls is as final for
-/// that waiter as for this exchange.
+/// by the retry's status set ([`crate::retry`]), and a 2xx body that could
+/// not be read always (an interrupted transfer; the only source of a
+/// token-path `decode error`). An unusable 2xx body is not.
 pub(crate) async fn exchange(
     request: reqwest::RequestBuilder,
     endpoint: &str,
     timeout: Duration,
-    status_line: &AtomicU16,
 ) -> Result<Fetched, Failed<GcpAuthError>> {
     let endpoint = redact_url(endpoint);
     let request_failed = |category: Category| GcpAuthError::Request {
@@ -1036,7 +996,6 @@ pub(crate) async fn exchange(
     let status = response.status();
 
     if !status.is_success() {
-        status_line.store(status.as_u16(), Ordering::Release);
         let body = read_error_body(response).await;
         return Err(Failed::status(
             status.as_u16(),
@@ -1217,15 +1176,7 @@ mod tests {
             .unwrap();
         let exchange_at = |url: String| {
             let http = http.clone();
-            async move {
-                exchange(
-                    http.get(&url),
-                    &url,
-                    Duration::from_secs(5),
-                    &AtomicU16::new(0),
-                )
-                .await
-            }
+            async move { exchange(http.get(&url), &url, Duration::from_secs(5)).await }
         };
         let request = |failed: &Failed<GcpAuthError>| match &failed.error {
             GcpAuthError::Request { reason, .. } => (reason.clone(), failed.transient),
@@ -1253,7 +1204,7 @@ mod tests {
         .unwrap();
         assert_eq!(request(&failed), ("decode error".to_owned(), true));
 
-        // An error status: by google-cloud-storage's status set.
+        // An error status: by the retry's status set.
         for (response, status, transient) in [
             (&b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n"[..], 503, true),
             (b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\n\r\n", 429, true),

@@ -30,11 +30,8 @@ vertex = []
 workspace = true
 
 [dependencies]
-# `form` for the two token-endpoint grants
-# (`application/x-www-form-urlencoded`). `json` is no longer used here (Vertex
-# serializes its body itself, once, so a `401` replay resends the same bytes)
-# but stays on as in v0.8.0: turning it off could take `RequestBuilder::json`
-# from a consumer that gets it only through this crate. Nothing else,
+# `json` for request bodies (`RequestBuilder::json`), `form` for the two
+# token-endpoint grants (`application/x-www-form-urlencoded`). Nothing else,
 # TLS above all: like stridelabs-auth, this crate never builds a client — every
 # constructor takes the consumer's — so the TLS stack and the process's rustls
 # provider stay the consumer's choice. Its tests talk plain HTTP to wiremock.

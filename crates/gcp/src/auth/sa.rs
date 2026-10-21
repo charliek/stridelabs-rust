@@ -2,7 +2,6 @@
 //! JWT-bearer assertion (RFC 7523) and exchange it at the key's `token_uri`.
 
 use std::fmt;
-use std::sync::atomic::AtomicU16;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
@@ -103,7 +102,6 @@ impl ServiceAccountKey {
         http: &reqwest::Client,
         scopes: &[String],
         options: &TokenOptions,
-        status_line: &AtomicU16,
     ) -> Result<Fetched, Failed<GcpAuthError>> {
         let assertion = self
             .assertion(scopes, unix_now())
@@ -112,7 +110,7 @@ impl ServiceAccountKey {
             ("grant_type", JWT_BEARER_GRANT),
             ("assertion", assertion.as_str()),
         ]);
-        exchange(request, &self.token_uri, options.token_timeout, status_line).await
+        exchange(request, &self.token_uri, options.token_timeout).await
     }
 
     pub(crate) fn client_email(&self) -> &str {

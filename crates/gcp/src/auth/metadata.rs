@@ -1,8 +1,6 @@
 //! The GCE / Cloud Run metadata server: the runtime service account's token
 //! is one GET away, so production needs no key at all.
 
-use std::sync::atomic::AtomicU16;
-
 use super::error::GcpAuthError;
 use super::{exchange, Fetched, TokenOptions};
 use crate::util::Failed;
@@ -19,7 +17,6 @@ pub(crate) async fn fetch(
     http: &reqwest::Client,
     scopes: &[String],
     options: &TokenOptions,
-    status_line: &AtomicU16,
 ) -> Result<Fetched, Failed<GcpAuthError>> {
     let mut url = format!(
         "{}{TOKEN_PATH}",
@@ -34,5 +31,5 @@ pub(crate) async fn fetch(
         url.push_str(&scopes.join(","));
     }
     let request = http.get(&url).header("Metadata-Flavor", "Google");
-    exchange(request, &url, options.metadata_timeout, status_line).await
+    exchange(request, &url, options.metadata_timeout).await
 }

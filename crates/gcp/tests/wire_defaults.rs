@@ -1,20 +1,9 @@
-//! What a default client puts on the wire, byte for byte: every GCS
-//! operation and a Vertex call, refresh off, read off a raw socket. The
-//! expected requests were recorded by running this same file on v0.8.0
-//! (9a1b3e5), so a change to how requests are built (the closure that
-//! rebuilds them, the body as `Bytes`, Vertex's JSON serialized once) cannot
-//! change a header, its order or a body byte unnoticed. Only the server's
-//! `host:port` and the multipart boundary's random bits are normalized, the
-//! latter only once the header and every delimiter are shown to share one
-//! boundary.
-//!
-//! It uses only v0.8.0's API, so it still compiles there.
-//!
-//! The client it injects has reqwest's decoders switched off
-//! ([`wire_client`]): the requests were recorded with none compiled in, and
-//! this workspace's test build now compiles the gzip one (stridelabs-http's
-//! dev-dependency, for its proxy tests), whose `Accept-Encoding` would be
-//! the injected client's, not this crate's.
+//! What a default client puts on the wire, read off a raw socket: for every
+//! GCS operation and a Vertex call, the method, the path and query, the
+//! headers that carry meaning (the bearer, the quota project, the content
+//! type) and the body. What reqwest adds on its own (`accept`, `host`,
+//! `content-length`) and the header order are the transport's, so they are
+//! not asserted.
 
 mod common;
 
@@ -28,144 +17,68 @@ use wiremock::MockServer;
 const ANSWER: &[u8] =
     b"HTTP/1.1 200 OK\r\ncontent-type: image/png\r\ncontent-length: 4\r\n\r\nPNG!";
 
-/// [`never_retrying`] with reqwest's four decoders off, as they were (not
-/// compiled) when the expected requests were recorded. `no_*` exists
-/// whatever reqwest's features, so this compiles on v0.8.0 too.
-fn wire_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .retry(reqwest::retry::never())
-        .no_gzip()
-        .no_brotli()
-        .no_zstd()
-        .no_deflate()
-        .build()
-        .unwrap()
+/// One request as the server received it.
+struct Received {
+    line: String,
+    /// Lower-cased names, values as sent.
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
 }
 
-/// What every multipart boundary starts with; 32 random hex digits follow.
-const BOUNDARY_PREFIX: &[u8] = b"stridelabs-gcp-";
-
-/// `raw` with its multipart boundary's random digits written `RANDOM`, once
-/// that is shown to be ONE boundary: the one its `content-type` header
-/// declares, which every `stridelabs-gcp-` delimiter in the body must be
-/// (and there must be delimiters). A request that declares no boundary must
-/// carry none. Normalizing each occurrence on its own would let a header and
-/// a body that disagree both read `RANDOM`.
-fn without_boundary(raw: &[u8]) -> Result<Vec<u8>, String> {
-    const DECLARED: &[u8] = b"\r\ncontent-type: multipart/related; boundary=";
-    let boundary_at = |at: usize| -> Result<&[u8], String> {
-        let candidate = raw
-            .get(at..at + BOUNDARY_PREFIX.len() + 32)
-            .ok_or("a boundary cut short")?;
-        let random = &candidate[BOUNDARY_PREFIX.len()..];
-        if candidate.starts_with(BOUNDARY_PREFIX)
-            && random
-                .iter()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
-        {
-            Ok(candidate)
-        } else {
-            Err(format!("not a boundary: {}", escaped(candidate)))
-        }
-    };
-    let head_end = raw
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .ok_or("no end of the head")?;
-    let occurrences: Vec<usize> = (0..raw.len())
-        .filter(|&at| raw[at..].starts_with(BOUNDARY_PREFIX))
-        .collect();
-    let declared = raw[..head_end]
-        .windows(DECLARED.len())
-        .position(|window| window == DECLARED);
-    let Some(declared) = declared else {
-        return if occurrences.is_empty() {
-            Ok(raw.to_vec())
-        } else {
-            Err("a boundary in a request that declares none".to_owned())
-        };
-    };
-    let boundary = boundary_at(declared + DECLARED.len())?;
-    if raw
-        .get(declared + DECLARED.len() + boundary.len()..)
-        .map(|rest| rest.starts_with(b"\r\n"))
-        != Some(true)
-    {
-        return Err("the declared boundary does not end its header line".to_owned());
-    }
-    let delimiters: Vec<usize> = occurrences
-        .into_iter()
-        .filter(|&at| at > head_end)
-        .collect();
-    if delimiters.is_empty() {
-        return Err("a declared boundary the body never uses".to_owned());
-    }
-    for at in delimiters {
-        let delimiter = boundary_at(at)?;
-        if delimiter != boundary {
-            return Err(format!(
-                "the body delimits with {} where the header declares {}",
-                escaped(delimiter),
-                escaped(boundary)
-            ));
+impl Received {
+    fn parse(raw: &[u8]) -> Received {
+        let head_end = raw
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("a whole head");
+        let head = std::str::from_utf8(&raw[..head_end]).expect("an ASCII head");
+        let headers = head
+            .split("\r\n")
+            .skip(1)
+            .map(|line| {
+                let (name, value) = line.split_once(':').expect("a header line");
+                (name.to_ascii_lowercase(), value.trim().to_owned())
+            })
+            .collect();
+        Received {
+            line: request_line(raw),
+            headers,
+            body: request_body(raw).to_vec(),
         }
     }
-    Ok(replace_bytes(raw, boundary, b"stridelabs-gcp-RANDOM"))
-}
 
-/// The normalization proves the boundary is one and the same, rather than
-/// assuming it: a header and a body that disagree are refused.
-#[test]
-fn a_boundary_the_header_and_the_body_disagree_on_is_refused() {
-    let request = |declared: &str, used: &str| {
-        format!(
-            "POST /o HTTP/1.1\r\ncontent-type: multipart/related; boundary=stridelabs-gcp-{declared}\r\n\
-             host: HOST\r\n\r\n--stridelabs-gcp-{used}\r\nmeta\r\n--stridelabs-gcp-{used}\r\n\
-             media\r\n--stridelabs-gcp-{used}--"
-        )
-        .into_bytes()
-    };
-    let (a, b) = ("a".repeat(32), "b".repeat(32));
-
-    assert_eq!(
-        without_boundary(&request(&a, &a)).unwrap(),
-        request("RANDOM", "RANDOM"),
-        "one boundary throughout: normalized"
-    );
-    let refused = without_boundary(&request(&b, &a)).unwrap_err();
-    assert!(refused.contains("where the header declares"), "{refused}");
-    // One delimiter out of three is enough to refuse.
-    let mut one_off = request(&a, &a);
-    let last = one_off.len() - 34;
-    one_off[last..last + 32].copy_from_slice(b.as_bytes());
-    assert!(without_boundary(&one_off).is_err());
-    // A body boundary with nothing declared, and a declared one never used.
-    let undeclared = b"GET /o HTTP/1.1\r\n\r\n--stridelabs-gcp-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    assert!(without_boundary(undeclared).is_err());
-    let unused = format!(
-        "POST /o HTTP/1.1\r\ncontent-type: multipart/related; boundary=stridelabs-gcp-{a}\r\n\r\nbody"
-    );
-    assert!(without_boundary(unused.as_bytes()).is_err());
-    // No multipart at all: unchanged.
-    let plain = b"DELETE /o HTTP/1.1\r\nhost: HOST\r\n\r\n";
-    assert_eq!(without_boundary(plain).unwrap(), plain);
-}
-
-/// The requests `raw` received, normalized, each printed as a byte-string
-/// literal (what the expectations below were pasted from).
-fn sent(raw: &RawServer) -> Vec<Vec<u8>> {
-    let sent: Vec<Vec<u8>> = raw
-        .requests()
-        .iter()
-        .map(|request| {
-            without_boundary(&normalized(request, &raw.base_url))
-                .unwrap_or_else(|why| panic!("{why}"))
-        })
-        .collect();
-    for (n, request) in sent.iter().enumerate() {
-        println!("--- request {n}\nb\"{}\"", escaped(request));
+    /// The one value of header `name`, or `None`; sent twice is a failure.
+    fn header(&self, name: &str) -> Option<&str> {
+        let mut values = self
+            .headers
+            .iter()
+            .filter(|(n, _)| n == name)
+            .map(|(_, value)| value.as_str());
+        let value = values.next();
+        assert!(values.next().is_none(), "{name} sent twice: {}", self.line);
+        value
     }
-    sent
+
+    /// The request line, the bearer and quota project every call carries,
+    /// and the content type.
+    fn assert_call(&self, line: &str, content_type: Option<&str>) {
+        assert_eq!(self.line, line);
+        assert_eq!(
+            self.header("authorization"),
+            Some("Bearer wire-token"),
+            "{line}"
+        );
+        assert_eq!(
+            self.header("x-goog-user-project"),
+            Some("quota-project"),
+            "{line}"
+        );
+        assert_eq!(self.header("content-type"), content_type, "{line}");
+    }
+}
+
+fn received(raw: &RawServer) -> Vec<Received> {
+    raw.requests().iter().map(|r| Received::parse(r)).collect()
 }
 
 async fn tokens(server: &MockServer) -> stridelabs_gcp::TokenProvider {
@@ -177,19 +90,11 @@ async fn tokens(server: &MockServer) -> stridelabs_gcp::TokenProvider {
     .with_quota_project(Some("quota-project".into()))
 }
 
-/// Recorded on v0.8.0: media upload, multipart upload, download, delete.
-const GCS_EXPECTED: [&[u8]; 4] = [
-    b"POST /upload/storage/v1/b/img-bucket/o?uploadType=media&name=a%2Fb%20c.png HTTP/1.1\r\ncontent-type: image/png\r\nauthorization: Bearer wire-token\r\nx-goog-user-project: quota-project\r\naccept: */*\r\nhost: HOST\r\ncontent-length: 14\r\n\r\n\x89PNG\r\n\x1a\n\x00--x\r\n",
-    b"POST /upload/storage/v1/b/img-bucket/o?uploadType=multipart&ifGenerationMatch=0 HTTP/1.1\r\ncontent-type: multipart/related; boundary=stridelabs-gcp-RANDOM\r\nauthorization: Bearer wire-token\r\nx-goog-user-project: quota-project\r\naccept: */*\r\nhost: HOST\r\ncontent-length: 369\r\n\r\n--stridelabs-gcp-RANDOM\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n{\"name\":\"a/b c.png\",\"contentType\":\"image/png\",\"customTime\":\"2025-10-09T08:53:20Z\",\"cacheControl\":\"private, max-age=86400\"}\r\n--stridelabs-gcp-RANDOM\r\nContent-Type: image/png\r\n\r\n\x89PNG\r\n\x1a\n\x00--x\r\n\r\n--stridelabs-gcp-RANDOM--",
-    b"GET /storage/v1/b/img-bucket/o/a%2Fb%20c.png?alt=media HTTP/1.1\r\nauthorization: Bearer wire-token\r\nx-goog-user-project: quota-project\r\naccept: */*\r\nhost: HOST\r\n\r\n",
-    b"DELETE /storage/v1/b/img-bucket/o/a%2Fb%20c.png HTTP/1.1\r\nauthorization: Bearer wire-token\r\nx-goog-user-project: quota-project\r\naccept: */*\r\nhost: HOST\r\n\r\n",
-];
-
 #[tokio::test]
-async fn a_default_gcs_client_sends_v080s_requests_byte_for_byte() {
+async fn a_default_gcs_client_sends_each_operations_request() {
     let token_server = MockServer::start().await;
     let raw = RawServer::start(|_, _| RawReply::Full(ANSWER.to_vec())).await;
-    let gcs = GcsClient::new(wire_client(), tokens(&token_server).await)
+    let gcs = GcsClient::new(never_retrying(), tokens(&token_server).await)
         .with_base_url(&raw.base_url)
         .with_timeout(Duration::from_secs(20));
     let media = Bytes::from_static(b"\x89PNG\r\n\x1a\n\0--x\r\n");
@@ -200,7 +105,7 @@ async fn a_default_gcs_client_sends_v080s_requests_byte_for_byte() {
     gcs.upload_with(
         "img-bucket",
         "a/b c.png",
-        media,
+        media.clone(),
         "image/png",
         &UploadOptions::default()
             .with_if_generation_match(0)
@@ -215,18 +120,62 @@ async fn a_default_gcs_client_sends_v080s_requests_byte_for_byte() {
         .unwrap()
         .is_some());
     assert!(gcs.delete("img-bucket", "a/b c.png").await.unwrap());
+    gcs.bucket_reachable("img-bucket").await.unwrap();
 
-    let sent = sent(&raw);
-    assert_eq!(sent, GCS_EXPECTED);
+    let sent = received(&raw);
+    let [media_upload, multipart, download, delete, list] = &sent[..] else {
+        panic!("{} requests", sent.len());
+    };
+
+    media_upload.assert_call(
+        "POST /upload/storage/v1/b/img-bucket/o?uploadType=media&name=a%2Fb%20c.png HTTP/1.1",
+        Some("image/png"),
+    );
+    assert_eq!(media_upload.body, media);
+
+    // One boundary, declared in the header and delimiting the body.
+    let content_type = multipart.header("content-type").unwrap();
+    let boundary = content_type
+        .strip_prefix("multipart/related; boundary=")
+        .expect("a multipart/related content type");
+    let random = boundary.strip_prefix("stridelabs-gcp-").unwrap();
+    assert!(
+        random.len() == 32 && random.bytes().all(|b| b.is_ascii_hexdigit()),
+        "{boundary}"
+    );
+    multipart.assert_call(
+        "POST /upload/storage/v1/b/img-bucket/o?uploadType=multipart&ifGenerationMatch=0 HTTP/1.1",
+        Some(content_type),
+    );
+    let mut expected = format!(
+        "--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n\
+         {{\"name\":\"a/b c.png\",\"contentType\":\"image/png\",\
+         \"customTime\":\"2025-10-09T08:53:20Z\",\"cacheControl\":\"private, max-age=86400\"}}\r\n\
+         --{boundary}\r\nContent-Type: image/png\r\n\r\n"
+    )
+    .into_bytes();
+    expected.extend_from_slice(&media);
+    expected.extend_from_slice(format!("\r\n--{boundary}--").as_bytes());
+    assert_eq!(multipart.body, expected);
+
+    download.assert_call(
+        "GET /storage/v1/b/img-bucket/o/a%2Fb%20c.png?alt=media HTTP/1.1",
+        None,
+    );
+    delete.assert_call(
+        "DELETE /storage/v1/b/img-bucket/o/a%2Fb%20c.png HTTP/1.1",
+        None,
+    );
+    list.assert_call("GET /storage/v1/b/img-bucket/o?maxResults=1 HTTP/1.1", None);
+    for request in [download, delete, list] {
+        assert!(request.body.is_empty(), "{}", request.line);
+    }
 }
 
 #[cfg(feature = "vertex")]
-/// Recorded on v0.8.0.
-const VERTEX_EXPECTED: &[u8] = b"POST /v1beta1/projects/test-project/locations/global/publishers/google/models/m:generateContent HTTP/1.1\r\nauthorization: Bearer wire-token\r\nx-goog-user-project: quota-project\r\ncontent-type: application/json\r\naccept: */*\r\nhost: HOST\r\ncontent-length: 181\r\n\r\n{\"contents\":[{\"role\":\"user\",\"parts\":[{\"text\":\"make it \\\"blue\\\" \xc3\xa9\"},{\"inlineData\":{\"mimeType\":\"image/png\",\"data\":\"iVBORw==\"}}]}],\"generationConfig\":{\"responseModalities\":[\"IMAGE\"]}}";
-
-#[cfg(feature = "vertex")]
 #[tokio::test]
-async fn a_default_vertex_client_sends_v080s_request_byte_for_byte() {
+async fn a_default_vertex_client_sends_the_request_as_json() {
+    use serde_json::{json, Value};
     use stridelabs_gcp::vertex::{GenerateContentRequest, GenerationConfig, Part, VertexClient};
 
     let token_server = MockServer::start().await;
@@ -238,7 +187,7 @@ async fn a_default_vertex_client_sends_v080s_request_byte_for_byte() {
     })
     .await;
     let vertex = VertexClient::new(
-        wire_client(),
+        never_retrying(),
         tokens(&token_server).await,
         "test-project",
         "global",
@@ -253,5 +202,26 @@ async fn a_default_vertex_client_sends_v080s_request_byte_for_byte() {
 
     vertex.generate_content("m", &request).await.unwrap();
 
-    assert_eq!(sent(&raw), [VERTEX_EXPECTED]);
+    let sent = received(&raw);
+    let [call] = &sent[..] else {
+        panic!("{} requests", sent.len());
+    };
+    call.assert_call(
+        "POST /v1beta1/projects/test-project/locations/global/publishers/google/models/m:generateContent HTTP/1.1",
+        Some("application/json"),
+    );
+    let body: Value = serde_json::from_slice(&call.body).unwrap();
+    assert_eq!(
+        body,
+        json!({
+            "contents": [{
+                "role": "user",
+                "parts": [
+                    {"text": "make it \"blue\" \u{e9}"},
+                    {"inlineData": {"mimeType": "image/png", "data": "iVBORw=="}},
+                ],
+            }],
+            "generationConfig": {"responseModalities": ["IMAGE"]},
+        })
+    );
 }

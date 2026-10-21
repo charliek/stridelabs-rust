@@ -1,13 +1,12 @@
 //! GCS request shapes against wiremock: the paths, the encoding, the auth
 //! headers, each status the operations accept or refuse, the name rules, the
 //! download cap, what an error may quote, `upload_with`'s multipart bodies,
-//! byte for byte, and the opt-in 401 refresh and replay, by exact request
-//! counts.
+//! byte for byte, the object-name policies, and the opt-in retry, by exact
+//! request counts.
 
 mod common;
 
 use std::fmt::Write as _;
-use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
@@ -915,7 +914,7 @@ async fn a_multipart_upload_fails_like_upload_auth_timeout_and_status() {
     assert_eq!(error.sensitive_message(), Some("denied on NAME-CANARY.png"));
 }
 
-// --- the 401 refresh and replay ---------------------------------------------------
+// --- every operation, against a counting rig --------------------------------------
 //
 // Every client here is built on `never_retrying()`, so each request counted
 // is one the client sent, and every rig gives the tokens a server of their
@@ -1001,14 +1000,6 @@ impl Rig {
             .with_base_url(&self.gcs.uri())
     }
 
-    /// [`Rig::client`] with its first token already cached, so no token
-    /// exchange runs before the first send of a window a test measures.
-    async fn warm_client(&self) -> GcsClient {
-        let tokens = exact_provider(&self.tokens);
-        tokens.token().await.unwrap();
-        GcsClient::new(never_retrying(), tokens).with_base_url(&self.gcs.uri())
-    }
-
     /// (GCS requests, tokens minted)
     async fn counts(&self) -> (usize, usize) {
         (
@@ -1023,592 +1014,85 @@ fn is_status(result: &Result<(), StorageError>, op: Op, expected: u16) -> bool {
         if *operation == op.name() && *status == expected)
 }
 
-/// v0.8.0's behaviour, pinned: without the opt-in a 401 is one request and
-/// `Status { 401 }`, and no second token is asked for. A count set alone
-/// does not turn it on.
+/// A `401` is the answer: one request, `Status { 401 }`, and no second
+/// token, on every operation (a caller that wants a refreshed token evicts
+/// it with `TokenProvider::invalidate` and replays itself).
 #[tokio::test]
-async fn by_default_a_401_is_one_request_and_no_refresh() {
+async fn a_401_is_one_request_and_no_refresh() {
     for op in OPS {
-        for gcs in [
-            |rig: &Rig| rig.client(),
-            |rig: &Rig| rig.client().with_max_refresh_attempts(5),
-        ] {
-            let rig = Rig::start(statuses(&[401, 200]), bearers(&BEARERS)).await;
-            let gcs = gcs(&rig);
-            assert!(!gcs.unauthorized_refresh());
-
-            let result = op.run(&gcs).await;
-
-            assert!(is_status(&result, op, 401), "{op:?}: {result:?}");
-            assert_eq!(rig.counts().await, (1, 1), "{op:?}: (requests, tokens)");
-        }
-    }
-}
-
-/// N refresh-and-replay cycles per call, N = 0, 1, 2, on every operation: a
-/// persistent 401 costs N + 1 requests and N refreshes, 401 then 200 within
-/// the budget succeeds, and each replay carries the bearer just refreshed.
-#[tokio::test]
-async fn the_count_bounds_the_replays_on_every_operation() {
-    for op in OPS {
-        for (n, answers, failure, sent) in REFRESH_CASES {
-            let case = format!("{op:?}, N = {n}, answers {answers:?}");
-            let rig = Rig::start(statuses(answers), bearers(&BEARERS)).await;
-            let gcs = rig
-                .client()
-                .with_unauthorized_refresh(true)
-                .with_max_refresh_attempts(n);
-
-            let result = op.run(&gcs).await;
-
-            match failure {
-                None => assert!(result.is_ok(), "{case}: {result:?}"),
-                Some(status) => assert!(is_status(&result, op, status), "{case}: {result:?}"),
-            }
-            assert_eq!(
-                rig.counts().await,
-                (sent, sent),
-                "{case}: (requests, tokens): the first token and one refresh per replay"
-            );
-            assert_eq!(
-                bearers_sent(&rig.gcs).await,
-                BEARERS[..sent],
-                "{case}: each replay carries the refreshed bearer"
-            );
-        }
-    }
-}
-
-/// The opt-in alone is google-auth's two refreshes, and the API's shape is
-/// pinned.
-#[tokio::test]
-async fn the_default_count_is_two() {
-    let _: fn(GcsClient, bool) -> GcsClient = GcsClient::with_unauthorized_refresh;
-    let _: fn(GcsClient, u32) -> GcsClient = GcsClient::with_max_refresh_attempts;
-    let _: fn(&GcsClient) -> bool = GcsClient::unauthorized_refresh;
-    let _: fn(&GcsClient) -> u32 = GcsClient::max_refresh_attempts;
-
-    let rig = Rig::start(statuses(&[401]), bearers(&BEARERS)).await;
-    let gcs = rig.client();
-    assert_eq!(
-        (gcs.unauthorized_refresh(), gcs.max_refresh_attempts()),
-        (false, 2)
-    );
-    let gcs = gcs.with_unauthorized_refresh(true);
-    assert_eq!(
-        (gcs.unauthorized_refresh(), gcs.max_refresh_attempts()),
-        (true, 2)
-    );
-
-    let result = Op::Download.run(&gcs).await;
-
-    assert!(is_status(&result, Op::Download, 401), "{result:?}");
-    assert_eq!(rig.counts().await, (3, 3), "3 requests, 2 refreshes");
-}
-
-/// The metadata server re-serves one bearer: every refresh returns it, so
-/// every replay carries it, and the count still bounds them.
-#[tokio::test]
-async fn a_same_bearer_source_replays_the_same_bearer_bounded_by_the_count() {
-    let rig = Rig::start(statuses(&[401]), bearers(&["same"])).await;
-    let gcs = rig.client().with_unauthorized_refresh(true);
-
-    let result = Op::Delete.run(&gcs).await;
-
-    assert!(is_status(&result, Op::Delete, 401), "{result:?}");
-    assert_eq!(rig.counts().await, (3, 3));
-    assert_eq!(bearers_sent(&rig.gcs).await, ["same", "same", "same"]);
-}
-
-/// A replay is the same request: a create-only multipart upload goes out
-/// again with the same `ifGenerationMatch=0`, the same boundary and the same
-/// body bytes, and a media upload with the same query and bytes. Only the
-/// bearer changes.
-#[tokio::test]
-async fn a_replayed_upload_is_the_same_request_byte_for_byte() {
-    for op in [Op::CreateOnly, Op::Upload] {
         let rig = Rig::start(statuses(&[401, 200]), bearers(&BEARERS)).await;
-        let gcs = rig.client().with_unauthorized_refresh(true);
 
-        op.run(&gcs).await.unwrap();
+        let result = op.run(&rig.client()).await;
 
-        let requests = rig.gcs.received_requests().await.unwrap();
-        assert_eq!(requests.len(), 2, "{op:?}");
-        let (first, replay) = (&requests[0], &requests[1]);
-        assert_eq!(first.method, replay.method, "{op:?}");
-        assert_eq!(first.url, replay.url, "{op:?}: path and query");
-        assert_eq!(
-            header_of(first, "content-type"),
-            header_of(replay, "content-type"),
-            "{op:?}: the boundary too"
-        );
-        assert_eq!(first.body, replay.body, "{op:?}");
-        assert_eq!(
-            header_of(replay, "x-goog-user-project"),
-            header_of(first, "x-goog-user-project")
-        );
-        assert_eq!(bearers_sent(&rig.gcs).await, ["t1", "t2"], "{op:?}");
-        match op {
-            Op::CreateOnly => {
-                assert_eq!(
-                    first.url.query(),
-                    Some("uploadType=multipart&ifGenerationMatch=0")
-                );
-                assert_eq!(
-                    replay.body,
-                    multipart(
-                        &boundary_of(replay),
-                        r#"{"name":"a/b c.png","contentType":"image/png"}"#,
-                        "image/png",
-                        MEDIA
-                    )
-                );
-            }
-            _ => {
-                assert_eq!(
-                    first.url.query(),
-                    Some(format!("uploadType=media&name={ENCODED}").as_str())
-                );
-                assert_eq!(replay.body, MEDIA);
-            }
-        }
+        assert!(is_status(&result, op, 401), "{op:?}: {result:?}");
+        assert_eq!(rig.counts().await, (1, 1), "{op:?}: (requests, tokens)");
     }
 }
 
-/// Only a completed 401 is replayed: never a 403, never a 5xx, never a
-/// transport failure, whose outcome for a write is unknown.
-#[tokio::test]
-async fn only_a_401_is_replayed() {
-    for status in [403, 500, 503] {
-        let rig = Rig::start(statuses(&[status, 200]), bearers(&BEARERS)).await;
-        let gcs = rig.client().with_unauthorized_refresh(true);
-
-        let result = Op::CreateOnly.run(&gcs).await;
-
-        assert!(
-            is_status(&result, Op::CreateOnly, status),
-            "{status}: {result:?}"
-        );
-        assert_eq!(rig.counts().await, (1, 1), "{status}: (requests, tokens)");
-    }
-
-    let tokens = token_server(bearers(&BEARERS)).await;
-    let gcs = GcsClient::new(never_retrying(), exact_provider(&tokens))
-        .with_base_url("http://127.0.0.1:1")
-        .with_unauthorized_refresh(true);
-    assert!(matches!(
-        gcs.delete(BUCKET, OBJECT).await,
-        Err(StorageError::Request {
-            operation: "delete",
-            ..
-        })
-    ));
-    assert_eq!(
-        request_count(&tokens).await,
-        1,
-        "no refresh after a transport failure"
-    );
-}
-
-/// A 401 whose body never finishes is dropped after 2 s, its connection
-/// with it, and the replay goes out on a fresh connection and succeeds. The
-/// operation's own 20 s bound is never reached. The window is 2 s to 4.9 s:
-/// a 5 s body bound fails it, and a starved machine has almost 3 s on top
-/// of the 2 s for the refresh and two local requests (the first token is
-/// cached before the clock starts).
-#[tokio::test]
-async fn a_slow_401_body_is_dropped_after_two_seconds_and_the_replay_proceeds() {
-    let raw = RawServer::start(|n, _| {
-        if n == 0 {
-            RawReply::Stall(
-                b"HTTP/1.1 401 Unauthorized\r\ncontent-type: application/json\r\ncontent-length: 1000\r\n\r\n{\"error\":"
-                    .to_vec(),
-            )
-        } else {
-            RawReply::Full(
-                b"HTTP/1.1 200 OK\r\ncontent-type: image/png\r\ncontent-length: 4\r\n\r\nPNG!".to_vec(),
-            )
-        }
-    })
-    .await;
-    let tokens_server = token_server(bearers(&BEARERS)).await;
-    let tokens = exact_provider(&tokens_server);
-    tokens.token().await.unwrap(); // t1 cached: no exchange inside the window
-    let gcs = GcsClient::new(never_retrying(), tokens)
-        .with_base_url(&raw.base_url)
-        .with_timeout(Duration::from_secs(20))
-        .with_unauthorized_refresh(true);
-
-    let started = Instant::now();
-    let (bytes, _) = gcs.download(BUCKET, OBJECT).await.unwrap().expect("found");
-    let elapsed = started.elapsed();
-
-    assert_eq!(bytes, Bytes::from_static(b"PNG!"));
-    assert!(elapsed >= Duration::from_secs(2), "{elapsed:?}");
-    assert!(elapsed < Duration::from_millis(4900), "{elapsed:?}");
-    let requests = raw.requests();
-    assert_eq!(requests.len(), 2);
-    assert!(String::from_utf8_lossy(&requests[0]).contains("authorization: Bearer t1\r\n"));
-    assert!(String::from_utf8_lossy(&requests[1]).contains("authorization: Bearer t2\r\n"));
-    assert_eq!(raw.accepted(), 2, "the replay had to open a new connection");
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !raw.stalled_connection_closed() {
-        assert!(
-            Instant::now() < deadline,
-            "the stalled connection was never closed"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-}
-
-/// Eight operations in flight on one provider, each answered 401 on t1:
-/// one of them evicts t1, one refresh mints t2, and all eight replay with it.
-/// Two tokens minted in all. On worker threads, for the races.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn concurrent_operations_rejected_on_one_bearer_share_one_refresh() {
-    eight_rejected_on_one_bearer().await;
-}
-
-/// The same eight on one thread, where the capture sees every log line:
-/// exactly one eviction among them.
-#[tokio::test]
-async fn concurrent_operations_rejected_on_one_bearer_make_one_eviction() {
-    let capture = LogCapture::default();
-    let _guard = capture.install();
-
-    eight_rejected_on_one_bearer().await;
-
-    let logs = capture.text();
-    assert_eq!(
-        logs.matches("evicted a rejected GCP access token").count(),
-        1,
-        "{logs}"
-    );
-    assert_eq!(
-        logs.matches("replaying it with a refreshed token").count(),
-        8,
-        "{logs}"
-    );
-}
-
-async fn eight_rejected_on_one_bearer() {
-    // No 401 goes out until all eight t1 requests are in (a barrier, not a
-    // delay), so no operation can refresh before the last one has sent t1,
-    // however the runtime schedules them.
-    let all_sent = Arc::new(tokio::sync::Barrier::new(8));
-    let server = RawServer::start(move |_, request| {
-        if contains(request, b"authorization: Bearer t1\r\n") {
-            RawReply::AfterBarrier(
-                Arc::clone(&all_sent),
-                b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\n\r\n".to_vec(),
-            )
-        } else {
-            RawReply::Full(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok".to_vec())
-        }
-    })
-    .await;
-    let tokens_server = token_server(bearers(&BEARERS)).await;
-    let tokens = exact_provider(&tokens_server);
-    assert_eq!(tokens.token().await.unwrap().token, "t1", "cached up front");
-    let gcs = GcsClient::new(never_retrying(), tokens)
-        .with_base_url(&server.base_url)
-        .with_timeout(Duration::from_secs(60))
-        .with_unauthorized_refresh(true);
-
-    let mut operations = tokio::task::JoinSet::new();
-    for _ in 0..8 {
-        let gcs = gcs.clone();
-        operations.spawn(async move { gcs.download(BUCKET, OBJECT).await });
-    }
-    while let Some(result) = operations.join_next().await {
-        let (bytes, _) = result.unwrap().unwrap().expect("found");
-        assert_eq!(bytes, Bytes::from_static(b"ok"));
-    }
-
-    assert_eq!(
-        request_count(&tokens_server).await,
-        2,
-        "t1, then one refresh"
-    );
-    let sent = server.requests();
-    let with = |bearer: &str| {
-        let header = format!("authorization: Bearer {bearer}\r\n");
-        sent.iter()
-            .filter(|request| contains(request, header.as_bytes()))
-            .count()
-    };
-    assert_eq!((with("t1"), with("t2"), sent.len()), (8, 8, 16));
-}
-
-#[tokio::test]
-async fn a_failed_refresh_is_an_auth_error_and_sends_no_replay() {
-    let rig = Rig::start(
-        statuses(&[401, 200]),
-        vec![token_body("t1", json!(3600)), ResponseTemplate::new(500)],
-    )
-    .await;
-    let gcs = rig.client().with_unauthorized_refresh(true);
-
-    assert!(matches!(
-        Op::Download.run(&gcs).await,
-        Err(StorageError::Auth {
-            operation: "download",
-            source: GcpAuthError::Status { status: 500, .. },
-        })
-    ));
-    assert_eq!(rig.counts().await, (1, 2));
-}
-
-/// The replays run inside the operation's bound: a replay that hangs is the
-/// client's `Timeout`, not a wait without end.
-#[tokio::test]
-async fn the_timeout_covers_the_replays() {
-    let rig = Rig::start(
-        vec![
-            ResponseTemplate::new(401),
-            ResponseTemplate::new(200).set_delay(Duration::from_secs(10)),
-        ],
-        bearers(&BEARERS),
-    )
-    .await;
-    let gcs = rig
-        .client()
-        .with_unauthorized_refresh(true)
-        .with_timeout(Duration::from_millis(500));
-
-    let started = Instant::now();
-    let result = Op::Upload.run(&gcs).await;
-
-    assert!(
-        matches!(
-            result,
-            Err(StorageError::Timeout {
-                operation: "upload",
-                ..
-            })
-        ),
-        "{result:?}"
-    );
-    assert!(started.elapsed() < Duration::from_secs(3));
-    assert_eq!(
-        rig.counts().await,
-        (2, 2),
-        "the replay was sent, inside the bound"
-    );
-}
-
-/// One deadline for the whole operation, never one per send: the 401 and
-/// the replay's answer each take 2.5 s, 1.5 s inside the 4 s bound, but not
-/// together (5 s). A deadline restarted for each send would let this
-/// succeed. The first token is cached beforehand, so the only exchange in
-/// the window is the replay's refresh, and the replay is still sent 1.5 s
-/// before the deadline.
-#[tokio::test]
-async fn one_deadline_covers_the_first_send_and_the_replay_together() {
-    let rig = Rig::start(
-        vec![
-            ResponseTemplate::new(401).set_delay(Duration::from_millis(2500)),
-            ResponseTemplate::new(200).set_delay(Duration::from_millis(2500)),
-        ],
-        bearers(&BEARERS),
-    )
-    .await;
-    let gcs = rig
-        .warm_client()
-        .await
-        .with_unauthorized_refresh(true)
-        .with_timeout(Duration::from_secs(4));
-
-    let started = Instant::now();
-    let result = Op::Download.run(&gcs).await;
-    let elapsed = started.elapsed();
-
-    assert!(
-        matches!(
-            result,
-            Err(StorageError::Timeout {
-                operation: "download",
-                ..
-            })
-        ),
-        "{result:?} after {elapsed:?}"
-    );
-    assert_eq!(
-        rig.counts().await,
-        (2, 2),
-        "the replay was sent before the deadline"
-    );
-}
-
-#[tokio::test]
-async fn an_emulator_without_tokens_never_replays() {
-    let server = MockServer::start().await;
-    Mock::given(any())
-        .respond_with(Sequence::new(statuses(&[401, 200])))
-        .mount(&server)
-        .await;
-    let gcs =
-        GcsClient::emulator(never_retrying(), &server.uri(), None).with_unauthorized_refresh(true);
-
-    let result = Op::Download.run(&gcs).await;
-
-    assert!(is_status(&result, Op::Download, 401), "{result:?}");
-    assert_eq!(
-        bearers_sent(&server).await,
-        ["-"],
-        "one request, no authorization"
-    );
-}
-
-/// The budget is per attempt, and without a retry policy a call is one
-/// attempt: each operation starts with its own N, whatever the one before it
-/// used. (Under a retry policy each retry attempt starts with its own too:
-/// `each_retry_attempt_has_a_refresh_budget_of_its_own`.)
-#[tokio::test]
-async fn each_operation_has_a_refresh_budget_of_its_own() {
-    let rig = Rig::start(statuses(&[401]), bearers(&BEARERS)).await;
-    let gcs = rig
-        .client()
-        .with_unauthorized_refresh(true)
-        .with_max_refresh_attempts(1);
-
-    for (call, requests) in [(1, 2), (2, 4)] {
-        let result = Op::Download.run(&gcs).await;
-        assert!(
-            is_status(&result, Op::Download, 401),
-            "call {call}: {result:?}"
-        );
-        assert_eq!(request_count(&rig.gcs).await, requests, "call {call}");
-    }
-    // t1, refreshed to t2 (the first call's last 401 leaves t2 cached), then
-    // the second call's one refresh, to t3.
-    assert_eq!(bearers_sent(&rig.gcs).await, ["t1", "t2", "t2", "t3"]);
-    assert_eq!(request_count(&rig.tokens).await, 3);
-}
-
-#[test]
-fn a_client_debug_shows_the_refresh_toggle_and_count() {
-    let gcs = GcsClient::emulator(reqwest::Client::new(), "localhost:4443", None)
-        .with_unauthorized_refresh(true)
-        .with_max_refresh_attempts(3);
-    let rendered = format!("{gcs:?}");
-    assert!(
-        rendered.contains("unauthorized_refresh: true"),
-        "{rendered}"
-    );
-    assert!(rendered.contains("max_refresh_attempts: 3"), "{rendered}");
-    let rendered = format!(
-        "{:?}",
-        GcsClient::emulator(reqwest::Client::new(), "localhost:4443", None)
-    );
-    assert!(
-        rendered.contains("unauthorized_refresh: false"),
-        "{rendered}"
-    );
-    assert!(rendered.contains("max_refresh_attempts: 2"), "{rendered}");
-}
-
-/// Everything the replay path logs — the eviction, each replay, each
-/// refresh — and every error and `Debug` it produces, is free of the
-/// bearers. A current-thread runtime, so the refresh tasks log on this
-/// thread, into this test's capture.
-#[tokio::test]
-async fn the_replay_path_never_logs_a_bearer() {
-    let capture = LogCapture::default();
-    let _guard = capture.install();
-    let canaries = ["CANARY-T1", "CANARY-T2", "CANARY-T3"];
-    let rig = Rig::start(statuses(&[401]), bearers(&canaries)).await;
-    let gcs = rig.client().with_unauthorized_refresh(true);
-
-    let error = gcs.download(BUCKET, OBJECT).await.unwrap_err();
-
-    assert_eq!(
-        bearers_sent(&rig.gcs).await,
-        canaries,
-        "premise: all three were sent"
-    );
-    let logs = capture.text();
-    for expected in [
-        "evicted a rejected GCP access token",
-        "a request was answered 401; replaying it with a refreshed token",
-        "refresh=2",
-        "refreshed GCP access token",
-    ] {
-        assert!(logs.contains(expected), "{expected:?} not logged: {logs}");
-    }
-    let rendered = format!("{logs}\n{error} | {error:?} | {error:#?} | {gcs:?} | {gcs:#?}");
-    assert!(!rendered.contains("CANARY"), "a bearer leaked: {rendered}");
-}
-
-// --- object names: the policy, the golden names, the quoting sweep -----------------
+// --- object names: the policies, the name table, the quoting sweep -----------------
 //
 // The request lines are read off a raw socket (`RawServer`): what went out is
 // exactly what is compared, with nothing parsed or normalized on the way.
 
-/// slaudio's golden names: what Python's google-cloud-storage 3.6.0 makes of
-/// 31 object names (see `fixtures/gcs_object_names.provenance.txt`).
-const GOLDEN: &str = include_str!("fixtures/gcs_object_names.json");
+/// The bucket the name table is addressed in.
+const NAMES_BUCKET: &str = "names-bucket";
 
-struct Golden {
-    name: String,
-    public_url: String,
-    quoted: String,
-    /// Python's DELETE path, its query dropped; `None` where it refused.
-    delete_path: Option<String>,
-    /// The multipart metadata's name, parsed from Python's JSON token.
-    metadata_name: String,
-}
-
-fn golden() -> (String, Vec<Golden>) {
-    let fixture: serde_json::Value = serde_json::from_str(GOLDEN).unwrap();
-    assert_eq!(fixture["google_cloud_storage_version"], "3.6.0");
-    let text = |value: &serde_json::Value| value.as_str().unwrap().to_owned();
-    let cases: Vec<Golden> = fixture["cases"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|case| Golden {
-            name: text(&case["name"]),
-            public_url: text(&case["python_public_url"]),
-            quoted: text(&case["python_quoted"]),
-            delete_path: case["python_delete"]["request"]
-                .as_str()
-                .map(|request| request.split('?').next().unwrap().to_owned()),
-            metadata_name: serde_json::from_str(case["python_metadata_name"].as_str().unwrap())
-                .unwrap(),
-        })
-        .collect();
-    assert_eq!(cases.len(), 31);
-    (text(&fixture["bucket"]), cases)
-}
-
-/// The 14 golden names v0.8.0's rule refuses: an empty, `.` or `..`
-/// segment, or a leading or trailing `/`.
-const STRICT_REFUSED: [&str; 14] = [
-    "stridelabs/alice/news//daily/20261019-070509-title.mp3",
-    "stridelabs/alice/./20261019-070509-title.mp3",
-    "stridelabs/alice/../20261019-070509-title.mp3",
-    "/leading.mp3",
-    "trailing/",
-    "a/./b.mp3",
-    "a/../b.mp3",
-    "./x",
-    "../x",
-    "x/.",
-    "x/..",
-    ".",
-    "..",
-    "",
+/// The library's own name table: names GCS accepts, every one written as
+/// GCS addresses it. RFC 3986's unreserved characters (`A-Z a-z 0-9 - . _
+/// ~`) stay literal and everything else is percent-encoded, UTF-8 bytes in
+/// upper-case hex; `/` is `%2F` in a path segment or a query value and kept
+/// in a public URL's path. The rows `Strict` refuses come first.
+///
+/// (name, as one segment or query value, as a public URL's path)
+#[rustfmt::skip]
+const NAMES: [(&str, &str, &str); 31] = [
+    // An empty, `.` or `..` segment, or a leading or trailing `/`: the 14
+    // names `Strict` refuses.
+    ("media/alice/news//daily/clip.mp3", "media%2Falice%2Fnews%2F%2Fdaily%2Fclip.mp3", "media/alice/news//daily/clip.mp3"),
+    ("media/alice/./clip.mp3", "media%2Falice%2F.%2Fclip.mp3", "media/alice/./clip.mp3"),
+    ("media/alice/../clip.mp3", "media%2Falice%2F..%2Fclip.mp3", "media/alice/../clip.mp3"),
+    ("/leading.mp3", "%2Fleading.mp3", "/leading.mp3"),
+    ("trailing/", "trailing%2F", "trailing/"),
+    ("a/./b.mp3", "a%2F.%2Fb.mp3", "a/./b.mp3"),
+    ("a/../b.mp3", "a%2F..%2Fb.mp3", "a/../b.mp3"),
+    ("./x", ".%2Fx", "./x"),
+    ("../x", "..%2Fx", "../x"),
+    ("x/.", "x%2F.", "x/."),
+    ("x/..", "x%2F..", "x/.."),
+    (".", ".", "."),
+    ("..", "..", ".."),
+    ("", "", ""),
+    // The 17 every policy sends.
+    ("media/someone/show/20261019-070509-the-title.mp3", "media%2Fsomeone%2Fshow%2F20261019-070509-the-title.mp3", "media/someone/show/20261019-070509-the-title.mp3"),
+    ("media/someone/covers/0123456789abcdef.jpg", "media%2Fsomeone%2Fcovers%2F0123456789abcdef.jpg", "media/someone/covers/0123456789abcdef.jpg"),
+    ("previews/voice-a-v1.mp3", "previews%2Fvoice-a-v1.mp3", "previews/voice-a-v1.mp3"),
+    ("...", "...", "..."),
+    ("a b/c~d_e-f.g", "a%20b%2Fc~d_e-f.g", "a%20b/c~d_e-f.g"),
+    ("a b.mp3", "a%20b.mp3", "a%20b.mp3"),
+    ("a+b.mp3", "a%2Bb.mp3", "a%2Bb.mp3"),
+    ("what?.mp3", "what%3F.mp3", "what%3F.mp3"),
+    ("hash#tag.mp3", "hash%23tag.mp3", "hash%23tag.mp3"),
+    ("100%.mp3", "100%25.mp3", "100%25.mp3"),
+    ("a%2Fb.mp3", "a%252Fb.mp3", "a%252Fb.mp3"),
+    ("%2e%2e", "%252e%252e", "%252e%252e"),
+    ("x+y%z&=;,@!$'()*:", "x%2By%25z%26%3D%3B%2C%40%21%24%27%28%29%2A%3A", "x%2By%25z%26%3D%3B%2C%40%21%24%27%28%29%2A%3A"),
+    ("\\|^`{}[]\"<>#?", "%5C%7C%5E%60%7B%7D%5B%5D%22%3C%3E%23%3F", "%5C%7C%5E%60%7B%7D%5B%5D%22%3C%3E%23%3F"),
+    ("caf\u{e9}/\u{fc}\u{df}-\u{2603}-\u{1f600}.mp3", "caf%C3%A9%2F%C3%BC%C3%9F-%E2%98%83-%F0%9F%98%80.mp3", "caf%C3%A9/%C3%BC%C3%9F-%E2%98%83-%F0%9F%98%80.mp3"),
+    ("caf\u{e9} \u{2603} \u{1f989}.mp3", "caf%C3%A9%20%E2%98%83%20%F0%9F%A6%89.mp3", "caf%C3%A9%20%E2%98%83%20%F0%9F%A6%89.mp3"),
+    ("nul\0 tab\t cr-lf\r\n del\u{7f}", "nul%00%20tab%09%20cr-lf%0D%0A%20del%7F", "nul%00%20tab%09%20cr-lf%0D%0A%20del%7F"),
 ];
+
+/// How many leading [`NAMES`] rows `Strict` refuses.
+const STRICT_REFUSED: usize = 14;
 
 /// The names no URL path segment can carry, which `Literal` refuses on a
 /// download and a delete.
 const UNSENDABLE: [&str; 3] = ["", ".", ".."];
 
-/// Python's `_quote(name, safe=…)`, written out independently of the crate:
-/// every UTF-8 byte but `A-Z a-z 0-9 _ . - ~` (and `/` when `keep_slash`)
-/// as `%XX`, upper-case hex.
-fn python_quote(name: &str, keep_slash: bool) -> String {
+/// The table's rule, written out independently of the crate: every UTF-8
+/// byte but `A-Z a-z 0-9 - . _ ~` (and `/` when `keep_slash`) as `%XX`,
+/// upper-case hex.
+fn unreserved_quote(name: &str, keep_slash: bool) -> String {
     let mut out = String::new();
     for &byte in name.as_bytes() {
         if byte.is_ascii_alphanumeric() || b"_.-~".contains(&byte) || (keep_slash && byte == b'/') {
@@ -1618,6 +1102,25 @@ fn python_quote(name: &str, keep_slash: bool) -> String {
         }
     }
     out
+}
+
+/// The table agrees with its own rule, row by row: it is the rule written
+/// down, not a recording.
+#[test]
+fn the_name_table_is_the_unreserved_rule() {
+    for (name, segment, path) in NAMES {
+        assert_eq!(unreserved_quote(name, false), segment, "{name:?}");
+        assert_eq!(unreserved_quote(name, true), path, "{name:?}");
+    }
+    let mut names: Vec<&str> = NAMES.iter().map(|(name, ..)| *name).collect();
+    names.sort_unstable();
+    names.dedup();
+    assert_eq!(names.len(), NAMES.len(), "no repeated row");
+}
+
+/// The public URL of a table row.
+fn table_url(path: &str) -> String {
+    format!("https://storage.googleapis.com/{NAMES_BUCKET}/{path}")
 }
 
 /// A GCS stand-in on a raw socket that accepts everything but a 1,025-byte
@@ -1718,12 +1221,12 @@ fn multipart_name(request: &[u8]) -> String {
     value["name"].as_str().unwrap().to_owned()
 }
 
-/// v0.8.0's rule, pinned on the golden names: the 14 are refused by every
+/// v0.8.0's rule, pinned on the name table: the 14 are refused by every
 /// operation and both public URLs, with no request sent and no token
-/// fetched; the 17 others go out with Python's encoding.
+/// fetched; the 17 others go out encoded as the table says.
 #[tokio::test]
-async fn strict_refuses_the_same_fourteen_golden_names_everywhere() {
-    let (bucket, cases) = golden();
+async fn strict_refuses_the_same_fourteen_names_everywhere() {
+    let bucket = NAMES_BUCKET;
     let rig = NameRig::start().await;
     let gcs = rig.client(ObjectNamePolicy::Strict);
     assert_eq!(
@@ -1736,38 +1239,34 @@ async fn strict_refuses_the_same_fourteen_golden_names_everywhere() {
         ObjectNamePolicy::Strict
     );
 
-    let mut refused = Vec::new();
-    for case in &cases {
+    let mut refused = 0;
+    for (index, (name, segment, path)) in NAMES.into_iter().enumerate() {
         let before = rig.sent().await;
-        let results = every_object_op(&gcs, &bucket, &case.name).await;
+        let results = every_object_op(&gcs, bucket, name).await;
         let urls = [
-            public_url(&bucket, &case.name),
-            public_url_with(&bucket, &case.name, ObjectNamePolicy::Strict),
+            public_url(bucket, name),
+            public_url_with(bucket, name, ObjectNamePolicy::Strict),
         ];
-        if STRICT_REFUSED.contains(&case.name.as_str()) {
-            refused.push(case.name.as_str());
+        if urls[0].is_err() {
+            refused += 1;
+            assert!(index < STRICT_REFUSED, "{name:?} refused");
             for result in &results {
                 assert!(
                     matches!(result, Err(StorageError::InvalidObjectName { .. })),
-                    "{:?}: {result:?}",
-                    case.name
+                    "{name:?}: {result:?}"
                 );
             }
             for url in &urls {
                 assert!(matches!(url, Err(StorageError::InvalidObjectName { .. })));
             }
-            assert_eq!(
-                rig.sent().await,
-                before,
-                "{:?}: nothing sent, no token",
-                case.name
-            );
+            assert_eq!(rig.sent().await, before, "{name:?}: nothing sent, no token");
         } else {
+            assert!(index >= STRICT_REFUSED, "{name:?} accepted");
             for result in &results {
-                assert!(result.is_ok(), "{:?}: {result:?}", case.name);
+                assert!(result.is_ok(), "{name:?}: {result:?}");
             }
             for url in urls {
-                assert_eq!(url.unwrap(), case.public_url, "{:?}", case.name);
+                assert_eq!(url.unwrap(), table_url(path), "{name:?}");
             }
             let requests = rig.gcs.requests();
             let sent: Vec<String> = requests[requests.len() - 4..]
@@ -1776,31 +1275,29 @@ async fn strict_refuses_the_same_fourteen_golden_names_everywhere() {
                 .collect();
             assert_eq!(
                 sent,
-                object_op_lines(&bucket, &case.quoted, case.delete_path.as_deref().unwrap()),
-                "{:?}",
-                case.name
+                object_op_lines(
+                    bucket,
+                    segment,
+                    &format!("/storage/v1/b/{bucket}/o/{segment}")
+                ),
+                "{name:?}"
             );
-            assert_eq!(
-                multipart_name(&requests[requests.len() - 3]),
-                case.metadata_name
-            );
+            assert_eq!(multipart_name(&requests[requests.len() - 3]), name);
         }
     }
-    assert_eq!(refused, STRICT_REFUSED, "exactly the 14, in fixture order");
-    assert_eq!(cases.len() - refused.len(), 17);
+    assert_eq!(refused, STRICT_REFUSED, "exactly the 14");
 }
 
-/// `public_url_with(.., Literal)` is Python's `Blob.public_url` for all 31
-/// golden names, the empty one included, and still checks the bucket.
+/// `public_url_with(.., Literal)` writes every table name as the table
+/// says, the empty one included, and still checks the bucket.
 #[test]
-fn literal_public_urls_are_pythons_for_every_golden_name() {
-    let (bucket, cases) = golden();
-    for case in &cases {
+fn literal_public_urls_address_every_name() {
+    let bucket = NAMES_BUCKET;
+    for (name, _, path) in NAMES {
         assert_eq!(
-            public_url_with(&bucket, &case.name, ObjectNamePolicy::Literal).unwrap(),
-            case.public_url,
-            "{:?}",
-            case.name
+            public_url_with(bucket, name, ObjectNamePolicy::Literal).unwrap(),
+            table_url(path),
+            "{name:?}"
         );
     }
     assert!(matches!(
@@ -1809,64 +1306,56 @@ fn literal_public_urls_are_pythons_for_every_golden_name() {
     ));
     // Exact addressing, not a safe URL: the segments are written as given.
     assert_eq!(
-        public_url_with(&bucket, "u/../victim.png", ObjectNamePolicy::Literal).unwrap(),
+        public_url_with(bucket, "u/../victim.png", ObjectNamePolicy::Literal).unwrap(),
         format!("https://storage.googleapis.com/{bucket}/u/../victim.png")
     );
 }
 
-/// Under `Literal` a delete goes to Python's path for every golden name but
-/// the three no path segment can carry: those are refused (Python refuses
-/// `""` too, and sends `.` and `..` to `/o/` and to the bucket itself),
-/// with nothing sent and no token.
+/// Under `Literal` a delete goes to the name's own path for every table
+/// name but the three no path segment can carry (`.` and `..` would be sent
+/// to `/o/` and to the bucket itself): those are refused, with nothing sent
+/// and no token.
 #[tokio::test]
-async fn literal_deletes_go_to_pythons_paths_and_the_unsendable_are_refused() {
-    let (bucket, cases) = golden();
+async fn literal_deletes_go_to_each_names_path_and_the_unsendable_are_refused() {
+    let bucket = NAMES_BUCKET;
     let rig = NameRig::start().await;
     let gcs = rig.client(ObjectNamePolicy::Literal);
-    for case in &cases {
+    for (name, segment, _) in NAMES {
         let before = rig.sent().await;
-        if UNSENDABLE.contains(&case.name.as_str()) {
+        if UNSENDABLE.contains(&name) {
             for result in [
-                gcs.delete(&bucket, &case.name).await.map(drop),
-                gcs.download(&bucket, &case.name).await.map(drop),
+                gcs.delete(bucket, name).await.map(drop),
+                gcs.download(bucket, name).await.map(drop),
             ] {
                 assert!(
                     matches!(result, Err(StorageError::InvalidObjectName { .. })),
-                    "{:?}: {result:?}",
-                    case.name
+                    "{name:?}: {result:?}"
                 );
             }
-            assert_eq!(
-                rig.sent().await,
-                before,
-                "{:?}: nothing sent, no token",
-                case.name
-            );
+            assert_eq!(rig.sent().await, before, "{name:?}: nothing sent, no token");
             continue;
         }
-        assert!(gcs.delete(&bucket, &case.name).await.unwrap());
+        assert!(gcs.delete(bucket, name).await.unwrap());
         let requests = rig.gcs.requests();
         assert_eq!(
             request_line(requests.last().unwrap()),
-            format!("DELETE {} HTTP/1.1", case.delete_path.as_deref().unwrap()),
-            "{:?}",
-            case.name
+            format!("DELETE /storage/v1/b/{bucket}/o/{segment} HTTP/1.1"),
+            "{name:?}"
         );
     }
-    rig.assert_never_the_bucket(&bucket);
+    rig.assert_never_the_bucket(bucket);
 }
 
 /// The hazard `Literal` must never open: `/o/..` is sent as the bucket
 /// itself, and a `DELETE` there deletes an empty bucket. `delete("..")`
 /// (and `"."` and `""`) is refused with nothing sent and no token fetched,
-/// under a retry policy and the refresh too.
+/// under a retry policy too.
 #[tokio::test]
 async fn a_literal_delete_of_dot_dot_never_reaches_the_bucket() {
     let rig = NameRig::start().await;
     let gcs = rig
         .client(ObjectNamePolicy::Literal)
-        .with_retry(ms_policy())
-        .with_unauthorized_refresh(true);
+        .with_retry(ms_policy());
     for name in ["..", ".", ""] {
         let result = gcs.delete(BUCKET, name).await;
         assert!(
@@ -1877,23 +1366,22 @@ async fn a_literal_delete_of_dot_dot_never_reaches_the_bucket() {
     assert_eq!(rig.sent().await, (Vec::new(), 0), "nothing sent, no token");
 }
 
-/// Under `Literal` both uploads send all 31 golden names, the unsendable
-/// three included: the media upload's `name=` is Python's `_quote`, and the
-/// multipart metadata names the object as Python's JSON does (equal as
-/// JSON; serde_json writes non-ASCII raw where `json.dumps` escapes it).
+/// Under `Literal` both uploads send all 31 table names, the unsendable
+/// three included: the media upload's `name=` is the name as one query
+/// value, and the multipart metadata names the object, exactly.
 #[tokio::test]
-async fn literal_uploads_send_every_golden_name() {
-    let (bucket, cases) = golden();
+async fn literal_uploads_send_every_name() {
+    let bucket = NAMES_BUCKET;
     let rig = NameRig::start().await;
     let gcs = rig.client(ObjectNamePolicy::Literal);
-    for case in &cases {
+    for (name, segment, _) in NAMES {
         let media = || Bytes::from_static(b"clip");
-        gcs.upload(&bucket, &case.name, media(), "audio/mpeg")
+        gcs.upload(bucket, name, media(), "audio/mpeg")
             .await
             .unwrap();
         gcs.upload_with(
-            &bucket,
-            &case.name,
+            bucket,
+            name,
             media(),
             "audio/mpeg",
             &UploadOptions::default().with_cache_control("no-store"),
@@ -1907,21 +1395,14 @@ async fn literal_uploads_send_every_golden_name() {
         assert_eq!(
             request_line(media_upload),
             format!(
-                "POST /upload/storage/v1/b/{bucket}/o?uploadType=media&name={} HTTP/1.1",
-                case.quoted
+                "POST /upload/storage/v1/b/{bucket}/o?uploadType=media&name={segment} HTTP/1.1"
             ),
-            "{:?}",
-            case.name
+            "{name:?}"
         );
-        assert_eq!(
-            multipart_name(multipart),
-            case.metadata_name,
-            "{:?}",
-            case.name
-        );
+        assert_eq!(multipart_name(multipart), name, "{name:?}");
     }
     assert_eq!(rig.gcs.requests().len(), 62);
-    rig.assert_never_the_bucket(&bucket);
+    rig.assert_never_the_bucket(bucket);
 }
 
 /// Odd names `Literal` sends exactly — in the path, the query and the JSON:
@@ -1938,7 +1419,7 @@ async fn literal_names_go_out_exactly_in_the_path_the_query_and_the_json() {
         "a/",
         "./a",
         "a/../b",
-        "stridelabs/alice/news//daily/20261019-070509-title.mp3",
+        "media/alice/news//daily/clip.mp3",
         "%2e%2e",
         "a/%2E%2e/b",
         "a\\..\\b\\",
@@ -1953,7 +1434,7 @@ async fn literal_names_go_out_exactly_in_the_path_the_query_and_the_json() {
         }
         let requests = rig.gcs.requests();
         let sent = &requests[requests.len() - 4..];
-        let quoted = python_quote(name, false);
+        let quoted = unreserved_quote(name, false);
         assert_eq!(
             sent.iter().map(|r| request_line(r)).collect::<Vec<_>>(),
             object_op_lines(
@@ -1965,7 +1446,7 @@ async fn literal_names_go_out_exactly_in_the_path_the_query_and_the_json() {
         );
         assert_eq!(multipart_name(&sent[1]), name);
     }
-    assert_eq!(python_quote("%2e%2e", false), "%252e%252e");
+    assert_eq!(unreserved_quote("%2e%2e", false), "%252e%252e");
     let requests = rig.gcs.requests();
     assert!(
         requests
@@ -2008,12 +1489,13 @@ async fn literal_leaves_the_rest_to_gcs() {
 }
 
 /// The quoting sweep: `x{c}y/z{c}` for every code point from U+0001 to
-/// U+2FFF, U+1F989 and U+10FFFF. `public_url_with` (either policy) is
-/// Python's `_quote(name, safe="/~")` everywhere `Strict` accepts the name,
-/// and `Strict` refuses exactly one (`/` makes `x/y/z/`, a trailing slash).
-/// On the wire, the media upload's `name=` is `_quote(name)`, `/` included.
+/// U+2FFF, U+1F989 and U+10FFFF. `public_url_with` (either policy) keeps
+/// the unreserved characters and `/` and encodes the rest everywhere
+/// `Strict` accepts the name, and `Strict` refuses exactly one (`/` makes
+/// `x/y/z/`, a trailing slash). On the wire, the media upload's `name=`
+/// encodes `/` too.
 #[tokio::test]
-async fn the_quoting_sweep_is_pythons_quote() {
+async fn the_quoting_sweep_keeps_only_the_unreserved_characters() {
     let names: Vec<String> = (1..0x3000)
         .chain([0x1F989, 0x10FFFF])
         .filter_map(char::from_u32)
@@ -2025,7 +1507,7 @@ async fn the_quoting_sweep_is_pythons_quote() {
     for name in &names {
         let expected = format!(
             "https://storage.googleapis.com/{BUCKET}/{}",
-            python_quote(name, true)
+            unreserved_quote(name, true)
         );
         assert_eq!(
             public_url_with(BUCKET, name, ObjectNamePolicy::Literal).unwrap(),
@@ -2054,7 +1536,7 @@ async fn the_quoting_sweep_is_pythons_quote() {
             request_line(request),
             format!(
                 "POST /upload/storage/v1/b/{BUCKET}/o?uploadType=media&name={} HTTP/1.1",
-                python_quote(name, false)
+                unreserved_quote(name, false)
             ),
             "{name:?}"
         );
@@ -2068,7 +1550,7 @@ async fn the_quoting_sweep_is_pythons_quote() {
 // full jitter, the 1 ms floor, normalization) is tested on tokio's paused
 // clock with synthetic attempts, in `src/retry.rs`; no socket runs there.
 
-/// google-cloud-storage's schedule at millisecond scale, with a deadline
+/// The default schedule at millisecond scale, with a deadline
 /// long enough that a retry is never skipped for time.
 fn ms_policy() -> RetryPolicy {
     RetryPolicy::google_default()
@@ -2126,9 +1608,8 @@ async fn the_six_transient_statuses_are_retried() {
     }
 }
 
-/// Every other status is the answer: one request, that status. A `401` is
-/// pinned on its own: with the refresh off it is one request, and with it on
-/// the refresh's three requests, never more — the retry leaves it alone.
+/// Every other status is the answer: one request, that status, a `401`
+/// included.
 #[tokio::test]
 async fn other_statuses_are_not_retried_and_a_401_is_not() {
     for status in [400, 401, 403, 409, 412, 501, 505] {
@@ -2141,23 +1622,6 @@ async fn other_statuses_are_not_retried_and_a_401_is_not() {
             );
             assert_eq!(rig.counts().await, (1, 1), "{status} {op:?}");
         }
-    }
-
-    for op in OPS {
-        let rig = Rig::start(statuses(&[401, 200]), bearers(&BEARERS)).await;
-        let result = op.run(&rig.retrying()).await;
-        assert!(is_status(&result, op, 401), "{op:?}: {result:?}");
-        assert_eq!(rig.counts().await, (1, 1), "{op:?}: refresh off");
-
-        let rig = Rig::start(statuses(&[401]), bearers(&BEARERS)).await;
-        let gcs = rig.retrying().with_unauthorized_refresh(true);
-        let result = op.run(&gcs).await;
-        assert!(is_status(&result, op, 401), "{op:?}: {result:?}");
-        assert_eq!(
-            rig.counts().await,
-            (3, 3),
-            "{op:?}: the refresh's 3 requests and 2 refreshes, not retried"
-        );
     }
 }
 
@@ -2191,40 +1655,24 @@ async fn a_failed_precondition_is_one_request_under_a_policy() {
     );
 }
 
-/// The 401 refresh inside a retry attempt: the 401 is refreshed and replayed
-/// into a 503, which is the attempt's final answer and transient, so the
-/// next attempt (on the refreshed token, cached) succeeds: 3 requests.
+/// The attempt cap bounds the requests: a persistent `503` under a cap of
+/// three is three requests and the last `503`, long before the deadline; a
+/// success inside the cap is a success.
 #[tokio::test]
-async fn a_401_replayed_into_a_503_is_retried_and_succeeds_in_three_requests() {
-    let rig = Rig::start(statuses(&[401, 503, 200]), bearers(&BEARERS)).await;
-    let gcs = rig.retrying().with_unauthorized_refresh(true);
-
-    let result = Op::Download.run(&gcs).await;
-
-    assert!(result.is_ok(), "{result:?}");
-    assert_eq!(rig.counts().await, (3, 2), "(requests, tokens)");
-    assert_eq!(bearers_sent(&rig.gcs).await, ["t1", "t2", "t2"]);
-}
-
-/// Each retry attempt has a refresh budget of its own. With a budget of one,
-/// attempt 1 spends it (401, refreshed, 503) and attempt 2 still has one
-/// (401, refreshed, 200): 4 requests. One budget for the whole call would
-/// have returned the second 401.
-#[tokio::test]
-async fn each_retry_attempt_has_a_refresh_budget_of_its_own() {
+async fn the_attempt_cap_bounds_the_requests() {
     for op in OPS {
-        let rig = Rig::start(statuses(&[401, 503, 401, 200]), bearers(&BEARERS)).await;
-        let gcs = rig
-            .retrying()
-            .with_unauthorized_refresh(true)
-            .with_max_refresh_attempts(1);
+        let rig = Rig::start(statuses(&[503]), bearers(&BEARERS)).await;
+        let gcs = rig.client().with_retry(ms_policy().with_max_attempts(3));
 
         let result = op.run(&gcs).await;
 
-        assert!(result.is_ok(), "{op:?}: {result:?}");
-        assert_eq!(rig.counts().await, (4, 3), "{op:?}: (requests, tokens)");
-        assert_eq!(bearers_sent(&rig.gcs).await, ["t1", "t2", "t2", "t3"]);
+        assert!(is_status(&result, op, 503), "{op:?}: {result:?}");
+        assert_eq!(rig.counts().await, (3, 1), "{op:?}: (requests, tokens)");
     }
+    let rig = Rig::start(statuses(&[503, 503, 200]), bearers(&BEARERS)).await;
+    let gcs = rig.client().with_retry(ms_policy().with_max_attempts(3));
+    assert!(Op::Download.run(&gcs).await.is_ok());
+    assert_eq!(request_count(&rig.gcs).await, 3);
 }
 
 // --- interrupted transfers --------------------------------------------------------
@@ -2502,8 +1950,8 @@ async fn a_412_whose_body_stalls_is_not_retried() {
     }
 }
 
-/// The same for a `401` with the refresh off: a `401` is never the retry's
-/// business, however its body behaves.
+/// The same for a `401`: never the retry's business, however its body
+/// behaves.
 #[tokio::test]
 async fn a_401_whose_body_stalls_is_not_retried() {
     for (op, result, requests) in every_op_after_a_stall("401 Unauthorized", ms_policy()).await {
@@ -2554,62 +2002,6 @@ async fn without_a_policy_a_stalled_error_body_is_a_timeout_as_in_v0_8_0() {
     }
 }
 
-/// With the refresh on, a `401` whose body stalls past the attempt's
-/// timeout (here 500 ms, under the 2 s drain bound) ends the attempt while
-/// it is being drained: still that `401`'s attempt, so not retried — one
-/// request, one token, no refresh.
-#[tokio::test]
-async fn a_401_cut_off_while_it_is_refreshed_is_not_retried() {
-    futures::future::join_all(OPS.map(|op| async move {
-        let server =
-            RawServer::first_then(stalled("401 Unauthorized"), RawReply::Full(raw_ok(BODY))).await;
-        let tokens = token_server(bearers(&BEARERS)).await;
-        let gcs = GcsClient::new(never_retrying(), exact_provider(&tokens))
-            .with_base_url(&server.base_url)
-            .with_retry(ms_policy())
-            .with_unauthorized_refresh(true)
-            .with_timeout(STALL_TIMEOUT);
-
-        let result = op.run(&gcs).await;
-
-        assert!(is_timeout(&result, op), "{op:?}: {result:?}");
-        assert_eq!(
-            (server.requests().len(), request_count(&tokens).await),
-            (1, 1),
-            "{op:?}: (requests, tokens)"
-        );
-    }))
-    .await;
-}
-
-/// What the `401` was ends with its replay: a replay whose answer has not
-/// come when the attempt's timeout cuts it off is any request in flight,
-/// transient, and the next attempt (on the refreshed token) succeeds.
-#[tokio::test]
-async fn a_replay_cut_off_before_its_answer_is_retried() {
-    let rig = Rig::start(
-        vec![
-            ResponseTemplate::new(401),
-            ResponseTemplate::new(200).set_delay(Duration::from_secs(5)),
-            ResponseTemplate::new(200),
-        ],
-        bearers(&BEARERS),
-    )
-    .await;
-    let gcs = rig
-        .warm_client()
-        .await
-        .with_retry(ms_policy())
-        .with_unauthorized_refresh(true)
-        .with_timeout(Duration::from_secs(1));
-
-    let result = Op::Delete.run(&gcs).await;
-
-    assert!(result.is_ok(), "{result:?}");
-    assert_eq!(rig.counts().await, (3, 2), "(requests, tokens)");
-    assert_eq!(bearers_sent(&rig.gcs).await, ["t1", "t2", "t2"]);
-}
-
 /// A metadata server answering `first` and then a token, a GCS that serves
 /// `BODY`, and a client on both with a retry policy and [`STALL_TIMEOUT`];
 /// the token request's own timeout is `token_timeout`.
@@ -2636,35 +2028,45 @@ async fn stalled_token_rig(
     (tokens, gcs_server, gcs)
 }
 
-/// The token endpoint's status line is final too. Its `400` arrives and its
-/// body stalls; the refresh would end only at its own 3 s timeout, but the
-/// operation's 500 ms attempt timeout comes first. That attempt waited on a
-/// refresh already answered `400`, so it is not retried: `Timeout` at once,
-/// one token request, nothing sent to GCS. (Retrying would join the same
-/// stalled refresh until it ended as `Auth { Status { 400 } }`.)
+/// What the token endpoint said is the refresh's, not the attempt's: an
+/// attempt cut off by its own timeout while it waits on a refresh is a
+/// transient `Timeout`, whatever that refresh has heard. The next attempts
+/// join the same refresh, and the operation ends with its outcome: here the
+/// refresh's `400` (its body stalled until its 1.25 s timeout, mid-way
+/// through the third 500 ms attempt), which is not retried. One token
+/// request, nothing sent to GCS.
 #[tokio::test]
-async fn a_token_status_whose_body_stalls_is_final_for_the_operation() {
+async fn an_attempt_cut_off_waiting_on_a_refresh_is_retried_until_the_refresh_ends() {
     let (tokens, gcs_server, gcs) =
-        stalled_token_rig(stalled("400 Bad Request"), Duration::from_secs(3)).await;
+        stalled_token_rig(stalled("400 Bad Request"), Duration::from_millis(1_250)).await;
 
     let started = Instant::now();
     let result = gcs.download(BUCKET, OBJECT).await.map(drop);
     let elapsed = started.elapsed();
 
     assert!(
-        is_timeout(&result, Op::Download),
+        matches!(
+            &result,
+            Err(StorageError::Auth {
+                operation: "download",
+                source: GcpAuthError::Status { status: 400, .. },
+            })
+        ),
         "{result:?} after {elapsed:?}"
     );
-    assert!(elapsed < Duration::from_secs(2), "not retried: {elapsed:?}");
+    assert!(
+        elapsed >= Duration::from_millis(1_150),
+        "the attempts outlived their 500 ms timeout: {elapsed:?}"
+    );
     assert_eq!(
         (tokens.accepted(), request_count(&gcs_server).await),
         (1, 0)
     );
 }
 
-/// A transient token status stays transient when its body stalls: the
-/// operation keeps trying, and once the refresh has ended (its 1.5 s
-/// timeout, as `Status { 503 }`), a new one gets the token.
+/// A transient token status whose body stalls ends its refresh at the
+/// refresh's 1.5 s timeout, as `Status { 503 }`, transient: a new refresh
+/// gets the token.
 #[tokio::test]
 async fn a_transient_token_status_whose_body_stalls_is_still_retried() {
     let (tokens, gcs_server, gcs) = stalled_token_rig(
@@ -2930,6 +2332,10 @@ fn the_name_and_retry_api_is_pinned() {
     let _: fn(&GcsClient) -> ObjectNamePolicy = GcsClient::object_name_policy;
     let _: fn(GcsClient, RetryPolicy) -> GcsClient = GcsClient::with_retry;
     let _: fn(&GcsClient) -> RetryPolicy = GcsClient::retry_policy;
+    let _: fn(RetryPolicy, u32) -> RetryPolicy = RetryPolicy::with_max_attempts;
+    // One type at every path: the module, `storage` and the crate root.
+    let _: stridelabs_gcp::retry::RetryPolicy = stridelabs_gcp::RetryPolicy::disabled();
+    let _: RetryPolicy = stridelabs_gcp::retry::RetryPolicy::disabled();
     let _: fn(&str, &str, ObjectNamePolicy) -> Result<String, StorageError> = public_url_with;
     let _: fn(&str) -> Result<(), StorageError> = validate_bucket_name;
     // The crate root re-exports them.
@@ -2945,32 +2351,35 @@ fn the_name_and_retry_api_is_pinned() {
             google.initial_delay,
             google.multiplier,
             google.max_delay,
-            google.deadline
+            google.deadline,
+            google.max_attempts
         ),
         (
             Duration::from_secs(1),
             2.0,
             Duration::from_secs(60),
-            Duration::from_secs(120)
+            Duration::from_secs(120),
+            None
         )
     );
     assert_eq!(RetryPolicy::disabled().deadline, Duration::ZERO);
     assert_eq!(
         RetryPolicy::disabled().with_deadline(Duration::from_secs(120)),
         google,
-        "disabled is Python's schedule with no time to use it"
+        "disabled is the default schedule with no time to use it"
     );
     const QUICK: RetryPolicy = RetryPolicy::google_default()
         .with_initial_delay(Duration::from_millis(100))
         .with_multiplier(1.5)
         .with_max_delay(Duration::from_secs(2))
-        .with_deadline(Duration::from_secs(10));
-    assert_eq!(QUICK.multiplier, 1.5);
+        .with_deadline(Duration::from_secs(10))
+        .with_max_attempts(4);
+    assert_eq!((QUICK.multiplier, QUICK.max_attempts), (1.5, Some(4)));
 }
 
 /// Every operation's future is `Send`, so a service can spawn it: what each
-/// attempt shares across its awaits (the status lines it has heard) is
-/// atomics, never a `Cell`.
+/// attempt shares across its awaits (the status line it received) is an
+/// atomic, never a `Cell`.
 #[test]
 fn every_operation_is_send() {
     fn send<T: Send>(_: &T) {}
@@ -2994,14 +2403,11 @@ fn a_client_debug_shows_the_name_policy_and_the_retry_policy() {
     assert!(rendered.contains("deadline: 0ns"), "{rendered}");
     let gcs = gcs
         .with_object_name_policy(ObjectNamePolicy::Literal)
-        .with_retry(RetryPolicy::google_default())
-        .with_unauthorized_refresh(true);
+        .with_retry(RetryPolicy::google_default());
     let rendered = format!("{gcs:?}");
     for expected in [
         "object_name_policy: Literal",
-        "retry: RetryPolicy { initial_delay: 1s, multiplier: 2.0, max_delay: 60s, deadline: 120s }",
-        "unauthorized_refresh: true",
-        "max_refresh_attempts: 2",
+        "retry: RetryPolicy { initial_delay: 1s, multiplier: 2.0, max_delay: 60s, deadline: 120s, max_attempts: None }",
     ] {
         assert!(rendered.contains(expected), "{expected}: {rendered}");
     }

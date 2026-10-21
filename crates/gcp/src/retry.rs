@@ -1,17 +1,48 @@
-//! The driver behind [`GcsClient::with_retry`](crate::storage::GcsClient::with_retry):
-//! google-api-core's `retry_target` (`retry_unary.py`), with
-//! google-cloud-storage's predicate decided at the source
-//! ([`Failed::transient`](crate::util::Failed)), on tokio's clock.
+//! An opt-in retry for transient failures: [`RetryPolicy`], which
+//! [`GcsClient::with_retry`](crate::storage::GcsClient::with_retry) takes.
 //!
-//! The schedule is `exponential_sleep_generator`'s
-//! (`retry_base.py:110-126`): the first ceiling is `min(initial_delay,
-//! max_delay)`, each wait a uniform draw under the current ceiling, and the
-//! next ceiling the last times the multiplier, capped at `max_delay`. After a
-//! transient failure the driver draws the wait and gives up, returning that
-//! attempt's error, when `elapsed + wait > deadline` (`retry_base.py:223`);
-//! otherwise it sleeps and tries again. An attempt in flight is never cut
-//! off. Every wait is at least [`MIN_RETRY_WAIT`], so the clock always moves
-//! and a nonzero deadline always ends the loop.
+//! The policy is Cloud Storage's documented retry strategy: capped
+//! exponential backoff with full jitter, bounded by a deadline, and
+//! optionally by a number of attempts. After a transient failure the wait is
+//! a uniform draw under a ceiling; the first ceiling is
+//! `min(initial_delay, max_delay)`, and each next one the last times
+//! `multiplier`, capped at `max_delay`. The operation gives up, returning
+//! that attempt's error unchanged, when the attempt cap is reached or the
+//! wait would end past `deadline` from the first attempt's start. An attempt
+//! already running is never cut off. Every wait is at least 1 ms, so the
+//! clock always moves and a nonzero deadline always ends the loop.
+//!
+//! **What is transient** is decided where each failure happens, never by
+//! reading an error's text back:
+//!
+//! - a `408`, a `429`, and the `5xx` that report a transient server
+//!   condition: `500`, `502`, `503` and `504`;
+//! - a transport failure before any response that timed out, failed to
+//!   connect, or broke in flight;
+//! - any failure reading a body after the headers (an interrupted transfer);
+//! - an attempt cut off by the client's timeout, unless that attempt had
+//!   already received an error status that is not transient (a `412` whose
+//!   error body stalls is still a `412`'s attempt);
+//! - the same classes on the way to the access token.
+//!
+//! Never: a `404` (an answer), any other status (`401`, `403`, `412`, `501`
+//! and `505` included), a refused redirect, a request that cannot be built,
+//! a body over a cap, a refusal before anything was sent, any other token
+//! error.
+//!
+//! ```
+//! use std::time::Duration;
+//! use stridelabs_gcp::retry::RetryPolicy;
+//!
+//! // 1 s, doubling, at most 60 s a wait, for 120 s.
+//! let policy = RetryPolicy::google_default();
+//! assert_eq!(policy.deadline, Duration::from_secs(120));
+//! // A shorter budget for a call on a request path.
+//! let quick = RetryPolicy::google_default()
+//!     .with_deadline(Duration::from_secs(10))
+//!     .with_max_attempts(3);
+//! assert_eq!(quick.max_attempts, Some(3));
+//! ```
 
 use std::future::Future;
 use std::time::Duration;
@@ -19,16 +50,114 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use crate::auth::GcpAuthError;
-use crate::storage::{RetryPolicy, StorageError};
+use crate::storage::StorageError;
 use crate::util::Failed;
+
+/// When, and how often, a failed operation is tried again.
+/// [`RetryPolicy::disabled`] (the default) retries nothing.
+///
+/// See [the module docs](self) for the schedule and for what is transient.
+/// The fields are public and readable; nothing validates them, and every
+/// value means something (normalized when used):
+///
+/// - a zero `deadline` retries nothing: exactly one attempt;
+/// - a `max_attempts` of `Some(0)` or `Some(1)` is one attempt too, and
+///   `None` caps nothing but the deadline;
+/// - a `multiplier` that is NaN or below `1.0` is `1.0`; `+∞`, or a product
+///   past `max_delay`, is `max_delay`;
+/// - `initial_delay > max_delay` starts at `max_delay`;
+/// - zero delays are allowed, and every wait is still at least 1 ms, so the
+///   loop always ends by the deadline: at most `deadline / 1 ms + 1`
+///   attempts that fail instantly;
+/// - a `Duration::MAX` deadline with no attempt cap retries until the
+///   operation succeeds or meets a failure that is not transient.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
+pub struct RetryPolicy {
+    /// The first wait's ceiling.
+    pub initial_delay: Duration,
+    /// How much each ceiling grows.
+    pub multiplier: f64,
+    /// The largest ceiling.
+    pub max_delay: Duration,
+    /// How long after the first attempt starts the operation may still
+    /// wait for another. Zero is no retry.
+    pub deadline: Duration,
+    /// The most attempts an operation makes, the first included; `None`
+    /// (the default) leaves the deadline as the only bound.
+    pub max_attempts: Option<u32>,
+}
+
+impl Default for RetryPolicy {
+    /// [`RetryPolicy::disabled`].
+    fn default() -> RetryPolicy {
+        RetryPolicy::disabled()
+    }
+}
+
+impl RetryPolicy {
+    /// No retry: one attempt per operation, as without a policy. It is
+    /// [`RetryPolicy::google_default`]'s schedule with a zero deadline, so
+    /// `disabled().with_deadline(d)` is that schedule for `d`.
+    pub const fn disabled() -> RetryPolicy {
+        RetryPolicy::google_default().with_deadline(Duration::ZERO)
+    }
+
+    /// The defaults Google's Cloud Storage client libraries document: 1 s
+    /// initial, ×2, 60 s at most, a 120 s deadline, no attempt cap.
+    pub const fn google_default() -> RetryPolicy {
+        RetryPolicy {
+            initial_delay: Duration::from_secs(1),
+            multiplier: 2.0,
+            max_delay: Duration::from_secs(60),
+            deadline: Duration::from_secs(120),
+            max_attempts: None,
+        }
+    }
+
+    /// Set [`RetryPolicy::initial_delay`].
+    #[must_use]
+    pub const fn with_initial_delay(mut self, delay: Duration) -> RetryPolicy {
+        self.initial_delay = delay;
+        self
+    }
+
+    /// Set [`RetryPolicy::multiplier`].
+    #[must_use]
+    pub const fn with_multiplier(mut self, multiplier: f64) -> RetryPolicy {
+        self.multiplier = multiplier;
+        self
+    }
+
+    /// Set [`RetryPolicy::max_delay`].
+    #[must_use]
+    pub const fn with_max_delay(mut self, delay: Duration) -> RetryPolicy {
+        self.max_delay = delay;
+        self
+    }
+
+    /// Set [`RetryPolicy::deadline`].
+    #[must_use]
+    pub const fn with_deadline(mut self, deadline: Duration) -> RetryPolicy {
+        self.deadline = deadline;
+        self
+    }
+
+    /// Cap the attempts an operation makes at `attempts`, the first
+    /// included ([`RetryPolicy::max_attempts`]); the deadline still applies.
+    #[must_use]
+    pub const fn with_max_attempts(mut self, attempts: u32) -> RetryPolicy {
+        self.max_attempts = Some(attempts);
+        self
+    }
+}
 
 /// The shortest wait between two attempts, whatever the policy says: zero
 /// delays still advance the clock, so `deadline / 1 ms + 1` bounds the
 /// attempts a run of instant failures can make.
 pub(crate) const MIN_RETRY_WAIT: Duration = Duration::from_millis(1);
 
-/// A [`RetryPolicy`] normalized for use. The fields are public, so a policy
-/// can hold anything; nothing is rejected, every value means something.
+/// A [`RetryPolicy`] normalized for use.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct Schedule {
     /// The first wait's ceiling: `min(initial_delay, max_delay)`, so an
@@ -40,13 +169,15 @@ pub(crate) struct Schedule {
     max_delay: Duration,
     /// Nonzero: a zero deadline is no schedule at all.
     deadline: Duration,
+    /// At least 2 when set: a cap of one attempt or none is no schedule.
+    max_attempts: Option<u32>,
 }
 
 impl Schedule {
     /// `policy`'s schedule, or `None` when it retries nothing (a zero
-    /// deadline: exactly one attempt, v0.8.0's behaviour).
+    /// deadline, or an attempt cap of at most one: exactly one attempt).
     pub(crate) fn of(policy: RetryPolicy) -> Option<Schedule> {
-        if policy.deadline.is_zero() {
+        if policy.deadline.is_zero() || policy.max_attempts.is_some_and(|max| max <= 1) {
             return None;
         }
         // `>=` is false for NaN, so NaN lands on 1.0 too.
@@ -60,6 +191,7 @@ impl Schedule {
             multiplier,
             max_delay: policy.max_delay,
             deadline: policy.deadline,
+            max_attempts: policy.max_attempts,
         })
     }
 
@@ -82,6 +214,11 @@ impl Schedule {
             .max(MIN_RETRY_WAIT)
     }
 
+    /// Whether attempt `made` (from 1) was the last the cap allows.
+    fn capped(&self, made: u64) -> bool {
+        self.max_attempts.is_some_and(|max| made >= u64::from(max))
+    }
+
     /// Whether waiting `wait` more, `elapsed` into the run, would pass the
     /// deadline. Saturating: a `Duration::MAX` deadline is never passed.
     fn exhausted(&self, elapsed: Duration, wait: Duration) -> bool {
@@ -96,9 +233,9 @@ pub(crate) fn uniform() -> f64 {
 
 /// Run `attempt` under `policy` for `operation`: once when the policy
 /// retries nothing; otherwise again after each transient failure, on the
-/// schedule, until a success, a permanent failure, or a wait that would pass
-/// the deadline, each of which returns that attempt's outcome unchanged.
-/// `unit` is the jitter's draw (see [`uniform`]).
+/// schedule, until a success, a permanent failure, the attempt cap, or a
+/// wait that would pass the deadline, each of which returns that attempt's
+/// outcome unchanged. `unit` is the jitter's draw (see [`uniform`]).
 pub(crate) async fn run<T, F>(
     policy: RetryPolicy,
     operation: &'static str,
@@ -118,7 +255,7 @@ where
         // The failure is not held through the wait.
         let wait = match attempt().await {
             Ok(value) => return Ok(value),
-            Err(failed) if !failed.transient => return Err(failed.error),
+            Err(failed) if !failed.transient || schedule.capped(number) => return Err(failed.error),
             Err(failed) => {
                 let wait = Schedule::wait(ceiling, unit());
                 if schedule.exhausted(started.elapsed(), wait) {
@@ -251,9 +388,12 @@ mod tests {
         for unit in [0.0, 0.5, 1.0] {
             assert_eq!(Schedule::wait(Duration::ZERO, unit), MIN_RETRY_WAIT);
         }
-        // A zero deadline is no schedule: one attempt.
+        // A zero deadline, or a cap of at most one attempt, is no schedule.
         assert_eq!(Schedule::of(RetryPolicy::disabled()), None);
         assert_eq!(Schedule::of(base.with_deadline(Duration::ZERO)), None);
+        assert_eq!(Schedule::of(base.with_max_attempts(0)), None);
+        assert_eq!(Schedule::of(base.with_max_attempts(1)), None);
+        assert!(Schedule::of(base.with_max_attempts(2)).is_some());
         // Duration::MAX: the deadline is never passed, and the largest
         // delays draw without a panic.
         let forever = base
@@ -264,7 +404,7 @@ mod tests {
         assert!(!schedule.exhausted(Duration::MAX, Duration::MAX));
         assert_eq!(Schedule::wait(Duration::MAX, 1.0), Duration::MAX);
         assert_eq!(schedule.next(Duration::MAX), Duration::MAX);
-        // And at a finite deadline the comparison is strict, as Python's.
+        // And at a finite deadline the comparison is strict.
         let schedule = Schedule::of(base).unwrap();
         assert!(!schedule.exhausted(Duration::from_secs(60), Duration::from_secs(60)));
         assert!(schedule.exhausted(Duration::from_secs(60), Duration::from_secs(61)));
@@ -381,12 +521,68 @@ mod tests {
         ));
     }
 
+    /// The attempt cap ends the loop before the deadline does, and the
+    /// capped attempt's error comes back unchanged, with no wait after it.
+    #[tokio::test(start_paused = true)]
+    async fn the_attempt_cap_ends_the_loop_at_its_count() {
+        for (cap, starts) in [
+            (2u32, &[0, 1][..]),
+            (3, &[0, 1, 3][..]),
+            (7, &[0, 1, 3, 7, 15, 31, 63][..]),
+        ] {
+            let started = Instant::now();
+            let policy = RetryPolicy::google_default().with_max_attempts(cap);
+            let run = drive(policy, 1.0, Duration::ZERO, 100, |_| {
+                Outcome::Transient(503)
+            })
+            .await;
+            assert_eq!(run.starts, secs(starts), "cap {cap}");
+            assert_eq!(
+                attempt_of(&run.result).map(str::to_owned),
+                Some(format!("attempt-{cap}"))
+            );
+            assert_eq!(
+                started.elapsed(),
+                *run.starts.last().unwrap(),
+                "cap {cap}: no wait after the last attempt"
+            );
+        }
+        // A cap the deadline reaches first changes nothing.
+        let run = drive(
+            RetryPolicy::google_default().with_max_attempts(50),
+            1.0,
+            Duration::ZERO,
+            100,
+            |_| Outcome::Transient(503),
+        )
+        .await;
+        assert_eq!(run.starts.len(), 7);
+        // And a success inside the cap is a success.
+        let run = drive(
+            RetryPolicy::google_default().with_max_attempts(3),
+            1.0,
+            Duration::ZERO,
+            100,
+            |n| {
+                if n < 3 {
+                    Outcome::Transient(503)
+                } else {
+                    Outcome::Ok
+                }
+            },
+        )
+        .await;
+        assert_eq!(run.result.unwrap(), 3);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn disabled_is_exactly_one_attempt_even_with_zero_jitter() {
         for policy in [
             RetryPolicy::disabled(),
             RetryPolicy::default(),
             RetryPolicy::google_default().with_deadline(Duration::ZERO),
+            RetryPolicy::google_default().with_max_attempts(1),
+            RetryPolicy::google_default().with_max_attempts(0),
         ] {
             let run = drive(policy, 0.0, Duration::ZERO, 2, |_| Outcome::Transient(503)).await;
             assert_eq!(run.starts, [Duration::ZERO], "{policy:?}");
