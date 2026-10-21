@@ -1780,13 +1780,14 @@ mod tests {
             "HS256",
         );
 
-        // Inside the refetch floor of that fetch: from memory, no request.
+        // Inside the refetch floor of that fetch: from memory, no request,
+        // and a kid no fetched set held is a suppressed refetch.
         let token = TestKey::primary().mint_with_kid("no-such-kid", &client_claims().build());
         let err = verifier
             .verify_bearer_claims::<Value>(&token)
             .await
             .unwrap_err();
-        assert!(matches!(err, AuthError::UnknownKid), "unknown kid: {err}");
+        assert!(matches!(err, AuthError::UnseenKid), "unseen kid: {err}");
     }
 
     /// The plan's C1 inheritance test: `for_issuer` builds its own

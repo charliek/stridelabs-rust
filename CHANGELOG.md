@@ -97,55 +97,38 @@ for a consumer's pin.
     url::Url`, `headers: HeaderMap`, `redirects`), the answering hop's
     status, URL and parsed headers. `url::Url` is now public API of `ssrf`,
     as it was of `proxy`. Its `Debug` is hand-written: the body length, the
-    status, the URL with its query and fragment redacted, header names
-    only, and the redirect count. `final_url` and `headers` are not
-    client-safe. `impl From<FetchResponse> for Fetched`; `fetch_public` is
-    that conversion, and `Fetched` is unchanged.
-  - `FetchPolicy::with_user_agent(HeaderValue)` and
-    `FetchPolicy::with_header(HeaderName, HeaderValue) -> Result<_,
-    ReservedHeader>`. Policy headers are trusted configuration, never
-    secrets: they go on every hop, cross-host redirects included. The
-    reserved names (hop-by-hop and framing, routing and every
-    `x-forwarded-*`, method and route overrides, cloud metadata headers,
-    credentials, the fetch's own `accept`/`accept-encoding`/`user-agent`,
-    and the not-yet-designed `if-match`/`if-unmodified-since`/`if-range`/
-    `range`) are refused, case-insensitively; the list is part of the
-    contract. `If-None-Match` and `If-Modified-Since` replace, every other
-    name appends.
-  - Conditional requests: those two validators go to the first hop only and
-    are dropped on any redirect (RFC 9110 section 15.4). A `304` answering
-    them there is terminal: `FetchResponse { status: 304, body: empty,
-    redirects: 0, final_url: the original }`, never a redirect, whatever
-    the statuses policy says. `fetch_public` reports it as `HttpStatus`. A
-    `304` without a validator, or past the first hop, is a 3xx as before.
+    status, the URL as `scheme://host[:port]/path` with its query and
+    fragment redacted (never userinfo), header names only, and the redirect
+    count. `final_url` and `headers` are not client-safe. `impl
+    From<FetchResponse> for Fetched`; `fetch_public` is that conversion, and
+    `Fetched` is unchanged.
+  - `FetchPolicy::with_user_agent(HeaderValue)`: the `User-Agent` sent on
+    every hop, cross-host redirects included. Trusted configuration, never a
+    secret.
   - `FetchPolicy::with_accepted_statuses(AcceptedStatuses)`
     (`#[non_exhaustive]`): `OkOnly` (default, `== 200`) or `AnySuccess`
-    (any 2xx).
-  - New feature `ssrf-decompress` (`["ssrf", "dep:flate2"]`):
+    (any 2xx). A 3xx, a `304` included, is a redirect as before.
+  - New feature `ssrf-decompress` (`["ssrf", "dep:flate2", "tokio/rt"]`):
     `FetchPolicy::with_decompression(Decompression)` (`#[non_exhaustive]`;
     `Off` by default, `GzipDeflate`). Under `GzipDeflate` the request sends
     `Accept-Encoding: gzip, deflate`; a response coded with exactly one of
     `gzip`, `x-gzip` or `deflate` (identity tokens aside, case-insensitive)
-    is decoded, and anything else coded is refused as before. The wire
-    bytes are capped at `max_bytes + max_bytes / 8 + 4096` (declared and
-    streamed) and the decoded bytes at `max_bytes`; `TooLarge` wins the
-    moment the decoded allowance would be passed (counting output an
-    inflate call writes before it reports corruption, decided before it is
-    stored) and never falls back to raw deflate. Neither body buffer's
-    capacity passes its cap (the decoded body's, `max_bytes`); both are
-    reserved fallibly, and a refused reservation is `FetchFailed`. The
-    decode runs in bounded steps that yield between them, with the fetch's
-    deadline checked before each step and on every answer: past it, any
-    outcome (a body, an empty one, `TooLarge`, a corruption) is
-    `TimedOut`. gzip is framed as CPython's `gzip`
-    module frames it (reserved flag bits and the header CRC unchecked,
-    FNAME and FCOMMENT of any length), every member, skipping zero padding;
-    deflate is zlib, then raw, each required to end. Corrupt or truncated
-    input is `FetchFailed`, never a partial body. Parity with feedparser
-    6.0.12 is a tested subset (a 66-case golden fixture and its generator),
-    with three recorded residues: `GZIP` and a `gzip`-then-`identity`
-    header pair are decoded here, and stacked or unknown codings are
-    refused here where feedparser passes them through.
+    is decoded, and anything else coded is refused as before. Decoding is
+    flate2's: gzip with `MultiGzDecoder` (every member, back to back),
+    deflate with `ZlibDecoder`, or as raw deflate when the body has no zlib
+    header (a mislabelled `deflate`, as browsers accept). The wire bytes are
+    capped at `max_bytes + max_bytes / 8 + 4096` (declared and streamed) and
+    the decoded bytes at `max_bytes` (`TooLarge`); neither body buffer's
+    capacity passes its cap, and both are reserved fallibly (a refused
+    reservation is `FetchFailed`). The decode runs in bounded steps (at most
+    16 KiB in and 32 KiB out each, so thousands of tiny gzip members are
+    many short steps) that yield between them, with the fetch's deadline
+    checked before each step and on every answer: past it, any outcome (a
+    body, an empty one, `TooLarge`, a corruption) is `TimedOut`. An empty
+    coded body is an empty body. Corrupt or truncated input, or anything
+    after a gzip member that is not another member, is `FetchFailed`, never
+    a partial body. The library's tests cover multi-member gzip, thousands
+    of tiny members, zlib, raw deflate, a bomb, truncation and the deadline.
   - No `with_*` method can let a fetch reach a non-public address, and
     `user:pass@` is still `EmbeddedCredentials` everywhere.
   - CI builds and lints `stridelabs-http:ssrf-decompress` on its own.
@@ -166,87 +149,53 @@ for a consumer's pin.
   - Logged at `debug` with the source and kind, never the bearer.
   - A new test pins that `TokenOptions::token_timeout` bounds the
     token-endpoint exchange; there is no API change there.
-- `stridelabs-gcp`: an opt-in `401` refresh and replay on `GcsClient` and
-  `VertexClient`, google-auth's `AuthorizedSession` loop. Each client gains
-  `with_unauthorized_refresh(bool)` (default `false`),
-  `with_max_refresh_attempts(u32)` (default 2, effective only when
-  enabled), `unauthorized_refresh()` and `max_refresh_attempts()`.
-  - Enabled, a completed `401` has its body read and dropped (at most
-    16 KiB and 2 s, then the connection is dropped). Its bearer is
-    invalidated, a token is taken again and the same request is sent again,
-    up to the count per attempt: once per operation, or afresh in each
-    attempt under `GcsClient::with_retry`. A persistent `401` costs N + 1
-    requests and N refreshes (3 and 2 by default), and `0` replays nothing.
-  - Never on a `403`, a `5xx` or a transport failure. Every replay runs
-    inside the operation's timeout. A multipart upload's body and boundary
-    are built once, and Vertex's JSON is serialized once (after the first
-    token, as in v0.8.0, so a call that gets no token never encodes it), so
-    every send of one call carries the same bytes.
-  - On the metadata server a refresh can return the same bearer, so a
-    replay can add requests without different credentials: one reason it is
-    off by default.
-  - Off, every request is v0.8.0's byte for byte, pinned by a raw-socket
-    test whose expectations were recorded on the v0.8.0 tree. A `401` is
-    still one request and `Status`.
-  - Both clients' `Debug` prints the toggle and the count.
 - `stridelabs-gcp`: `ObjectNamePolicy` (`#[non_exhaustive]`, `Default` =
   `Strict`), `GcsClient::with_object_name_policy` / `object_name_policy()`
   and `public_url_with(bucket, object, policy)`. `Strict` is v0.8.0's name
-  check everywhere, and the free `public_url` stays `Strict`. `Literal` is a
-  transport policy, not validation: uploads send every name (a query value
-  or a JSON string), a download or a delete refuses only `""`, `.` and `..`
-  (no URL path segment can carry them; nothing is sent and no token
-  fetched), `public_url_with(.., Literal)` refuses no object name, and
-  whatever else GCS refuses comes back as its `400`. A `Literal` public URL
-  is exact addressing, not a safe URL: a `..` segment resolves elsewhere in
-  a normalizing client, as Python's string does. Pinned by slaudio's 31
-  golden names from google-cloud-storage 3.6.0
-  (`crates/gcp/tests/fixtures/gcs_object_names.json`, with its
-  provenance): `public_url_with(.., Literal)` is Python's for all 31, deletes
-  go to Python's paths but for the three refused, both uploads send all 31,
-  and `Strict` refuses the same 14 as v0.8.0.
+  check everywhere, and the free `public_url` stays `Strict`. `Literal` is
+  GCS's literal addressing, for objects whose names `Strict` refuses and
+  that must stay addressable: a transport policy, not validation. Uploads
+  send every name (a query value or a JSON string), a download or a delete
+  refuses only `""`, `.` and `..` (no URL path segment can carry them;
+  nothing is sent and no token fetched), `public_url_with(.., Literal)`
+  refuses no object name, and whatever else GCS refuses comes back as its
+  `400`. A `Literal` public URL is exact addressing, not a safe URL: a `..`
+  segment resolves elsewhere in a normalizing client. Encoding is the same
+  under both policies (RFC 3986 unreserved characters literal, everything
+  else percent-encoded), pinned by a 31-name table the library's tests own.
 - `stridelabs-gcp`: an opt-in retry, `GcsClient::with_retry(RetryPolicy)` /
-  `retry_policy()`. `RetryPolicy` (`#[non_exhaustive]`, `Copy`,
-  `PartialEq`; public `initial_delay`, `multiplier`, `max_delay`,
-  `deadline`; `const` `with_*` setters) has `disabled()` (the default: one
-  attempt, as in v0.8.0) and `google_default()` (1 s, ×2, 60 s, 120 s,
-  google-cloud-storage's `DEFAULT_RETRY`).
-  - google-api-core's schedule: a full-jitter draw under a ceiling that
-    grows by the multiplier to `max_delay`, at least 1 ms a wait, until a
-    success, a failure that is not transient, or a wait that would pass the
-    deadline; then that attempt's error is returned unchanged (Python raises
-    `RetryError` instead: a recorded difference). No attempt cap, as in
-    Python; invalid values are normalized at use, never refused, and every
-    nonzero deadline ends the loop.
+  `retry_policy()`, in a new public `retry` module (`RetryPolicy` is
+  re-exported from `storage` and the crate root). `RetryPolicy`
+  (`#[non_exhaustive]`, `Copy`, `PartialEq`; public `initial_delay`,
+  `multiplier`, `max_delay`, `deadline`, `max_attempts: Option<u32>`;
+  `const` `with_*` setters, `with_max_attempts(n)` among them) has
+  `disabled()` (the default: one attempt, as in v0.8.0) and
+  `google_default()` (1 s, ×2, 60 s, 120 s, no attempt cap: the Cloud
+  Storage client libraries' documented defaults).
+  - Cloud Storage's documented retry strategy: capped exponential backoff,
+    a full-jitter draw under a ceiling that grows by the multiplier to
+    `max_delay`, at least 1 ms a wait, until a success, a failure that is
+    not transient, the attempt cap, or a wait that would pass the deadline;
+    then that attempt's error is returned unchanged. Invalid values are
+    normalized at use, never refused, and every nonzero deadline ends the
+    loop.
   - Transient, decided where each failure happens (never by reading an
-    error's text back): `408`, `429`, `500`, `502`, `503`, `504`; the
-    client's `Timeout`, unless the attempt had already heard a status that
-    is not; a transport failure before the response that timed out, failed
-    to connect or broke in flight; any failure reading a body after the
-    headers (an interrupted transfer); and those classes on the way to the
-    token. Never: a `404`, any other status (`401`, `403`, `412` included),
-    `TooLarge`, the `Invalid*` refusals, other token errors.
-  - A status line, once in, is final. An error body that stalls until the
-    attempt's timeout ends the attempt as `Timeout` (v0.8.0's error there;
-    the default client returns exactly that), classed by the status: a
-    `412` or `401` whose body never arrives is not retried, a `503`'s is.
-    So is a token refresh's: an attempt cut off waiting on a refresh whose
-    token endpoint already answered `400` is not retried, and a `401` being
-    drained by the refresh is the attempt's answer until its replay goes
-    out.
-  - Token failures recover differently from Python's, not only in count:
-    google-auth retries inside its refresh on `408`, `429`, `500`, `503`,
-    `504`, and on any status (a `400` included) whose OAuth `error` is
-    `internal_failure`, `server_error` or `temporarily_unavailable`; this
-    client retries a token failure by status alone, so a token `400
-    {"error":"temporarily_unavailable"}` then a token recovers in Python
-    and fails here.
+    error's text back): `408`, `429`, `500`, `502`, `503`, `504`; a
+    transport failure before the response that timed out, failed to
+    connect or broke in flight; any failure reading a body after the
+    headers (an interrupted transfer); those classes on the way to the
+    token; and an attempt cut off by the client's timeout (`Timeout`),
+    unless that attempt had itself received an error status that is not
+    transient (a `412` or `401` whose body never arrives is not retried, a
+    `503`'s is). Never: a `404`, any other status (`401`, `403`, `412`
+    included), `TooLarge`, the `Invalid*` refusals, other token errors. A
+    `401` is returned at once; recovering from one is the caller's
+    (`TokenProvider::invalidate` and one replay).
   - The error strings are unchanged: an interrupted body is still
     `Request { reason: "decode error" }`.
-  - Each attempt takes a token, runs the opt-in `401` refresh with a budget
-    of its own (a `401` replayed into a `503` is retried), and is bounded by
-    the client's timeout, which is per attempt under a policy: the loop ends
-    within the deadline plus one attempt.
+  - Each attempt takes a token and is bounded by the client's timeout,
+    which is per attempt under a policy: the loop ends within the deadline
+    plus one attempt.
   - Documented: library attempts are not wire requests (do not add a
     reqwest retry for the GCS host); a retried create-only upload whose
     first response was lost answers `412`, and a retried delete may return
@@ -255,8 +204,8 @@ for a consumer's pin.
     or the transport category. Never a name, a message or a URL.
 - `stridelabs-gcp`: `GcsClient::bucket_reachable(bucket)`, a startup probe
   (`GET {base}/storage/v1/b/{bucket}/o?maxResults=1`; any 2xx is `Ok(())`,
-  anything else `Status { operation: "list" }`) on the same timeout, retry
-  and refresh, point-in-time evidence that needs `storage.objects.list` (a
+  anything else `Status { operation: "list" }`) on the same timeout and
+  retry, point-in-time evidence that needs `storage.objects.list` (a
   `403` says nothing about whether the bucket exists); and
   `validate_bucket_name`, the bucket rule every operation applies, public.
   `GcsClient`'s `Debug` prints the name policy and the retry policy. All the
@@ -326,25 +275,25 @@ for a consumer's pin.
   - **Refresh ahead.** In the last 10 % of the TTL (at least 60 s, at most
     10 min; 6 min at the defaults), a lookup the set answers starts a
     background refresh. A failed refresh is retried from its completion
-    (1 s, doubling, at most `MIN_REFETCH_INTERVAL`) while the set keeps
-    answering until its TTL. Refresh-ahead needs traffic in that window.
+    (1 s, doubling to 8 s, never more than the refetch floor) while the set
+    keeps answering until its TTL. Refresh-ahead needs traffic in that window.
     Without it, or with a TTL under three intervals, the first lookup at or
     after the TTL fetches.
   - **No stale fallback.** From the TTL on, a lookup waits for a fetch in
     flight or is refused with `AuthError::Jwks` (a 500 under `http`, a 503
-    `Unavailable` in stridelabs-mcp), as stridelabs-python's `JWKSCache`
-    refuses (`jwks.py:35-61`).
+    `Unavailable` in stridelabs-mcp).
   - **Prompt recovery.** After a failure, the next fetch of a needed set is
-    allowed 1 s after that failure completes, doubling to 8 s. Lookups in
-    between are refused at once. A lookup that joins such a retry waits at
-    most 2 s. Once the issuer returns, recovery takes at most what is left of
-    an attempt still failing at that moment (up to `FETCH_TIMEOUT`), then the
-    backoff (up to 8 s), then one successful fetch (up to `FETCH_TIMEOUT`):
-    about 28 s at the defaults, and only once a lookup arrives. Python
-    refetches on every request instead.
+    allowed on the same spacing, 1 s after that failure completes, doubling
+    to 8 s. Lookups in between are refused at once. A lookup that joins such
+    a retry waits at most 2 s. Once the issuer returns, recovery takes at
+    most what is left of an attempt still failing at that moment (up to
+    `FETCH_TIMEOUT`), then the backoff (up to 8 s), then one successful
+    fetch (up to `FETCH_TIMEOUT`): about 28 s at the defaults, and only once
+    a lookup arrives.
   - **Unknown kids stay rate-limited.** Against a set inside its TTL, an
     unknown `kid` refetches at most once per `MIN_REFETCH_INTERVAL`, as
-    before.
+    before. Inside that floor the answer depends on the kid (below,
+    `AuthError::UnseenKid`).
   - **Fetches run on their own task, single-flight.** Cancelling the request
     that started one does not cancel it, and fresh lookups never wait behind
     it. Every lookup that joins a fetch has its own bound (`FETCH_TIMEOUT`
@@ -366,17 +315,42 @@ for a consumer's pin.
   - During an issuer outage that outlasts the refresh window, or that starts
     in an idle window, JWT requests are refused from the TTL on (previously
     up to 30 s later). They recover as above.
-  - A lookup polled outside a tokio runtime gets `AuthError::Jwks` when it
-    would start or join a fetch.
-  - Lookups require a Tokio runtime with the time driver enabled, as reqwest
-    does: a lookup that has to wait on a fetch, polled on a runtime built
-    without `enable_time`, panics in tokio's timer.
+  - Lookups require a Tokio runtime with IO and the time driver enabled, as
+    reqwest does: a lookup that starts a fetch (a refresh-ahead included)
+    or joins one panics outside a runtime, as v0.8.0's fetch did, and one
+    that has to wait on a fetch, polled on a runtime built without
+    `enable_time`, panics in tokio's timer. A fresh hit needs no runtime.
   - The runtime that starts a fetch must keep being driven until it ends. A
     fetch frozen in an undriven runtime (a current-thread runtime whose
     `block_on` returned) holds the slot: lookups elsewhere give up at their
     bound until that runtime runs the fetch or is dropped.
   - `JwksCache`'s `Debug` output changed.
-  - No public item was added, removed or re-typed.
+  - No public item was removed or re-typed; `AuthError::UnseenKid` (below)
+    is the one addition.
+- **BREAKING (type and behaviour, for `AuthError` matchers and `JwksCache`
+  users; slaudio plan 025 L2): `AuthError` is `#[non_exhaustive]` and gains
+  `UnseenKid`**, "token signed by a key not seen yet; refetch suppressed".
+  Inside the unknown-kid refetch floor, a lookup for a kid the current set
+  lacks now tells two cases apart, by the kids of the sets the cache
+  fetched (the last few sets' kids, at most 64; only a fetched set adds to
+  that memory, so forged kids cannot grow it):
+  - a kid seen in an earlier set and since removed (a retired key) is
+    `UnknownKid`, as before, so a client refreshes its token at once;
+  - a kid no fetched set held (a rotation newer than the last fetch, or a
+    forged kid) is `UnseenKid`, where it was `UnknownKid`. The token is
+    still refused; the next lookup past the floor refetches, and a kid
+    still absent after a refetch is `UnknownKid`.
+  - The `http` bridge maps `UnseenKid` where it maps `Jwks`, to
+    `AppError::Internal` (a 500, detail logged), and stridelabs-mcp's
+    `From<AuthError> for VerifyError` maps it to `Unavailable` (a 503 that
+    keeps the client's token). So a never-seen kid inside the floor is a
+    500 (http) or 503 (mcp) where it was a 401.
+
+  **Migration:** a `match` on `AuthError` needs a wildcard arm; send
+  `UnseenKid` where `Jwks` goes if you map the error yourself (lumen maps
+  `Jwks` to 503 and everything else to 401, so `UnseenKid` is a 401 there
+  until it adds the arm). parcel and imgmcp use the mcp mapping and need no
+  change.
 - `stridelabs-auth` now names tokio's `rt` and `time` features (alongside
   `sync`) and depends on `futures-util` with `std` only. Both were already in every
   consumer's graph (reqwest, hyper); `futures-executor` stays out of an
@@ -464,11 +438,10 @@ for a consumer's pin.
   the flate2 already locked), reached only through that dev edge: `cargo
   tree -e normal`, for the workspace and for `stridelabs-http`, is
   unchanged, so no consumer compiles them. `cargo test --workspace`
-  unifies the feature into every member's test build; stridelabs-gcp's
-  v0.8.0 wire pins (`tests/wire_defaults.rs`) now inject a client with the
-  decoders switched off, because the `Accept-Encoding: gzip` a decoding
-  client adds is the client's, not stridelabs-gcp's, and the pins were
-  recorded without one.
+  unifies the feature into every member's test build, so stridelabs-gcp's
+  wire tests (`tests/wire_defaults.rs`) assert the request line, the
+  bearer, the quota project, the content type and the body, not the
+  `Accept-Encoding` the injected client adds.
 - `flate2` 1.1.10 (`default-features = false`, `rust_backend` +
   `runtime_detection`), new, optional, behind `stridelabs-http`'s
   `ssrf-decompress` only: with miniz_oxide, adler2, crc32fast and

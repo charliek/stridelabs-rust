@@ -9,7 +9,7 @@ resolver = "2"
 # Lockstep versioning: every crate in this workspace ships at the same
 # version, bumped together at release time regardless of which crate(s)
 # changed. Consumers pin a single git rev/tag for the whole set.
-version = "0.8.0"
+version = "0.9.0"
 edition = "2021"
 rust-version = "1.97"
 license = "MIT"
@@ -164,10 +164,9 @@ url = "2"
 # checksums, kept with the defaults off; through its weak `zlib-rs?/std` it
 # also leaves a lock-only `zlib-rs` entry in Cargo.lock, which nothing
 # compiles (no feature here turns flate2's `zlib-rs` backend on). The decoder
-# drives `Decompress` and `Crc` itself and requires the stream's end
-# explicitly, so it leans on none of flate2's readers; 1.1.10 is the version
-# it is proven on (its readers, used only by tests, report a truncated
-# deflate stream as an error from 1.1.10 on).
+# is flate2's `bufread` readers; 1.1.10 is the floor because from 1.1.10 on
+# they report a deflate stream that ends early as an error, not as the end
+# of the body.
 flate2 = { version = "1.1.10", default-features = false, features = [
     "rust_backend",
     "runtime_detection",

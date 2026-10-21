@@ -181,7 +181,7 @@ identifier, never dialled. The `Host` check is configured separately.
 |---|---|
 | no bearer token | `401`, `WWW-Authenticate: Bearer resource_metadata="…", scope="…"` (no `error`, RFC 6750 §3.1) |
 | a refused token | `401`, `Bearer error="invalid_token", error_description="…", resource_metadata="…", scope="…"` |
-| verifier unavailable (JWKS fetch failed, app token store down) | `503 {"error":"temporarily_unavailable", …}`; the client keeps its token |
+| verifier unavailable (JWKS fetch failed, a never-seen `kid` inside the JWKS refetch floor, app token store down) | `503 {"error":"temporarily_unavailable", …}`; the client keeps its token |
 | valid, but missing a boundary-level scope (opt-in) | `403`, `Bearer error="insufficient_scope", …, scope="<held + required>"` |
 | valid | the request, with its `Principal` in the extensions |
 

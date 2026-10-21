@@ -315,26 +315,26 @@ monotonic clock.
 - **Refresh ahead.** In the last tenth of the TTL (at least 60 s, at most
   10 min: the last 6 minutes at the defaults), a lookup the set answers is
   still served at once and also starts a background refresh nobody waits on.
-  A failed refresh is retried 1 s after it *completed*, doubling, at most
-  `MIN_REFETCH_INTERVAL`, while the set keeps answering until its TTL, so an
+  A failed refresh is retried 1 s after it *completed*, doubling to 8 s
+  (never more than the refetch floor), while the set keeps answering until
+  its TTL, so an
   issuer blip near the hour costs nothing. It needs traffic in that window,
   and it is off for a TTL under three refetch floors (below); without it,
   the first lookup at or after the TTL fetches.
 - **No stale fallback.** From the TTL on, a lookup waits for the fetch in
   flight or starts one, and is refused with `AuthError::Jwks` (a 500 under
-  the `http` feature, a 503 `Unavailable` in stridelabs-mcp) if that fails,
-  as stridelabs-python's `JWKSCache` refuses. A key the issuer retired (say,
+  the `http` feature, a 503 `Unavailable` in stridelabs-mcp) if that fails.
+  A key the issuer retired (say,
   because it leaked) stops verifying no later than one TTL after the last
   successful fetch that still published it, whatever the issuer is doing.
   Through v0.8.0 that bound was `JWKS_TTL + MIN_REFETCH_INTERVAL`.
 - **Prompt recovery.** After a failure, the next fetch of a needed set is
-  allowed 1 s after that failure completed, doubling to 8 s; lookups in
-  between are refused at once. Once the issuer is back, recovery takes at
-  most what is left of an attempt still failing at that moment (up to
-  `FETCH_TIMEOUT`, 10 s), then the backoff (up to 8 s), then one successful
-  fetch (up to `FETCH_TIMEOUT`): about 28 s at the defaults, and only once a
-  lookup arrives to start that fetch. (Python refetches on every request
-  instead.)
+  allowed on the same spacing, 1 s after that failure completed, doubling to
+  8 s; lookups in between are refused at once. Once the issuer is back,
+  recovery takes at most what is left of an attempt still failing at that
+  moment (up to `FETCH_TIMEOUT`, 10 s), then the backoff (up to 8 s), then
+  one successful fetch (up to `FETCH_TIMEOUT`): about 28 s at the defaults,
+  and only once a lookup arrives to start that fetch.
 - **Unknown kids are rate-limited.** Refetching on an unknown kid, not just
   on age, is what makes a key rotation take effect in seconds rather than an
   hour. Against a set inside its TTL it happens **at most once per refetch
@@ -342,9 +342,20 @@ monotonic clock.
   of any kind. Without that floor, anyone can mint a syntactically valid
   token carrying a random `kid` and turn every request into an outbound
   HTTPS call — a request amplifier pointed at the one service every other
-  service depends on. Inside the floor the answer is `AuthError::UnknownKid`
-  from memory. Only a set inside its TTL gives that verdict: without one the
-  error is `Jwks`, not a 401 blaming the caller's token for an outage.
+  service depends on. Inside the floor the answer comes from memory, and
+  tells two cases apart by the kids of the sets this cache fetched (it
+  remembers the last few sets' kids, at most 64; only a fetched set adds to
+  that memory, so forged kids cannot grow it):
+  - a kid **seen** in an earlier set and since removed is a retired key:
+    `AuthError::UnknownKid` (401), so a client refreshes its token at once;
+  - a kid **never seen** may be a rotation newer than the last fetch, or a
+    forged kid: `AuthError::UnseenKid`, "refetch suppressed" (a 500 under the
+    `http` feature, a 503 `Unavailable` in stridelabs-mcp, as for `Jwks`).
+    The token is refused either way, and the next lookup past the floor
+    refetches; a kid still absent after that refetch is `UnknownKid`.
+
+  Only a set inside its TTL gives either verdict: without one the error is
+  `Jwks`, not a 401 blaming the caller's token for an outage.
 - **The body is capped.** A fetch reads at most `jwks::MAX_JWKS_BYTES`
   (1 MiB; an issuer's set is a few keys of under 2 KiB each), chunk by
   chunk and inside `FETCH_TIMEOUT`. A larger body, a valid key set
@@ -366,15 +377,15 @@ interval: no limit).
 
 The cost of the floor is bounded and worth naming: **a key rotation landing
 within 30 seconds of the last attempt is invisible for the rest of that
-floor**, so tokens signed by the brand-new key are rejected for up to 30
-seconds. A failed attempt counts, so a rotation that coincides with an issuer
+floor**, so tokens signed by the brand-new key are refused (`UnseenKid`) for
+up to 30 seconds. A failed attempt counts, so a rotation that coincides with an issuer
 blip waits out both. Issuers roll keys on the order of days.
 
 **Load on the issuer**, per cache, with a failing issuer and steady traffic:
 at most one unknown-kid fetch per floor against a valid set (2 a minute);
-16 refresh-ahead attempts in the 6-minute window; and after expiry, attempts
-1, 2, 4, 8, 8 … s apart (7.5 a minute). Nobody can make the age-driven ones
-happen early. Replicas of one service expire, and so retry, in lockstep.
+and, in the refresh window and after expiry alike, attempts 1, 2, 4, 8, 8 …
+s apart (about 8 a minute). Nobody can make the age-driven ones happen
+early. Replicas of one service expire, and so retry, in lockstep.
 
 **Concurrency.** A fetch is single-flight and runs on a tokio task of its
 own: cancelling the request that started it never cancels it, no lock is
@@ -387,18 +398,18 @@ hold every request for a whole fetch timeout over and over. At its bound a
 lookup gets `Jwks` while the fetch carries on. A joiner checks the set's age again when it resumes, and refuses
 a set that crossed its TTL meanwhile.
 
-**The tokio runtime.** Lookups require a Tokio runtime with the time driver
-enabled, as reqwest does: on a runtime built without `enable_time`, a lookup
-that has to wait on a fetch panics in tokio's timer. The fetch is spawned on
-the runtime of the lookup that starts it, which needs IO and time enabled
-and **must keep being driven until the fetch ends**. A fetch on a
+**The tokio runtime.** Lookups require a Tokio runtime with IO and the time
+driver enabled, as reqwest does: a lookup that starts a fetch (a
+refresh-ahead included) or joins one panics outside a runtime, as v0.8.0's
+did, and on a runtime built without `enable_time` a lookup that has to wait
+on a fetch panics in tokio's timer; a fresh hit needs no runtime. The fetch
+is spawned on the runtime of the lookup that starts it, which **must keep
+being driven until the fetch ends**. A fetch on a
 current-thread runtime whose `block_on` has returned is frozen with it:
 lookups on other runtimes that need it give up at their own bound (their
 own runtime's timer, never the frozen one's), but the slot stays taken until
 that runtime finishes the fetch or is dropped. A runtime shut down mid-fetch
 drops the task, which counts as a failed attempt; its waiters get `Jwks`.
-Outside any runtime nothing panics: a refresh-ahead is skipped, and a lookup
-that would start or join a fetch is `Jwks`.
 
 `JwksCache::with_ttl` and `JwksCache::with_min_refetch_interval` replace the
 two durations, for tests that need to watch a set expire or a floor close
@@ -442,10 +453,14 @@ With the `http` feature:
 | `AuthError` | `AppError` | Status |
 |---|---|---|
 | `Jwks(_)` | `Internal(anyhow)` | 500 |
+| `UnseenKid` | `Internal(anyhow)` | 500 |
 | everything else | `Unauthorized("invalid or missing credentials")` | 401 |
 
 A JWKS failure is *this service's* outage and says nothing about the caller's
-token, so it is a 500 whose detail is logged and not returned. Every other
+token, so it is a 500 whose detail is logged and not returned. So is a
+refetch the cache suppressed for a never-seen kid. `AuthError` is
+`#[non_exhaustive]`: a consumer mapping it itself needs a wildcard arm, and
+should send `UnseenKid` where it sends `Jwks`. Every other
 failure collapses to one generic 401 message: `AppError`'s contract is that a
 non-`Internal` payload reaches the client verbatim, and telling a caller which
 check failed ("audience is not accepted" vs "signature is invalid") is a free

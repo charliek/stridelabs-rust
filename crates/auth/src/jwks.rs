@@ -15,8 +15,9 @@
 //!    10 min: the last 6 min at the defaults), a lookup the set answers is
 //!    still served at once, and it also starts a background refresh that
 //!    nobody waits on. A failed refresh is retried 1 s after it *completed*,
-//!    doubling, at most the refetch floor (below), and the set keeps
-//!    answering until its TTL. So an issuer blip near the hour costs nothing.
+//!    doubling to 8 s (never more than the refetch floor, below), and the set
+//!    keeps answering until its TTL. So an issuer blip near the hour costs
+//!    nothing.
 //!    Refresh-ahead needs traffic in that window, and it is off for a TTL
 //!    under three floors. Without it, the first lookup at or after the TTL
 //!    fetches.
@@ -27,13 +28,14 @@
 //!    cache no later than one TTL after the last successful fetch that still
 //!    published it, whatever the issuer is doing. (Through v0.8.0 that bound
 //!    was `ttl + min_refetch_interval`.) After a failure, the next fetch of a
-//!    needed set is allowed 1 s after that failure completed, doubling to
-//!    8 s; a lookup in between is refused at once, from memory ("recent fetch
-//!    failed; refetch suppressed"). So once the issuer is back, recovery
-//!    takes at most what is left of an attempt still failing at that moment
-//!    (up to [`FETCH_TIMEOUT`]), then the backoff (up to 8 s), then one
-//!    successful fetch (up to [`FETCH_TIMEOUT`]): about 28 s at the
-//!    defaults, and only once a lookup arrives to start that fetch.
+//!    needed set is allowed on the same spacing, 1 s after that failure
+//!    completed, doubling to 8 s; a lookup in between is refused at once,
+//!    from memory ("recent fetch failed; refetch suppressed"). So once the
+//!    issuer is back, recovery takes at most what is left of an attempt still
+//!    failing at that moment (up to [`FETCH_TIMEOUT`]), then the backoff (up
+//!    to 8 s), then one successful fetch (up to [`FETCH_TIMEOUT`]): about
+//!    28 s at the defaults, and only once a lookup arrives to start that
+//!    fetch.
 //! 4. **Unknown kids are rate-limited.** A set inside its TTL that lacks the
 //!    kid refetches (what makes a key rotation take effect in seconds rather
 //!    than an hour), but at most once per refetch floor, counted from the
@@ -41,10 +43,22 @@
 //!    could mint a syntactically valid token carrying a random `kid` and turn
 //!    every request into an outbound HTTPS call to the issuer: a request
 //!    amplifier pointed at the one service every other service depends on.
-//!    Inside the floor the answer is [`AuthError::UnknownKid`] from memory, the
-//!    issuer's word on which keys exist. Only a set inside its TTL gives that
-//!    verdict: without one the answer is `Jwks`, because "unknown key" would
-//!    blame the caller's token for this service's outage.
+//!    Inside the floor the answer comes from memory, and depends on whether
+//!    the kid was **seen**, in any set this cache fetched (it remembers the
+//!    kids of the last few sets, at most 64; only a fetched set adds to that
+//!    memory, so a flood of forged kids cannot grow it):
+//!    - a kid seen and since removed is a retired key: [`AuthError::UnknownKid`],
+//!      the issuer's word on which keys exist, so a client refreshes its
+//!      token at once;
+//!    - a kid never seen may be a rotation newer than the last fetch (or a
+//!      forged kid): [`AuthError::UnseenKid`], "refetch suppressed". It is a
+//!      refusal of the token all the same, and the next lookup past the
+//!      floor refetches.
+//!
+//!    Only a set inside its TTL gives either verdict: without one the answer
+//!    is `Jwks`, because "unknown key" would blame the caller's token for
+//!    this service's outage. A kid still absent after an actual refetch is
+//!    `UnknownKid`.
 //!
 //! The **refetch floor** `F` is `min(min_refetch_interval, max(ttl, 1 s))`:
 //! [`MIN_REFETCH_INTERVAL`] (30 s) at the defaults; the TTL, when that is
@@ -60,21 +74,19 @@
 //!
 //! The cost of rule 4 is bounded and worth naming: a key rotation that lands
 //! within the floor of the last attempt is invisible for the rest of it, so
-//! tokens signed by the new key are rejected for up to 30 seconds. A failed
-//! attempt counts, so a rotation that coincides with an issuer blip waits out
-//! both. Issuers roll keys on the order of days.
+//! tokens signed by the new key are refused ([`AuthError::UnseenKid`]) for up
+//! to 30 seconds. A failed attempt counts, so a rotation that coincides with
+//! an issuer blip waits out both. Issuers roll keys on the order of days.
 //!
 //! # Load on the issuer
 //!
 //! With a zero-latency failing issuer and steady traffic, one cache makes at
 //! most: one unknown-kid fetch per floor against a valid set (2 a minute);
-//! refresh-ahead attempts at the window's start plus 0, 1, 3, 7, 15 and 31 s,
-//! then one per floor (16 in the 6-minute window at the defaults); and after
-//! expiry, attempts 1, 2, 4, 8, 8 … s apart (7.5 a minute). Nobody can make
-//! the two age-driven kinds happen early. Fetch latency lowers each rate,
-//! because spacing runs from completion. v0.8.0 made 2 a minute;
-//! stridelabs-python refetches on every request once its set has expired.
-//! Replicas of one service expire, and so retry, in lockstep.
+//! and, in the refresh window and after expiry alike, attempts 1, 2, 4, 8,
+//! 8 … s apart (about 8 a minute). Nobody can make the two age-driven kinds
+//! happen early. Fetch latency lowers each rate, because spacing runs from
+//! completion. v0.8.0 made 2 a minute. Replicas of one service expire, and
+//! so retry, in lockstep.
 //!
 //! # Concurrency
 //!
@@ -97,19 +109,17 @@
 //! runtime hosting the fetch: it holds whatever that one is doing, including
 //! when it is no longer being driven.
 //!
-//! **Lookups require a Tokio runtime with the time driver enabled, as
-//! reqwest does** (its timeouts need it, and so do the bounds above). The
-//! fetch is spawned on the runtime of the lookup that starts it, which
-//! therefore needs IO and time, and which **must keep being driven until the
-//! fetch ends**: a fetch on a current-thread runtime whose `block_on` has
-//! returned is frozen with it, and while it is, every lookup that needs it
-//! joins it and gives up at its bound, because the slot stays taken until
-//! that runtime finishes the fetch or is dropped. A runtime that shuts down
-//! mid-fetch drops the fetch's task; the attempt counts as a failure and its
-//! waiters get `Jwks` ("refetch aborted"). Outside any tokio runtime the
-//! cache does not panic: a refresh-ahead is skipped (the set answers), and a
-//! lookup that would start or join a fetch is `Jwks` ("no tokio runtime to
-//! fetch the JWKS on").
+//! **Lookups require a Tokio runtime with IO and the time driver enabled, as
+//! reqwest does** (its timeouts need it, and so do the bounds above): a
+//! lookup that starts a fetch (a refresh-ahead included) or joins one panics
+//! outside one, as v0.8.0's did; a fresh hit needs none. The fetch is
+//! spawned on the runtime of the lookup that starts it, which **must keep
+//! being driven until the fetch ends**: a fetch on a current-thread runtime
+//! whose `block_on` has returned is frozen with it, and while it is, every
+//! lookup that needs it joins it and gives up at its bound, because the slot
+//! stays taken until that runtime finishes the fetch or is dropped. A
+//! runtime that shuts down mid-fetch drops the fetch's task; the attempt
+//! counts as a failure and its waiters get `Jwks` ("refetch aborted").
 //!
 //! # Departures from the original implementation this crate replaced
 //!
@@ -119,6 +129,7 @@
 //! meant two verifiers in one process — the shape every test that wanted an
 //! isolated cache needs — silently shared one key set.
 
+use std::collections::VecDeque;
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 use std::time::{Duration, Instant};
@@ -176,14 +187,15 @@ const FLOOR_MIN: Duration = Duration::from_secs(1);
 const WINDOW_MIN: Duration = Duration::from_secs(60);
 const WINDOW_MAX: Duration = Duration::from_secs(600);
 
-/// The first retry spacing after a failure, doubling from there. Whole
-/// seconds, which `Tuning::backoff` relies on.
+/// The first retry spacing after a failure, doubling from there.
 const BACKOFF_START: Duration = Duration::from_secs(1);
-const _: () = assert!(BACKOFF_START.subsec_nanos() == 0);
 
-/// The cap on the retry spacing once the set has expired: what bounds
-/// recovery after the issuer returns.
-const EXPIRED_BACKOFF_MAX: Duration = Duration::from_secs(8);
+/// The cap on the retry spacing after a failure: what bounds recovery once
+/// the issuer returns.
+const BACKOFF_MAX: Duration = Duration::from_secs(8);
+
+/// How many key ids the cache remembers from the sets it fetched.
+const SEEN_KIDS: usize = 64;
 
 /// v0.8.0's text, kept: no usable set, and a failure too recent to retry.
 const SUPPRESSED: &str = "recent fetch failed; refetch suppressed";
@@ -193,7 +205,6 @@ const TOO_SOON: &str = "key set expired inside the minimum refetch spacing; refe
 const STILL_IN_PROGRESS: &str = "JWKS refetch still in progress";
 const EXPIRED_BEFORE_USE: &str = "key set expired before the lookup could use it";
 const ABORTED: &str = "refetch aborted";
-const NO_RUNTIME: &str = "no tokio runtime to fetch the JWKS on";
 
 /// A JWKS endpoint plus the last thing it said.
 ///
@@ -311,30 +322,17 @@ impl Tuning {
     }
 
     /// The spacing after `failures` consecutive failed or aborted attempts,
-    /// from the last one's completion, while the set still answers:
-    /// `min(1 s × 2^(n-1), floor)`, and the floor itself after a success.
-    fn window_backoff(&self, failures: u32) -> Duration {
-        self.backoff(failures, self.floor())
-    }
-
-    /// The same once the set has expired, capped at 8 s as well: the cap is
-    /// what bounds recovery after the issuer returns.
-    fn expired_backoff(&self, failures: u32) -> Duration {
-        self.backoff(failures, self.floor().min(EXPIRED_BACKOFF_MAX))
-    }
-
-    fn backoff(&self, failures: u32, cap: Duration) -> Duration {
+    /// from the last one's completion: `min(1 s × 2^(n-1), 8 s, floor)`, and
+    /// the floor itself after a success. One schedule, whether the set still
+    /// answers (a refresh-ahead's retry) or has expired.
+    fn backoff(&self, failures: u32) -> Duration {
         let Some(doublings) = failures.checked_sub(1) else {
             return self.floor();
         };
-        // 2^(n-1) whole seconds, in u64 seconds so that any cap a `Duration`
-        // holds is reached exactly; only a step beyond `Duration::MAX`
-        // (2^64 s and up) saturates.
-        let step = 1u64
-            .checked_shl(doublings)
-            .and_then(|factor| BACKOFF_START.as_secs().checked_mul(factor))
-            .map_or(Duration::MAX, Duration::from_secs);
-        step.min(cap)
+        // 1 s, 2 s, 4 s, 8 s: every step from the fifth on is past the cap.
+        BACKOFF_START
+            .saturating_mul(1 << doublings.min(4))
+            .min(self.floor().min(BACKOFF_MAX))
     }
 }
 
@@ -353,6 +351,9 @@ struct State {
     /// Consecutive failed or aborted attempts since the last success.
     failures: u32,
     next_id: u64,
+    /// The kids of the sets fetched so far: what tells a retired key from
+    /// one this cache has not fetched yet (module docs, rule 4).
+    seen: Seen,
 }
 
 impl fmt::Debug for State {
@@ -363,7 +364,37 @@ impl fmt::Debug for State {
             .field("last_start", &self.last_start)
             .field("last_end", &self.last_end)
             .field("failures", &self.failures)
+            .field("seen", &self.seen.0.len())
             .finish_non_exhaustive()
+    }
+}
+
+/// The key ids of the sets this cache fetched, newest last, at most
+/// [`SEEN_KIDS`]. Only a fetched set adds to it, so forged kids never do.
+#[derive(Default)]
+struct Seen(VecDeque<String>);
+
+impl Seen {
+    fn contains(&self, kid: &str) -> bool {
+        self.0.iter().any(|seen| seen == kid)
+    }
+
+    /// Remember `set`'s kids as the newest, forgetting the oldest past the
+    /// cap.
+    fn record(&mut self, set: &JwkSet) {
+        for kid in set
+            .keys
+            .iter()
+            .filter_map(|key| key.common.key_id.as_deref())
+        {
+            if let Some(at) = self.0.iter().position(|seen| seen == kid) {
+                self.0.remove(at);
+            }
+            self.0.push_back(kid.to_owned());
+        }
+        while self.0.len() > SEEN_KIDS {
+            self.0.pop_front();
+        }
     }
 }
 
@@ -435,21 +466,22 @@ struct InFlight {
 /// | the set | in flight | has the kid | gate | decision |
 /// |---|---|---|---|---|
 /// | `age < R` | any | yes | — | `Serve` |
-/// | `R ≤ age < T` | any | yes | none in flight and `last_end + Bw(n)` | open: `ServeAndRefresh`; closed: `Serve` |
+/// | `R ≤ age < T` | any | yes | none in flight and `last_end + B(n)` | open: `ServeAndRefresh`; closed: `Serve` |
 /// | `age < T` | yes | no | — | `Join` |
-/// | `age < T` | no | no | `last_start + F` | open: `Start`; closed: `UnknownKid` |
+/// | `age < T` | no | no | `last_start + F` | open: `Start`; closed: `UnknownKid` for a seen kid, `UnseenKid` for one never seen |
 /// | none, or `age ≥ T` | yes | any | — | `Join` (never the expired set) |
-/// | none, or `age ≥ T` | no | any | `last_end + Bx(n)` | open: `Start`; closed: `Suppressed`, or `TooSoon` with no failure |
+/// | none, or `age ≥ T` | no | any | `last_end + B(n)` | open: `Start`; closed: `Suppressed`, or `TooSoon` with no failure |
 ///
 /// `T` is the TTL, `R` the age the refresh window opens at, `F` the refetch
-/// floor, `Bw(n)` and `Bx(n)` the backoffs in the window and after expiry
-/// ([`Tuning`]), and `n` the failure count; `Bw(0) = Bx(0) = F`.
+/// floor, `B(n)` the backoff ([`Tuning`]), and `n` the failure count;
+/// `B(0) = F`.
 enum Decision<'a> {
     Serve(&'a Arc<JwkSet>),
     ServeAndRefresh(&'a Arc<JwkSet>),
     Join(&'a InFlight),
     Start,
     UnknownKid,
+    UnseenKid,
     Suppressed,
     TooSoon,
 }
@@ -470,7 +502,7 @@ fn decide<'a>(state: &'a State, kid: &str, now: Instant, tuning: &Tuning) -> Dec
         (Some((cached, age)), in_flight) if cached.set.find(kid).is_some() => {
             let refresh = age >= tuning.refresh_at()
                 && in_flight.is_none()
-                && since(state.last_end) >= tuning.window_backoff(state.failures);
+                && since(state.last_end) >= tuning.backoff(state.failures);
             if refresh {
                 Decision::ServeAndRefresh(&cached.set)
             } else {
@@ -479,10 +511,9 @@ fn decide<'a>(state: &'a State, kid: &str, now: Instant, tuning: &Tuning) -> Dec
         }
         (_, Some(in_flight)) => Decision::Join(in_flight),
         (Some(_), None) if since(state.last_start) >= tuning.floor() => Decision::Start,
-        (Some(_), None) => Decision::UnknownKid,
-        (None, None) if since(state.last_end) >= tuning.expired_backoff(state.failures) => {
-            Decision::Start
-        }
+        (Some(_), None) if state.seen.contains(kid) => Decision::UnknownKid,
+        (Some(_), None) => Decision::UnseenKid,
+        (None, None) if since(state.last_end) >= tuning.backoff(state.failures) => Decision::Start,
         (None, None) if state.failures == 0 => Decision::TooSoon,
         (None, None) => Decision::Suppressed,
     }
@@ -499,7 +530,6 @@ enum Purpose {
 /// A reserved attempt, not yet spawned. Built under the lock and spawned
 /// only after it is released (`start`).
 struct Reservation {
-    handle: tokio::runtime::Handle,
     id: u64,
     retry: bool,
     attempt: Attempt,
@@ -570,26 +600,31 @@ impl JwksCache {
     /// one past its TTL.
     ///
     /// See the module docs for when this makes a network call, and for when
-    /// it waits on one. Errors are [`AuthError::UnknownKid`] (a set inside its
-    /// TTL lacks the kid: just refetched, or within the refetch floor of the
-    /// last attempt) or [`AuthError::Jwks`]: the endpoint could not be
-    /// reached, answered non-2xx, sent a body over [`MAX_JWKS_BYTES`] or
-    /// answered with something that isn't a JWKS; or, with no set inside its
-    /// TTL, a refetch is not allowed yet, the fetch this lookup joined
-    /// outlasted its wait (2 s on a retry, [`FETCH_TIMEOUT`] plus 1 s on a
-    /// first attempt), the set it waited for aged past its TTL first, the
-    /// attempt was aborted, or there is no tokio runtime to start or wait on
-    /// a fetch on.
+    /// it waits on one. Errors are:
+    ///
+    /// - [`AuthError::UnknownKid`]: a set inside its TTL lacks the kid, just
+    ///   refetched, or within the refetch floor of the last attempt for a kid
+    ///   seen in an earlier set (a retired key);
+    /// - [`AuthError::UnseenKid`]: within the floor, for a kid no fetched set
+    ///   has held (refetch suppressed: possibly a rotation not fetched yet);
+    /// - [`AuthError::Jwks`]: the endpoint could not be reached, answered
+    ///   non-2xx, sent a body over [`MAX_JWKS_BYTES`] or answered with
+    ///   something that isn't a JWKS; or, with no set inside its TTL, a
+    ///   refetch is not allowed yet, the fetch this lookup joined outlasted
+    ///   its wait (2 s on a retry, [`FETCH_TIMEOUT`] plus 1 s on a first
+    ///   attempt), the set it waited for aged past its TTL first, or the
+    ///   attempt was aborted.
     ///
     /// Returned behind an `Arc`: a cache hit costs a refcount bump, not a
     /// copy of the key set.
     ///
     /// # Panics
     ///
-    /// Requires a Tokio runtime with the time driver enabled, as reqwest
-    /// does: a lookup that has to wait on a fetch, polled on a runtime built
-    /// without `enable_time`, panics in tokio's timer. Outside any runtime it
-    /// never panics (module docs, "Concurrency").
+    /// Requires a Tokio runtime with IO and the time driver enabled, as
+    /// reqwest does: a lookup that starts or joins a fetch panics outside
+    /// one, and one that has to wait on a fetch, polled on a runtime built
+    /// without `enable_time`, panics in tokio's timer (module docs,
+    /// "Concurrency").
     pub async fn jwks_for_kid(&self, kid: &str) -> Result<Arc<JwkSet>, AuthError> {
         let (attempt, retry) = {
             let state = self.inner.state();
@@ -598,28 +633,20 @@ impl JwksCache {
                 Decision::Serve(set) => return Ok(Arc::clone(set)),
                 Decision::ServeAndRefresh(set) => {
                     let set = Arc::clone(set);
-                    // No runtime: the set still answers, and the refresh
-                    // waits for a lookup that has one.
                     let _nobody_waits = self.start(state, now, Purpose::RefreshAhead);
                     return Ok(set);
                 }
-                // A wait, like a start, needs a runtime: outside one, the
-                // lookup is refused at once (module docs, "Concurrency").
-                Decision::Join(_) if tokio::runtime::Handle::try_current().is_err() => {
-                    return Err(AuthError::Jwks(NO_RUNTIME.into()));
-                }
                 Decision::Join(in_flight) => (in_flight.attempt.clone(), in_flight.retry),
-                Decision::Start => {
-                    let Some(joined) = self.start(state, now, Purpose::Needed) else {
-                        return Err(AuthError::Jwks(NO_RUNTIME.into()));
-                    };
-                    joined
-                }
+                Decision::Start => self.start(state, now, Purpose::Needed),
                 Decision::UnknownKid => {
-                    tracing::debug!(
-                        "unknown JWKS kid inside the refetch floor; refetch suppressed"
-                    );
+                    tracing::debug!("retired JWKS kid inside the refetch floor");
                     return Err(AuthError::UnknownKid);
+                }
+                Decision::UnseenKid => {
+                    tracing::debug!(
+                        "JWKS kid never seen, inside the refetch floor; refetch suppressed"
+                    );
+                    return Err(AuthError::UnseenKid);
                 }
                 Decision::Suppressed => {
                     tracing::debug!("suppressing JWKS refetch after a recent failure");
@@ -632,10 +659,10 @@ impl JwksCache {
             }
         };
 
-        // Every wait has a bound of its own, on this lookup's runtime (it has
-        // one: both arms above that reach here checked). Not the fetch's own
-        // timeout alone: that fires only while the runtime hosting the fetch
-        // is being driven, and this lookup may be on another runtime.
+        // Every wait has a bound of its own, on this lookup's runtime. Not the
+        // fetch's own timeout alone: that fires only while the runtime
+        // hosting the fetch is being driven, and this lookup may be on
+        // another runtime.
         let wait = if retry {
             self.tuning.retry_join_wait
         } else {
@@ -684,10 +711,8 @@ impl JwksCache {
         }
     }
 
-    /// Reserve the slot for a new attempt, under the lock. `None`, with
-    /// nothing changed, outside a tokio runtime.
-    fn reserve(&self, state: &mut State, now: Instant) -> Option<Reservation> {
-        let handle = tokio::runtime::Handle::try_current().ok()?;
+    /// Reserve the slot for a new attempt, under the lock.
+    fn reserve(&self, state: &mut State, now: Instant) -> Reservation {
         let id = state.next_id;
         state.next_id = id.wrapping_add(1);
         let retry = state.failures > 0;
@@ -698,18 +723,17 @@ impl JwksCache {
             attempt: attempt.clone(),
         });
         state.last_start = Some(now);
-        Some(Reservation {
-            handle,
+        Reservation {
             id,
             retry,
             attempt,
             sender,
-        })
+        }
     }
 
     /// Start an attempt: reserve the slot, release the lock, spawn the
     /// fetch, and return what a lookup joins (the attempt, and whether it is
-    /// a retry). `None`, with nothing changed, outside a tokio runtime.
+    /// a retry).
     ///
     /// The lock is taken by value so that it is always released before the
     /// spawn: nothing that runs a guard's drop — a runtime that drops the
@@ -721,14 +745,13 @@ impl JwksCache {
         mut state: MutexGuard<'_, State>,
         now: Instant,
         purpose: Purpose,
-    ) -> Option<(Attempt, bool)> {
+    ) -> (Attempt, bool) {
         let Reservation {
-            handle,
             id,
             retry,
             attempt,
             sender,
-        } = self.reserve(&mut state, now)?;
+        } = self.reserve(&mut state, now);
         drop(state);
         // The guard exists before the task does, so even a task dropped
         // before its first poll clears the slot it reserved.
@@ -746,8 +769,10 @@ impl JwksCache {
             Purpose::Needed => tracing::Span::current(),
             Purpose::RefreshAhead => tracing::Span::none(),
         };
-        drop(handle.spawn(run(guard, self.tuning.fetch_timeout).instrument(span)));
-        Some((attempt, retry))
+        drop(tokio::spawn(
+            run(guard, self.tuning.fetch_timeout).instrument(span),
+        ));
+        (attempt, retry)
     }
 
     /// Test seam: move this cache's clock forward.
@@ -822,11 +847,14 @@ impl SlotGuard {
                 Err(AuthError::Jwks(message)) => Err(message),
                 Err(other) => Err(other.to_string()),
             };
-            if state.finish(self.id, now, outcome.is_ok()) && self.cache_success {
+            if state.finish(self.id, now, outcome.is_ok()) {
                 if let Ok(fetched) = &outcome {
-                    // Replace rather than merge: a rotation that *retires* a
-                    // key must actually retire it here too.
-                    state.cached = Some(fetched.clone());
+                    state.seen.record(&fetched.set);
+                    if self.cache_success {
+                        // Replace rather than merge: a rotation that
+                        // *retires* a key must actually retire it here too.
+                        state.cached = Some(fetched.clone());
+                    }
                 }
             }
             outcome
