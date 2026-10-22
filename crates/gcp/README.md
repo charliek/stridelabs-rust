@@ -51,7 +51,7 @@ crypto provider").
 
 ```toml
 [dependencies]
-stridelabs-gcp = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.8.0", features = ["service-account-key", "vertex"] }
+stridelabs-gcp = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.9.0", features = ["service-account-key", "vertex"] }
 ```
 
 (`v0.7.0` is the first release with this crate; `upload_with` and
