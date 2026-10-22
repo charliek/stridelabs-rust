@@ -35,11 +35,10 @@ README, "One crypto provider").
 
 ```toml
 [dependencies]
-stridelabs-inworld = { git = "https://github.com/charliek/stridelabs-rust.git", rev = "<sha>", features = ["client-builder"] }
+stridelabs-inworld = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.9.0", features = ["client-builder"] }
 ```
 
-The crate is unreleased: pin `rev = "<sha>"` until a tag contains it, then
-`tag = "vX.Y.Z"`. See the workspace root README for the local `[patch]`
+New in v0.9.0. See the workspace root README for the local `[patch]`
 co-development snippet.
 
 ## Usage

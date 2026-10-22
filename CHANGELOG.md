@@ -11,6 +11,17 @@ for a consumer's pin.
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-10-22
+
+A joint release: slaudio's port gaps and their curation (plan 024's #44, plan 025's L1 #48 and L2 #50), lumen's S1
+additions (#46), a lock-only advisory fix (#47), downstream-check's lumen case (#49), and a new crate,
+`stridelabs-inworld` (slaudio plan 022 L3b, to lumen 001 §6.3, reviewed by lumen). **BREAKING (behaviour, security):** a JWKS key set is never served past its TTL, and `AuthError` is
+`#[non_exhaustive]` with a new `UnseenKid` verdict (a `match` needs a wildcard arm; map `UnseenKid` where `Jwks`
+goes). Everything else is additive or opt-in: lumen's `Verifier::for_issuer`/`ClaimChecks`, `RedisHandle::eval`,
+`TargetCaps` and `redact_url`; the SSRF fetch's feed options; `TokenProvider::invalidate`; GCS `ObjectNamePolicy`
+and a `retry` module; the JWKS body cap. Downstream-checked against imgmcp, limen and slaudio (and lumen's suite
+against L2). Details below.
+
 ### Added
 
 - `stridelabs-inworld`, a new crate (slaudio plan 022 L3b, to lumen plan 001
