@@ -47,10 +47,12 @@ stridelabs-testing = { path = "crates/testing" }
 # a consumer's rustls `ring` (redis-rs 0.27's `tls-rustls`, sqlx
 # `tls-rustls-ring`) every `rustls::ClientConfig::builder()` that relies on the
 # crate-feature default panics. Only stridelabs-http's `proxy` and `ssrf` build
-# a client of their own, so only they turn reqwest's TLS on
-# (crates/http/Cargo.toml). stridelabs-auth and stridelabs-gcp are handed the
-# consumer's client and must not pick a TLS stack for it; CI's "Guard:
-# stridelabs-auth pulls no rustls" keeps rustls out of stridelabs-auth's graph.
+# a client of their own, and stridelabs-inworld's `client-builder` a client
+# builder, so only they turn reqwest's TLS on (crates/http/Cargo.toml,
+# crates/inworld/Cargo.toml). stridelabs-auth, stridelabs-gcp and
+# stridelabs-inworld's core are handed the consumer's client and must not pick
+# a TLS stack for it; CI's "Guard: stridelabs-auth pulls no rustls" keeps
+# rustls out of stridelabs-auth's graph.
 reqwest = { version = "0.13", default-features = false }
 
 # OpenAPI. No schema features (`uuid`, `time`, …) here: the shared crate

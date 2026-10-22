@@ -80,10 +80,10 @@ will not silently skip.
 
 ## Crate map
 
-All eight crates are implemented: `stridelabs-config`,
+All nine crates are implemented: `stridelabs-config`,
 `stridelabs-observability`, `stridelabs-http`, `stridelabs-auth`,
-`stridelabs-testing`, `stridelabs-mcp`, `stridelabs-redis` and
-`stridelabs-gcp`.
+`stridelabs-testing`, `stridelabs-mcp`, `stridelabs-redis`,
+`stridelabs-gcp` and `stridelabs-inworld`.
 
 | Crate | Status | Contents |
 |---|---|---|
@@ -95,6 +95,7 @@ All eight crates are implemented: `stridelabs-config`,
 | `stridelabs-mcp` | Implemented | MCP-server middle on rmcp: canonical protected resource + RFC 9728 metadata router, slauth bearer verification (audience = resource URL; JWKS outage → 503) and its `401` challenges, stateless Streamable HTTP router, scoped/rate-limited/audited tool boundary, slauth PATs as a credential with a fail-through cache, the committed `tools/list` snapshot, MCP token minting (feature `test-support`); a Redis-backed limiter and PAT cache (feature `redis`), the SSRF-hardened image fetch (feature `image-fetch`), the CORS preset (feature `cors`) |
 | `stridelabs-redis` | Implemented | A lazy, single-flight Redis handle (`rediss://` over rustls, no crypto provider of its own): an atomic fixed-window counter that is never replayed, idempotent `GET` / `SET EX`, `EVAL` under a caller-chosen replay policy (`Replay`), `PING` |
 | `stridelabs-gcp` | Implemented | Policy-free Google Cloud building blocks on the consumer's `reqwest::Client`: an ADC access-token provider with a single-flight cache (`service_account` keys behind feature `service-account-key`), a small GCS JSON-API client, Vertex AI `generateContent` (feature `vertex`) |
+| `stridelabs-inworld` | Implemented | A policy-free Inworld text-to-speech client on the consumer's `reqwest::Client`: one bounded synthesis (whole-exchange timeout, streamed response cap with a `Content-Length` pre-check, pre-decode base64 guard, decoded-audio and text bounds), errors classified as unavailable/rejected/malformed and safe to log, an optional MP3 shape check; `client_builder()` (feature `client-builder`) |
 
 Each crate documents its own **feature topology** in its README — most are
 `default = []` so a consumer's dependency graph stays as lean as it wants.

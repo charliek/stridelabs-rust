@@ -3,7 +3,7 @@
 All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
-Versioning is lockstep across all eight crates in this workspace (one
+Versioning is lockstep across all nine crates in this workspace (one
 `[workspace.package].version`, bumped together regardless of which crate(s)
 changed) rather than independent per-crate versioning —
 see the root README's "Consuming these crates" section for what that means
@@ -12,6 +12,78 @@ for a consumer's pin.
 ## [Unreleased]
 
 ### Added
+
+- `stridelabs-inworld`, a new crate (slaudio plan 022 L3b, to lumen plan 001
+  §6.3's spec): a policy-free Inworld text-to-speech client on the
+  consumer's `reqwest::Client`, which it never retries, chunks or logs
+  through. First consumers: slaudio's Rust port, then tapper and lumen.
+  - `InworldClient::builder(http, api_key)` → `InworldClientBuilder`
+    (`base_url`, `timeout`, `max_response_bytes`, `max_audio_bytes`,
+    `max_text_chars`, `mp3_check`) → `build()`, refusing a base URL that is
+    not `https://` (plain `http://` only to a loopback IP literal, the test
+    seam) or carries userinfo, a query or a fragment
+    (`BuildError::InvalidBaseUrl`), and a zero timeout
+    (`BuildError::ZeroTimeout`). The client must follow no redirects; its own
+    timeout does not matter.
+  - `synthesize(&SynthesisRequest)` sends one `POST {base}/tts/v1/voice`
+    with exactly `{text, voiceId, modelId, language?, deliveryMode?,
+    audioConfig{audioEncoding, bitRate?, speakingRate?, sampleRateHertz?}}`,
+    every unset option omitted, and `Authorization: Basic <key>` (trimmed,
+    verbatim, marked sensitive). It returns a `Synthesis` (`#[non_exhaustive]`:
+    the audio as `Bytes`, and `Usage` with `processed_characters_count` and
+    `model_id` as `Option`s, an ill-typed field `None`). `Usage`'s `Debug`
+    shows the model id as its length only (`Some(<12 chars>)`): it is the
+    provider's string, and could echo the request.
+  - `InworldBounds` (`#[non_exhaustive]`, `DEFAULT`, lumen's numbers): a
+    15 s whole-exchange timeout set on each request; a 4 MiB response,
+    refused unread past its `Content-Length` and otherwise cut chunk by
+    chunk, never buffered whole; 2 MiB of audio, checked on the base64
+    length before decoding and on the decoded length; 600 characters of
+    text, before anything is sent.
+  - Strict standard base64, then the MP3 sniff (`starts_with(b"ID3")`, or
+    `0xFF` and a byte whose top three bits are set), on by default.
+  - `InworldError` (`#[non_exhaustive]`, `Clone`, `PartialEq`, `Eq`,
+    `is_retryable()`): `Unavailable { reason, cause }` for a `408`, a `429`,
+    a `5xx`, a timeout, or a failed or broken connection
+    (`UnavailableReason`: `Status`, `TimedOut`, `Connect`, `Transport`), the
+    only retryable class; `Rejected(status)` for any other
+    non-`2xx`, every `3xx` included; `Malformed(MalformedReason)`
+    for a `2xx` that is too large, not a JSON object, without a string
+    `audioContent`, not base64, empty, over the audio bound or not
+    MP3-shaped; `UnusableKey`, `TextTooLong { chars, max }` and
+    `SpeakingRateNotFinite`, which send nothing. Every `Display` and `Debug`
+    is fixed phrases, a status, a count or a `std::io::ErrorKind`, and
+    `source()` is always `None`: no error keeps a `reqwest::Error`, whose
+    source chain can carry what the peer sent (h2 renders a GOAWAY's debug
+    data in both `Display` and `Debug`; `without_url()` strips only the
+    URL). A transport failure's `cause` is a `TransportCause` (`Copy`,
+    `#[non_exhaustive]`): its `TransportStage` (`Connect`, `Request`, `Body`,
+    `Decode`, `Other`, from reqwest's predicates), `timed_out`, and the
+    innermost `io::ErrorKind` found by downcasting the chain. Error bodies
+    are never read. Canary tests hold the key, the text, a response body,
+    the URL, a success's `usage.modelId`, and what a peer puts inside a
+    transport failure (a malformed status line, an unparseable header, an
+    HTTP/2 GOAWAY's debug data, with a control showing reqwest's own error
+    renders it) out of every rendering, and the `Debug`s show neither the
+    key, the text, the audio nor the model id.
+  - Feature `client-builder` (off by default): `client_builder()`, a
+    `reqwest::ClientBuilder` with reqwest's rustls backend (aws-lc-rs),
+    `no_proxy()` and `redirect::Policy::none()`. Without it the crate turns
+    on no reqwest feature at all.
+  - Its bounds tests include lumen L1.8's four blind spots, the first three
+    against a raw TCP server: an endless chunked stream cut at the bound
+    before the timeout, a stall after the headers, a declared-oversized
+    `Content-Length` that then stalls, and audio of `MAX_AUDIO_BYTES + 2`
+    refused before decoding. `Cargo.lock` gains the crate's own entry, and
+    reqwest's entry an `h2` edge: the tests' dev-only `reqwest/http2` (h2c,
+    for the GOAWAY canary), h2 itself already locked through wiremock.
+  - CI lists it in its per-feature lanes, the `cargo-semver-checks` loop
+    (new since the baseline tag, so passed over until the next one) and the
+    `downstream-limen` `[patch]`, with a guard that its core pulls no TLS at
+    all (no rustls, and no `native-tls`, `openssl`, `openssl-sys`,
+    `hyper-tls` or `tokio-native-tls`) and that `client-builder` puts rustls
+    on aws-lc-rs, never ring and never native TLS;
+    `scripts/downstream-check.sh` patches it too.
 
 - `scripts/downstream-check.sh`: an informational `lumen` consumer (the
   `lumen-rs` workspace on lumen's `main`; pass `origin/main` or set

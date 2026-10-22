@@ -145,6 +145,8 @@ jobs:
             stridelabs-gcp: \
             stridelabs-gcp:service-account-key \
             stridelabs-gcp:vertex \
+            stridelabs-inworld: \
+            stridelabs-inworld:client-builder \
             stridelabs-http:tls \
             stridelabs-http:redact-url \
             stridelabs-http:ssrf \
@@ -298,6 +300,84 @@ jobs:
             exit 1
           fi
           echo "ok: rustls absent with every feature on, jsonwebtoken and reqwest present"
+
+      # stridelabs-inworld is handed the consumer's `reqwest::Client`, so its
+      # core (no features: its reqwest has none at all) must pick no TLS
+      # stack, like stridelabs-gcp. Its `client-builder` feature is TLS by
+      # design (reqwest's `rustls`, for `client_builder()`), and must put
+      # rustls on aws-lc-rs and never ring. Neither may bring native TLS
+      # (reqwest's `native-tls`, `default-tls` under another name, would put
+      # OpenSSL in every consumer's image): no `native-tls`, `openssl`,
+      # `openssl-sys`, `hyper-tls` or `tokio-native-tls` in either listing.
+      # Two listings: the core, with reqwest as the positive control; then
+      # the feature, with rustls as the control (the feature really is the
+      # TLS one), no ring crate, no native TLS crate, and no rustls provider
+      # feature but aws-lc-rs.
+      - name: "Guard: stridelabs-inworld's core pulls no TLS; client-builder puts rustls on aws-lc-rs, never ring or native TLS"
+        run: |
+          set -euo pipefail
+          listing="$(mktemp)"
+          trap 'rm -f "$listing"' EXIT
+          native_tls='native-tls openssl openssl-sys hyper-tls tokio-native-tls'
+          cargo tree --locked --target all -e normal -p stridelabs-inworld --no-default-features \
+            --prefix none --format '{p}' | awk '{print $1}' | sort -u > "$listing"
+          echo "$(wc -l < "$listing") packages in stridelabs-inworld's core normal graph"
+          if [ ! -s "$listing" ]; then
+            echo "::error::the stridelabs-inworld package listing is empty; the guard proved nothing"
+            exit 1
+          fi
+          if ! grep -qx reqwest "$listing"; then
+            echo "::error::positive control failed: reqwest is not in stridelabs-inworld's graph, so this listing is not the one the guard means to inspect"
+            exit 1
+          fi
+          if grep -qx rustls "$listing"; then
+            echo "::error::rustls is in stridelabs-inworld's core graph; a TLS feature on its reqwest picks a rustls provider for every consumer"
+            cargo tree --locked --target all -e normal -p stridelabs-inworld --no-default-features -i rustls || true
+            exit 1
+          fi
+          for crate in $native_tls; do
+            if grep -qx "$crate" "$listing"; then
+              echo "::error::$crate is in stridelabs-inworld's core graph; a native TLS feature on its reqwest picks a TLS stack (and OpenSSL) for every consumer"
+              cargo tree --locked --target all -e normal -p stridelabs-inworld --no-default-features -i "$crate" || true
+              exit 1
+            fi
+          done
+          echo "ok: [core] rustls and native TLS absent, reqwest present"
+          cargo tree --locked --target all -e normal -p stridelabs-inworld --no-default-features \
+            --features client-builder --prefix none --format '{p} [{f}]' | sort -u > "$listing"
+          echo "$(wc -l < "$listing") lines in stridelabs-inworld[client-builder]'s normal graph"
+          if [ ! -s "$listing" ]; then
+            echo "::error::the stridelabs-inworld[client-builder] listing is empty; the guard proved nothing"
+            exit 1
+          fi
+          if ! grep -q '^rustls v' "$listing"; then
+            echo "::error::positive control failed: rustls is not in stridelabs-inworld[client-builder]'s graph, so this listing is not the one the guard means to inspect"
+            exit 1
+          fi
+          if awk '{print $1}' "$listing" | grep -qx ring; then
+            echo "::error::ring is in stridelabs-inworld[client-builder]'s graph; next to aws-lc-rs it is a second crypto provider, and rustls::ClientConfig::builder() panics"
+            cargo tree --locked --target all -e normal -p stridelabs-inworld --no-default-features --features client-builder -i ring || true
+            exit 1
+          fi
+          for crate in $native_tls; do
+            if awk '{print $1}' "$listing" | grep -qx "$crate"; then
+              echo "::error::$crate is in stridelabs-inworld[client-builder]'s graph; client_builder() is rustls on aws-lc-rs, and native TLS next to it is a second TLS stack (and OpenSSL) in every consumer's graph"
+              cargo tree --locked --target all -e normal -p stridelabs-inworld --no-default-features --features client-builder -i "$crate" || true
+              exit 1
+            fi
+          done
+          providers="$(awk '$1 == "rustls"' "$listing" | sed -n 's/^[^[]*\[\(.*\)\].*$/\1/p' | tr ',' '\n' \
+            | grep -E '^(ring|aws_lc_rs|aws-lc-rs|fips|custom-provider)$' | sort -u || true)"
+          others="$(grep -vE '^(aws_lc_rs|aws-lc-rs)$' <<<"$providers" | grep . || true)"
+          if [ -n "$others" ]; then
+            echo "::error::rustls in stridelabs-inworld[client-builder]'s graph has a provider feature other than aws-lc-rs: $(echo $others)"
+            exit 1
+          fi
+          if ! grep -qx aws_lc_rs <<<"$providers"; then
+            echo "::error::rustls in stridelabs-inworld[client-builder]'s graph does not name aws-lc-rs, though reqwest's rustls feature should"
+            exit 1
+          fi
+          echo "ok: [client-builder] rustls present, ring and native TLS absent, provider features: $(echo $providers)"
 
       # stridelabs-mcp sits in consumers' production graphs too, and its core
       # has the same reason to pick no TLS stack: its reqwest (no features) is
@@ -530,7 +610,7 @@ jobs:
           status=0
           failed=""
           checked=0
-          for crate in stridelabs-config stridelabs-observability stridelabs-http stridelabs-auth stridelabs-testing stridelabs-mcp stridelabs-redis stridelabs-gcp; do
+          for crate in stridelabs-config stridelabs-observability stridelabs-http stridelabs-auth stridelabs-testing stridelabs-mcp stridelabs-redis stridelabs-gcp stridelabs-inworld; do
             if ! git cat-file -e "$baseline:crates/${crate#stridelabs-}/Cargo.toml" 2>/dev/null; then
               echo "::notice::$crate is new since $baseline (no crates/${crate#stridelabs-}/Cargo.toml there), so it has no baseline API to check; it is checked from the next tag on"
               continue
@@ -668,7 +748,7 @@ jobs:
           set -euo pipefail
           patch="$RUNNER_TEMP/stridelabs-patch.toml"
           echo '[patch."https://github.com/charliek/stridelabs-rust.git"]' > "$patch"
-          for c in config observability http auth testing mcp redis gcp; do
+          for c in config observability http auth testing mcp redis gcp inworld; do
             echo "stridelabs-$c = { path = \"$GITHUB_WORKSPACE/stridelabs-rust/crates/$c\" }" >> "$patch"
           done
           cat "$patch"

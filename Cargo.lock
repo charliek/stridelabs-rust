@@ -2046,6 +2046,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-util",
+ "h2",
  "http",
  "http-body",
  "http-body-util",
@@ -2843,6 +2844,21 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "utoipa",
+ "wiremock",
+]
+
+[[package]]
+name = "stridelabs-inworld"
+version = "0.9.0"
+dependencies = [
+ "base64 0.22.1",
+ "bytes",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "url",
  "wiremock",
 ]
 

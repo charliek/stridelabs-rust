@@ -1,0 +1,56 @@
+[package]
+name = "stridelabs-inworld"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "A policy-free Inworld text-to-speech client for StrideLabs services: one bounded, classified, log-safe synthesis on the consumer's reqwest::Client"
+publish = false
+
+[features]
+default = []
+# `client_builder()`: a `reqwest::ClientBuilder` with the rustls backend, no
+# proxy and no redirects. It turns on reqwest's `rustls` (rustls's aws-lc-rs
+# provider plus the OS trust store; never ring), so it is off by default:
+# without it the crate picks no TLS stack, and the client a consumer hands in
+# keeps whatever TLS that consumer chose, as with stridelabs-gcp. The same
+# reqwest feature stridelabs-http's `proxy` and `ssrf` turn on, so a service
+# with both compiles it once.
+client-builder = ["reqwest/rustls"]
+
+[lints]
+workspace = true
+
+[dependencies]
+# No features: the request body is serialized here (`serde_json::to_vec`) and
+# the response is read chunk by chunk (`Response::chunk`, in reqwest's core),
+# so neither `json` nor `stream` is needed. No TLS unless `client-builder`
+# (above): every constructor takes the consumer's client.
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# `audioContent` is standard base64, decoded strictly (canonical padding, no
+# whitespace, no stray trailing bits).
+base64 = { workspace = true }
+# The audio handed back. Already in every graph through reqwest.
+bytes = { workspace = true }
+# `url::Host`, to tell a loopback IP literal (the plain-`http` test seam) from
+# a name. The `url` reqwest itself is built on, so nothing is added to the
+# lock.
+url = { workspace = true }
+
+[dev-dependencies]
+# The workspace pin carries `full`: `net` and `io-util` for the raw TCP
+# servers the bounds tests stall and stream from, `time` for their sleeps.
+tokio = { workspace = true }
+wiremock = { workspace = true }
+# `http2`, for `http2_prior_knowledge()`: the redaction tests speak h2c to a
+# raw server that answers with a GOAWAY whose debug data is a canary, the
+# provider-controlled text h2 renders in its errors. Dev-only, so no
+# consumer's graph and no `cargo build` gets it; h2 is already in the lock
+# (wiremock's hyper), and `cargo test --workspace` unifies it into every
+# member's test build, as stridelabs-http's dev-only `gzip` is.
+reqwest = { workspace = true, features = ["http2"] }
