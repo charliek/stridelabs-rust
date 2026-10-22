@@ -99,7 +99,11 @@ pub(crate) fn decode(
     max_audio_bytes: usize,
     mp3_check: bool,
 ) -> Result<Synthesis, InworldError> {
-    let mut deserializer = serde_json::Deserializer::from_slice(body);
+    // The whole body is checked as UTF-8 first: serde_json validates the
+    // strings it builds, but skips an ignored one by its delimiters and
+    // escapes only, so invalid UTF-8 inside a skipped field would pass.
+    let body = std::str::from_utf8(body).map_err(|_| malformed(MalformedReason::NotJsonObject))?;
+    let mut deserializer = serde_json::Deserializer::from_str(body);
     let response = WireResponse
         .deserialize(&mut deserializer)
         .and_then(|response| deserializer.end().map(|()| response))
@@ -499,6 +503,28 @@ mod tests {
             "]".repeat(100_000)
         );
         assert_eq!(reason(&deep, true), None);
+    }
+
+    /// Invalid UTF-8 anywhere in the body is refused, a skipped field's
+    /// string included (serde_json would skip that one unchecked).
+    #[test]
+    fn invalid_utf8_anywhere_is_refused() {
+        for body in [
+            &b"{\"audioContent\":\"//OQ\",\"x\":\"\xFF\"}"[..],
+            &b"{\"audioContent\":\"//OQ\",\"usage\":{\"y\":\"\xC3\"}}"[..],
+            &b"{\"audioContent\":\"//OQ\xFF\"}"[..],
+            &b"{\"\xFF\":1,\"audioContent\":\"//OQ\"}"[..],
+        ] {
+            let outcome = decode(body, DEFAULT_MAX_AUDIO_BYTES, true);
+            assert!(
+                matches!(
+                    outcome,
+                    Err(InworldError::Malformed(MalformedReason::NotJsonObject))
+                ),
+                "{:?}: {outcome:?}",
+                String::from_utf8_lossy(body)
+            );
+        }
     }
 
     #[test]

@@ -166,7 +166,7 @@ Builder options, with lumen's defaults (`InworldBounds::DEFAULT`):
 | a connection that could not be made | `Unavailable { reason: Connect, cause: Some(_), .. }` | yes |
 | a connection that broke, a body cut off before its declared length, an unparseable response, an HTTP/2 GOAWAY | `Unavailable { reason: Transport, cause: Some(_), .. }` | yes |
 | any other non-`2xx`: a `4xx`, a `3xx` (never followed) | `Rejected { status, .. }` | no |
-| a `2xx` that is too large, not a JSON object, without a string `audioContent`, not base64, empty, over the audio bound, or (check on) not MP3-shaped | `Malformed(MalformedReason::…)` | no |
+| a `2xx` that is too large, not UTF-8, not a JSON object, without a string `audioContent`, not base64, empty, over the audio bound, or (check on) not MP3-shaped | `Malformed(MalformedReason::…)` | no |
 | a key empty after trimming, or holding a byte no header can carry | `UnusableKey` | no |
 | text over `max_text_chars` | `TextTooLong { chars, max }` | no |
 | a NaN or infinite speaking rate | `SpeakingRateNotFinite` | no |

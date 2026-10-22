@@ -61,7 +61,7 @@ for a consumer's pin.
     `Rejected { status, .. }` for any other non-`2xx`, every `3xx` included.
     Both are `#[non_exhaustive]` struct variants, so a field (an RPC code)
     can join them without breaking a caller; `Malformed(MalformedReason)`
-    for a `2xx` that is too large, not a JSON object, without a string
+    for a `2xx` that is too large, not UTF-8, not a JSON object, without a string
     `audioContent`, not base64, empty, over the audio bound or not
     MP3-shaped; `UnusableKey`, `TextTooLong { chars, max }` and
     `SpeakingRateNotFinite`, which send nothing. Every `Display` and `Debug`
