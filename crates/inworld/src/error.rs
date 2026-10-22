@@ -3,8 +3,8 @@
 //! Every `Display` and `Debug` here is safe to log: fixed phrases, a status
 //! code, a count, or a `std::io::ErrorKind`. No error keeps a `reqwest::Error`
 //! or anything else from the exchange: a transport failure is reduced to a
-//! [`TransportCause`] (reqwest's own classification and the innermost I/O
-//! error kind) and the `reqwest::Error` is dropped, because its source chain
+//! [`TransportCause`] (where it failed, whether it timed out, and the
+//! innermost I/O error kind) and the `reqwest::Error` is dropped, because its source chain
 //! can carry what the peer sent (an HTTP/2 GOAWAY's debug data, rendered by
 //! h2 in both `Display` and `Debug`), and `without_url()` strips only the URL.
 //! So [`std::error::Error::source`] is `None` for every variant. Never a
@@ -24,10 +24,15 @@ use std::io;
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum InworldError {
-    /// Inworld answered `408`, `429` or a `5xx`, the exchange passed its timeout
-    /// (before the headers or while the body was read), or the connection
-    /// could not be made or broke (a body cut off before its end included).
+    /// Inworld answered `408`, `429` or any status of `500` or more (`5xx`
+    /// and the `600`–`999` hyper also accepts), the exchange passed its
+    /// timeout (before the headers or while the body was read), or the
+    /// connection could not be made or broke (a body cut off before its end
+    /// included).
+    ///
+    /// `#[non_exhaustive]`, so a field can join it: match it with `..`.
     #[error("Inworld is unavailable: {reason}{}", cause_suffix(.cause))]
+    #[non_exhaustive]
     Unavailable {
         /// Which of those it was.
         reason: UnavailableReason,
@@ -36,10 +41,18 @@ pub enum InworldError {
         cause: Option<TransportCause>,
     },
     /// Inworld answered a status that is neither a `2xx` nor retryable: any
-    /// `4xx` but `408` and `429`, and any `3xx`. A `3xx` is an answer, never followed
-    /// (see [`crate::InworldClient::builder`]). No body is read.
-    #[error("Inworld rejected the request with HTTP {0}")]
-    Rejected(u16),
+    /// `4xx` but `408` and `429`, any `3xx` (an answer, never followed; see
+    /// [`crate::InworldClient::builder`]), and any `1xx` final status. No body
+    /// is read.
+    ///
+    /// `#[non_exhaustive]`, so a field (an RPC code, say) can join `status`
+    /// without breaking a caller: match it as `Rejected { status, .. }`.
+    #[error("Inworld rejected the request with HTTP {status}")]
+    #[non_exhaustive]
+    Rejected {
+        /// The HTTP status code.
+        status: u16,
+    },
     /// Inworld answered a `2xx` that is not usable audio.
     #[error("Inworld answered 2xx, but {0}")]
     Malformed(MalformedReason),
@@ -79,7 +92,8 @@ impl InworldError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum UnavailableReason {
-    /// It answered `408`, `429` or a `5xx` (the code). The body is not read.
+    /// It answered `408`, `429` or a status of `500` or more (the code). The
+    /// body is not read.
     Status(u16),
     /// The exchange passed the client's timeout, before the response's
     /// headers or while its body was read.
@@ -109,15 +123,14 @@ fn cause_suffix(cause: &Option<TransportCause>) -> String {
     cause.map(|cause| format!(" ({cause})")).unwrap_or_default()
 }
 
-/// A transport failure, sanitized: what reqwest said about it, and the
-/// innermost I/O error kind, never the error itself
+/// A transport failure, sanitized: where it happened, whether it timed out,
+/// and the innermost I/O error kind, never the error itself
 /// ([`InworldError::Unavailable`]'s `cause`). Its `Display` and `Debug` are
 /// fixed phrases, field names and `std::io::ErrorKind`s only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub struct TransportCause {
-    /// Where in the exchange it failed (reqwest's `is_connect`, `is_body`,
-    /// `is_decode` and `is_request`, in that order).
+    /// Where in the exchange it failed ([`TransportStage`]).
     pub stage: TransportStage,
     /// reqwest's `is_timeout`: the client's timeout ended it.
     pub timed_out: bool,
@@ -132,19 +145,29 @@ impl TransportCause {
     /// links; the cap only keeps a pathological one from being walked forever.
     const MAX_CHAIN: usize = 32;
 
-    /// `error`, classified. Nothing of it is kept but the classification.
-    pub(crate) fn of(error: &reqwest::Error) -> TransportCause {
+    /// A failure of the send (`RequestBuilder::send`): making the connection
+    /// when reqwest says so (`is_connect`), otherwise sending the request or
+    /// waiting for the response's head.
+    pub(crate) fn sending(error: &reqwest::Error) -> TransportCause {
         let stage = if error.is_connect() {
             TransportStage::Connect
-        } else if error.is_body() {
-            TransportStage::Body
-        } else if error.is_decode() {
-            TransportStage::Decode
-        } else if error.is_request() {
-            TransportStage::Request
         } else {
-            TransportStage::Other
+            TransportStage::Request
         };
+        TransportCause::at(stage, error)
+    }
+
+    /// A failure of a body read (`Response::chunk`). Always
+    /// [`TransportStage::Body`], whatever reqwest's predicates say: reqwest
+    /// wraps every frame error of a body read in a decode error, so
+    /// `is_decode` would label a stall or a cut-off body a decoding failure.
+    pub(crate) fn reading_body(error: &reqwest::Error) -> TransportCause {
+        TransportCause::at(TransportStage::Body, error)
+    }
+
+    /// `error`, at `stage`. Nothing of it is kept but `is_timeout` and the
+    /// innermost I/O error kind.
+    fn at(stage: TransportStage, error: &reqwest::Error) -> TransportCause {
         let mut io = None;
         let mut link = error.source();
         for _ in 0..TransportCause::MAX_CHAIN {
@@ -178,21 +201,21 @@ impl fmt::Display for TransportCause {
     }
 }
 
-/// Where in the exchange a transport failure happened ([`TransportCause`]).
+/// Where in the exchange a transport failure happened ([`TransportCause`]),
+/// by where the crate was when it failed (the send, or a body read) and,
+/// within the send, reqwest's `is_connect`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum TransportStage {
-    /// Making the connection (reqwest's `is_connect`).
+    /// Making the connection: the send failed, and reqwest's `is_connect`
+    /// says it was the connect.
     Connect,
-    /// Sending the request or waiting for the response's head
-    /// (`is_request`).
+    /// Sending the request or waiting for the response's head: any other
+    /// failure of the send.
     Request,
-    /// Reading the response body (`is_body`).
+    /// Reading the response body, after its head arrived: a stall (with
+    /// `timed_out`), a body cut off before its end, a malformed chunk.
     Body,
-    /// Decoding the response body (`is_decode`).
-    Decode,
-    /// None of those.
-    Other,
 }
 
 impl TransportStage {
@@ -203,8 +226,6 @@ impl TransportStage {
             TransportStage::Connect => "while connecting",
             TransportStage::Request => "while sending the request or awaiting the response",
             TransportStage::Body => "while reading the response body",
-            TransportStage::Decode => "while decoding the response body",
-            TransportStage::Other => "at an unclassified stage",
         }
     }
 }
@@ -302,8 +323,8 @@ mod tests {
             assert!(error.is_retryable(), "{error}");
         }
         for error in [
-            InworldError::Rejected(400),
-            InworldError::Rejected(302),
+            InworldError::Rejected { status: 400 },
+            InworldError::Rejected { status: 302 },
             InworldError::Malformed(MalformedReason::NotMp3),
             InworldError::UnusableKey,
             InworldError::TextTooLong {
@@ -352,7 +373,7 @@ mod tests {
                  (failed while connecting; I/O error: connection refused)",
             ),
             (
-                InworldError::Rejected(400),
+                InworldError::Rejected { status: 400 },
                 "Inworld rejected the request with HTTP 400",
             ),
             (

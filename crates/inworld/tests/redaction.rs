@@ -54,6 +54,7 @@ fn assert_only_fixed_phrases(error: &InworldError) {
     let InworldError::Unavailable {
         reason,
         cause: Some(cause),
+        ..
     } = error
     else {
         panic!("not a transport failure: {error:?}");
@@ -68,8 +69,6 @@ fn assert_only_fixed_phrases(error: &InworldError) {
         TransportStage::Connect => "while connecting",
         TransportStage::Request => "while sending the request or awaiting the response",
         TransportStage::Body => "while reading the response body",
-        TransportStage::Decode => "while decoding the response body",
-        TransportStage::Other => "at an unclassified stage",
         other => panic!("a stage this test does not know: {other:?}"),
     };
     let ended = if cause.timed_out {
@@ -255,6 +254,7 @@ async fn a_transport_failure_carries_no_url() {
         assert_only_fixed_phrases(&error);
         assert_no_canary(&format!("the error for {base}"), &renderings(&error));
     }
+    assert_eq!(broken.finish().await, 1);
     // The control: the reqwest error of a client that keeps the URL shows it.
     let kept = common::http()
         .post(format!("{}/{URL_CANARY}", common::refused_base_url().await))
@@ -346,7 +346,12 @@ async fn a_peer_controlled_transport_failure_renders_no_secret() {
         let server = RawServer::start(move |mut exchange| async move {
             // The request, key and text included, on one line.
             let echo = String::from_utf8_lossy(&exchange.request).replace(['\r', '\n'], " ");
-            assert!(echo.contains(KEY_CANARY) && echo.contains(TEXT_CANARY));
+            // The control, awaited through `finish` below: the peer really
+            // has the key and the text to echo.
+            assert!(
+                echo.contains(KEY_CANARY) && echo.contains(TEXT_CANARY),
+                "the request did not carry the canaries"
+            );
             let _ = exchange.send(answer(&echo).as_bytes()).await;
             // Dropping the stream closes it.
         })
@@ -359,6 +364,7 @@ async fn a_peer_controlled_transport_failure_renders_no_secret() {
             .await
             .expect_err(what);
         assert_eq!(server.connections(), 1, "{what}");
+        assert_eq!(server.finish().await, 1, "{what}");
         assert_only_fixed_phrases(&error);
         assert_no_canary(
             &format!("the error for {what} ({error})"),

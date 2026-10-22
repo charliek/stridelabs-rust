@@ -15,16 +15,20 @@
 //! can delay a whole response, but cannot send its headers and then stall,
 //! or stream without end. Each test tells the outcomes apart by their class,
 //! never by wall time alone: a client that failed the bound would answer
-//! `TimedOut`, where the bound's answer is `BodyTooLarge`.
+//! `TimedOut`, where the bound's answer is `BodyTooLarge`. Every raw server's
+//! handlers are awaited at the end ([`RawServer::finish`]), so a handler's
+//! own assertion fails its test. A stalled handler holds its socket until the
+//! client hangs up.
 
 mod common;
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use common::{audio_body, builder, client, mp3, request, Flag, RawServer, STALL};
+use common::{audio_body, builder, client, mp3, request, Flag, RawServer, HOLD};
 use stridelabs_inworld::{
-    InworldError, MalformedReason, UnavailableReason, DEFAULT_MAX_AUDIO_BYTES,
-    DEFAULT_MAX_RESPONSE_BYTES,
+    InworldError, MalformedReason, TransportCause, TransportStage, UnavailableReason,
+    DEFAULT_MAX_AUDIO_BYTES, DEFAULT_MAX_RESPONSE_BYTES,
 };
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -45,6 +49,35 @@ fn is_unavailable(
         Err(InworldError::Unavailable { reason, .. }) => Some(*reason),
         _ => None,
     }
+}
+
+/// A transport failure's stage and timeout flag.
+fn stage(
+    result: &Result<stridelabs_inworld::Synthesis, InworldError>,
+) -> Option<(TransportStage, bool)> {
+    match result {
+        Err(InworldError::Unavailable {
+            cause: Some(TransportCause {
+                stage, timed_out, ..
+            }),
+            ..
+        }) => Some((*stage, *timed_out)),
+        _ => None,
+    }
+}
+
+/// Inworld's `2xx` body for a small MP3, padded with a field the crate
+/// ignores to exactly `len` bytes.
+fn padded_body(len: usize) -> String {
+    let fitting = audio_body(&mp3(1024));
+    // `"padding":"",` is 13 bytes.
+    let padding = len
+        .checked_sub(fitting.len() + 13)
+        .expect("a length that fits the audio");
+    let mut body = fitting;
+    body.insert_str(1, &format!(r#""padding":"{}","#, " ".repeat(padding)));
+    assert_eq!(body.len(), len);
+    body
 }
 
 /// One HTTP/1.1 chunk.
@@ -76,8 +109,8 @@ async fn an_endless_chunked_stream_is_cut_at_the_bound_before_the_timeout() {
         let padding = chunk(&[b'A'; 64 * 1024]);
         let started = Instant::now();
         // Until the client hangs up (the write fails), or for longer than any
-        // test waits.
-        while started.elapsed() < STALL {
+        // client here waits.
+        while started.elapsed() < HOLD {
             if exchange.send(&padding).await.is_err() {
                 return;
             }
@@ -102,6 +135,8 @@ async fn an_endless_chunked_stream_is_cut_at_the_bound_before_the_timeout() {
         elapsed < timeout,
         "{elapsed:?}: the stream was not cut before the {timeout:?} timeout"
     );
+    drop(inworld);
+    assert_eq!(server.finish().await, 1);
 }
 
 /// Required test 2. A `200` whose headers (and the first bytes of its body)
@@ -120,7 +155,7 @@ async fn a_stall_after_the_headers_is_timed_out_at_the_timeout() {
                          content-length: 64\r\n\r\n{\"audioContent\":\"";
             if exchange.send(head).await.is_ok() {
                 flag.set();
-                tokio::time::sleep(STALL).await;
+                exchange.hold_until_hangup().await;
             }
         }
     })
@@ -149,6 +184,12 @@ async fn a_stall_after_the_headers_is_timed_out_at_the_timeout() {
             Some(UnavailableReason::TimedOut),
             "{result:?}"
         );
+        // Labelled where it happened, the body read, not reqwest's decode.
+        assert_eq!(
+            stage(&result),
+            Some((TransportStage::Body, true)),
+            "{result:?}"
+        );
         assert!(result.as_ref().is_err_and(InworldError::is_retryable));
         assert!(
             elapsed >= timeout,
@@ -160,6 +201,7 @@ async fn a_stall_after_the_headers_is_timed_out_at_the_timeout() {
         );
     }
     assert_eq!(server.connections(), 2);
+    assert_eq!(server.finish().await, 2);
 }
 
 /// The other half of test 2's contrast: a stall before any header is the
@@ -168,8 +210,7 @@ async fn a_stall_after_the_headers_is_timed_out_at_the_timeout() {
 async fn a_stall_before_the_headers_is_timed_out_at_the_timeout() {
     let server = RawServer::start(|exchange| async move {
         // Held, not dropped: a closed socket would be a broken connection.
-        let _held = exchange;
-        tokio::time::sleep(STALL).await;
+        exchange.hold_until_hangup().await;
     })
     .await;
     let timeout = Duration::from_millis(500);
@@ -185,11 +226,18 @@ async fn a_stall_before_the_headers_is_timed_out_at_the_timeout() {
         Some(UnavailableReason::TimedOut),
         "{result:?}"
     );
+    assert_eq!(
+        stage(&result),
+        Some((TransportStage::Request, true)),
+        "{result:?}"
+    );
     assert!(
         elapsed >= timeout,
         "{elapsed:?}: before the {timeout:?} bound"
     );
     assert!(elapsed < Duration::from_secs(10), "{elapsed:?}");
+    drop(inworld);
+    assert_eq!(server.finish().await, 1);
 }
 
 /// A `200` that declares `declared` bytes, sends its headers, and stalls.
@@ -203,7 +251,7 @@ async fn declaring_then_stalling(declared: usize, headers_sent: Flag) -> RawServ
             );
             if exchange.send(head.as_bytes()).await.is_ok() {
                 flag.set();
-                tokio::time::sleep(STALL).await;
+                exchange.hold_until_hangup().await;
             }
         }
     })
@@ -238,6 +286,8 @@ async fn a_declared_oversized_length_that_stalls_is_refused_unread() {
         elapsed < timeout,
         "{elapsed:?}: the declared length was not refused before the {timeout:?} timeout"
     );
+    drop(inworld);
+    assert_eq!(server.finish().await, 1);
 
     let at_the_bound = Flag::default();
     let server = declaring_then_stalling(DEFAULT_MAX_RESPONSE_BYTES, at_the_bound.clone()).await;
@@ -253,6 +303,8 @@ async fn a_declared_oversized_length_that_stalls_is_refused_unread() {
         Some(UnavailableReason::TimedOut),
         "{result:?}"
     );
+    drop(inworld);
+    assert_eq!(server.finish().await, 1);
 }
 
 /// Required test 4. Audio of `MAX_AUDIO_BYTES + 2` is refused by the guard
@@ -327,19 +379,7 @@ async fn a_body_over_the_response_bound_is_refused() {
         .max_response_bytes(max)
         .build()
         .expect("builds");
-    let fitting = audio_body(&mp3(1024));
-    let padded = |len: usize| {
-        let mut body = fitting.clone();
-        body.insert_str(1, &format!(r#""padding":"{}","#, " ".repeat(len)));
-        body
-    };
-    // `"padding":"",` is 13 bytes.
-    let at_the_bound = padded(max - fitting.len() - 13);
-    assert_eq!(at_the_bound.len(), max);
-    for (body, refused) in [
-        (padded(max - fitting.len() - 12), true),
-        (at_the_bound, false),
-    ] {
+    for (body, refused) in [(padded_body(max + 1), true), (padded_body(max), false)] {
         server.reset().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200).set_body_raw(body, "application/json"))
@@ -379,4 +419,55 @@ async fn a_truncated_body_is_unavailable() {
         Some(UnavailableReason::Transport),
         "{result:?}"
     );
+    assert_eq!(
+        stage(&result),
+        Some((TransportStage::Body, false)),
+        "{result:?}"
+    );
+    assert_eq!(server.finish().await, 1);
+}
+
+/// A chunked body (no `Content-Length`, so no pre-check) is cut by the chunk
+/// loop at exactly the bound: one byte over, arriving as its own final
+/// chunk after the bound's worth, is `BodyTooLarge`; exactly the bound is
+/// read. The body is valid audio either way, so a loop that let one more
+/// chunk through would answer the first with audio, and one that cut at the
+/// bound itself would refuse the second.
+#[tokio::test]
+async fn a_chunked_body_one_byte_over_the_bound_is_cut_by_the_chunk_loop() {
+    let max = 64 * 1024;
+    for (len, refused) in [(max + 1, true), (max, false)] {
+        let body = Arc::new(padded_body(len));
+        let server = RawServer::start(move |mut exchange| {
+            let body = Arc::clone(&body);
+            async move {
+                let head = b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                             transfer-encoding: chunked\r\n\r\n";
+                let (most, last) = body.as_bytes().split_at(body.len() - 1);
+                let mut sent = exchange.send(head).await;
+                for piece in most.chunks(4096).chain([last]) {
+                    sent = sent.and(exchange.send(&chunk(piece)).await);
+                }
+                // A refusing client may already have hung up.
+                let _ = sent.and(exchange.send(b"0\r\n\r\n").await);
+            }
+        })
+        .await;
+        let inworld = builder(&server.base_url)
+            .max_response_bytes(max)
+            .build()
+            .expect("builds");
+        let result = inworld.synthesize(&request("hi")).await;
+        if refused {
+            assert_eq!(
+                is_malformed(&result),
+                Some(MalformedReason::BodyTooLarge),
+                "{len}: {result:?}"
+            );
+        } else {
+            assert!(result.is_ok(), "{len}: {result:?}");
+        }
+        drop(inworld);
+        assert_eq!(server.finish().await, 1);
+    }
 }

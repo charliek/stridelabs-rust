@@ -117,8 +117,25 @@ impl InworldClient {
     /// name, and the guard against replaying `Authorization` to another host
     /// is lost (reqwest strips the header on a cross-origin hop, but a
     /// same-origin one keeps it, and a followed answer is read as Inworld's).
-    /// `http` should carry no default credentials, and its own timeout does
+    ///
+    /// **`http` must not retry**: build it with `.retry(reqwest::retry::never())`.
+    /// reqwest 0.13's default policy replays a request the server refused at
+    /// the protocol level (an HTTP/2 `REFUSED_STREAM`, a GOAWAY), which this
+    /// crate's "never retries" would not survive; whether and when to send a
+    /// synthesis again is the caller's.
+    ///
+    /// **`http` should decode no body**: `.no_gzip().no_brotli().no_deflate()
+    /// .no_zstd()`. Any of reqwest's decoders that a crate in the graph turns
+    /// on decodes a coded response and drops its `Content-Length`, which
+    /// defeats the pre-check ([`InworldBounds::max_response_bytes`]): a
+    /// declared-oversized body that stalls is then waited out to the timeout
+    /// instead of refused at once. The chunk-by-chunk cut still bounds it.
+    ///
+    /// `http` should carry no default credentials, and should use no proxy
+    /// the caller did not choose (`no_proxy()`: reqwest otherwise reads
+    /// `HTTPS_PROXY`/`ALL_PROXY` from the environment). Its own timeout does
     /// not matter: each request carries [`InworldBounds::timeout`].
+    /// `client_builder()` (feature `client-builder`) does all of the above.
     ///
     /// The key is used verbatim after trimming (an Inworld key is already the
     /// base64 credential), as `Authorization: Basic <key>`, with the header
@@ -196,12 +213,15 @@ impl InworldClient {
             .body(request.wire_body())
             .send()
             .await
-            .map_err(transport)?;
+            .map_err(|error| transport(TransportCause::sending(&error)))?;
 
         let status = response.status();
+        // `>= 500`, not `is_server_error()`: hyper accepts any three-digit
+        // status, and `600`–`999` are as retryable as a `5xx` (slaudio's
+        // Python classifies them the same way).
         if status == StatusCode::REQUEST_TIMEOUT
             || status == StatusCode::TOO_MANY_REQUESTS
-            || status.is_server_error()
+            || status.as_u16() >= 500
         {
             return Err(InworldError::Unavailable {
                 reason: UnavailableReason::Status(status.as_u16()),
@@ -209,7 +229,9 @@ impl InworldClient {
             });
         }
         if !status.is_success() {
-            return Err(InworldError::Rejected(status.as_u16()));
+            return Err(InworldError::Rejected {
+                status: status.as_u16(),
+            });
         }
         let body = read_capped(response, self.bounds.max_response_bytes).await?;
         decode(&body, self.bounds.max_audio_bytes, self.mp3_check)
@@ -365,12 +387,11 @@ fn endpoint(base_url: &str) -> Result<Url, BuildError> {
     Url::parse(&joined).map_err(|_| invalid("it does not parse as a URL"))
 }
 
-/// A `reqwest` failure, the send or a body read, as
-/// [`InworldError::Unavailable`] with its [`TransportCause`]. The error itself
-/// is dropped here: its source chain can carry what the peer sent (an HTTP/2
-/// GOAWAY's debug data), which `without_url()` would not remove.
-fn transport(error: reqwest::Error) -> InworldError {
-    let cause = TransportCause::of(&error);
+/// A transport failure, as [`InworldError::Unavailable`]. The caller made
+/// `cause` from the `reqwest::Error` and dropped it: its source chain can
+/// carry what the peer sent (an HTTP/2 GOAWAY's debug data), which
+/// `without_url()` would not remove.
+fn transport(cause: TransportCause) -> InworldError {
     let reason = if cause.timed_out {
         UnavailableReason::TimedOut
     } else if cause.stage == TransportStage::Connect {
@@ -384,12 +405,19 @@ fn transport(error: reqwest::Error) -> InworldError {
     }
 }
 
+/// The most body capacity reserved up front, whatever the `Content-Length`
+/// declares: the buffer grows past it only as bytes actually arrive, so a
+/// caller's large bound is never one large allocation a lying header asked
+/// for.
+const INITIAL_BODY_CAPACITY: usize = 64 * 1024;
+
 /// The response body, refused once it passes `max_bytes`: unread when its
 /// `Content-Length` already says so, and otherwise read chunk by chunk and
 /// cut at the first chunk that would pass it, so a body with no (or a lying)
 /// `Content-Length` is bounded too and is never buffered whole. Dropping the
 /// response on the way out closes the connection. A body that breaks off is
-/// the transport failing, not a malformed answer.
+/// the transport failing, not a malformed answer, and any failure here is a
+/// [`TransportStage::Body`] one.
 async fn read_capped(
     mut response: reqwest::Response,
     max_bytes: usize,
@@ -398,9 +426,15 @@ async fn read_capped(
     if declared > u64::try_from(max_bytes).unwrap_or(u64::MAX) {
         return Err(InworldError::Malformed(MalformedReason::BodyTooLarge));
     }
-    // At most `max_bytes`, by the check above; only a hint.
-    let mut body = Vec::with_capacity(usize::try_from(declared).unwrap_or(0));
-    while let Some(chunk) = response.chunk().await.map_err(transport)? {
+    let reserve = usize::try_from(declared)
+        .unwrap_or(0)
+        .min(INITIAL_BODY_CAPACITY);
+    let mut body = Vec::with_capacity(reserve);
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| transport(TransportCause::reading_body(&error)))?
+    {
         if body.len().saturating_add(chunk.len()) > max_bytes {
             return Err(InworldError::Malformed(MalformedReason::BodyTooLarge));
         }

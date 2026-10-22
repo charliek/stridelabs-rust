@@ -5,7 +5,7 @@ use std::fmt;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
 use bytes::Bytes;
-use serde_json::{Map, Value};
+use serde::de::{self, DeserializeSeed, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
 
 use crate::error::{InworldError, MalformedReason};
 
@@ -80,8 +80,10 @@ pub(crate) const fn max_audio_base64_len(max_audio_bytes: usize) -> usize {
 }
 
 /// Whether `audio` opens the way an MP3 does: an ID3v2 tag, or an MPEG audio
-/// frame sync (`0xFF`, then a byte whose top three bits are set). slaudio's
-/// `mp3.py` sniff, exactly. A shape check, not a decode.
+/// frame sync (`0xFF`, then a byte whose top three bits are set). Exactly
+/// lumen 001 §6.3's expression, so a 2-byte frame sync passes (slaudio's
+/// Python `mp3.py` also refuses anything under 3 bytes; this does not). A
+/// shape check, not a decode.
 pub(crate) fn opens_like_mp3(audio: &[u8]) -> bool {
     audio.starts_with(b"ID3") || (audio.len() >= 2 && audio[0] == 0xFF && (audio[1] & 0xE0) == 0xE0)
 }
@@ -97,9 +99,12 @@ pub(crate) fn decode(
     max_audio_bytes: usize,
     mp3_check: bool,
 ) -> Result<Synthesis, InworldError> {
-    let mut object: Map<String, Value> =
-        serde_json::from_slice(body).map_err(|_| malformed(MalformedReason::NotJsonObject))?;
-    let Some(Value::String(audio_content)) = object.remove("audioContent") else {
+    let mut deserializer = serde_json::Deserializer::from_slice(body);
+    let response = WireResponse
+        .deserialize(&mut deserializer)
+        .and_then(|response| deserializer.end().map(|()| response))
+        .map_err(|_| malformed(MalformedReason::NotJsonObject))?;
+    let Some(audio_content) = response.audio_content else {
         return Err(malformed(MalformedReason::NoAudioContent));
     };
     if audio_content.len() > max_audio_base64_len(max_audio_bytes) {
@@ -119,22 +124,218 @@ pub(crate) fn decode(
     }
     Ok(Synthesis {
         audio: Bytes::from(audio),
-        usage: usage(object.remove("usage")),
+        usage: response.usage,
     })
 }
 
-fn usage(value: Option<Value>) -> Usage {
-    let Some(Value::Object(mut usage)) = value else {
-        return Usage::default();
-    };
-    Usage {
-        processed_characters_count: usage
-            .get("processedCharactersCount")
-            .and_then(Value::as_u64),
-        model_id: match usage.remove("modelId") {
-            Some(Value::String(model_id)) if !model_id.is_empty() => Some(model_id),
-            _ => None,
-        },
+/// What the crate reads of a `2xx` body: `audioContent`, when it is a string,
+/// and `usage`, field by field.
+///
+/// Read by [`WireResponse`], a seed whose visitor, not a derive, decides what
+/// is built, so that the response bound is also the memory bound: the top
+/// level must be a JSON object (a derived struct would also take an array),
+/// and every other field, and any field of another type than the one read
+/// (an object where the string was, say), is skipped with [`IgnoredAny`],
+/// which builds nothing. A `serde_json::Value` of the body would cost about
+/// 32 bytes per JSON value: some 64 MiB for a 4 MiB array of zeros. A key
+/// that repeats keeps its last value, as a `serde_json::Map` (and Python's
+/// `json`) would.
+struct Wire {
+    audio_content: Option<String>,
+    usage: Usage,
+}
+
+/// The seed that reads a [`Wire`] from the top-level object.
+struct WireResponse;
+
+impl<'de> DeserializeSeed<'de> for WireResponse {
+    type Value = Wire;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Wire, D::Error> {
+        deserializer.deserialize_map(self)
+    }
+}
+
+impl<'de> Visitor<'de> for WireResponse {
+    type Value = Wire;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON object")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Wire, A::Error> {
+        let mut wire = Wire {
+            audio_content: None,
+            usage: Usage::default(),
+        };
+        while let Some(key) = map.next_key::<Key>()? {
+            match key {
+                Key::AudioContent => {
+                    wire.audio_content = match map.next_value_seed(Pick::String)? {
+                        Picked::String(audio_content) => Some(audio_content),
+                        _ => None,
+                    };
+                }
+                Key::Usage => {
+                    wire.usage = match map.next_value_seed(Pick::Usage)? {
+                        Picked::Usage(usage) => usage,
+                        _ => Usage::default(),
+                    };
+                }
+                Key::ProcessedCharactersCount | Key::ModelId | Key::Other => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+        Ok(wire)
+    }
+}
+
+/// A field name the crate reads, at either level; any other is [`Key::Other`].
+enum Key {
+    AudioContent,
+    Usage,
+    ProcessedCharactersCount,
+    ModelId,
+    Other,
+}
+
+impl<'de> de::Deserialize<'de> for Key {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Key, D::Error> {
+        struct KeyVisitor;
+
+        impl Visitor<'_> for KeyVisitor {
+            type Value = Key;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a field name")
+            }
+
+            fn visit_str<E: de::Error>(self, name: &str) -> Result<Key, E> {
+                Ok(match name {
+                    "audioContent" => Key::AudioContent,
+                    "usage" => Key::Usage,
+                    "processedCharactersCount" => Key::ProcessedCharactersCount,
+                    "modelId" => Key::ModelId,
+                    _ => Key::Other,
+                })
+            }
+        }
+
+        deserializer.deserialize_identifier(KeyVisitor)
+    }
+}
+
+/// What a field is read as. Any other type is drained ([`IgnoredAny`] for a
+/// nested array or object) and is [`Picked::Nothing`].
+#[derive(Clone, Copy)]
+enum Pick {
+    /// A string, kept whole.
+    String,
+    /// A non-negative integer.
+    Count,
+    /// The `usage` object.
+    Usage,
+}
+
+enum Picked {
+    Nothing,
+    String(String),
+    Count(u64),
+    Usage(Usage),
+}
+
+impl<'de> DeserializeSeed<'de> for Pick {
+    type Value = Picked;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Picked, D::Error> {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for Pick {
+    type Value = Picked;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("any JSON value")
+    }
+
+    fn visit_bool<E: de::Error>(self, _: bool) -> Result<Picked, E> {
+        Ok(Picked::Nothing)
+    }
+
+    fn visit_i64<E: de::Error>(self, value: i64) -> Result<Picked, E> {
+        Ok(match (self, u64::try_from(value)) {
+            (Pick::Count, Ok(count)) => Picked::Count(count),
+            _ => Picked::Nothing,
+        })
+    }
+
+    fn visit_u64<E: de::Error>(self, value: u64) -> Result<Picked, E> {
+        Ok(match self {
+            Pick::Count => Picked::Count(value),
+            _ => Picked::Nothing,
+        })
+    }
+
+    /// A float is never a count, `5.0` included (Python's `int` check).
+    fn visit_f64<E: de::Error>(self, _: f64) -> Result<Picked, E> {
+        Ok(Picked::Nothing)
+    }
+
+    fn visit_str<E: de::Error>(self, value: &str) -> Result<Picked, E> {
+        Ok(match self {
+            Pick::String => Picked::String(value.to_owned()),
+            _ => Picked::Nothing,
+        })
+    }
+
+    fn visit_string<E: de::Error>(self, value: String) -> Result<Picked, E> {
+        Ok(match self {
+            Pick::String => Picked::String(value),
+            _ => Picked::Nothing,
+        })
+    }
+
+    fn visit_unit<E: de::Error>(self) -> Result<Picked, E> {
+        Ok(Picked::Nothing)
+    }
+
+    fn visit_none<E: de::Error>(self) -> Result<Picked, E> {
+        Ok(Picked::Nothing)
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Picked, A::Error> {
+        while seq.next_element::<IgnoredAny>()?.is_some() {}
+        Ok(Picked::Nothing)
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Picked, A::Error> {
+        let Pick::Usage = self else {
+            while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+            return Ok(Picked::Nothing);
+        };
+        let mut usage = Usage::default();
+        while let Some(key) = map.next_key::<Key>()? {
+            match key {
+                Key::ProcessedCharactersCount => {
+                    usage.processed_characters_count = match map.next_value_seed(Pick::Count)? {
+                        Picked::Count(count) => Some(count),
+                        _ => None,
+                    };
+                }
+                Key::ModelId => {
+                    usage.model_id = match map.next_value_seed(Pick::String)? {
+                        Picked::String(model_id) if !model_id.is_empty() => Some(model_id),
+                        _ => None,
+                    };
+                }
+                Key::AudioContent | Key::Usage | Key::Other => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+        Ok(Picked::Usage(usage))
     }
 }
 
@@ -211,8 +412,11 @@ mod tests {
         assert_eq!(max_audio_base64_len(4), 8);
     }
 
+    /// Exactly §6.3's expression: a 2-byte frame sync passes (slaudio's
+    /// Python `mp3.py` would refuse it, and anything else under 3 bytes);
+    /// one byte, or a 2-byte `ID`, does not.
     #[test]
-    fn the_mp3_sniff_is_slaudios() {
+    fn the_mp3_sniff_is_the_specs_expression() {
         for accepted in [
             &b"ID3"[..],
             b"ID3\x04\x00",
@@ -234,6 +438,67 @@ mod tests {
         ] {
             assert!(!opens_like_mp3(refused), "{refused:02x?}");
         }
+        // Through the decode, the check on: a 2-byte frame-sync clip is
+        // audio; a 1-byte `0xFF` is not MP3, and only zero bytes are empty.
+        let two = decode(br#"{"audioContent":"//M="}"#, DEFAULT_MAX_AUDIO_BYTES, true)
+            .expect("a 2-byte frame sync is MP3-shaped");
+        assert_eq!(two.audio.as_ref(), &[0xFF, 0xF3]);
+        assert_eq!(
+            reason(r#"{"audioContent":"/w=="}"#, true),
+            Some(MalformedReason::NotMp3)
+        );
+        assert_eq!(
+            reason(r#"{"audioContent":""}"#, false),
+            Some(MalformedReason::EmptyAudio)
+        );
+        assert_eq!(reason(r#"{"audioContent":"/w=="}"#, false), None);
+    }
+
+    /// Only `audioContent` and `usage` are read; everything else, however
+    /// large or deep, is skipped, and a field of another type is skipped too.
+    /// Escapes in keys and values are JSON's, and a repeated key keeps its
+    /// last value.
+    #[test]
+    fn the_body_is_read_field_by_field_and_the_rest_is_skipped() {
+        let decoded = |body: &str| decode(body.as_bytes(), DEFAULT_MAX_AUDIO_BYTES, true);
+        let zeros = format!("[{}0]", "0,".repeat(100_000));
+        let nested = r#"{"a":[1,{"b":[true,null,"xA"]}],"c":{"d":{}}}"#;
+        for body in [
+            format!(r#"{{"x":{zeros},"audioContent":"//OQ","y":{nested}}}"#),
+            format!(r#"{{"audioContent":"//OQ","usage":{{"x":{zeros},"modelId":"m"}}}}"#),
+            // An escaped key and an escaped `/` in the base64.
+            r#"{"audioContent":"\/\/OQ"}"#.to_string(),
+            // The last of a repeated key wins, both ways.
+            r#"{"audioContent":5,"audioContent":"//OQ"}"#.to_string(),
+        ] {
+            let synthesis = decoded(&body).expect("audio");
+            assert_eq!(synthesis.audio.as_ref(), &[0xFF, 0xF3, 0x90], "{body}");
+        }
+        assert_eq!(
+            reason(r#"{"audioContent":"//OQ","audioContent":{"a":1}}"#, true),
+            Some(MalformedReason::NoAudioContent)
+        );
+        assert_eq!(
+            reason(r#"{"audioContent":{"audioContent":"//OQ"}}"#, true),
+            Some(MalformedReason::NoAudioContent)
+        );
+        // `usage` that repeats, and fields of another type inside it.
+        let usage = decoded(
+            r#"{"audioContent":"//OQ","usage":{"modelId":"a"},"usage":{"modelId":"b","processedCharactersCount":{"n":1}}}"#,
+        )
+        .expect("audio")
+        .usage;
+        assert_eq!(usage.model_id.as_deref(), Some("b"));
+        assert_eq!(usage.processed_characters_count, None);
+        // serde_json skips a value iteratively, a byte of state per level of
+        // nesting: a skipped field nested far past its recursion limit costs
+        // no stack, and memory within the body's own size.
+        let deep = format!(
+            r#"{{"audioContent":"//OQ","x":{}{}}}"#,
+            "[".repeat(100_000),
+            "]".repeat(100_000)
+        );
+        assert_eq!(reason(&deep, true), None);
     }
 
     #[test]

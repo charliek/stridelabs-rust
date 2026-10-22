@@ -49,8 +49,13 @@ tokio = { workspace = true }
 wiremock = { workspace = true }
 # `http2`, for `http2_prior_knowledge()`: the redaction tests speak h2c to a
 # raw server that answers with a GOAWAY whose debug data is a canary, the
-# provider-controlled text h2 renders in its errors. Dev-only, so no
-# consumer's graph and no `cargo build` gets it; h2 is already in the lock
-# (wiremock's hyper), and `cargo test --workspace` unifies it into every
-# member's test build, as stridelabs-http's dev-only `gzip` is.
-reqwest = { workspace = true, features = ["http2"] }
+# provider-controlled text h2 renders in its errors, and the no-retry test to
+# one that refuses every stream (`REFUSED_STREAM`, which reqwest's default
+# policy replays). `gzip`, so that a decoder is really on in this crate's own
+# test build: the control of `client_builder()`'s no-decoder test shows a
+# client with one loses the `Content-Length` pre-check. Dev-only, so no
+# consumer's graph and no `cargo build` gets either; h2 and gzip's crates are
+# already in the lock (wiremock's hyper, stridelabs-http's dev-only `gzip`),
+# and `cargo test --workspace` unifies both into every member's test build,
+# as it does stridelabs-http's `gzip`.
+reqwest = { workspace = true, features = ["http2", "gzip"] }

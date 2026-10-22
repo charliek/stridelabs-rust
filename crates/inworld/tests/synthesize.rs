@@ -1,8 +1,9 @@
 //! The wire and the classification, against wiremock: the exact request
 //! (method, path, headers, a body with every unset option omitted), each
 //! status class, redirects never followed, the key, the client-side refusals
-//! that send nothing, the MP3 check both ways, and `usage` absent and
-//! present.
+//! that send nothing, the MP3 check both ways, `usage` absent and present,
+//! and (feature `client-builder`) that `client_builder()`'s client follows
+//! no redirect and uses no proxy.
 
 mod common;
 
@@ -62,7 +63,7 @@ fn unavailable(outcome: &Outcome) -> Option<UnavailableReason> {
 
 fn rejected(outcome: &Outcome) -> Option<u16> {
     match outcome {
-        Err(InworldError::Rejected(status)) => Some(*status),
+        Err(InworldError::Rejected { status, .. }) => Some(*status),
         _ => None,
     }
 }
@@ -258,12 +259,13 @@ async fn a_non_finite_speaking_rate_sends_nothing() {
     }
 }
 
-/// `408`, `429` and every `5xx` are `Unavailable` (retryable); every other
-/// non-2xx, `400` among them, is `Rejected` (not retryable). No error body
-/// is read.
+/// `408`, `429` and every status of `500` or more are `Unavailable`
+/// (retryable): the `5xx`, and the `600`–`999` hyper also accepts. Every
+/// other non-2xx, `400` among them, is `Rejected` (not retryable). No error
+/// body is read.
 #[tokio::test]
 async fn statuses_are_classified() {
-    for status in [408, 429, 500, 502, 503, 504, 599] {
+    for status in [408, 429, 500, 502, 503, 504, 599, 600, 999] {
         let server = answering(
             ResponseTemplate::new(status).set_body_json(json!({"code": 8, "message": "busy"})),
         )
@@ -329,14 +331,314 @@ async fn client_builders_client_does_not_follow_a_redirect() {
     .await;
 }
 
-/// The MP3 check, on by default: an ID3 tag or a frame sync passes; a WAV
-/// header does not, unless the check is off.
+/// Set in the environment of the child process
+/// [`client_builders_client_uses_no_proxy`] starts: the target's base URL.
+#[cfg(feature = "client-builder")]
+const PROXY_CHILD_TARGET: &str = "STRIDELABS_INWORLD_TEST_PROXY_CHILD_TARGET";
+
+/// `client_builder()`'s client uses no proxy, whatever the environment says.
+/// Tests never set an environment variable in their own process, so this one
+/// re-runs itself as a child process (this test binary, this test alone)
+/// whose environment names a proxy in every variable reqwest reads
+/// (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, both cases, `NO_PROXY` empty).
+/// In the child, the control (a default reqwest client) is answered `418` by
+/// the proxy, which shows the variables are read; `client_builder()`'s
+/// client reaches the target directly. The parent checks the child passed
+/// and that the proxy saw exactly the control.
+#[cfg(feature = "client-builder")]
+#[tokio::test]
+async fn client_builders_client_uses_no_proxy() {
+    if let Ok(target) = std::env::var(PROXY_CHILD_TARGET) {
+        return in_the_proxied_child(&target).await;
+    }
+    let proxy = common::RawServer::start(|mut exchange| async move {
+        exchange
+            .send(b"HTTP/1.1 418 I'm a teapot\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+            .await
+            .expect("the proxy answers");
+    })
+    .await;
+    let target = answering(ok_with(audio_body(&mp3(16)))).await;
+    let proxy_url = proxy.base_url.as_str();
+    let mut child =
+        tokio::process::Command::new(std::env::current_exe().expect("this test binary's path"));
+    child
+        .args([
+            "--exact",
+            "client_builders_client_uses_no_proxy",
+            "--test-threads=1",
+        ])
+        .env(PROXY_CHILD_TARGET, target.uri())
+        .env_remove("REQUEST_METHOD")
+        .kill_on_drop(true);
+    for variable in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"] {
+        child
+            .env(variable, proxy_url)
+            .env(variable.to_ascii_lowercase(), proxy_url);
+    }
+    child.env("NO_PROXY", "").env("no_proxy", "");
+    let output = tokio::time::timeout(Duration::from_secs(60), child.output())
+        .await
+        .expect("the child finishes within 60 s")
+        .expect("the child runs");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("test result: ok. 1 passed"),
+        "the child failed ({}):\n{stdout}\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(proxy.finish().await, 1, "the proxy saw the control alone");
+    assert_eq!(
+        target
+            .received_requests()
+            .await
+            .expect("recording is on")
+            .len(),
+        1,
+        "client_builder()'s request reached the target"
+    );
+}
+
+/// `client_builder()`'s client decodes no body, whatever decoders the graph
+/// turned on (this test build has reqwest's `gzip`), so a coded response
+/// keeps its `Content-Length` and the pre-check holds: a `gzip` answer that
+/// declares one byte over the bound and stalls is refused at once. The
+/// control: a client with the decoder on loses the declared length, waits on
+/// the stall, and times out.
+#[cfg(feature = "client-builder")]
+#[tokio::test]
+async fn client_builders_client_decodes_nothing_so_the_pre_check_holds() {
+    use stridelabs_inworld::{InworldBounds, DEFAULT_MAX_RESPONSE_BYTES};
+    let server = common::RawServer::start(|mut exchange| async move {
+        let head = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-encoding: gzip\r\n\
+             content-length: {}\r\n\r\n",
+            DEFAULT_MAX_RESPONSE_BYTES + 1
+        );
+        exchange
+            .send(head.as_bytes())
+            .await
+            .expect("the head goes out");
+        exchange.hold_until_hangup().await;
+    })
+    .await;
+    let short = Duration::from_millis(500);
+    let decoding = builder(&server.base_url)
+        .timeout(short)
+        .build()
+        .expect("builds");
+    let outcome = decoding.synthesize(&request("hi")).await;
+    assert!(
+        matches!(
+            outcome,
+            Err(InworldError::Unavailable {
+                reason: UnavailableReason::TimedOut,
+                ..
+            })
+        ),
+        "the control: a decoding client should lose the declared length and time out: {outcome:?}"
+    );
+    drop(decoding);
+
+    let timeout = InworldBounds::DEFAULT.timeout;
+    let inworld = InworldClient::builder(
+        stridelabs_inworld::client_builder()
+            .build()
+            .expect("client_builder() builds"),
+        KEY,
+    )
+    .base_url(&server.base_url)
+    .build()
+    .expect("builds");
+    let started = std::time::Instant::now();
+    let outcome = inworld.synthesize(&request("hi")).await;
+    assert_eq!(
+        malformed(&outcome),
+        Some(MalformedReason::BodyTooLarge),
+        "{outcome:?}"
+    );
+    assert!(started.elapsed() < timeout, "refused only at the timeout");
+    drop(inworld);
+    assert_eq!(server.finish().await, 2);
+}
+
+/// An h2c peer that refuses every stream it is sent with `REFUSED_STREAM`,
+/// counting the request `HEADERS` it saw, until the client hangs up.
+#[cfg(feature = "client-builder")]
+async fn refuse_every_stream(
+    mut stream: tokio::net::TcpStream,
+    seen: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) -> std::io::Result<()> {
+    use std::sync::atomic::Ordering;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut preface = [0u8; 24];
+    stream.read_exact(&mut preface).await?;
+    stream
+        .write_all(&common::h2_frame_on(0x4, 0, 0, &[]))
+        .await?;
+    loop {
+        let mut head = [0u8; 9];
+        if stream.read_exact(&mut head).await.is_err() {
+            return Ok(());
+        }
+        let length = u32::from_be_bytes([0, head[0], head[1], head[2]]) as usize;
+        let id = u32::from_be_bytes([head[5], head[6], head[7], head[8]]) & 0x7FFF_FFFF;
+        let mut payload = vec![0u8; length];
+        stream.read_exact(&mut payload).await?;
+        match (head[3], head[4] & 0x1) {
+            (0x4, 0) => {
+                stream
+                    .write_all(&common::h2_frame_on(0x4, 0x1, 0, &[]))
+                    .await?
+            }
+            (0x1, _) => {
+                seen.fetch_add(1, Ordering::SeqCst);
+                // RST_STREAM, REFUSED_STREAM (0x7).
+                stream
+                    .write_all(&common::h2_frame_on(0x3, 0, id, &7u32.to_be_bytes()))
+                    .await?;
+            }
+            _ => {}
+        }
+    }
+}
+
+/// `client_builder()`'s client never retries: reqwest 0.13's default policy
+/// replays a request the server refused with `REFUSED_STREAM` (up to twice),
+/// which the control shows; `client_builder()`'s sends the synthesis once,
+/// and the refusal is the caller's `Unavailable`.
+#[cfg(feature = "client-builder")]
+#[tokio::test]
+async fn client_builders_client_never_retries() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("a loopback port");
+    let base = format!("http://{}", listener.local_addr().expect("its address"));
+    let seen = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&seen);
+    let peers = tokio::spawn(async move {
+        let mut peers = Vec::new();
+        for _ in 0..2 {
+            let (stream, _) = listener.accept().await.expect("a client connects");
+            peers.push(tokio::spawn(refuse_every_stream(
+                stream,
+                Arc::clone(&counter),
+            )));
+        }
+        peers
+    });
+    let bound = Duration::from_secs(10);
+
+    let control = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .http2_prior_knowledge()
+        .build()
+        .expect("an h2c client builds");
+    let refused = tokio::time::timeout(
+        bound,
+        control
+            .post(format!("{base}/tts/v1/voice"))
+            .body("{}")
+            .send(),
+    )
+    .await
+    .expect("the control answers within its bound");
+    assert!(refused.is_err(), "{refused:?}");
+    let replayed = seen.load(Ordering::SeqCst);
+    assert!(
+        replayed > 1,
+        "the control: reqwest's default policy should have replayed the refused POST ({replayed} sent)"
+    );
+    drop(control);
+
+    let inworld = InworldClient::builder(
+        stridelabs_inworld::client_builder()
+            .http2_prior_knowledge()
+            .build()
+            .expect("client_builder() builds"),
+        KEY,
+    )
+    .base_url(&base)
+    .build()
+    .expect("builds");
+    let outcome = tokio::time::timeout(bound, inworld.synthesize(&request("hi")))
+        .await
+        .expect("the synthesis answers within its bound");
+    assert!(
+        outcome.as_ref().is_err_and(InworldError::is_retryable),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        seen.load(Ordering::SeqCst) - replayed,
+        1,
+        "client_builder()'s client sent the synthesis more than once"
+    );
+    drop(inworld);
+    for peer in tokio::time::timeout(bound, peers)
+        .await
+        .expect("both clients connected")
+        .expect("the acceptor")
+    {
+        tokio::time::timeout(bound, peer)
+            .await
+            .expect("the peer ends when its client hangs up")
+            .expect("the peer task")
+            .expect("the peer's exchange");
+    }
+}
+
+/// The child's half of [`client_builders_client_uses_no_proxy`].
+#[cfg(feature = "client-builder")]
+async fn in_the_proxied_child(target: &str) {
+    let control = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("a default client builds");
+    let answer = control
+        .post(format!("{target}/tts/v1/voice"))
+        .body("{}")
+        .send()
+        .await
+        .expect("the proxy answers the control");
+    assert_eq!(
+        answer.status().as_u16(),
+        418,
+        "the control did not go through the proxy, so the test proves nothing"
+    );
+    let inworld = InworldClient::builder(
+        stridelabs_inworld::client_builder()
+            .build()
+            .expect("client_builder() builds"),
+        KEY,
+    )
+    .base_url(target)
+    .build()
+    .expect("builds");
+    inworld
+        .synthesize(&request("hi"))
+        .await
+        .expect("client_builder()'s client reaches the target directly");
+}
+
+/// The MP3 check, on by default: an ID3 tag or a frame sync passes, a
+/// 2-byte frame-sync clip included (§6.3's expression); a WAV header, or a
+/// lone `0xFF`, does not, unless the check is off.
 #[tokio::test]
 async fn the_mp3_check_passes_and_fails() {
     let mut id3 = b"ID3\x04\x00\x00\x00\x00\x00\x00".to_vec();
     id3.extend(mp3(32));
     let wav = b"RIFF\x24\x00\x00\x00WAVEfmt ".to_vec();
-    for (audio, mp3_shaped) in [(id3, true), (mp3(32), true), (wav, false)] {
+    for (audio, mp3_shaped) in [
+        (id3, true),
+        (mp3(32), true),
+        (mp3(2), true),
+        (wav, false),
+        (vec![0xFF], false),
+    ] {
         let server = answering(ok_with(audio_body(&audio))).await;
         let outcome = client(&server.uri()).synthesize(&request("hi")).await;
         if mp3_shaped {
