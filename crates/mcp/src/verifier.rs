@@ -51,7 +51,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use serde::Deserialize;
-use stridelabs_auth::{AuthError, SlauthConfig, Verifier};
+use stridelabs_auth::{
+    Audience, AuthError, ClaimChecks, JwksCache, ScreenPolicy, SlauthConfig, Verifier,
+};
 
 use crate::principal::{AuthMethod, Principal};
 use crate::resource::ProtectedResource;
@@ -148,6 +150,44 @@ where
     }
 }
 
+/// Which of a JWT's scope claims a [`McpVerifier`] reads
+/// ([`McpVerifier::with_scope_source`]).
+///
+/// Either way, each claim may be a space-separated string or an array, and
+/// either claim present in any other shape (a number, an object, an array
+/// holding a non-string) is [`VerifyError::Invalid`], even one this source
+/// would not read. A `null` claim counts as absent.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ScopeSource {
+    /// The union of `scope` and `scp`: what every [`McpVerifier`] has always
+    /// granted, and the default.
+    #[default]
+    Union,
+    /// `scope` when the token carries it, else `scp`: the precedence fastmcp
+    /// (and so a Python MCP server built on it) applies. A `scope` that is
+    /// present but empty grants nothing, whatever `scp` holds. Never more
+    /// than [`ScopeSource::Union`] grants: for a token carrying both, a
+    /// scope only `scp` names is not granted.
+    ScopeThenScp,
+}
+
+/// Why [`McpVerifier::with_cache`] refused its [`ClaimChecks`]: they would
+/// check tokens for something other than the [`ProtectedResource`].
+///
+/// Startup configuration errors with fixed messages, quoting neither value.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum ClaimChecksError {
+    /// The checks' issuer is not the resource's issuer, exactly.
+    #[error("the claim checks' issuer is not the MCP resource's issuer")]
+    IssuerMismatch,
+    /// The checks' audience is not [`Audience::Required`] with the resource
+    /// URL: an MCP token must name the resource it was minted for.
+    #[error("the claim checks' audience must be required and equal to the MCP resource URL")]
+    AudienceMismatch,
+}
+
 /// Verifies MCP bearer credentials for one [`ProtectedResource`].
 ///
 /// Cheap to clone, and meant to be built once: the JWKS cache lives inside.
@@ -155,6 +195,7 @@ where
 pub struct McpVerifier {
     resource: ProtectedResource,
     jwt: Verifier,
+    scope_source: ScopeSource,
     credentials: Arc<[(String, Arc<dyn CredentialVerifier>)]>,
 }
 
@@ -165,6 +206,9 @@ impl McpVerifier {
     /// The audience is `resource.url()` and the issuer `resource.issuer()`,
     /// by construction. `http` is the app's client: its TLS stack is the
     /// app's choice (this crate's `reqwest` has no TLS feature).
+    ///
+    /// The claim rules are [`Verifier::new`]'s: a 60 s leeway on `exp`, and
+    /// `nbf` not checked. [`McpVerifier::with_cache`] takes the consumer's.
     pub fn new(
         resource: &ProtectedResource,
         jwks_url: impl Into<String>,
@@ -179,11 +223,96 @@ impl McpVerifier {
             },
             http,
         );
+        McpVerifier::from_jwt(resource, jwt)
+    }
+
+    /// A verifier for JWTs minted for `resource`, under the consumer's
+    /// `checks`, with keys from the consumer's `cache`: what
+    /// [`Verifier::with_cache`] is to [`Verifier::new`], so an MCP endpoint
+    /// can apply the claim rules its REST API does (a zero leeway, `nbf`
+    /// checked) and the cache settings it chose
+    /// ([`JwksCache::report_unusable_keys`], its TTL and refetch interval).
+    ///
+    /// `checks` must still be the resource's: its issuer `resource.issuer()`
+    /// exactly, and its audience [`Audience::Required`] with
+    /// `resource.url()`. [`ProtectedResource::claim_checks`] starts from
+    /// those; anything else is a [`ClaimChecksError`], so the audience still
+    /// cannot drift from the metadata document's `resource`. Pairing `cache`
+    /// with the issuer is the caller's job, as for [`Verifier::with_cache`]:
+    /// build it from the same configuration.
+    ///
+    /// ```no_run
+    /// # fn example(http: reqwest::Client) -> Result<(), Box<dyn std::error::Error>> {
+    /// use std::time::Duration;
+    ///
+    /// use stridelabs_auth::{JwksCache, ScreenPolicy};
+    /// use stridelabs_mcp::{McpVerifier, ProtectedResource, ScopeSource};
+    ///
+    /// let resource = ProtectedResource::new(
+    ///     "https://parcel.stridelabs.ai/mcp",
+    ///     "https://auth.stridelabs.ai",
+    ///     ["parcel:read"],
+    /// )?;
+    /// let cache = JwksCache::new("https://auth.stridelabs.ai/jwks.json", http)
+    ///     .report_unusable_keys(true);
+    /// let verifier = McpVerifier::with_cache(
+    ///     &resource,
+    ///     resource.claim_checks().with_leeway(Duration::ZERO),
+    ///     cache,
+    /// )?
+    /// .screen(ScreenPolicy::Strict)
+    /// .with_scope_source(ScopeSource::ScopeThenScp);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_cache(
+        resource: &ProtectedResource,
+        checks: ClaimChecks,
+        cache: JwksCache,
+    ) -> Result<McpVerifier, ClaimChecksError> {
+        if checks.issuer() != resource.issuer() {
+            return Err(ClaimChecksError::IssuerMismatch);
+        }
+        if !matches!(checks.audience(), Audience::Required(audience) if audience == resource.url())
+        {
+            return Err(ClaimChecksError::AudienceMismatch);
+        }
+        Ok(McpVerifier::from_jwt(
+            resource,
+            Verifier::with_cache(checks, cache),
+        ))
+    }
+
+    fn from_jwt(resource: &ProtectedResource, jwt: Verifier) -> McpVerifier {
         McpVerifier {
             resource: resource.clone(),
             jwt,
+            scope_source: ScopeSource::default(),
             credentials: Arc::new([]),
         }
+    }
+
+    /// This verifier with `policy` deciding what is checked before a JWT's
+    /// key is looked up ([`Verifier::screen`]; [`ScreenPolicy::Basic`] by
+    /// default). [`ScreenPolicy::Strict`] refuses a malformed or non-RS256
+    /// token before any JWKS fetch, so never with an outage's `503`.
+    #[must_use]
+    pub fn screen(mut self, policy: ScreenPolicy) -> McpVerifier {
+        self.jwt = self.jwt.screen(policy);
+        self
+    }
+
+    /// This verifier reading scopes from `source` ([`ScopeSource::Union`] by
+    /// default).
+    #[must_use]
+    pub fn with_scope_source(mut self, source: ScopeSource) -> McpVerifier {
+        self.scope_source = source;
+        self
+    }
+
+    /// The claim rules a JWT is checked against ([`Verifier::claim_checks`]).
+    pub fn claim_checks(&self) -> &ClaimChecks {
+        self.jwt.claim_checks()
     }
 
     /// Route every credential starting with `prefix` to `verifier` instead of
@@ -211,9 +340,11 @@ impl McpVerifier {
     /// Verify a bearer credential (the part after `Bearer `).
     ///
     /// For a JWT: everything stridelabs-auth checks (an RS256-fit key under
-    /// the `kid`, the signature, `exp`, `iss`, `aud`), then a non-empty
-    /// `sub`. Scopes are the union of `scope` (a space-separated string) and
-    /// `scp` (Hydra's array); either claim may be a string or an array.
+    /// the `kid`, the signature, `exp`, `iss`, `aud`, and `nbf` where the
+    /// claim checks say so), then a non-empty `sub`. Scopes come from `scope`
+    /// (a space-separated string) and `scp` (Hydra's array) as the
+    /// [`ScopeSource`] says, by default their union; either claim may be a
+    /// string or an array.
     /// `client_id` comes from `client_id`, else `azp`. `email` and `name`
     /// are optional; an empty one counts as absent.
     pub async fn verify(&self, token: &str) -> Result<Principal, VerifyError> {
@@ -233,7 +364,7 @@ impl McpVerifier {
         }
 
         let claims: McpClaims = self.jwt.verify_bearer_claims(token).await?;
-        claims.into_principal()
+        claims.into_principal(self.scope_source)
     }
 }
 
@@ -244,12 +375,16 @@ impl fmt::Debug for McpVerifier {
             .iter()
             .map(|(prefix, _)| prefix.as_str())
             .collect();
-        f.debug_struct("McpVerifier")
+        let mut debug = f.debug_struct("McpVerifier");
+        debug
             .field("resource", &self.resource.url())
             // stridelabs-auth's `Debug` redacts the JWKS URL.
-            .field("jwt", &self.jwt)
-            .field("credential_prefixes", &prefixes)
-            .finish()
+            .field("jwt", &self.jwt);
+        // Only when opted into, so a default verifier's output is unchanged.
+        if self.scope_source != ScopeSource::default() {
+            debug.field("scope_source", &self.scope_source);
+        }
+        debug.field("credential_prefixes", &prefixes).finish()
     }
 }
 
@@ -295,14 +430,18 @@ impl ScopeClaim {
 }
 
 impl McpClaims {
-    fn into_principal(self) -> Result<Principal, VerifyError> {
+    fn into_principal(self, source: ScopeSource) -> Result<Principal, VerifyError> {
         // Tools key users on the subject: an empty one would make every such
         // token the same user.
         if self.sub.is_empty() {
             return Err(AuthError::MissingSubject.into());
         }
         let present = |value: Option<String>| value.filter(|value| !value.is_empty());
-        let scopes = [self.scope, self.scp]
+        let scp = match source {
+            ScopeSource::ScopeThenScp if self.scope.is_some() => None,
+            _ => self.scp,
+        };
+        let scopes = [self.scope, scp]
             .into_iter()
             .flatten()
             .flat_map(ScopeClaim::into_scopes);
@@ -316,6 +455,8 @@ impl McpClaims {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use serde_json::{json, Value};
     use stridelabs_auth::test_support::{TestClaims, TestKey};
     use wiremock::matchers::{method, path};
@@ -584,6 +725,252 @@ mod tests {
             .is_empty());
     }
 
+    // --- opt-in claim checks and scope source ------------------------------
+
+    /// The rules tapper's and lumen's REST verifiers apply: no leeway, `nbf`
+    /// checked.
+    fn rest_rules_verifier(server: &MockServer) -> McpVerifier {
+        let resource = resource();
+        McpVerifier::with_cache(
+            &resource,
+            resource.claim_checks().with_leeway(Duration::ZERO),
+            JwksCache::new(format!("{}/jwks", server.uri()), reqwest::Client::new()),
+        )
+        .expect("the resource's own checks")
+    }
+
+    #[tokio::test]
+    async fn with_rest_rules_a_just_expired_or_not_yet_valid_token_is_invalid() {
+        let server = jwks_issuer().await;
+        let key = TestKey::primary();
+        let just_expired = key.mint(&mcp_claims().expires_in(-1).build());
+        let not_yet_valid = key.mint(&mcp_claims().not_before_in(30).build());
+        let rest_rules = rest_rules_verifier(&server);
+
+        assert_eq!(
+            rest_rules.verify(&just_expired).await,
+            Err(VerifyError::invalid("token rejected: token has expired"))
+        );
+        assert_eq!(
+            rest_rules.verify(&not_yet_valid).await,
+            Err(VerifyError::invalid(
+                "token rejected: token is not valid yet"
+            ))
+        );
+        let principal = rest_rules
+            .verify(&key.mint(&mcp_claims().not_before_in(-1).build()))
+            .await
+            .expect("a current token");
+        assert_eq!(principal.auth_method, AuthMethod::Jwt);
+
+        // `new` is unchanged: a 60 s leeway on `exp`, and `nbf` never read,
+        // shown with an `nbf` no leeway would cover.
+        let default = verifier(&server);
+        assert_eq!(default.claim_checks().leeway(), Duration::from_secs(60));
+        assert!(!default.claim_checks().validates_nbf());
+        default
+            .verify(&just_expired)
+            .await
+            .expect("within the default 60 s leeway");
+        default
+            .verify(&key.mint(&mcp_claims().not_before_in(600).build()))
+            .await
+            .expect("the default verifier does not check nbf");
+    }
+
+    #[test]
+    fn claim_checks_for_anything_but_the_resource_are_refused() {
+        let resource = resource();
+        let url = resource.url().to_owned();
+        let cache = || JwksCache::new("https://auth.example/jwks", reqwest::Client::new());
+
+        for (checks, expected) in [
+            (
+                ClaimChecks::new("https://evil.example", Audience::Required(url.clone())),
+                ClaimChecksError::IssuerMismatch,
+            ),
+            (
+                ClaimChecks::new(format!("{ISSUER}/"), Audience::Required(url.clone())),
+                ClaimChecksError::IssuerMismatch,
+            ),
+            (
+                ClaimChecks::new(ISSUER, Audience::Required(format!("{url}/"))),
+                ClaimChecksError::AudienceMismatch,
+            ),
+            (
+                ClaimChecks::new(ISSUER, Audience::Required("parcel-rest-api".into())),
+                ClaimChecksError::AudienceMismatch,
+            ),
+            (
+                ClaimChecks::new(ISSUER, Audience::IfPresent(url.clone())),
+                ClaimChecksError::AudienceMismatch,
+            ),
+            (
+                ClaimChecks::new(ISSUER, Audience::NotValidated),
+                ClaimChecksError::AudienceMismatch,
+            ),
+        ] {
+            assert_eq!(
+                McpVerifier::with_cache(&resource, checks, cache()).unwrap_err(),
+                expected
+            );
+        }
+
+        let checks = resource
+            .claim_checks()
+            .with_leeway(Duration::ZERO)
+            .with_nbf_validation(true);
+        let verifier =
+            McpVerifier::with_cache(&resource, checks.clone(), cache()).expect("the resource's");
+        assert_eq!(verifier.claim_checks(), &checks);
+        assert_eq!(verifier.resource(), &resource);
+    }
+
+    /// `with_cache` verifies over the consumer's cache, settings and all, not
+    /// one rebuilt from its URL: with unusable-key reporting on, a published
+    /// key that cannot verify RS256 (`use: enc`) is the issuer's broken key,
+    /// `Unavailable`; with it off (the default), the token is `Invalid`.
+    #[tokio::test]
+    async fn with_cache_keeps_the_consumers_cache_settings() {
+        let mut jwks: Value =
+            serde_json::from_str(TestKey::primary().jwks_json()).expect("the test key set");
+        jwks["keys"][0]["use"] = json!("enc");
+        let server = issuer(ResponseTemplate::new(200).set_body_json(&jwks)).await;
+        let token = TestKey::primary().mint(&mcp_claims().build());
+        let resource = resource();
+        let over_cache = |report: bool| {
+            let cache = JwksCache::new(format!("{}/jwks", server.uri()), reqwest::Client::new())
+                .report_unusable_keys(report);
+            McpVerifier::with_cache(&resource, resource.claim_checks(), cache)
+                .expect("the resource's")
+        };
+
+        let reporting = over_cache(true).verify(&token).await;
+        assert!(
+            matches!(reporting, Err(VerifyError::Unavailable(_))),
+            "{reporting:?}"
+        );
+        let default = over_cache(false).verify(&token).await;
+        assert!(
+            matches!(default, Err(VerifyError::Invalid(_))),
+            "{default:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_strict_screen_refuses_before_any_jwks_fetch() {
+        // Parses with a kid, but its payload is not UTF-8: only the strict
+        // screen reads it (stridelabs-auth's `screen::check` example).
+        let token = "eyJhbGciOiJSUzI1NiIsImtpZCI6ImsifQ.eyJ4Ijoi_yJ9.AA";
+        // No JWKS mock: any fetch is a 404, so an outage.
+        let server = MockServer::start().await;
+
+        let strict = verifier(&server).screen(ScreenPolicy::Strict);
+        assert_eq!(
+            strict.verify(token).await,
+            Err(VerifyError::invalid("malformed token"))
+        );
+        assert!(server
+            .received_requests()
+            .await
+            .expect("recording")
+            .is_empty());
+
+        let basic = verifier(&server);
+        assert!(matches!(
+            basic.verify(token).await,
+            Err(VerifyError::Unavailable(_))
+        ));
+    }
+
+    async fn scopes_under(
+        source: ScopeSource,
+        claims: &TestClaims,
+    ) -> Result<Vec<String>, VerifyError> {
+        let server = jwks_issuer().await;
+        let principal = verifier(&server)
+            .with_scope_source(source)
+            .verify(&TestKey::primary().mint(&claims.build()))
+            .await?;
+        Ok(principal.scopes.into_iter().collect())
+    }
+
+    #[tokio::test]
+    async fn the_scope_source_decides_between_scope_and_scp() {
+        // (claims, under Union, under ScopeThenScp)
+        for (claims, union, scope_then_scp) in [
+            (
+                mcp_claims().claim("scope", json!("x:read x:write")),
+                vec!["x:read", "x:write"],
+                vec!["x:read", "x:write"],
+            ),
+            (
+                mcp_claims().claim("scp", json!(["x:write"])),
+                vec!["x:write"],
+                vec!["x:write"],
+            ),
+            // Conflicting: the union grants what only `scp` names.
+            (
+                mcp_claims()
+                    .claim("scope", json!("x:read"))
+                    .claim("scp", json!(["x:write"])),
+                vec!["x:read", "x:write"],
+                vec!["x:read"],
+            ),
+            // An empty `scope` is present, so `scp` is never read.
+            (
+                mcp_claims()
+                    .claim("scope", json!(""))
+                    .claim("scp", json!(["x:write"])),
+                vec!["x:write"],
+                vec![],
+            ),
+            // A `null` one is absent.
+            (
+                mcp_claims()
+                    .claim("scope", Value::Null)
+                    .claim("scp", json!(["x:write"])),
+                vec!["x:write"],
+                vec!["x:write"],
+            ),
+            (mcp_claims(), vec![], vec![]),
+        ] {
+            for (source, expected) in [
+                (ScopeSource::Union, union),
+                (ScopeSource::ScopeThenScp, scope_then_scp),
+            ] {
+                assert_eq!(
+                    scopes_under(source, &claims).await.expect("valid token"),
+                    expected,
+                    "{source:?}: {}",
+                    claims.build()
+                );
+            }
+        }
+        assert_eq!(ScopeSource::default(), ScopeSource::Union);
+    }
+
+    #[tokio::test]
+    async fn a_malformed_scope_claim_is_invalid_under_either_source() {
+        for claims in [
+            mcp_claims().claim("scope", json!({"hunter2": 1})),
+            // Malformed even where ScopeThenScp would not read it.
+            mcp_claims()
+                .claim("scope", json!("x:read"))
+                .claim("scp", json!(7)),
+        ] {
+            for source in [ScopeSource::Union, ScopeSource::ScopeThenScp] {
+                let err = scopes_under(source, &claims).await.unwrap_err();
+                assert_eq!(
+                    err,
+                    VerifyError::invalid("token rejected: claims are malformed"),
+                    "{source:?}"
+                );
+                assert!(!err.to_string().contains("hunter2"));
+            }
+        }
+    }
+
     #[test]
     fn debug_shows_prefixes_and_no_url_secrets() {
         let verifier = McpVerifier::new(
@@ -603,5 +990,13 @@ mod tests {
             "{debug}"
         );
         assert!(!debug.contains("SECRET"), "{debug}");
+        // The default scope source is not printed, so the default's output is
+        // what it always was; an opted-into one is.
+        assert!(!debug.contains("scope_source"), "{debug}");
+        let debug = format!(
+            "{:?}",
+            verifier.with_scope_source(ScopeSource::ScopeThenScp)
+        );
+        assert!(debug.contains("scope_source: ScopeThenScp"), "{debug}");
     }
 }

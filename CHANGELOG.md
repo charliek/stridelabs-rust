@@ -11,6 +11,33 @@ for a consumer's pin.
 
 ## [Unreleased]
 
+### Added
+
+- `stridelabs-mcp`: two opt-ins for `McpVerifier`, so an MCP endpoint can
+  check JWTs as the app's REST API (and its Python MCP server) does
+  (slaudio plan 027). A consumer that uses neither sees no change:
+  `McpVerifier::new` keeps `Verifier::new`'s rules (a 60 s leeway, `nbf`
+  unchecked) and scopes stay the union of `scope` and `scp`.
+  - **`McpVerifier::with_cache(&resource, checks: ClaimChecks, cache:
+    JwksCache) -> Result<McpVerifier, ClaimChecksError>`**: stridelabs-auth's
+    `Verifier::with_cache` for the MCP endpoint, so a zero leeway, `nbf`
+    checked and the consumer's cache settings (`report_unusable_keys`, TTL,
+    refetch interval). `checks` must be the resource's: issuer
+    `resource.issuer()` exactly and `Audience::Required(resource.url())`;
+    anything else, `IfPresent` and `NotValidated` included, is
+    **`ClaimChecksError`** (`IssuerMismatch` / `AudienceMismatch`, fixed
+    messages). **`ProtectedResource::claim_checks()`** returns exactly
+    those, with `ClaimChecks::new`'s defaults (60 s leeway, `nbf` checked),
+    to adjust. Plus **`McpVerifier::screen(ScreenPolicy)`** (either
+    constructor; `Basic` by default) and **`McpVerifier::claim_checks()`**.
+  - **`McpVerifier::with_scope_source(ScopeSource)`**: `ScopeSource::Union`
+    (the default, today's behaviour) or **`ScopeSource::ScopeThenScp`**,
+    fastmcp's precedence: `scope` when present (an empty one grants
+    nothing), else `scp`, so a token carrying both is never granted a scope
+    only `scp` names. Under either, a malformed `scope` or `scp` stays
+    `Invalid` (even the one `ScopeThenScp` does not read), and `null`
+    counts as absent.
+
 ## [0.10.0] - 2026-10-23
 
 A joint release: tapper plan 016 C-1 (stridelabs-auth's opt-in strict screen, `Audience::IfPresent`, `Verifier::with_cache`

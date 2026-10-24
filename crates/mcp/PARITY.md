@@ -278,10 +278,10 @@ and an endpoint that drops every connection) and on a day-only class; and
 | `TestPatBranch::test_invalid_pat_is_none` | `pat_credential::every_validation_outcome_maps_to_invalid_or_unavailable` (unknown, revoked, malformed → `Invalid`); `pat_credential::pats_work_end_to_end_and_refusals_keep_their_status` (→ `401 invalid_token`) | |
 | `TestPatBranch::test_pat_slauth_outage_raises_unavailable` | same (erroring, slow, unreachable → `Unavailable`; → `503`) | |
 | `TestPatBranch::test_non_pat_token_never_hits_the_pat_seam` | `verifier::prefixed_credentials_go_to_the_app_and_are_tokens` (a non-matching token takes the JWT path, and a prefixed one never reaches the JWKS) | |
-| `TestJwtBranch::test_valid_jwt_with_scp_array` | `verifier::scopes_come_from_scope_scp_or_both` | Scopes are the union of `scope` and `scp` |
+| `TestJwtBranch::test_valid_jwt_with_scp_array` | `verifier::scopes_come_from_scope_scp_or_both`; `verifier::the_scope_source_decides_between_scope_and_scp` | Scopes are the union of `scope` and `scp` by default; `ScopeSource::ScopeThenScp` (opt-in) is fastmcp's `scope`-first precedence |
 | `TestJwtBranch::test_valid_jwt_with_scope_string` | same | |
 | `TestJwtBranch::test_wrong_audience_rejected` | `verifier::a_token_for_another_audience_or_issuer_is_invalid`; `mcp_http::refused_tokens_get_invalid_token_whatever_the_reason` | |
-| `TestJwtBranch::test_expired_jwt_rejected` | same (`expires_in(-3600)`) | jsonwebtoken's 60 s leeway (README, "Testing a consumer") |
+| `TestJwtBranch::test_expired_jwt_rejected` | same (`expires_in(-3600)`); `verifier::with_rest_rules_a_just_expired_or_not_yet_valid_token_is_invalid` | `McpVerifier::new`'s 60 s leeway (README, "Testing a consumer"); `McpVerifier::with_cache` takes the consumer's `ClaimChecks` (a zero leeway refuses `expires_in(-1)`) |
 | `TestJwtBranch::test_bad_signature_rejected` | `test_support::the_rejection_shapes_are_rejected` (`signed_by_untrusted_key`); `mcp_http::refused_tokens_get_invalid_token_whatever_the_reason` | |
 | `TestJwtBranch::test_jwks_outage_raises_unavailable_not_none` | `verifier::a_jwks_outage_is_unavailable_not_invalid`; `mcp_http::a_jwks_outage_is_a_503_not_a_sign_out` | |
 | `TestJwtBranch::test_fetch_jwks_wraps_transport_error` | `auth jwks::an_unreachable_endpoint_is_a_jwks_error` (a refused connection is `AuthError::Jwks`), which `verifier`'s `From<AuthError>` makes `Unavailable` (`verifier::a_jwks_outage_is_unavailable_not_invalid`) | |
