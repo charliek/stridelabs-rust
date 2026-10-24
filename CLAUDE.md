@@ -124,22 +124,23 @@ will not silently skip.
 
 ## Crate map
 
-All nine crates are implemented: `stridelabs-config`,
+All ten crates are implemented: `stridelabs-config`,
 `stridelabs-observability`, `stridelabs-http`, `stridelabs-auth`,
 `stridelabs-testing`, `stridelabs-mcp`, `stridelabs-redis`,
-`stridelabs-gcp` and `stridelabs-inworld`.
+`stridelabs-gcp`, `stridelabs-inworld` and `stridelabs-postgres`.
 
 | Crate | Status | Contents |
 |---|---|---|
-| `stridelabs-config` | Implemented | Env-var helpers (`env_or`/`env_parse`/`parse_string_array`), layered YAML/JSON file loading with field-pathed errors, a validation-error accumulator + socket/fraction checks |
+| `stridelabs-config` | Implemented | Env-var helpers (`env_or`/`env_parse`/`parse_string_array`, and their `_from` forms over an injectable lookup, whose errors never carry the value), layered YAML/JSON file loading with field-pathed errors (feature `file`, default on), a validation-error accumulator (also for startup refusals) + socket/fraction checks |
 | `stridelabs-observability` | Implemented | tracing init (text/JSON/Google Cloud Logging lines, `LogFormat::from_environment`, `TargetCaps` that hold under `RUST_LOG`), a `RequestLogLayer` (outermost: request id, request/trace span, one `httpRequest` entry per request) and a `RequestIdLayer` tower middleware, optional Prometheus wiring |
 | `stridelabs-http` | Implemented | `AppError`→`IntoResponse` convention, security-headers layer, CORS layer (feature `cors`), graceful-shutdown helpers, reverse-proxy primitives (feature `proxy`), an SSRF-hardened outbound fetch (feature `ssrf`; `ssrf-test-support` admits a local TLS test server), the aws-lc-rs rustls provider install (feature `tls`), OpenAPI spec mechanics — canonical serialization, route enumeration, committed-spec freshness (feature `openapi`), URL redaction for log lines (feature `redact-url`) |
 | `stridelabs-auth` | Implemented | Resource-server token verification: slauth's access tokens (`Verifier::new`), and other issuers' (e.g. WorkOS, no `aud`) under consumer-chosen `ClaimChecks` (`Verifier::for_issuer`, `Audience::NotValidated`/`IfPresent`), or over a consumer's own cache (`Verifier::with_cache`); an opt-in pre-lookup screen (`ScreenPolicy::Strict`) and opt-in unusable-key reporting (`report_unusable_keys`, `AuthError::UnusableKey`); rate-limited JWKS cache, RS256 verification, bearer extraction (feature `axum`), slauth PAT validation (`PatValidator`), PAT hashing, offline test-key minting (feature `test-support`) |
-| `stridelabs-testing` | Implemented | Fail-loud real-Postgres pool (feature `postgres`) and real-Redis probe (feature `redis`), `oneshot` axum router-test helpers, a one-line wiremock JSON stub |
+| `stridelabs-testing` | Implemented | Fail-loud real-Postgres pool (feature `postgres`) and real-Redis probe (feature `redis`), local-only URL guards (`require_local_url`; `RedisDbPolicy::RefuseZero` opt-in), `oneshot` axum router-test helpers, a one-line wiremock JSON stub |
 | `stridelabs-mcp` | Implemented | MCP-server middle on rmcp: canonical protected resource + RFC 9728 metadata router, slauth bearer verification (audience = resource URL; JWKS outage → 503) and its `401` challenges, stateless Streamable HTTP router, scoped/rate-limited/audited tool boundary, slauth PATs as a credential with a fail-through cache, the committed `tools/list` snapshot, MCP token minting (feature `test-support`); a Redis-backed limiter and PAT cache (feature `redis`), the SSRF-hardened image fetch (feature `image-fetch`), the CORS preset (feature `cors`) |
 | `stridelabs-redis` | Implemented | A lazy, single-flight Redis handle (`rediss://` over rustls, no crypto provider of its own): an atomic fixed-window counter that is never replayed, idempotent `GET` / `SET EX`, `EVAL` under a caller-chosen replay policy (`Replay`), `PING` |
 | `stridelabs-gcp` | Implemented | Policy-free Google Cloud building blocks on the consumer's `reqwest::Client`: an ADC access-token provider with a single-flight cache (`service_account` keys behind feature `service-account-key`), offline service-account key validation (`ServiceAccountKey::validate`), a small GCS JSON-API client (opt-in crc32c on uploads), Vertex AI `generateContent` (feature `vertex`); errors keep only allow-listed upstream codes and token-endpoint origins |
 | `stridelabs-inworld` | Implemented | A policy-free Inworld text-to-speech client on the consumer's `reqwest::Client`: one bounded synthesis (whole-exchange timeout, streamed response cap with a `Content-Length` pre-check, pre-decode base64 guard, decoded-audio and text bounds), errors classified as unavailable/rejected/malformed and safe to log, an optional MP3 shape check; `client_builder()` (feature `client-builder`) |
+| `stridelabs-postgres` | Implemented | Postgres connection hygiene on sqlx (no TLS feature of its own; the consumer picks): `connect_options` with a query-parameter allow-list, `search_path`/NUL refusals and no password file, refusals that never print a value; `error_summary` (SQLSTATE + fixed description); `lazy_pool`; Neon pooler detection; `LOG_CAPS` for sqlx's targets that log raw errors, URL values or server notices |
 
 Each crate documents its own **feature topology** in its README — most are
 `default = []` so a consumer's dependency graph stays as lean as it wants.

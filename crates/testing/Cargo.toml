@@ -18,12 +18,14 @@ default = []
 # to a local Postgres without TLS, and a TLS feature here would unify into the
 # consumer's graph. CI's "Guard: stridelabs-testing pulls no ring" fails if a
 # TLS feature brings `ring` back.
-postgres = ["dep:sqlx", "dep:url"]
+postgres = ["dep:sqlx"]
 # Off by default for the same reason: a real Redis client, which only
 # consumers whose own tests talk to Redis need. Built with NO redis-rs TLS
 # feature (see `workspace.dependencies.redis`): the probe talks to a local or
-# CI Redis in the clear, and adds no rustls to a consumer's test graph.
-redis = ["dep:redis", "dep:url"]
+# CI Redis in the clear, and adds no rustls to a consumer's test graph. It
+# also adds `RedisDbPolicy` and `require_local_redis_url`, which ask redis-rs
+# which database a URL selects.
+redis = ["dep:redis"]
 
 [lints]
 workspace = true
@@ -43,16 +45,25 @@ serde_json = { workspace = true }
 # consumer, is the entire reason `stridelabs-testing` owns a `wiremock` module.
 wiremock = { workspace = true }
 
+# `require_local_url` reads a test URL's host with it, and the `postgres` and
+# `redis` probes redact the password out of a connection string before it can
+# reach a panic message. Not optional: wiremock (above) already puts this
+# exact crate in every consumer's test graph, so gating it would save nothing.
+url = { workspace = true }
+
 # --- `postgres` only -------------------------------------------------------
-sqlx = { workspace = true, optional = true }
+# The workspace entry is only the driver and the runtime; these four are the
+# features this crate has always built sqlx with (no TLS one: see the
+# `postgres` feature above).
+sqlx = { workspace = true, optional = true, features = [
+    "uuid",
+    "time",
+    "migrate",
+    "macros",
+] }
 
 # --- `redis` only ----------------------------------------------------------
 redis = { workspace = true, optional = true }
-
-# --- `postgres` or `redis` -------------------------------------------------
-# Only used to redact the password out of a connection string before it can
-# reach a panic message.
-url = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

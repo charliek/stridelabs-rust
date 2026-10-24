@@ -9,15 +9,30 @@ repository.workspace = true
 description = "Env-var config helpers + layered YAML/JSON file loading with field-pathed errors, for StrideLabs services"
 publish = false
 
+[features]
+# `file` is ON by default, so a consumer that names the crate with no
+# `features` keeps everything it had before the feature existed.
+default = ["file"]
+# `load_yaml`, `load_json`, `Loaded` and `FileError`: layered YAML/JSON file
+# loading with field-pathed errors. Off (`default-features = false`), the
+# crate is the env helpers and the validation accumulator only, and a
+# consumer's graph gets no YAML parser (`yaml_serde` and its libyaml port)
+# and no `serde_path_to_error` from it: a service configured from its
+# environment alone has no use for either.
+file = ["dep:serde", "dep:yaml_serde", "dep:serde_path_to_error"]
+
 [lints]
 workspace = true
 
 [dependencies]
-serde = { workspace = true }
+# `parse_string_array`'s JSON array, and `load_json`.
 serde_json = { workspace = true }
-yaml_serde = { workspace = true }
-serde_path_to_error = { workspace = true }
 thiserror = { workspace = true }
+
+# --- `file` only -------------------------------------------------------------
+serde = { workspace = true, optional = true }
+yaml_serde = { workspace = true, optional = true }
+serde_path_to_error = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = "3"

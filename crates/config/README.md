@@ -3,10 +3,26 @@
 Env-var config helpers + layered YAML/JSON file loading with field-pathed
 errors, for StrideLabs services.
 
-**No feature flags.** Everything in this crate is small and used widely
-enough that gating any of it behind a feature would only add friction for
-consumers — `default = []` isn't even meaningful here since there's nothing
-to turn off.
+## Feature topology
+
+| Feature | Default | Adds |
+|---|---|---|
+| `file` | **on** | `load_yaml`, `load_json`, `Loaded`, `FileError` (the `file` module), via `yaml_serde`, `serde_path_to_error` and `serde` |
+
+`file` is on by default, so naming the crate with no `features` keeps
+everything it ever had. A service configured from its environment alone
+turns it off and gets the env helpers and the validation accumulator with no
+YAML parser in its graph:
+
+```toml
+stridelabs-config = { git = "https://github.com/charliek/stridelabs-rust.git", rev = "<sha>", default-features = false }
+```
+
+(The feature is unreleased: pin `rev = "<sha>"` until a tag contains it,
+then `tag = "vX.Y.Z"`.)
+
+(`cargo tree -e normal -p stridelabs-config --no-default-features` shows
+`serde_json` and `thiserror` only.)
 
 ## Adding the dependency
 
@@ -43,11 +59,47 @@ let cors_origins: Vec<String> = parse_string_array("CORS_ORIGINS")?;
   (`CORS_ORIGINS=["https://a","https://b"]`); missing or blank yields `[]`;
   malformed JSON is `Err(EnvError)`.
 
-Internally, all three route through an injectable lookup closure instead of
-calling `std::env::var` directly, so unit tests never mutate the real process
-environment (`std::env::set_var` races with every other test in the binary).
+### The lookup seam: `env_or_from`, `env_parse_from`, `parse_string_array_from`
 
-## `file` — layered YAML/JSON loading
+Each helper has a `_from` twin that reads through a lookup closure
+(`impl Fn(&str) -> Option<String>`) instead of the process environment: the
+seam a consumer's `Config::from_lookup` builds on, and what its unit tests
+hand a `HashMap` to, so no test ever mutates the real environment
+(`std::env::set_var` races with every other test in the binary).
+
+**Their errors are value-free.** An `EnvError` from `env_parse_from` or
+`parse_string_array_from` names the variable and a fixed reason
+(`VALUE_DOES_NOT_PARSE`, `NOT_A_STRING_ARRAY`), never the value or the
+parser's text, which can quote it (serde_json's `invalid type: string "…"`,
+a `FromStr` error that echoes its input). Use them for any setting that can
+hold a secret, and for refusals that get printed or logged. The plain
+`env_parse` and `parse_string_array` keep the parser's text, as they always
+have. (`env_parse_from` also asks nothing of `T::Err`: it never renders it.)
+
+```rust
+use std::collections::HashMap;
+use stridelabs_config::{env_or_from, env_parse_from, VALUE_DOES_NOT_PARSE};
+
+let vars = HashMap::from([("PORT", "80a0"), ("LOG_FORMAT", "json")]);
+let get = |key: &str| vars.get(key).map(|value| value.to_string());
+
+assert_eq!(env_or_from("LOG_FORMAT", "text", &get), "json");
+let refusal = env_parse_from::<u16>("PORT", 8080, &get).unwrap_err();
+assert_eq!(refusal.to_string(), format!("invalid value for PORT: {VALUE_DOES_NOT_PARSE}"));
+```
+
+## Startup refusals: collect them in `Errors`
+
+A service that refuses to start on bad configuration should print every
+problem at once, not the first. There is no separate refusal type: read each
+setting through the `_from` seam and push what it refuses into an `Errors`
+(below), writing your own rules' messages the same way (the setting and the
+rule, never the value). `Errors::into_result` hands back every refusal in
+order; print each and exit non-zero. `validate_socket_addr` and
+`validate_fraction` quote the value they refuse, so keep them for settings
+that are not secret. The rustdoc on `Errors` has a worked `startup_check`.
+
+## `file` — layered YAML/JSON loading (feature `file`, on by default)
 
 ```rust
 use std::path::Path;
