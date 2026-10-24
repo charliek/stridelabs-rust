@@ -114,6 +114,128 @@ and `Cargo.lock`): tapper plan 016 C-1 bumps it for the v0.10.0 cycle
     (785 passed, 0 failed, 11 ignored). lumen-rs's own pin (rev `6d08a4a`)
     uses `for_issuer`, which is unchanged. parcel (through stridelabs-mcp)
     is not covered by the script; the paths it uses are unchanged.
+- `stridelabs-gcp`: offline validation of a service-account key (tapper
+  plan 016 C-2; slaudio-rust's follow-up 4, which it handed to tapper). With
+  `service-account-key`, the key type is public, `auth::ServiceAccountKey`
+  (also at the crate root), so that a service can refuse to start on a key
+  that could never mint a token instead of failing its first request.
+  Building a provider is unchanged: no constructor calls `validate`.
+  - `ServiceAccountKey::from_json(json)` parses exactly as
+    `TokenProvider::from_service_account_json` does, with the same errors
+    (`InvalidCredentials` from `credentials JSON`, naming the field;
+    `Unsupported` for another `type`).
+  - `validate()` checks offline, with nothing sent, what building a
+    provider does not. **It signs**: one throwaway RS256 assertion, signed
+    as a token request signs it and dropped (its `iat` is 0, so it expired
+    in 1970). This catches an RSA public key, or a private key missing
+    fields, whose PEM parses but which jsonwebtoken refuses when it signs.
+    **`token_uri` is safe to post the assertion to**: `https`, or `http`
+    only to the literal `localhost`, `127.0.0.0/8` or `::1`, and no
+    userinfo, query or fragment (empty ones included).
+  - A refusal is a `KeyDefect` (`#[non_exhaustive]`, `Copy`): `CannotSign`,
+    `TokenUriUnparseable`, `TokenUriScheme`, `TokenUriPlainHttp` or
+    `TokenUriCarriesExtras`, each a fixed phrase naming the field, never key
+    material or any part of the URL.
+  - `ServiceAccountKey`'s `Debug` prints the `client_email` and the
+    `token_uri`'s origin (`scheme://host[:port]`), never the key, its id or
+    the URI's path.
+  - Ported from tapper-rs's startup check (`google_credentials.rs`), with
+    its cases; tapper replaces its own with this at plan 016 C-5.
+- `stridelabs-gcp`: an opt-in CRC32C on uploads (tapper plan 016 C-2;
+  slaudio-rust's handoff, and a lumen plan-002 candidate):
+  `UploadOptions::with_crc32c(u32)` and the public field
+  `crc32c: Option<u32>` on the `#[non_exhaustive]` struct. The caller
+  computes the CRC-32C (Castagnoli) of the bytes; the crate adds no
+  dependency. GCS refuses a mismatch with a `400` (`StorageError::Status`,
+  never retried) and writes nothing. It is sent base64 of its big-endian
+  bytes, the way Google's "Data validation and change detection" page
+  documents for the JSON API: **alone**, the media upload stays a media
+  upload and gains `X-Goog-Hash: crc32c=<b64>`; **with any other option**,
+  the multipart upload's metadata carries `"crc32c":"<b64>"`, last, and no
+  header. Without it, every request is byte for byte what it was.
+  - **Verification, exactly** (against fake-gcs-server 1.56.1, never real
+    GCS): the **multipart** form is **verified** (a wrong value is a `400`
+    and nothing is written; the right one is stored). The **media-upload
+    header** form is **UNVERIFIED**: fake-gcs-server never reads
+    `X-Goog-Hash` on a media upload and stores the object whatever it says,
+    so only Google's documentation says real GCS checks it. A service that
+    needs the checksum enforced should not rely on the header form until it
+    is checked against real GCS.
+  - The wire forms are pinned by wiremock tests; the emulator check is the
+    `#[ignore]`d `crc32c_against_fake_gcs_server` (`tests/storage.rs`, run
+    with `STRIDELABS_FAKE_GCS_URL`), which also pins the emulator's
+    blindness to the header so that it fails the day that changes.
+- lumen-rs (rev `6d08a4a`) and parcel are not covered by
+  `scripts/downstream-check.sh`. lumen-rs uses `TokenProvider`, `GcsClient`
+  and the `vertex` module, whose requests are unchanged on the wire unless
+  `with_crc32c` is set (its error text changes, below); parcel has no
+  stridelabs-gcp dependency today.
+
+### Changed
+
+- `stridelabs-gcp` (error payloads and text; **no variant changes shape**):
+  upstream text is reduced **when an error is built**, so the derived
+  `Debug` (`?error`) holds no more than `Display` shows. An endorsed fix,
+  slaudio-rust's follow-ups 1, 2 and 5 (handed to tapper; tapper plan 016
+  C-2), whose workarounds tapper-rs carries in `google_errors.rs` and
+  `google_credentials.rs`.
+  - **`error.status`** (`StorageError::Status` and `VertexError::Status`,
+    `google_status`; one envelope reader serves GCS and Vertex) is one of
+    google.rpc.Code's 17 names or `"other"`. Before, any
+    `[A-Za-z0-9_.-]{1,64}` passed through, and anything else was `None`; an
+    empty or non-string `status` is still `None`.
+  - **The OAuth `error`** (`GcpAuthError::Status`, `detail`) is one of
+    RFC 6749's six token-endpoint codes or `access_denied`, `server_error`
+    or `temporarily_unavailable`, `"other"` for any other non-empty `error`
+    string (one that is not a plain code was `""` before), or `""` when the
+    body has none. `Display`: `…answered HTTP 400: invalid_grant` or
+    `…: other`.
+  - **A token endpoint** (`GcpAuthError::{Request, Status,
+    InvalidResponse}`, `endpoint`) is its origin, `scheme://host[:port]`,
+    no longer `…/path`: a service-account key's `token_uri` is used
+    verbatim, and a broker's path can hold a secret. The port stays: it is
+    a number, and it tells a mock or a non-default port apart.
+  - **An unsupported credential `type`** (`GcpAuthError::Unsupported`) is
+    named only when google-auth knows it (`credential type
+    "external_account" in …`); any other is `credential type other in …`.
+    Before, any plain `[a-z_]{1,64}` name was quoted, and anything else
+    shown as `<unrecognized>`.
+  - **A credential file that cannot be read** (`InvalidCredentials`,
+    `reason`) is a fixed phrase for its `io::ErrorKind`: `the file does not
+    exist`, `the file cannot be read: permission denied`, `…: it is a
+    directory`, or `the file cannot be read`. Before, any kind but not-found
+    appended the `io::Error`'s own text (`Permission denied (os error 13)`),
+    which an `AdcEnvironment` of a consumer's own can fill with anything.
+  - **`TokenOptions`' `Debug`** shows the token endpoint
+    (`default_token_uri`) as its origin, `scheme://host[:port]`, as the
+    errors do, no longer `…/path`. Base URLs keep their path in `Debug`:
+    `TokenOptions`' metadata base URL, `GcsClient`'s and `VertexClient`'s,
+    since a base URL is configuration, not a token path.
+  - Mapping: match on the variant and its fields, never on the text. A
+    consumer with an allow-list of its own (tapper-rs's `google_errors.rs`)
+    keeps working; `"other"` is never on any list. To see a full token
+    endpoint, log it from your own configuration.
+  - **Heads-up, lumen-rs and slaudio:** a test that asserts the old text
+    fails: an endpoint with its path, a plain unlisted code passed through,
+    a quoted unknown `type`, or `<unrecognized>`. The crate's own tests that
+    asserted those were updated for the same reason.
+  - Errors a consumer constructs itself (the variants are plain struct and
+    tuple variants) hold what it puts in them.
+- `stridelabs-gcp` (documentation only; no behaviour change): **an
+  `authorized_user` token is not limited to the scopes the provider asked
+  for.** The refresh-token grant sends no `scope`, so every token carries
+  whatever the gcloud login was granted (typically `cloud-platform`). Now
+  stated loudly in the `auth` module docs, `from_authorized_user_json`,
+  `from_environment`, `CredentialKind::AuthorizedUser` and the README: a
+  service whose security depends on its scopes must refuse
+  `CredentialKind::AuthorizedUser` itself. Unchanged on purpose: imgmcp's
+  local development runs on it (slaudio-rust's follow-up 3). The same docs
+  say that **the metadata server is no scope boundary by itself** either:
+  the crate sends `?scopes=` without `enforce_scopes=true`, so Compute
+  Engine answers with every scope the instance was given unless the
+  instance or project sets `enable-access-token-enforce-scopes` to `true`.
+  The request is unchanged (`enforce_scopes=true` would make a request for
+  scopes outside the instance's an error, a decision of its own).
 
 ## [0.9.0] - 2026-10-22
 

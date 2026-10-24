@@ -209,14 +209,44 @@ pub(crate) fn truncate(text: &str, max: usize) -> String {
     out.trim().to_owned()
 }
 
-/// Whether `text` is a machine code safe to quote: 1–64 ASCII letters,
-/// digits, `_`, `.` or `-` (`invalid_grant`, `RESOURCE_EXHAUSTED`). Anything
-/// else is dropped rather than quoted.
-pub(crate) fn is_code(text: &str) -> bool {
-    (1..=64).contains(&text.len())
-        && text
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
+/// The `error.status` values an error may name: google.rpc.Code's 17
+/// names, the closed set Google's JSON APIs answer with
+/// (`RESOURCE_EXHAUSTED`, `PERMISSION_DENIED`, …). Any other value is stored
+/// and shown as [`OTHER_CODE`].
+const GOOGLE_STATUS_CODES: [&str; 17] = [
+    "OK",
+    "CANCELLED",
+    "UNKNOWN",
+    "INVALID_ARGUMENT",
+    "DEADLINE_EXCEEDED",
+    "NOT_FOUND",
+    "ALREADY_EXISTS",
+    "PERMISSION_DENIED",
+    "RESOURCE_EXHAUSTED",
+    "FAILED_PRECONDITION",
+    "ABORTED",
+    "OUT_OF_RANGE",
+    "UNIMPLEMENTED",
+    "INTERNAL",
+    "UNAVAILABLE",
+    "DATA_LOSS",
+    "UNAUTHENTICATED",
+];
+
+/// What an error stores, and shows, in place of an upstream code (Google's
+/// `error.status`, an OAuth `error`) or a credential `type` that is not on
+/// its allow-list: the upstream string itself never reaches an error.
+pub(crate) const OTHER_CODE: &str = "other";
+
+/// `code` as an error may store it: the allow-list's own literal when `code`
+/// is on `known` (exactly, case included), else [`OTHER_CODE`]. Never the
+/// upstream string, so a derived `Debug` cannot echo it either.
+pub(crate) fn listed_code(code: &str, known: &[&'static str]) -> &'static str {
+    known
+        .iter()
+        .copied()
+        .find(|listed| *listed == code)
+        .unwrap_or(OTHER_CODE)
 }
 
 /// `: {detail}`, or nothing for an empty detail — the tail of a status
@@ -272,8 +302,9 @@ impl fmt::Debug for SensitiveMessage {
 /// `details[]`, debug info), everything outside it, and any body that is
 /// not it, is dropped.
 pub(crate) struct GoogleError {
-    /// `error.status` (`RESOURCE_EXHAUSTED`, …), only if [`is_code`]. Safe
-    /// for logs: a fixed enum name.
+    /// `error.status` (`RESOURCE_EXHAUSTED`, …) when it is a non-empty
+    /// string: one of [`GOOGLE_STATUS_CODES`], or [`OTHER_CODE`]. Safe for
+    /// logs: a fixed literal of this crate's.
     pub(crate) status: Option<String>,
     /// `error.message`, truncated to one line. Not safe for logs.
     pub(crate) message: Option<SensitiveMessage>,
@@ -297,8 +328,8 @@ pub(crate) fn google_error(body: &[u8]) -> GoogleError {
         status: error
             .get("status")
             .and_then(Value::as_str)
-            .filter(|status| is_code(status))
-            .map(str::to_owned),
+            .filter(|status| !status.is_empty())
+            .map(|status| listed_code(status, &GOOGLE_STATUS_CODES).to_owned()),
         message: error
             .get("message")
             .and_then(Value::as_str)
@@ -360,6 +391,19 @@ pub(crate) async fn read_error_body(response: reqwest::Response) -> Vec<u8> {
 /// query and fragment — the parts that can hold a credential — are dropped.
 /// stridelabs-auth's `redact_url`, which is crate-private there.
 pub(crate) fn redact_url(raw: &str) -> String {
+    render_url(raw, true)
+}
+
+/// `raw` as `scheme://host[:port]`, its origin, for an error's endpoint:
+/// [`redact_url`] without the path either. A token endpoint's path comes
+/// from a key file's `token_uri`, verbatim, and a broker's can hold a secret
+/// (`https://broker.example/token/<secret>`). The port is kept: it is a
+/// number, and it tells a mock or a non-default port apart.
+pub(crate) fn url_origin(raw: &str) -> String {
+    render_url(raw, false)
+}
+
+fn render_url(raw: &str, with_path: bool) -> String {
     reqwest::Url::parse(raw)
         .ok()
         .and_then(|url| {
@@ -368,7 +412,8 @@ pub(crate) fn redact_url(raw: &str) -> String {
                 .port()
                 .map(|port| format!(":{port}"))
                 .unwrap_or_default();
-            Some(format!("{}://{host}{port}{}", url.scheme(), url.path()))
+            let path = if with_path { url.path() } else { "" };
+            Some(format!("{}://{host}{port}{path}", url.scheme()))
         })
         .unwrap_or_else(|| "<unparseable URL>".to_owned())
 }
@@ -441,27 +486,35 @@ mod tests {
         assert_eq!(truncate("ééé", 2), "éé…");
     }
 
+    /// A listed code is stored as the list's own literal; anything else,
+    /// a short plain code included, is `other`.
     #[test]
-    fn codes_are_short_and_plain() {
-        for code in [
-            "invalid_grant",
-            "RESOURCE_EXHAUSTED",
-            "a.b-c_1",
-            &"x".repeat(64),
-        ] {
-            assert!(is_code(code), "{code}");
+    fn only_a_listed_code_is_stored_as_itself() {
+        for code in GOOGLE_STATUS_CODES {
+            assert_eq!(listed_code(code, &GOOGLE_STATUS_CODES), code);
         }
         for not in [
             "",
+            "CANARY",
+            "resource_exhausted",
+            "RESOURCE_EXHAUSTED ",
             "has space",
-            "quote\"",
             "new\nline",
-            "CANARY/x",
-            &"x".repeat(65),
-            "é",
+            "a.b-c_1",
+            &"X".repeat(65),
         ] {
-            assert!(!is_code(not), "{not}");
+            assert_eq!(
+                listed_code(not, &GOOGLE_STATUS_CODES),
+                OTHER_CODE,
+                "{not:?}"
+            );
         }
+        // The stored string is the list's, not the caller's.
+        let upstream = String::from("NOT_FOUND");
+        assert!(std::ptr::eq(
+            listed_code(&upstream, &GOOGLE_STATUS_CODES),
+            GOOGLE_STATUS_CODES[5]
+        ));
     }
 
     #[test]
@@ -489,11 +542,20 @@ mod tests {
         assert!(!message.as_str().contains("CANARY"));
         assert_eq!(format!("{message:?}"), "SensitiveMessage(<201 chars>)");
 
-        // A status that is not a plain code is dropped, the message kept.
-        let body = br#"{"error":{"status":"BAD STATUS CANARY","message":"No such object"}}"#;
-        let error = google_error(body);
-        assert_eq!(error.status, None);
-        assert_eq!(error.message.unwrap().as_str(), "No such object");
+        // A status off the list is `other`, a short plain code included; the
+        // message is kept. An empty or non-string one is none.
+        for status in ["BAD STATUS CANARY", "CANARY_CODE", "not_found"] {
+            let body = format!(r#"{{"error":{{"status":"{status}","message":"No such object"}}}}"#);
+            let error = google_error(body.as_bytes());
+            assert_eq!(error.status.as_deref(), Some(OTHER_CODE), "{status}");
+            assert_eq!(error.message.unwrap().as_str(), "No such object");
+        }
+        for body in [
+            &br#"{"error":{"status":""}}"#[..],
+            br#"{"error":{"status":7}}"#,
+        ] {
+            assert_eq!(google_error(body).status, None);
+        }
         // Not the envelope, or not JSON: nothing.
         for body in [
             &b"<html>CANARY</html>"[..],
@@ -521,6 +583,27 @@ mod tests {
             "http://host:8080/token"
         );
         assert_eq!(redact_url("not a url SECRET"), "<unparseable URL>");
+    }
+
+    #[test]
+    fn an_origin_drops_the_path_too() {
+        for (raw, origin) in [
+            (
+                "https://user:SECRET@broker.example/token/SECRET?key=SECRET#SECRET",
+                "https://broker.example",
+            ),
+            (
+                "https://oauth2.googleapis.com/token",
+                "https://oauth2.googleapis.com",
+            ),
+            ("http://127.0.0.1:8080/SECRET", "http://127.0.0.1:8080"),
+            ("http://[::1]:9/SECRET", "http://[::1]:9"),
+            // The scheme's default port is not shown: the parser drops it.
+            ("https://host.test:443/SECRET", "https://host.test"),
+            ("not a url SECRET", "<unparseable URL>"),
+        ] {
+            assert_eq!(url_origin(raw), origin, "{raw}");
+        }
     }
 
     async fn body_of(len: usize) -> reqwest::Response {

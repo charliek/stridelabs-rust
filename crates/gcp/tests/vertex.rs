@@ -295,6 +295,48 @@ async fn a_non_2xx_logs_only_statuses_and_keeps_the_prompt_echo_apart() {
     assert!(!format!("{error:?}").contains("CANARY"));
 }
 
+/// The `error.status` a `Status` stores, and so what `Display` and the
+/// derived `Debug` show: one of google.rpc.Code's names as itself, any other
+/// string as `other`. Before v0.10.0 any plain `[A-Za-z0-9_.-]{1,64}` code
+/// passed through, so `CANARY_STATUS` is the behaviour change.
+#[tokio::test]
+async fn an_error_status_is_shown_only_from_the_list() {
+    let cases = [
+        ("RESOURCE_EXHAUSTED", Some("RESOURCE_EXHAUSTED")),
+        ("ABORTED", Some("ABORTED")),
+        ("CANARY_STATUS", Some("other")),
+        ("resource_exhausted_canary", Some("other")),
+        ("", None),
+    ];
+    for (status, shown) in cases {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(MODEL_PATH))
+            .respond_with(ResponseTemplate::new(429).set_body_json(json!({
+                "error": {"code": 429, "status": status, "message": "quota"}
+            })))
+            .mount(&server)
+            .await;
+        let error = client(&server)
+            .await
+            .generate_content("gemini-3-pro-image-preview", &request())
+            .await
+            .unwrap_err();
+        let expected = match shown {
+            Some(shown) => format!("Vertex AI answered HTTP 429 ({shown})"),
+            None => "Vertex AI answered HTTP 429".to_owned(),
+        };
+        assert_eq!(error.to_string(), expected, "{status:?}");
+        assert!(
+            matches!(&error, VertexError::Status { google_status, .. }
+                if google_status.as_deref() == shown),
+            "{error:?}"
+        );
+        let debug = format!("{error:?} {error:#?}");
+        assert!(!debug.to_lowercase().contains("canary"), "{debug}");
+    }
+}
+
 /// A decode failure reports where, never what: serde's `Display` would quote
 /// the offending value.
 #[tokio::test]

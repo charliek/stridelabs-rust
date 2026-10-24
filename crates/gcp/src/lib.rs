@@ -20,6 +20,16 @@
 //! Wording, timeouts, models and object naming stay in the service: this
 //! crate says what Google answered, never what a user should read.
 //!
+//! # Errors are safe to log, `Debug` included
+//!
+//! Upstream text is reduced when an error is built, so neither `Display` nor
+//! the derived `Debug` can echo it: Google's `error.status` is one of
+//! google.rpc.Code's 17 names or `other`, an OAuth `error` one of RFC 6749's
+//! codes or `other`, a credential `type` google-auth does not know is
+//! `other`, and a token endpoint shows only its origin
+//! (`scheme://host[:port]`). Google's free-text `error.message` is held
+//! apart, as a [`SensitiveMessage`].
+//!
 //! # No TLS of its own
 //!
 //! Every constructor takes the consumer's `reqwest::Client` (0.13), and the
@@ -35,7 +45,7 @@
 //!
 //! | Feature | Default | Adds |
 //! |---|---|---|
-//! | `service-account-key` | off | `service_account` credentials: RS256 assertion signing via jsonwebtoken (`aws_lc_rs` backend) with `use_pem`. Off, such a credential is [`GcpAuthError::Unsupported`]. |
+//! | `service-account-key` | off | `service_account` credentials: RS256 assertion signing via jsonwebtoken (`aws_lc_rs` backend) with `use_pem`, and `auth::ServiceAccountKey` (offline `validate()`, `KeyDefect`). Off, such a credential is [`GcpAuthError::Unsupported`]. |
 //! | `vertex` | off | the `vertex` module. No extra dependency. |
 
 pub mod auth;
@@ -47,6 +57,8 @@ pub mod vertex;
 mod util;
 
 pub use auth::{AccessToken, CredentialKind, CredentialSource, GcpAuthError, TokenProvider};
+#[cfg(feature = "service-account-key")]
+pub use auth::{KeyDefect, ServiceAccountKey};
 pub use storage::{
     public_url, public_url_with, validate_bucket_name, GcsClient, ObjectNamePolicy, RetryPolicy,
     StorageError, UploadOptions,

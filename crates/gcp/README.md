@@ -18,7 +18,7 @@ answered.
 
 | Feature | Default | Adds |
 |---|---|---|
-| `service-account-key` | off | `service_account` credentials: signing the RS256 JWT-bearer assertion, through jsonwebtoken (`aws_lc_rs` backend) with `use_pem`. With the feature off, a `service_account` credential is `GcpAuthError::Unsupported("service_account key support not compiled in (enable stridelabs-gcp/service-account-key)")`. It is never skipped in favour of the next source. |
+| `service-account-key` | off | `service_account` credentials: signing the RS256 JWT-bearer assertion, through jsonwebtoken (`aws_lc_rs` backend) with `use_pem`; and `ServiceAccountKey` (`from_json`, offline `validate()`, `KeyDefect`). With the feature off, a `service_account` credential is `GcpAuthError::Unsupported("service_account key support not compiled in (enable stridelabs-gcp/service-account-key)")`. It is never skipped in favour of the next source. |
 | `vertex` | off | the `vertex` module. It adds no dependency. |
 
 `auth` and `storage` are always present.
@@ -112,15 +112,43 @@ refresh runs on a task of its own.
 |---|---|
 | **absent**: argument `None`, `GOOGLE_APPLICATION_CREDENTIALS` unset, well-known file missing (or `HOME`/`CLOUDSDK_CONFIG` unset or blank) | move on to the next source |
 | **configured but broken**: an argument or `GOOGLE_APPLICATION_CREDENTIALS` that is set but empty, undecodable base64, invalid JSON, a missing or mistyped field, a file the env var names that is missing or unreadable, a well-known file that exists but cannot be read | `GcpAuthError::InvalidCredentials` from the constructor |
-| **configured but unsupported**: any `type` other than the two below | `GcpAuthError::Unsupported` from the constructor; the type is quoted only if it is a plain `[a-z_]{1,64}` name, otherwise as `<unrecognized>` |
+| **configured but unsupported**: any `type` other than the two below | `GcpAuthError::Unsupported` from the constructor; the type is named (quoted) only if google-auth knows it (`external_account`, `external_account_authorized_user`, `impersonated_service_account`, `gdch_service_account`), otherwise it is `other` |
 
 A misconfigured credential never quietly selects a different identity.
 
 | `type` | Exchange |
 |---|---|
 | `service_account` (feature `service-account-key`) | RS256 assertion `{iss: client_email, scope: <space-joined scopes>, aud: token_uri, iat, exp: iat+3600}` (with `kid` = `private_key_id`), `POST token_uri` form `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=…`. PKCS#8 and PKCS#1 keys are both accepted. |
-| `authorized_user` | `POST https://oauth2.googleapis.com/token`, always, with form `grant_type=refresh_token&client_id&client_secret&refresh_token` and no scope. Like google-auth, a `token_uri` in the file is **ignored**, so a file cannot send the refresh token and client secret elsewhere. Only `TokenOptions::default_token_uri`, a test seam, moves the endpoint. |
+| `authorized_user` | `POST https://oauth2.googleapis.com/token`, always, with form `grant_type=refresh_token&client_id&client_secret&refresh_token` and **no scope**, so the token is **not limited to the scopes you ask for** (below). Like google-auth, a `token_uri` in the file is **ignored**, so a file cannot send the refresh token and client secret elsewhere. Only `TokenOptions::default_token_uri`, a test seam, moves the endpoint. |
 | anything else (`external_account`, `impersonated_service_account`, `external_account_authorized_user`, `gdch_service_account`, …) | `GcpAuthError::Unsupported` |
+
+### `authorized_user` tokens are NOT limited to your scopes
+
+> **Warning.** A gcloud user login (`authorized_user`) **ignores `scopes`.**
+> Its refresh-token grant sends no `scope` (google-auth sends none for ADC
+> either), so every token carries whatever the login was granted, typically
+> `cloud-platform`, whatever scopes the provider was built with. Two
+> providers built from one user credential with different scopes (say a
+> read-only storage token and a Vertex token) mint equally powerful tokens:
+> there is no least-privilege split by scope under a user login.
+>
+> This is deliberate and unchanged: imgmcp's local development runs on it.
+> If your service's security depends on its scopes, refuse
+> `CredentialKind::AuthorizedUser` yourself (check `TokenProvider::kind()`
+> at startup), and run on a service-account key, whose tokens are minted
+> for the scopes asked for. tapper does.
+>
+> **The metadata server is not a scope boundary by itself either.** The
+> crate sends the scopes in `?scopes=` but not `enforce_scopes=true`, and
+> unless downscoping is enforced Compute Engine answers with a token
+> carrying every scope the instance was given. It downscopes only when the
+> request says `enforce_scopes=true` or the instance or project sets the
+> `enable-access-token-enforce-scopes` metadata key to `true` (Google's
+> ["Obtain specific OAuth2 access tokens"](https://docs.cloud.google.com/compute/docs/metadata/querying-metadata#obtain_specific_oauth2_access_tokens)).
+> If you rely on the metadata server's scopes, set that key or give the
+> instance only the scopes it needs. The request is unchanged on purpose:
+> `enforce_scopes=true` turns a request for scopes outside the instance's
+> into an error, a compatibility decision of its own.
 
 Explicit constructors exist too: `from_credentials_json` (any supported
 type), `from_service_account_json`, `from_authorized_user_json` and
@@ -141,6 +169,41 @@ way:
 - an error status whose body stalls: that status,
   `GcpAuthError::Status { status, detail: "", .. }`. The body read is cut
   off at the timeout and the unread body contributes no error code.
+
+### Checking a key offline: `ServiceAccountKey` (feature `service-account-key`)
+
+```rust
+use stridelabs_gcp::auth::{ServiceAccountKey, TokenProvider, CLOUD_PLATFORM_SCOPE};
+
+// At startup: refuse to start on a key that could never mint a token.
+ServiceAccountKey::from_json(&key_json)?.validate()?;
+let tokens = TokenProvider::from_service_account_json(http, &[CLOUD_PLATFORM_SCOPE], &key_json)?;
+```
+
+Building a provider only parses the key: its PEM must decode, nothing more.
+jsonwebtoken loads the key pair when it first signs, so an RSA public key or
+a private key missing some of its fields builds a provider that fails
+(`GcpAuthError::Signing`) at the first token request, and a `token_uri` is
+never checked at all. `validate()` checks both offline, with nothing sent:
+
+- `ServiceAccountKey::from_json(json)` parses exactly as
+  `from_service_account_json` does, with the same errors
+  (`InvalidCredentials` from `credentials JSON`, naming the field;
+  `Unsupported` for another `type`).
+- **It signs**: one throwaway RS256 assertion, signed exactly as a token
+  request signs it and dropped. Its `iat` is 0, so it expired in 1970.
+- **`token_uri` is `https`**, or `http` only to a loopback host (the literal
+  `localhost`, `127.0.0.0/8` or `::1`, never a name that resolves there), and
+  carries **no userinfo, query or fragment** (empty ones included). The
+  endpoint is used verbatim, and is the assertion's audience.
+
+A refusal is a `KeyDefect` (`#[non_exhaustive]`, `Copy`): `CannotSign`,
+`TokenUriUnparseable`, `TokenUriScheme`, `TokenUriPlainHttp` or
+`TokenUriCarriesExtras`, each a fixed phrase naming the field. None carries
+key material or any part of the URL. A key that passes can still be refused
+by Google (revoked, deleted, a wrong key id), which only the first token
+request can tell. `ServiceAccountKey`'s `Debug` prints the `client_email` and
+the `token_uri`'s origin only.
 
 ### Quota project
 
@@ -229,23 +292,47 @@ env var, so it has none until you call `with_quota_project`.
 ### Errors never echo a secret
 
 No `GcpAuthError` carries a private key, a refresh token, a client secret,
-an access token, or a URL's query or userinfo:
+an access token, a token endpoint's path, or a URL's query or userinfo. The
+rules hold for what a variant **stores**, not only for its `Display`:
+upstream text is reduced when the error is built, so the derived `Debug`
+(`?error`) cannot echo it either.
 
 - A credential that fails to parse is described by its origin (for example
   `GOOGLE_APPLICATION_CREDENTIALS file /path`) and the field or the failure
   category. serde_json's `Display`, which can quote a value, is not used.
+- An unsupported `type` is named only when google-auth knows it
+  (`credential type "external_account" in …`); any other is
+  `credential type other in …`. A file whose `type` is not a credential type
+  may not be a credential at all.
 - A token endpoint's body is never quoted. A failure keeps its status plus
-  the RFC 6749 `error` code, and only when that code matches
-  `[A-Za-z0-9_.-]{1,64}`. `error_description` is free text that a server
-  may fill with anything, so it is dropped.
-- Endpoints are rendered as `scheme://host[:port]/path`. A `reqwest::Error`
+  the RFC 6749 `error` code, and only one of RFC 6749's `invalid_request`,
+  `invalid_client`, `invalid_grant`, `unauthorized_client`,
+  `unsupported_grant_type`, `invalid_scope`, `access_denied`, `server_error`
+  or `temporarily_unavailable`; any other `error` string is stored as
+  `other`, and a body with none leaves `detail` empty. `error_description`
+  is free text that a server may fill with anything, so it is dropped.
+- Endpoints are rendered as their **origin**, `scheme://host[:port]`: never
+  the path, which for a service account is its key file's `token_uri`,
+  verbatim, and a broker's path can hold a secret
+  (`https://broker.example/token/<secret>`). A `reqwest::Error`
   becomes a fixed category: `timed out`, `connection failed`, `redirect
   refused`, `body error`, `decode error`, `invalid request`, `request error`
   or, for anything else, `request failed`. Its text is never formatted, because `without_url()` strips only
   the outer URL, and a refused redirect nests its target URL, query and all,
   in the source chain.
 - `TokenProvider`'s, `AccessToken`'s and `TokenOptions`' `Debug` never print
-  a token, a key, a secret or a URL's userinfo and query.
+  a token, a key, a secret or a URL's userinfo and query. `TokenOptions`
+  shows its token endpoint by its origin alone, as the errors do; a base
+  URL (its metadata server's, `GcsClient`'s, `VertexClient`'s) keeps its
+  path, since it is configuration rather than a token path.
+- A credential file that cannot be read is described by a fixed phrase
+  for its `io::ErrorKind` (does not exist, permission denied, a directory,
+  or cannot be read), never the error's own text, which an
+  `AdcEnvironment` of your own could fill with anything.
+
+These are guarantees about the errors the crate builds. A variant you
+construct yourself (they are plain struct and tuple variants) holds what you
+put in it.
 
 ### Testing a consumer
 
@@ -315,10 +402,10 @@ one attempt per operation. Each widens on its own:
   Request, Timeout, TooLarge, Status, InvalidArgument}` names the
   operation (`upload`, `download`, `delete` or `list`).
   - **`Display` and `Debug` are safe for routine logs.** They carry the HTTP
-    status and, from Google's JSON envelope, `error.status` when it matches
-    `[A-Za-z0-9_.-]{1,64}` (for example `GCS upload answered HTTP 403
-    (PERMISSION_DENIED)`). They never carry a URL, a transport error's
-    text, or free text.
+    status and, from Google's JSON envelope, `error.status` when it is one
+    of google.rpc.Code's 17 names (for example `GCS upload answered HTTP
+    403 (PERMISSION_DENIED)`), or `other` for any other string. They never
+    carry a URL, a transport error's text, or free text.
   - **`error.message` is held apart.** It is truncated to 200 characters on
     one line and wrapped in a `SensitiveMessage`, whose `Debug` prints only
     its length. Read it only through `StorageError::sensitive_message()`,
@@ -346,13 +433,15 @@ gcs.upload_with(bucket, &object, bytes, "image/png", &options).await?;
 | `custom_time: Option<SystemTime>` | metadata `customTime`, RFC 3339 UTC at whole seconds (`2025-10-09T08:53:20Z`), the fraction truncated | 1970-01-01 to 9999-12-31, else `StorageError::InvalidArgument` |
 | `cache_control: Option<String>` | metadata `cacheControl`, which GCS serves as every read's `Cache-Control` (a public object without one is served `public, max-age=3600`, so an edge cache may keep it an hour) | a header value: non-empty visible ASCII, spaces and tabs only inside, never CR or LF |
 | `if_generation_match: Option<i64>` | the `ifGenerationMatch` query parameter; `0` means only if no live object of that name exists | not negative |
+| `crc32c: Option<u32>` | the caller's CRC32C of the bytes, base64 of its big-endian bytes: alone, the media upload's `X-Goog-Hash: crc32c=…` header; with any other option, the metadata's `crc32c` (below) | any value; GCS refuses a mismatch with a `400` |
 
-- **Default options are the media upload**, the request `upload` sends.
-  Any option set makes it a **multipart** upload, the JSON API's
+- **Default options are the media upload**, the request `upload` sends; a
+  CRC32C alone keeps it one, plus a header. Any other option set makes it a
+  **multipart** upload, the JSON API's
   one-request way to create an object with metadata. The body is the JSON
   API's multipart layout, framed with CRLF:
   `--{b}`, a `Content-Type: application/json; charset=UTF-8` part holding
-  `{"name","contentType"[,"customTime"][,"cacheControl"]}` (serde_json, in
+  `{"name","contentType"[,"customTime"][,"cacheControl"][,"crc32c"]}` (serde_json, in
   that order; the name is a JSON string here, never a query value), `--{b}`,
   a `Content-Type: {content_type}` part holding the bytes unchanged, and
   `--{b}--`. The request's `Content-Type` is `multipart/related;
@@ -372,6 +461,45 @@ gcs.upload_with(bucket, &object, bytes, "image/png", &options).await?;
   fallback upload that would overwrite.
 - Timeout, token, emulator base URL and sanitized errors are `upload`'s.
   The body is built in memory: one copy of the bytes.
+
+### CRC32C (opt-in)
+
+```rust
+let crc32c = crc32c::crc32c(&bytes); // the `crc32c` crate, or any CRC-32C (Castagnoli)
+gcs.upload_with(bucket, &object, bytes, "image/png", &UploadOptions::default().with_crc32c(crc32c)).await?;
+```
+
+`with_crc32c(u32)` sends the caller's CRC32C of the bytes so that GCS can
+check what it received: a mismatch is refused with a `400`
+(`StorageError::Status`, never retried, under a retry policy too) and
+nothing is written. The crate computes no checksum and adds no dependency.
+It is sent base64 of its four big-endian bytes (`0xE3069283` is
+`4waSgw==`), the way Google's "Data validation and change detection" page
+documents for the JSON API:
+
+- **alone**, on the media upload `upload` sends, as the
+  `X-Goog-Hash: crc32c=<b64>` header ("For JSON API media uploads, you can
+  specify checksums in the `X-Goog-Hash` header"). The upload stays a media
+  upload: a checksum never makes it multipart;
+- **with any other option**, on the multipart upload, as the metadata
+  part's `crc32c` field ("in the object metadata section"), and no header.
+
+**What was verified, and what was not.** Checked against fake-gcs-server
+1.56.1 (`-scheme http`), **never against real GCS**:
+
+| Form | Status |
+|---|---|
+| multipart metadata `crc32c` | **verified**: fake-gcs-server refuses a wrong value with `400` ("provided CRC32C … doesn't match calculated CRC32C …") and writes nothing; it stores the object under the right value |
+| media upload `X-Goog-Hash: crc32c=…` | **UNVERIFIED**: fake-gcs-server never reads `X-Goog-Hash` on a media upload (`simpleUpload`), so it stores the object whatever the checksum says. Only Google's documentation says real GCS checks it |
+
+Until the header form is checked against real GCS, a service that needs the
+checksum *enforced* should not rely on it alone. The wire format of both
+forms is pinned by wiremock tests, and the emulator check is an `#[ignore]`d
+test, `crc32c_against_fake_gcs_server` (`tests/storage.rs`), run with
+`STRIDELABS_FAKE_GCS_URL=http://localhost:4443` (it creates and deletes a
+scratch bucket `stridelabs-crc32c-test-<random>`). It also pins the
+emulator's blindness to the header, so it fails, and these docs can change,
+the day fake-gcs-server starts checking it.
 
 ### Object name policy
 
@@ -579,8 +707,9 @@ match first_inline_image(&vertex.generate_content(model, &request).await?) {
   as far as its first 16 KiB.
 - **Errors.** `VertexError::{InvalidArgument, Auth, Request, Timeout,
   TooLarge, Status, Decode}`.
-  - `Display` and `Debug` are safe for routine logs: the HTTP status, the
-    validated `error.status`, fixed phrases.
+  - `Display` and `Debug` are safe for routine logs: the HTTP status,
+    `error.status` when it is one of google.rpc.Code's names (else `other`),
+    fixed phrases.
   - Google's `error.message` can quote the **prompt**, so it is held apart
     as a `SensitiveMessage`, reachable only through
     `VertexError::sensitive_message()`.

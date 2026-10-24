@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 use common::*;
 use serde_json::{json, Value};
 use stridelabs_gcp::auth::{
-    AccessToken, CredentialKind, CredentialSource, GcpAuthError, TokenOptions, TokenProvider,
-    DEFAULT_METADATA_TIMEOUT, DEFAULT_TOKEN_TIMEOUT, GOOGLE_APPLICATION_CREDENTIALS,
+    AccessToken, AdcEnvironment, CredentialKind, CredentialSource, GcpAuthError, TokenOptions,
+    TokenProvider, DEFAULT_METADATA_TIMEOUT, DEFAULT_TOKEN_TIMEOUT, GOOGLE_APPLICATION_CREDENTIALS,
     GOOGLE_CLOUD_QUOTA_PROJECT, MAX_TOKEN_RESPONSE, REFRESH_MARGIN,
 };
 use wiremock::matchers::{body_string_contains, header, method, path, query_param};
@@ -161,14 +161,23 @@ fn construction_is_synchronous_and_makes_no_request() {
 
 // ---- unsupported types ----------------------------------------------------
 
+/// Every other `type` is `Unsupported`, from every source. The four
+/// google-auth knows are named, quoted; any other is `other` (v0.10.0: a
+/// plain `[a-z_]` name like `made_up` was quoted before).
 #[test]
 fn every_other_credential_type_is_unsupported_from_every_source() {
-    for kind in [
-        "external_account",
-        "impersonated_service_account",
-        "external_account_authorized_user",
-        "gdch_service_account",
-        "made_up",
+    for (kind, shown) in [
+        ("external_account", r#""external_account""#),
+        (
+            "impersonated_service_account",
+            r#""impersonated_service_account""#,
+        ),
+        (
+            "external_account_authorized_user",
+            r#""external_account_authorized_user""#,
+        ),
+        ("gdch_service_account", r#""gdch_service_account""#),
+        ("made_up", "other"),
     ] {
         let json = of_type(kind).to_string();
         let attempts = [
@@ -189,18 +198,26 @@ fn every_other_credential_type_is_unsupported_from_every_source() {
         ];
         for result in attempts {
             match result {
-                Err(GcpAuthError::Unsupported(message)) => {
-                    assert!(message.contains(kind), "{message:?} names {kind}")
-                }
+                Err(GcpAuthError::Unsupported(message)) => assert!(
+                    message.starts_with(&format!("credential type {shown} in ")),
+                    "{message:?} shows {kind} as {shown}"
+                ),
                 other => panic!("{kind} must be Unsupported, got {other:?}"),
             }
         }
     }
 }
 
+/// No `type` google-auth does not know is ever echoed, in `Display` or in
+/// the derived `Debug`: the variant stores `other` in its place. The plain
+/// lowercase names are the v0.10.0 change (they were quoted before); a
+/// `type` that differs from a known one only in case is not that one.
 #[test]
-fn a_hostile_type_is_not_quoted() {
+fn an_unknown_type_is_never_echoed() {
     for kind in [
+        "canary_plain_type",
+        "canary",
+        "External_Account_CANARY",
         "CANARY-Type",
         "has space CANARY",
         "external_account\nCANARY forged line",
@@ -213,13 +230,37 @@ fn a_hostile_type_is_not_quoted() {
             of_type(kind).to_string().as_bytes(),
         ) {
             Err(error @ GcpAuthError::Unsupported(_)) => {
-                let rendered = format!("{error} {error:?}");
-                assert!(!rendered.to_lowercase().contains("canary"), "{rendered}");
-                assert!(rendered.contains("<unrecognized>"), "{rendered}");
+                for rendered in [
+                    error.to_string(),
+                    format!("{error:?}"),
+                    format!("{error:#?}"),
+                ] {
+                    assert!(!rendered.to_lowercase().contains("canary"), "{rendered}");
+                    assert!(
+                        rendered.contains("credential type other in credentials JSON"),
+                        "{rendered}"
+                    );
+                }
             }
             other => panic!("{kind:?} must be Unsupported, got {other:?}"),
         }
     }
+    // A known type is named, in both renderings.
+    let error = TokenProvider::from_credentials_json(
+        http(),
+        SCOPES,
+        of_type("external_account").to_string().as_bytes(),
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "unsupported credentials: credential type \"external_account\" in credentials JSON \
+         is not supported (supported: service_account, authorized_user)"
+    );
+    assert!(
+        format!("{error:?}").starts_with(r#"Unsupported("credential type \"external_account\" in"#),
+        "{error:?}"
+    );
 }
 
 #[cfg(not(feature = "service-account-key"))]
@@ -415,6 +456,89 @@ fn a_configured_but_broken_source_fails_instead_of_falling_through() {
     }
 }
 
+/// An environment whose every file read fails with `error()`: what an
+/// `AdcEnvironment` of a consumer's own (a secret store, say) can return,
+/// message and all.
+struct FailingReads {
+    vars: Vec<(&'static str, &'static str)>,
+    error: ReadError,
+}
+
+/// How a [`FailingReads`] read fails.
+type ReadError = fn() -> io::Error;
+
+impl AdcEnvironment for FailingReads {
+    fn var(&self, name: &str) -> Option<String> {
+        self.vars
+            .iter()
+            .find(|(key, _)| *key == name)
+            .map(|(_, value)| (*value).to_owned())
+    }
+
+    fn read_file(&self, _: &std::path::Path) -> io::Result<Vec<u8>> {
+        Err((self.error)())
+    }
+}
+
+/// A file that cannot be read is a fixed phrase for its `io::ErrorKind`,
+/// never the error's own text, in `Display` and the derived `Debug`, from
+/// the file `GOOGLE_APPLICATION_CREDENTIALS` names and from the well-known
+/// file. (v0.10.0: any kind but not-found appended the text before.)
+#[test]
+fn a_read_failure_is_a_fixed_phrase_never_the_errors_text() {
+    let cases: [(ReadError, &str); 4] = [
+        (
+            || io::Error::other("credential backend rejected CANARY_SECRET"),
+            "the file cannot be read",
+        ),
+        (
+            || io::Error::new(io::ErrorKind::PermissionDenied, "CANARY denied"),
+            "the file cannot be read: permission denied",
+        ),
+        (
+            || io::Error::new(io::ErrorKind::IsADirectory, "CANARY is a directory"),
+            "the file cannot be read: it is a directory",
+        ),
+        (
+            || io::Error::new(io::ErrorKind::NotFound, "CANARY missing"),
+            "the file does not exist",
+        ),
+    ];
+    for (error, expected) in cases {
+        let named = FailingReads {
+            vars: vec![(GOOGLE_APPLICATION_CREDENTIALS, KEY_FILE)],
+            error,
+        };
+        let well_known = FailingReads {
+            vars: vec![("HOME", HOME)],
+            error,
+        };
+        let resolve =
+            |env: &FailingReads| TokenProvider::from_environment_with(http(), SCOPES, None, env);
+        let mut results = vec![("named", resolve(&named))];
+        // A well-known file that is not found is absent: the chain moves on.
+        if expected != "the file does not exist" {
+            results.push(("well-known", resolve(&well_known)));
+        }
+        for (source, result) in results {
+            let error = result.expect_err(source);
+            match &error {
+                GcpAuthError::InvalidCredentials { reason, .. } => {
+                    assert_eq!(reason, expected, "{source}")
+                }
+                other => panic!("{source}: expected InvalidCredentials, got {other:?}"),
+            }
+            for rendered in [
+                error.to_string(),
+                format!("{error:?}"),
+                format!("{error:#?}"),
+            ] {
+                assert!(!rendered.contains("CANARY"), "{source}: {rendered}");
+            }
+        }
+    }
+}
+
 #[test]
 fn a_configured_but_unsupported_source_fails_instead_of_falling_through() {
     let env = FakeEnv::new()
@@ -434,6 +558,7 @@ fn a_configured_but_unsupported_source_fails_instead_of_falling_through() {
 mod service_account {
     use jsonwebtoken::jwk::JwkSet;
     use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
+    use stridelabs_gcp::auth::{KeyDefect, ServiceAccountKey};
 
     use super::*;
 
@@ -562,48 +687,353 @@ mod service_account {
         assert!(rendered.contains(CLIENT_EMAIL), "{rendered}");
     }
 
-    /// PKCS#1 PEM → PKCS#8 PEM: `SEQUENCE { INTEGER 0, AlgorithmIdentifier
-    /// { rsaEncryption, NULL }, OCTET STRING <PKCS#1 DER> }`.
-    fn pkcs8(pkcs1_pem: &str) -> String {
+    /// The path of a key file's `token_uri` (a broker's can hold a secret)
+    /// never reaches an error: a refused exchange, an unusable answer and an
+    /// unreachable endpoint each name only the origin.
+    #[tokio::test]
+    async fn a_key_files_token_uri_path_never_reaches_an_error() {
+        let (_server, endpoints) = path_canary_endpoints().await;
+        for (token_uri, origin) in endpoints {
+            let json = service_account(&token_uri).to_string();
+            let error = TokenProvider::from_service_account_json(http(), SCOPES, json.as_bytes())
+                .unwrap()
+                .token()
+                .await
+                .unwrap_err();
+            assert_origin_only(&error, &origin);
+        }
+    }
+
+    /// `from_json` parses as `from_service_account_json` does, and a good
+    /// key validates in both PEM formats with every accepted `token_uri`
+    /// shape: `https` anywhere (a path included), `http` to the literal
+    /// loopback hosts. The negative control of every refusal below.
+    #[test]
+    fn a_good_key_validates_offline() {
+        for private_key in [TEST_KEY_PEM.to_owned(), pkcs8(TEST_KEY_PEM)] {
+            for token_uri in [
+                "https://oauth2.googleapis.com/token",
+                "https://broker.example/token/PATH-SEGMENT",
+                "https://127.0.0.1:9/token",
+                "http://127.0.0.1:9/token",
+                "http://127.9.9.9/token",
+                "http://localhost:9/token",
+                "http://LOCALHOST:9/token",
+                "http://[::1]:9/token",
+            ] {
+                let json = service_account_with_key(token_uri, &private_key).to_string();
+                let key = ServiceAccountKey::from_json(json.as_bytes()).expect(token_uri);
+                assert_eq!(key.validate(), Ok(()), "{token_uri}");
+            }
+        }
+    }
+
+    /// A `token_uri` the signed assertion should not be posted to: plain
+    /// `http` beyond loopback (a mapped address, a trailing-dot name and a
+    /// private address included), another scheme, not a URL, or one that
+    /// carries userinfo, a query or a fragment (empty ones included). Each
+    /// premise: a provider builds from it, so only `validate` refuses it. The
+    /// refusal names the field and never the URL.
+    #[test]
+    fn a_token_uri_that_is_not_a_safe_endpoint_is_refused() {
+        for (token_uri, defect) in [
+            (
+                "http://oauth2.googleapis.com/CANARY",
+                KeyDefect::TokenUriPlainHttp,
+            ),
+            (
+                "http://[::ffff:127.0.0.1]:9/CANARY",
+                KeyDefect::TokenUriPlainHttp,
+            ),
+            ("http://localhost.:9/CANARY", KeyDefect::TokenUriPlainHttp),
+            ("http://10.0.0.1/CANARY", KeyDefect::TokenUriPlainHttp),
+            (
+                "ftp://oauth2.googleapis.com/CANARY",
+                KeyDefect::TokenUriScheme,
+            ),
+            ("file:///CANARY", KeyDefect::TokenUriScheme),
+            ("not a url CANARY", KeyDefect::TokenUriUnparseable),
+            (
+                "https://user:CANARY@oauth2.googleapis.com/token",
+                KeyDefect::TokenUriCarriesExtras,
+            ),
+            (
+                "https://CANARY@oauth2.googleapis.com/token",
+                KeyDefect::TokenUriCarriesExtras,
+            ),
+            (
+                "https://oauth2.googleapis.com/token?key=CANARY",
+                KeyDefect::TokenUriCarriesExtras,
+            ),
+            (
+                "https://oauth2.googleapis.com/token?",
+                KeyDefect::TokenUriCarriesExtras,
+            ),
+            (
+                "https://oauth2.googleapis.com/token#CANARY",
+                KeyDefect::TokenUriCarriesExtras,
+            ),
+            (
+                "https://oauth2.googleapis.com/token#",
+                KeyDefect::TokenUriCarriesExtras,
+            ),
+            (
+                "http://127.0.0.1:9/token?CANARY",
+                KeyDefect::TokenUriCarriesExtras,
+            ),
+        ] {
+            let json = service_account(token_uri).to_string();
+            assert!(
+                TokenProvider::from_service_account_json(http(), SCOPES, json.as_bytes()).is_ok(),
+                "premise: a provider builds from {token_uri}"
+            );
+            let key = ServiceAccountKey::from_json(json.as_bytes()).unwrap();
+            let refused = key.validate().expect_err(token_uri);
+            assert_eq!(refused, defect, "{token_uri}");
+            let display = refused.to_string();
+            assert!(display.starts_with("field `token_uri` "), "{display}");
+            for rendered in [display, format!("{refused:?}")] {
+                assert!(!rendered.contains("CANARY"), "{rendered}");
+                assert!(!rendered.contains("googleapis"), "{rendered}");
+            }
+        }
+    }
+
+    /// A `private_key` that parses but cannot sign is refused by `validate`,
+    /// offline. Building a provider only parses the PEM (its DER must
+    /// decode); jsonwebtoken loads the key pair when it signs, so each of
+    /// these builds a provider whose first token request fails `Signing`
+    /// (the premise), and only `validate` catches it before then. A key that
+    /// does not parse is refused by `from_json` itself. Ported from
+    /// tapper-rs's startup check (plan 015 C-4), with its cases.
+    #[tokio::test]
+    async fn a_key_that_cannot_sign_is_refused_offline() {
+        let der = der_of(TEST_KEY_PEM);
+        // RSAPrivateKey: version, n, e, d, p, q, dp, dq, qinv.
+        let fields = elements_of(&der);
+        assert_eq!(fields.len(), 9, "premise: a PKCS#1 private key");
+        let rsa_public_key = encode_element(0x30, &[fields[1], fields[2]].concat());
+        // SubjectPublicKeyInfo: rsaEncryption, then the RSAPublicKey in a
+        // BIT STRING with no unused bits.
+        let bits = encode_element(0x03, &[&[0u8][..], &rsa_public_key].concat());
+        let spki = encode_element(0x30, &[&RSA_ENCRYPTION[..], &bits].concat());
+        // (name, PEM, whether it parses)
+        let cases = [
+            // An empty body does not decode in the locked simple_asn1.
+            (
+                "an empty ASN.1 sequence",
+                "-----BEGIN RSA PRIVATE KEY-----\nMAA=\n-----END RSA PRIVATE KEY-----\n".to_owned(),
+                false,
+            ),
+            // The smallest sequence that does: `SEQUENCE { INTEGER 0 }`.
+            (
+                "a sequence holding only the version",
+                "-----BEGIN RSA PRIVATE KEY-----\nMAMCAQA=\n-----END RSA PRIVATE KEY-----\n"
+                    .to_owned(),
+                true,
+            ),
+            (
+                "an RSA public key (PKCS#1)",
+                pem_of("RSA PUBLIC KEY", &rsa_public_key),
+                true,
+            ),
+            (
+                "an RSA public key (SPKI)",
+                pem_of("PUBLIC KEY", &spki),
+                true,
+            ),
+            (
+                "a private key truncated to its first three fields",
+                pem_of(
+                    "RSA PRIVATE KEY",
+                    &encode_element(0x30, &fields[..3].concat()),
+                ),
+                true,
+            ),
+            (
+                "a private key cut off mid-stream",
+                pem_of("RSA PRIVATE KEY", &der[..der.len() / 2]),
+                false,
+            ),
+        ];
+        for (name, private_key, parses) in cases {
+            // A token endpoint nothing listens on, should a key ever sign.
+            let json =
+                service_account_with_key("http://127.0.0.1:1/token", &private_key).to_string();
+            let parsed = ServiceAccountKey::from_json(json.as_bytes());
+            assert_eq!(parsed.is_ok(), parses, "{name}: {parsed:?}");
+            let Ok(key) = parsed else {
+                assert!(
+                    matches!(
+                        parsed,
+                        Err(GcpAuthError::InvalidCredentials { ref reason, .. })
+                            if reason == "field `private_key` is not a PEM-encoded RSA private key"
+                    ),
+                    "{name}: {parsed:?}"
+                );
+                continue;
+            };
+            let provider =
+                TokenProvider::from_service_account_json(http(), SCOPES, json.as_bytes())
+                    .expect("premise: a provider builds");
+            assert!(
+                matches!(provider.token().await, Err(GcpAuthError::Signing)),
+                "premise: {name} fails at the first token request"
+            );
+
+            let refused = key.validate().expect_err(name);
+            assert_eq!(refused, KeyDefect::CannotSign, "{name}");
+            for rendered in [refused.to_string(), format!("{refused:?}")] {
+                assert!(!rendered.contains("KEY-----"), "{rendered}");
+            }
+            assert!(
+                refused.to_string().starts_with("field `private_key` "),
+                "{refused}"
+            );
+        }
+    }
+
+    /// `from_json` takes a `service_account` key and nothing else, with the
+    /// errors `from_service_account_json` gives.
+    #[test]
+    fn from_json_takes_only_a_service_account_key() {
+        let user = ServiceAccountKey::from_json(authorized_user().to_string().as_bytes());
+        assert!(
+            matches!(
+                &user,
+                Err(GcpAuthError::Unsupported(message))
+                    if message == "expected service_account credentials, got authorized_user"
+            ),
+            "{user:?}"
+        );
+        let other = ServiceAccountKey::from_json(of_type("canary_type").to_string().as_bytes());
+        assert!(
+            matches!(&other, Err(GcpAuthError::Unsupported(message))
+                if message.starts_with("credential type other in credentials JSON")),
+            "{other:?}"
+        );
+        let mut no_email = service_account("https://oauth2.googleapis.com/token");
+        no_email.as_object_mut().unwrap().remove("client_email");
+        let broken = ServiceAccountKey::from_json(no_email.to_string().as_bytes());
+        assert!(
+            matches!(
+                &broken,
+                Err(GcpAuthError::InvalidCredentials { origin, reason })
+                    if origin == "credentials JSON"
+                        && reason == "field `client_email` is missing or empty"
+            ),
+            "{broken:?}"
+        );
+    }
+
+    /// A key's `Debug` names the account and the `token_uri`'s origin, never
+    /// the key, its id, or the URI's path, userinfo, query or fragment.
+    #[test]
+    fn a_key_debug_shows_the_email_and_the_token_origin_only() {
+        let json = service_account(
+            "https://user:CANARY@broker.example/token/PATH-CANARY?key=CANARY#CANARY",
+        )
+        .to_string();
+        let key = ServiceAccountKey::from_json(json.as_bytes()).unwrap();
+        for rendered in [format!("{key:?}"), format!("{key:#?}")] {
+            assert!(!rendered.contains("PRIVATE KEY"), "{rendered}");
+            assert!(!rendered.contains("CANARY"), "{rendered}");
+            assert!(!rendered.contains("test-key-id"), "{rendered}");
+            assert!(rendered.contains(CLIENT_EMAIL), "{rendered}");
+            assert!(
+                rendered.contains(r#""https://broker.example""#),
+                "{rendered}"
+            );
+        }
+    }
+
+    /// The DER inside a PEM.
+    fn der_of(pem: &str) -> Vec<u8> {
         use base64::engine::general_purpose::STANDARD;
         use base64::Engine as _;
 
-        fn der_len(len: usize) -> Vec<u8> {
-            match len {
-                0..=0x7f => vec![len as u8],
-                0x80..=0xff => vec![0x81, len as u8],
-                _ => vec![0x82, (len >> 8) as u8, len as u8],
-            }
-        }
-        fn tlv(tag: u8, content: &[u8]) -> Vec<u8> {
-            let mut out = vec![tag];
-            out.extend(der_len(content.len()));
-            out.extend_from_slice(content);
-            out
-        }
-
-        let body: String = pkcs1_pem
+        let body: String = pem
             .lines()
             .filter(|line| !line.starts_with("-----"))
             .collect();
-        let pkcs1 = STANDARD.decode(body).unwrap();
-        let rsa_encryption = [
-            0x30, 0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01, 0x05,
-            0x00,
-        ];
-        let mut info = vec![0x02, 0x01, 0x00];
-        info.extend_from_slice(&rsa_encryption);
-        info.extend(tlv(0x04, &pkcs1));
-        let der = tlv(0x30, &info);
+        STANDARD.decode(body).unwrap()
+    }
 
-        let encoded = STANDARD.encode(der);
-        let mut pem = String::from("-----BEGIN PRIVATE KEY-----\n");
-        for chunk in encoded.as_bytes().chunks(64) {
-            pem.push_str(std::str::from_utf8(chunk).unwrap());
-            pem.push('\n');
+    /// `der` as a PEM of `tag`.
+    fn pem_of(tag: &str, der: &[u8]) -> String {
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine as _;
+
+        let body = STANDARD.encode(der);
+        let lines: Vec<&str> = body
+            .as_bytes()
+            .chunks(64)
+            .map(|line| std::str::from_utf8(line).unwrap())
+            .collect();
+        format!(
+            "-----BEGIN {tag}-----\n{}\n-----END {tag}-----\n",
+            lines.join("\n")
+        )
+    }
+
+    /// The length of the DER element at the start of `der`, and of its
+    /// header.
+    fn element(der: &[u8]) -> (usize, usize) {
+        let first = usize::from(der[1]);
+        if first < 0x80 {
+            (2 + first, 2)
+        } else {
+            let octets = first & 0x7f;
+            let length = der[2..2 + octets]
+                .iter()
+                .fold(0usize, |acc, byte| acc << 8 | usize::from(*byte));
+            (2 + octets + length, 2 + octets)
         }
-        pem.push_str("-----END PRIVATE KEY-----\n");
-        pem
+    }
+
+    /// The elements inside the SEQUENCE `der`.
+    fn elements_of(der: &[u8]) -> Vec<&[u8]> {
+        let (_, header) = element(der);
+        let mut rest = &der[header..];
+        let mut elements = Vec::new();
+        while !rest.is_empty() {
+            let (length, _) = element(rest);
+            elements.push(&rest[..length]);
+            rest = &rest[length..];
+        }
+        elements
+    }
+
+    /// A DER element of `tag` around `contents`.
+    fn encode_element(tag: u8, contents: &[u8]) -> Vec<u8> {
+        let mut out = vec![tag];
+        match contents.len() {
+            length @ 0..=0x7f => out.push(u8::try_from(length).unwrap()),
+            length @ 0x80..=0xff => out.extend([0x81, u8::try_from(length).unwrap()]),
+            length => out.extend([
+                0x82,
+                u8::try_from(length >> 8).unwrap(),
+                u8::try_from(length & 0xff).unwrap(),
+            ]),
+        }
+        out.extend_from_slice(contents);
+        out
+    }
+
+    /// The AlgorithmIdentifier `{ rsaEncryption, NULL }`.
+    const RSA_ENCRYPTION: [u8; 15] = [
+        0x30, 0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01, 0x05, 0x00,
+    ];
+
+    /// PKCS#1 PEM → PKCS#8 PEM: `SEQUENCE { INTEGER 0, AlgorithmIdentifier
+    /// { rsaEncryption, NULL }, OCTET STRING <PKCS#1 DER> }`.
+    fn pkcs8(pkcs1_pem: &str) -> String {
+        let version = [0x02, 0x01, 0x00];
+        let key = encode_element(0x04, &der_of(pkcs1_pem));
+        pem_of(
+            "PRIVATE KEY",
+            &encode_element(0x30, &[&version[..], &RSA_ENCRYPTION, &key].concat()),
+        )
     }
 }
 
@@ -708,7 +1138,9 @@ async fn a_hanging_metadata_server_times_out() {
     match error {
         GcpAuthError::Request { reason, endpoint } => {
             assert_eq!(reason, "timed out");
-            assert!(endpoint.contains(METADATA_TOKEN_PATH), "{endpoint}");
+            // The origin only (v0.10.0; the path was shown before).
+            assert_eq!(endpoint, server.uri());
+            assert!(!endpoint.contains(METADATA_TOKEN_PATH), "{endpoint}");
         }
         other => panic!("expected a Request error, got {other:?}"),
     }
@@ -739,7 +1171,9 @@ async fn a_hanging_token_endpoint_times_out_at_the_token_timeout() {
     match error {
         GcpAuthError::Request { reason, endpoint } => {
             assert_eq!(reason, "timed out");
-            assert!(endpoint.contains(USER_TOKEN_PATH), "{endpoint}");
+            // The origin only (v0.10.0; the path was shown before).
+            assert_eq!(endpoint, server.uri());
+            assert!(!endpoint.contains(USER_TOKEN_PATH), "{endpoint}");
         }
         other => panic!("expected Request, got {other:?}"),
     }
@@ -1120,6 +1554,123 @@ async fn a_refused_redirect_never_leaks_its_target() {
     assert!(!rendered.contains("attacker"), "{rendered}");
 }
 
+/// The OAuth `error` a refused exchange stores, and so what `Display` and
+/// the derived `Debug` show: a listed code as itself, any other `error`
+/// string as `other`. Before v0.10.0 any plain `[A-Za-z0-9_.-]{1,64}` code
+/// passed through, so `canary_plain_code` is the behaviour change.
+#[tokio::test]
+async fn an_oauth_error_is_shown_only_from_the_list() {
+    let server = MockServer::start().await;
+    let cases = [
+        ("/listed", "invalid_grant", "invalid_grant"),
+        ("/scope", "invalid_scope", "invalid_scope"),
+        ("/plain", "canary_plain_code", "other"),
+        ("/case", "Invalid_Grant_CANARY", "other"),
+        ("/dotted", "canary.code-1", "other"),
+    ];
+    for (route, code, _) in cases {
+        Mock::given(method("POST"))
+            .and(path(route))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({"error": code})))
+            .mount(&server)
+            .await;
+    }
+    for (route, code, shown) in cases {
+        let error = user_provider(&authorized_user())
+            .with_options(
+                TokenOptions::default().default_token_uri(format!("{}{route}", server.uri())),
+            )
+            .token()
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "access token request to {} answered HTTP 400: {shown}",
+                server.uri()
+            ),
+            "{code}"
+        );
+        let debug = format!("{error:?} {error:#?}");
+        assert!(debug.contains(&format!(r#"detail: "{shown}""#)), "{debug}");
+        assert!(!debug.to_lowercase().contains("canary"), "{debug}");
+    }
+}
+
+/// Every token-endpoint failure names the endpoint by its origin alone,
+/// `scheme://host[:port]`, in `Display` and the derived `Debug`: a path that
+/// holds a secret never reaches either (v0.10.0; the path was shown before).
+/// The `service_account` module drives the same through a key file's
+/// `token_uri`, where the path really comes from.
+#[tokio::test]
+async fn a_token_endpoint_is_shown_by_its_origin_alone() {
+    let (_server, endpoints) = path_canary_endpoints().await;
+    for (uri, origin) in endpoints {
+        let error = user_provider(&authorized_user())
+            .with_options(TokenOptions::default().default_token_uri(&uri))
+            .token()
+            .await
+            .unwrap_err();
+        assert_origin_only(&error, &origin);
+    }
+}
+
+/// Three token endpoints whose path carries a canary, each with the origin
+/// an error may name: one that refuses the exchange (`400 invalid_grant`),
+/// one that answers an unusable token, and one nothing listens on (a query
+/// too). Keep the server alive while they are used.
+async fn path_canary_endpoints() -> (MockServer, [(String, String); 3]) {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/refused/PATH-CANARY"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({"error": "invalid_grant"})))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/unusable/PATH-CANARY"))
+        .respond_with(token_body(ACCESS_TOKEN, json!("never")))
+        .mount(&server)
+        .await;
+    let closed = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let endpoints = [
+        (
+            format!("{}/refused/PATH-CANARY", server.uri()),
+            server.uri(),
+        ),
+        (
+            format!("{}/unusable/PATH-CANARY", server.uri()),
+            server.uri(),
+        ),
+        (
+            format!("http://{closed}/token/PATH-CANARY?key=CANARY"),
+            format!("http://{closed}"),
+        ),
+    ];
+    (server, endpoints)
+}
+
+/// `error` names its endpoint as exactly `origin`, and no rendering of it
+/// carries a canary.
+fn assert_origin_only(error: &GcpAuthError, origin: &str) {
+    let endpoint = match error {
+        GcpAuthError::Request { endpoint, .. }
+        | GcpAuthError::Status { endpoint, .. }
+        | GcpAuthError::InvalidResponse { endpoint, .. } => endpoint,
+        other => panic!("expected an endpoint error, got {other:?}"),
+    };
+    assert_eq!(endpoint, origin);
+    let rendered = format!("{error} | {error:?} | {error:#?}");
+    assert!(!rendered.contains("CANARY"), "{rendered}");
+    assert!(
+        rendered.contains(&format!("request to {origin} "))
+            || rendered.contains(&format!("response from {origin} ")),
+        "{rendered}"
+    );
+}
+
 const CANARIES: &[&str] = &[CLIENT_SECRET, REFRESH_TOKEN, ACCESS_TOKEN, "CANARY"];
 
 fn assert_clean(what: &str, rendered: &str) {
@@ -1196,8 +1747,10 @@ async fn no_secret_reaches_an_error_or_a_debug() {
 
     let hostile = user_at("/hostile-code").token().await.unwrap_err();
     assert_error_clean("a hostile error code", &hostile);
+    // An `error` off the list is `other` (v0.10.0: it was dropped, an empty
+    // detail, before).
     assert!(
-        hostile.to_string().ends_with("answered HTTP 400"),
+        hostile.to_string().ends_with("answered HTTP 400: other"),
         "{hostile}"
     );
 

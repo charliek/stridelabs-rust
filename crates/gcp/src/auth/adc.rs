@@ -15,6 +15,7 @@ use serde_json::{Map, Value};
 use super::error::GcpAuthError;
 use super::user::AuthorizedUser;
 use super::{CredentialSource, Source};
+use crate::util::{listed_code, OTHER_CODE};
 
 /// The env var naming a credential file (google-auth's `CREDENTIALS`).
 pub const GOOGLE_APPLICATION_CREDENTIALS: &str = "GOOGLE_APPLICATION_CREDENTIALS";
@@ -156,13 +157,16 @@ fn non_empty(value: Option<String>) -> Option<String> {
     value.filter(|value| !value.trim().is_empty())
 }
 
-/// An `io::Error`'s kind and OS message ("Permission denied (os error 13)"),
-/// which name the failure and nothing of the file.
-fn read_failure(error: &io::Error) -> String {
-    if error.kind() == io::ErrorKind::NotFound {
-        "the file does not exist".to_owned()
-    } else {
-        format!("the file cannot be read: {error}")
+/// A failed read as a fixed phrase chosen by its `io::ErrorKind`. Never the
+/// error's own text: an [`AdcEnvironment`] other than [`ProcessEnvironment`]
+/// can return any message (`io::Error::other("…")`), and it would reach the
+/// error's `Display` and `Debug`.
+fn read_failure(error: &io::Error) -> &'static str {
+    match error.kind() {
+        io::ErrorKind::NotFound => "the file does not exist",
+        io::ErrorKind::PermissionDenied => "the file cannot be read: permission denied",
+        io::ErrorKind::IsADirectory => "the file cannot be read: it is a directory",
+        _ => "the file cannot be read",
     }
 }
 
@@ -217,8 +221,8 @@ pub(crate) fn parse_credentials(
         "service_account" => service_account(&fields)?,
         other => {
             return Err(GcpAuthError::Unsupported(format!(
-                "credential type \"{}\" in {origin} is not supported (supported: service_account, authorized_user)",
-                quotable_type(other)
+                "credential type {} in {origin} is not supported (supported: service_account, authorized_user)",
+                shown_type(other)
             )))
         }
     };
@@ -228,18 +232,26 @@ pub(crate) fn parse_credentials(
     })
 }
 
-/// A credential `type` as it may appear in an error: itself when it is a
-/// plain `[a-z_]{1,64}` name (`external_account`, …), else a placeholder —
-/// a file whose `type` is something else may not be what it claims at all.
-fn quotable_type(kind: &str) -> &str {
-    let plain = (1..=64).contains(&kind.len())
-        && kind
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte == b'_');
-    if plain {
-        kind
-    } else {
-        "<unrecognized>"
+/// The credential `type`s google-auth knows (`google.auth._default`'s
+/// `_*_TYPE` constants): the two this crate supports, and the four it does
+/// not. An error names only these.
+const KNOWN_CREDENTIAL_TYPES: [&str; 6] = [
+    "service_account",
+    "authorized_user",
+    "external_account",
+    "external_account_authorized_user",
+    "impersonated_service_account",
+    "gdch_service_account",
+];
+
+/// A credential `type` as an error may name it: quoted, as the allow-list's
+/// own literal, when google-auth knows it (`"external_account"`), else a bare
+/// [`OTHER_CODE`]. A file whose `type` is something else may not be a
+/// credential at all, so its `type` is never echoed.
+fn shown_type(kind: &str) -> String {
+    match listed_code(kind, &KNOWN_CREDENTIAL_TYPES) {
+        OTHER_CODE => OTHER_CODE.to_owned(),
+        known => format!("\"{known}\""),
     }
 }
 
@@ -289,6 +301,16 @@ impl Fields<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_known_type_is_named() {
+        for kind in KNOWN_CREDENTIAL_TYPES {
+            assert_eq!(shown_type(kind), format!("\"{kind}\""));
+        }
+        for kind in ["", "made_up", "CANARY", "External_Account", "other", "a\nb"] {
+            assert_eq!(shown_type(kind), "other", "{kind:?}");
+        }
+    }
 
     #[test]
     fn base64_tolerates_wrapping_and_missing_padding() {

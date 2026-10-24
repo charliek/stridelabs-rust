@@ -54,9 +54,11 @@
 //! # Upload options
 //!
 //! [`GcsClient::upload_with`] takes [`UploadOptions`]: a `customTime`, a
-//! `cacheControl` and an `ifGenerationMatch` precondition. With none set it
-//! is [`GcsClient::upload`]'s media upload, on the wire byte for byte. With
-//! any set it is a **multipart** upload
+//! `cacheControl`, an `ifGenerationMatch` precondition and a CRC32C
+//! checksum. With none set it is [`GcsClient::upload`]'s media upload, on
+//! the wire byte for byte. With only the checksum set it is that media
+//! upload plus one header, `X-Goog-Hash: crc32c=…` (below). With any other
+//! option set it is a **multipart** upload
 //! (`POST {base}/upload/storage/v1/b/{bucket}/o?uploadType=multipart[&ifGenerationMatch=N]`,
 //! `Content-Type: multipart/related; boundary=…`), the JSON API's one-request
 //! way to create an object together with its metadata:
@@ -65,7 +67,7 @@
 //! --{boundary}\r\n
 //! Content-Type: application/json; charset=UTF-8\r\n
 //! \r\n
-//! {"name":…,"contentType":…[,"customTime":…][,"cacheControl":…]}\r\n
+//! {"name":…,"contentType":…[,"customTime":…][,"cacheControl":…][,"crc32c":…]}\r\n
 //! --{boundary}\r\n
 //! Content-Type: {content_type}\r\n
 //! \r\n
@@ -88,6 +90,29 @@
 //! A precondition that fails is GCS's 412, which is [`StorageError::Status`]
 //! like any non-2xx answer: nothing retries it (a retry policy included) or
 //! falls back to an upload that could overwrite.
+//!
+//! ## CRC32C (opt-in)
+//!
+//! [`UploadOptions::with_crc32c`] sends the caller's CRC32C of the bytes,
+//! base64 of its four big-endian bytes, the way Google documents for the
+//! JSON API ("Data validation and change detection"): on a media upload, in
+//! the `X-Goog-Hash: crc32c=<b64>` header; on a multipart upload, as the
+//! metadata's `crc32c` field. GCS checks it against the bytes it received
+//! and refuses a mismatch with a `400` ([`StorageError::Status`], never
+//! retried), so no object is written from bytes the checksum was not
+//! computed over. A checksum alone keeps the media upload; it never makes
+//! an upload multipart.
+//!
+//! **What was verified, and what was not** (stridelabs-rust v0.10.0, against
+//! fake-gcs-server 1.56.1; never against real GCS):
+//!
+//! - the **multipart** form is verified: fake-gcs-server refuses a wrong
+//!   `crc32c` with a `400` and writes nothing, and accepts the right one;
+//! - the **media-upload header** form is **UNVERIFIED**: fake-gcs-server
+//!   ignores `X-Goog-Hash` on a media upload (it stores the object, wrong
+//!   checksum or not), so only Google's documentation says GCS checks it.
+//!   Until it is verified against real GCS, a service that needs the
+//!   checksum enforced should not rely on the header form.
 //!
 //! # Emulators
 //!
@@ -391,8 +416,10 @@ pub enum StorageError {
         operation: &'static str,
         /// The HTTP status code.
         status: u16,
-        /// Google's `error.status` (`PERMISSION_DENIED`, …), when the body
-        /// is Google's envelope and it is a plain code. Safe to log.
+        /// Google's `error.status`, when the body is Google's envelope and
+        /// carries one: one of google.rpc.Code's 17 names
+        /// (`PERMISSION_DENIED`, …), or `other` for any other string. Safe
+        /// to log.
         google_status: Option<String>,
         /// Google's `error.message`: may name the object, so not for
         /// routine logging. Its `Debug` prints only its length.
@@ -430,8 +457,9 @@ impl StorageError {
 /// [`GcsClient::upload_with`].
 ///
 /// `UploadOptions::default()` sets nothing, and the upload is
-/// [`GcsClient::upload`]'s media upload; any option set makes it a multipart
-/// upload (see [the module docs](self#upload-options)).
+/// [`GcsClient::upload`]'s media upload; a CRC32C alone keeps it a media
+/// upload, and any other option set makes it a multipart upload (see
+/// [the module docs](self#upload-options)).
 ///
 /// ```
 /// use std::time::{Duration, SystemTime};
@@ -440,7 +468,8 @@ impl StorageError {
 /// let options = UploadOptions::default()
 ///     .with_custom_time(SystemTime::now() - Duration::from_secs(335 * 86_400))
 ///     .with_if_generation_match(0) // create only: never overwrite
-///     .with_cache_control("private, max-age=86400");
+///     .with_cache_control("private, max-age=86400")
+///     .with_crc32c(0xE306_9283); // the CRC32C of the bytes, computed by the caller
 /// ```
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
@@ -459,6 +488,17 @@ pub struct UploadOptions {
     /// served `public, max-age=3600`: any cache, Google's edge included, may
     /// keep it an hour, deleted or not.
     pub cache_control: Option<String>,
+    /// The CRC32C (Castagnoli, RFC 4960 Appendix B: what GCS reports as an
+    /// object's `crc32c`) of the bytes uploaded, computed by the caller,
+    /// e.g. with the `crc32c` crate (`crc32c::crc32c(&bytes)`). GCS refuses
+    /// the upload with a `400` when it does not match what arrived. Sent as
+    /// base64 of its big-endian bytes: in `X-Goog-Hash: crc32c=…` on a
+    /// media upload, as the metadata's `crc32c` on a multipart one.
+    ///
+    /// **Only the multipart form is verified** (against fake-gcs-server);
+    /// the media-upload header is **unverified**: see
+    /// [the module docs](self#crc32c-opt-in).
+    pub crc32c: Option<u32>,
 }
 
 impl UploadOptions {
@@ -483,14 +523,24 @@ impl UploadOptions {
         self
     }
 
-    /// Nothing set: the upload is a media upload.
-    fn is_empty(&self) -> bool {
+    /// Set [`UploadOptions::crc32c`].
+    #[must_use]
+    pub fn with_crc32c(mut self, crc32c: u32) -> UploadOptions {
+        self.crc32c = Some(crc32c);
+        self
+    }
+
+    /// Whether the upload must be multipart: an option set that a media
+    /// upload cannot carry. A CRC32C is not one: a media upload carries it
+    /// in a header.
+    fn needs_multipart(&self) -> bool {
         let UploadOptions {
             custom_time,
             if_generation_match,
             cache_control,
+            crc32c: _,
         } = self;
-        custom_time.is_none() && if_generation_match.is_none() && cache_control.is_none()
+        custom_time.is_some() || if_generation_match.is_some() || cache_control.is_some()
     }
 }
 
@@ -630,6 +680,20 @@ impl GcsClient {
         bytes: Bytes,
         content_type: &str,
     ) -> Result<(), StorageError> {
+        self.media_upload(bucket, object, bytes, content_type, None)
+            .await
+    }
+
+    /// [`GcsClient::upload`]'s media upload, with `X-Goog-Hash:
+    /// crc32c=<b64>` when there is a checksum.
+    async fn media_upload(
+        &self,
+        bucket: &str,
+        object: &str,
+        bytes: Bytes,
+        content_type: &str,
+        crc32c: Option<u32>,
+    ) -> Result<(), StorageError> {
         const OP: &str = "upload";
         validate_bucket_name(bucket)?;
         self.names.check(object, Carried::Value)?;
@@ -639,18 +703,25 @@ impl GcsClient {
             encode_component(bucket),
             encode_component(object)
         );
+        let hash = crc32c.map(|crc32c| format!("crc32c={}", crc32c_base64(crc32c)));
         let build = || {
-            self.http
+            let request = self
+                .http
                 .post(&url)
                 .header(reqwest::header::CONTENT_TYPE, content_type)
-                .body(bytes.clone())
+                .body(bytes.clone());
+            match &hash {
+                Some(hash) => request.header("x-goog-hash", hash),
+                None => request,
+            }
         };
         self.succeeds(OP, build).await
     }
 
-    /// Write `bytes` to `object` in `bucket` with `options`' metadata and
-    /// precondition: with none set, exactly [`GcsClient::upload`]'s media
-    /// upload; otherwise one multipart upload
+    /// Write `bytes` to `object` in `bucket` with `options`' metadata,
+    /// precondition and checksum: with none set, exactly
+    /// [`GcsClient::upload`]'s media upload; with only a CRC32C, that media
+    /// upload plus its `X-Goog-Hash` header; otherwise one multipart upload
     /// (`POST {base}/upload/storage/v1/b/{bucket}/o?uploadType=multipart[&ifGenerationMatch=N]`)
     /// whose metadata part names the object and its content type, and the
     /// options set (see [the module docs](self#upload-options)). Without an
@@ -662,8 +733,9 @@ impl GcsClient {
     ///
     /// # Errors
     ///
-    /// With no options set, exactly [`GcsClient::upload`]'s. Otherwise an
-    /// invalid name, or [`StorageError::InvalidArgument`] for a content type,
+    /// With no option set, or only a CRC32C, exactly [`GcsClient::upload`]'s
+    /// (a checksum GCS finds wrong is its `400`, [`StorageError::Status`]).
+    /// Otherwise an invalid name, or [`StorageError::InvalidArgument`] for a content type,
     /// cache control, custom time or generation it cannot send — in every
     /// case before a token is fetched or anything is sent (the content type
     /// is written into the multipart body by hand, so it is checked here
@@ -679,10 +751,13 @@ impl GcsClient {
         options: &UploadOptions,
     ) -> Result<(), StorageError> {
         const OP: &str = "upload";
-        // No options: `upload` itself, so every input it accepts (and every
-        // one it refuses) behaves the same here.
-        if options.is_empty() {
-            return self.upload(bucket, object, bytes, content_type).await;
+        // Nothing a media upload cannot carry: `upload` itself (plus the
+        // checksum's header), so every input it accepts (and every one it
+        // refuses) behaves the same here.
+        if !options.needs_multipart() {
+            return self
+                .media_upload(bucket, object, bytes, content_type, options.crc32c)
+                .await;
         }
         validate_bucket_name(bucket)?;
         self.names.check(object, Carried::Value)?;
@@ -1012,6 +1087,8 @@ struct ObjectMetadata<'a> {
     custom_time: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cache_control: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    crc32c: Option<String>,
 }
 
 /// `object`'s metadata part, with `options`' fields checked first.
@@ -1034,11 +1111,19 @@ fn metadata_json(
         content_type,
         custom_time,
         cache_control,
+        crc32c: options.crc32c.map(crc32c_base64),
     })
     // Strings and nothing else: serializing cannot fail.
     .map_err(|_| StorageError::InvalidArgument {
         reason: "the object metadata could not be serialized",
     })
+}
+
+/// A CRC32C as GCS writes one: base64 (standard, padded) of its four
+/// big-endian bytes, so always 8 characters.
+fn crc32c_base64(crc32c: u32) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(crc32c.to_be_bytes())
 }
 
 /// The latest instant RFC 3339's four-digit year can write,
@@ -1409,10 +1494,39 @@ mod tests {
             metadata_json("o", "image/png", &UploadOptions::default()).unwrap(),
             br#"{"name":"o","contentType":"image/png"}"#
         );
-        assert!(UploadOptions::default().is_empty());
-        assert!(!UploadOptions::default()
-            .with_if_generation_match(0)
-            .is_empty());
+        assert_eq!(
+            String::from_utf8(
+                metadata_json("o", "image/png", &options.clone().with_crc32c(0xE306_9283)).unwrap()
+            )
+            .unwrap(),
+            r#"{"name":"o","contentType":"image/png","customTime":"2025-10-09T08:53:20Z","cacheControl":"private, max-age=86400","crc32c":"4waSgw=="}"#
+        );
+        assert!(!UploadOptions::default().needs_multipart());
+        assert!(!UploadOptions::default().with_crc32c(0).needs_multipart());
+        for multipart in [
+            UploadOptions::default().with_if_generation_match(0),
+            UploadOptions::default().with_cache_control("no-store"),
+            UploadOptions::default().with_custom_time(UNIX_EPOCH),
+        ] {
+            assert!(multipart.needs_multipart(), "{multipart:?}");
+            assert!(multipart.with_crc32c(0).needs_multipart());
+        }
+    }
+
+    /// CRC-32C's catalogue check value (`"123456789"` → `0xE3069283`) and
+    /// the edges, as base64 of the big-endian bytes: what GCS writes as
+    /// `crc32c` (`4waSgw==` is what fake-gcs-server reports for those nine
+    /// bytes).
+    #[test]
+    fn a_crc32c_is_base64_of_its_big_endian_bytes() {
+        for (crc32c, encoded) in [
+            (0xE306_9283, "4waSgw=="),
+            (0, "AAAAAA=="),
+            (u32::MAX, "/////w=="),
+            (0x0000_0001, "AAAAAQ=="),
+        ] {
+            assert_eq!(crc32c_base64(crc32c), encoded, "{crc32c:#x}");
+        }
     }
 
     #[test]

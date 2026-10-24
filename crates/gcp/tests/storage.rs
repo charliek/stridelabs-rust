@@ -319,6 +319,43 @@ async fn an_error_logs_only_statuses_and_keeps_the_message_apart() {
     assert!(!format!("{error:?}").contains("CANARY"));
 }
 
+/// The `error.status` a GCS `Status` stores, and so what `Display` and the
+/// derived `Debug` show: one of google.rpc.Code's names as itself, any other
+/// string as `other` (v0.10.0: a plain code like `CANARY_STATUS` passed
+/// through before).
+#[tokio::test]
+async fn an_error_status_is_shown_only_from_the_list() {
+    for (status, shown) in [
+        ("PERMISSION_DENIED", "PERMISSION_DENIED"),
+        ("CANARY_STATUS", "other"),
+        ("permission_denied", "other"),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(403).set_body_json(json!({
+                "error": {"code": 403, "status": status, "message": "denied"}
+            })))
+            .mount(&server)
+            .await;
+        let error = authorized_client(&server)
+            .await
+            .delete(BUCKET, OBJECT)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!("GCS delete answered HTTP 403 ({shown})"),
+            "{status}"
+        );
+        let debug = format!("{error:?} {error:#?}");
+        assert!(
+            debug.contains(&format!(r#"google_status: Some("{shown}")"#)),
+            "{debug}"
+        );
+        assert!(!debug.to_lowercase().contains("canary"), "{debug}");
+    }
+}
+
 #[tokio::test]
 async fn an_emulator_without_tokens_sends_no_authorization() {
     let server = MockServer::start().await;
@@ -637,6 +674,312 @@ async fn each_option_alone_and_together_is_one_exact_multipart_upload() {
             "{case}"
         );
     }
+}
+
+// --- crc32c --------------------------------------------------------------------
+
+/// CRC-32C's catalogue check value: the checksum of `CHECKED`, and what GCS
+/// (and fake-gcs-server) writes as its `crc32c`, base64 of the big-endian
+/// bytes.
+const CHECKED: &[u8] = b"123456789";
+const CHECKED_CRC32C: u32 = 0xE306_9283;
+const CHECKED_CRC32C_B64: &str = "4waSgw==";
+
+/// A CRC32C alone keeps the media upload: the same request as `upload`,
+/// plus `X-Goog-Hash: crc32c=<base64 big-endian>`, the JSON API's
+/// documented form for a media upload. Never multipart.
+#[tokio::test]
+async fn a_crc32c_alone_is_the_media_upload_plus_its_hash_header() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(format!("/upload/storage/v1/b/{BUCKET}/o")))
+        .and(query_param("uploadType", "media"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"name": OBJECT})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let gcs = authorized_client(&server).await;
+
+    gcs.upload_with(
+        BUCKET,
+        OBJECT,
+        Bytes::from_static(CHECKED),
+        "text/plain",
+        &UploadOptions::default().with_crc32c(CHECKED_CRC32C),
+    )
+    .await
+    .expect("uploaded");
+
+    let request = the_request(&server, "/upload/").await;
+    assert_eq!(
+        request.url.query(),
+        Some(format!("uploadType=media&name={ENCODED}").as_str())
+    );
+    assert_eq!(
+        request.body, CHECKED,
+        "the bytes alone, as upload sends them"
+    );
+    assert_eq!(
+        header_of(&request, "content-type").as_deref(),
+        Some("text/plain")
+    );
+    assert_eq!(
+        header_of(&request, "x-goog-hash"),
+        Some(format!("crc32c={CHECKED_CRC32C_B64}"))
+    );
+    assert_eq!(
+        request.headers.get_all("x-goog-hash").iter().count(),
+        1,
+        "one hash header"
+    );
+    assert_eq!(
+        header_of(&request, "authorization").as_deref(),
+        Some("Bearer gcs-token")
+    );
+    server.verify().await;
+}
+
+/// Without a CRC32C nothing carries a hash: `upload`, `upload_with`'s
+/// default options and a multipart upload send no `X-Goog-Hash`, and the
+/// multipart metadata no `crc32c`.
+#[tokio::test]
+async fn without_a_crc32c_no_hash_is_sent() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"name": OBJECT})))
+        .mount(&server)
+        .await;
+    let gcs = authorized_client(&server).await;
+    let bytes = || Bytes::from_static(CHECKED);
+    gcs.upload(BUCKET, OBJECT, bytes(), "text/plain")
+        .await
+        .unwrap();
+    for options in [
+        UploadOptions::default(),
+        UploadOptions::default().with_cache_control("no-store"),
+    ] {
+        gcs.upload_with(BUCKET, OBJECT, bytes(), "text/plain", &options)
+            .await
+            .unwrap();
+    }
+    let uploads: Vec<Request> = server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|request| request.url.path().starts_with("/upload/"))
+        .collect();
+    assert_eq!(uploads.len(), 3);
+    for request in uploads {
+        assert_eq!(header_of(&request, "x-goog-hash"), None, "{}", request.url);
+        assert!(
+            !contains(&request.body, b"crc32c"),
+            "{}",
+            String::from_utf8_lossy(&request.body)
+        );
+    }
+}
+
+/// With an option a media upload cannot carry, the upload is multipart and
+/// the CRC32C rides in its metadata (`"crc32c":"<base64 big-endian>"`, the
+/// JSON API's documented form for a multipart upload), last; no header.
+#[tokio::test]
+async fn a_crc32c_with_another_option_is_the_multipart_metadatas_crc32c() {
+    let server = multipart_server().await;
+    let gcs = authorized_client(&server).await;
+
+    gcs.upload_with(
+        BUCKET,
+        OBJECT,
+        Bytes::from_static(MEDIA),
+        "image/png",
+        &UploadOptions::default()
+            .with_crc32c(CHECKED_CRC32C)
+            .with_if_generation_match(0)
+            .with_cache_control("no-store"),
+    )
+    .await
+    .expect("uploaded");
+
+    let request = the_request(&server, "/upload/").await;
+    assert_eq!(
+        request.url.query(),
+        Some("uploadType=multipart&ifGenerationMatch=0")
+    );
+    let metadata = format!(
+        r#"{{"name":"a/b c.png","contentType":"image/png","cacheControl":"no-store","crc32c":"{CHECKED_CRC32C_B64}"}}"#
+    );
+    assert_eq!(
+        request.body,
+        multipart(&boundary_of(&request), &metadata, "image/png", MEDIA),
+        "{}",
+        String::from_utf8_lossy(&request.body)
+    );
+    assert_eq!(header_of(&request, "x-goog-hash"), None);
+}
+
+/// GCS's answer to a checksum it finds wrong is a `400`: a `Status`, sent
+/// once, never retried (under a retry policy too), whichever form carried
+/// it.
+#[tokio::test]
+async fn a_checksum_gcs_refuses_is_one_400() {
+    for options in [
+        UploadOptions::default().with_crc32c(0),
+        UploadOptions::default()
+            .with_crc32c(0)
+            .with_if_generation_match(0),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(format!("/upload/storage/v1/b/{BUCKET}/o")))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "error": {"code": 400, "message": "Provided CRC32C \"AAAAAA==\" doesn't match"}
+            })))
+            .mount(&server)
+            .await;
+        // A retrying client, capped so a regression costs three requests,
+        // not a deadline's worth.
+        let gcs = authorized_client(&server)
+            .await
+            .with_retry(ms_policy().with_max_attempts(3));
+
+        let error = gcs
+            .upload_with(
+                BUCKET,
+                OBJECT,
+                Bytes::from_static(CHECKED),
+                "text/plain",
+                &options,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, StorageError::Status { status: 400, .. }),
+            "{options:?}: {error:?}"
+        );
+        let _ = the_request(&server, "/upload/").await;
+    }
+}
+
+/// **The emulator check** (`#[ignore]`d: it needs a running
+/// fake-gcs-server, never real GCS). Run it with
+/// `STRIDELABS_FAKE_GCS_URL=http://localhost:4443 cargo test -p
+/// stridelabs-gcp --test storage -- --ignored crc32c_against_fake_gcs_server`.
+/// It creates a scratch bucket, `stridelabs-crc32c-test-<random>`, and
+/// deletes it.
+///
+/// - **The multipart form is verified**: a right `crc32c` is stored, a
+///   wrong one is a `400` and writes nothing (the negative control).
+/// - **The media-upload header form is not**: fake-gcs-server (1.56.1)
+///   never reads `X-Goog-Hash` on a media upload, so a wrong checksum is
+///   stored all the same. That is pinned here, so that the day the emulator
+///   starts checking it this test fails, and the docs' UNVERIFIED note can
+///   be revisited.
+#[tokio::test]
+#[ignore = "needs a fake-gcs-server: STRIDELABS_FAKE_GCS_URL"]
+async fn crc32c_against_fake_gcs_server() {
+    let Ok(base) = std::env::var("STRIDELABS_FAKE_GCS_URL") else {
+        panic!(
+            "STRIDELABS_FAKE_GCS_URL is not set: point it at a fake-gcs-server \
+             (e.g. http://localhost:4443, `-scheme http`); this test never runs against real GCS"
+        );
+    };
+    let base = base.trim_end_matches('/').to_owned();
+    let http = reqwest::Client::new();
+    let bucket = format!("stridelabs-crc32c-test-{:08x}", rand::random::<u32>());
+    let created = http
+        .post(format!("{base}/storage/v1/b"))
+        .json(&json!({"name": bucket}))
+        .send()
+        .await
+        .expect("the emulator answers");
+    assert!(
+        created.status().is_success(),
+        "create {bucket}: {}",
+        created.status()
+    );
+
+    let gcs = GcsClient::emulator(http.clone(), &base, None);
+    let upload = |object: &'static str, options: UploadOptions| {
+        let gcs = gcs.clone();
+        let bucket = bucket.clone();
+        async move {
+            gcs.upload_with(
+                &bucket,
+                object,
+                Bytes::from_static(CHECKED),
+                "text/plain",
+                &options,
+            )
+            .await
+        }
+    };
+    let multipart = || UploadOptions::default().with_cache_control("no-store");
+    let wrong = CHECKED_CRC32C ^ 1;
+
+    let multipart_right = upload("multipart-right", multipart().with_crc32c(CHECKED_CRC32C)).await;
+    let multipart_wrong = upload("multipart-wrong", multipart().with_crc32c(wrong)).await;
+    let media_right = upload(
+        "media-right",
+        UploadOptions::default().with_crc32c(CHECKED_CRC32C),
+    )
+    .await;
+    let media_wrong = upload("media-wrong", UploadOptions::default().with_crc32c(wrong)).await;
+    let mut stored = Vec::new();
+    for object in [
+        "multipart-right",
+        "multipart-wrong",
+        "media-right",
+        "media-wrong",
+    ] {
+        stored.push(
+            gcs.download(&bucket, object)
+                .await
+                .expect("a download")
+                .map(|(bytes, _)| bytes),
+        );
+    }
+
+    // Clean up before asserting, so a failure leaves no bucket behind.
+    for object in [
+        "multipart-right",
+        "multipart-wrong",
+        "media-right",
+        "media-wrong",
+    ] {
+        gcs.delete(&bucket, object).await.expect("a delete");
+    }
+    let deleted = http
+        .delete(format!("{base}/storage/v1/b/{bucket}"))
+        .send()
+        .await
+        .expect("the emulator answers");
+    assert!(
+        deleted.status().is_success(),
+        "delete {bucket}: {}",
+        deleted.status()
+    );
+
+    multipart_right.expect("a right crc32c in the multipart metadata is accepted");
+    assert_eq!(stored[0].as_deref(), Some(CHECKED));
+    assert!(
+        matches!(
+            multipart_wrong,
+            Err(StorageError::Status { status: 400, .. })
+        ),
+        "a wrong crc32c in the multipart metadata is refused: {multipart_wrong:?}"
+    );
+    assert_eq!(stored[1], None, "and nothing was written");
+    media_right.expect("a right X-Goog-Hash on a media upload is accepted");
+    assert_eq!(stored[2].as_deref(), Some(CHECKED));
+    // The emulator ignores the header: the reason the header form is
+    // documented as UNVERIFIED. If this fails, it checks it now.
+    assert!(
+        media_wrong.is_ok(),
+        "fake-gcs-server now refuses a wrong X-Goog-Hash on a media upload ({media_wrong:?}): \
+         the header form can be verified; update the README and the CHANGELOG"
+    );
+    assert_eq!(stored[3].as_deref(), Some(CHECKED));
 }
 
 /// The name is a JSON string in the metadata part, escaped by serde_json:
