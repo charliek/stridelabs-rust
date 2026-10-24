@@ -1,4 +1,5 @@
-//! [`neon_pooler`]: whether a connection reaches Neon's pooled endpoint.
+//! [`neon_pooler`]: whether a connection reaches Neon's pooled endpoint, and
+//! [`neon_pooler_url`]: whether a URL names it anywhere.
 //!
 //! A transaction pooler (Neon's `-pooler` endpoint, PgBouncer in transaction
 //! mode) hands each transaction a different server session, so anything
@@ -12,6 +13,7 @@ use std::fmt;
 
 use percent_encoding::percent_decode_str;
 use sqlx::postgres::PgConnectOptions;
+use url::Url;
 
 use crate::connect::{pg_split_opts, split_options};
 
@@ -66,8 +68,8 @@ impl fmt::Display for PoolerRef {
 ///
 /// Detection only: refusing is the caller's decision. A caller that wants to
 /// refuse an ambiguous URL as well (a pooler named in the URL's authority
-/// but redirected elsewhere by `?host=`, which sqlx would never dial) applies
-/// [`neon_pooler_host`] to those parts itself.
+/// but redirected elsewhere by `?host=`, which sqlx would never dial) uses
+/// [`neon_pooler_url`].
 ///
 /// ```
 /// use stridelabs_postgres::{connect_options, neon_pooler, PoolerRef};
@@ -86,6 +88,68 @@ impl fmt::Display for PoolerRef {
 /// ```
 pub fn neon_pooler(options: &PgConnectOptions) -> Option<PoolerRef> {
     neon_pooler_host(options.get_host()).or_else(|| options.get_options().and_then(pooler_endpoint))
+}
+
+/// [`neon_pooler`], plus every host the URL names that sqlx will NOT dial:
+/// whether `url` reaches Neon's pooled endpoint, or names it anywhere a
+/// reader could take it to.
+///
+/// sqlx (like libpq) dials the last `?host=` or `?hostaddr=` instead of the
+/// URL's authority, so `ep-x-pooler.example.com/db?host=127.0.0.1` dials
+/// `127.0.0.1` and [`neon_pooler`] finds nothing. Such a URL is ambiguous:
+/// whoever wrote it may have meant the pooler, and the next edit (dropping
+/// the parameter) reaches it. So this also reads, through
+/// [`neon_pooler_host`], the URL's authority (as is and percent-decoded) and
+/// every `host` query value, dialled or not. (`hostaddr` values need no
+/// reading: [`connect_options`](crate::connect_options) accepts only an IP
+/// address there, which has no label.) A host is reported before an
+/// endpoint, and the dialled host before the others.
+///
+/// `options` must be what [`connect_options`](crate::connect_options)
+/// returned for this `url`: the dialled host and the startup options come
+/// from it (`PGHOST` and `PGOPTIONS` included), so the URL is checked and
+/// parsed once, by the call that also hands back what to connect with. (A
+/// `url` that does not parse adds nothing to what `options` show; one that
+/// `connect_options` accepted always parses.) The refusal a migration runner
+/// needs is then:
+///
+/// ```
+/// use stridelabs_postgres::{connect_options, neon_pooler_url, PoolerRef, UrlRefusal};
+///
+/// # #[derive(Debug)]
+/// # enum Error { InvalidDatabaseUrl(UrlRefusal), Pooler(PoolerRef) }
+/// fn direct_connect_options(url: &str) -> Result<sqlx::postgres::PgConnectOptions, Error> {
+///     let options = connect_options(url).map_err(Error::InvalidDatabaseUrl)?;
+///     match neon_pooler_url(url, &options) {
+///         Some(pooler) => Err(Error::Pooler(pooler)),
+///         None => Ok(options),
+///     }
+/// }
+///
+/// let ambiguous = "postgres://app:secret@ep-x-pooler.example.com/app?host=127.0.0.1";
+/// assert!(matches!(
+///     direct_connect_options(ambiguous),
+///     Err(Error::Pooler(PoolerRef::Host(label))) if label == "ep-x-pooler"
+/// ));
+/// assert!(direct_connect_options("postgres://app:secret@ep-x.example.com/app").is_ok());
+/// ```
+pub fn neon_pooler_url(url: &str, options: &PgConnectOptions) -> Option<PoolerRef> {
+    let parsed = Url::parse(url).ok();
+    let authority = parsed.as_ref().and_then(Url::host_str).map(str::to_owned);
+    let redirects = parsed.iter().flat_map(|parsed| {
+        parsed
+            .query_pairs()
+            .filter(|(key, _)| key == "host")
+            .map(|(_, value)| value.into_owned())
+    });
+    neon_pooler_host(options.get_host())
+        .or_else(|| {
+            authority
+                .into_iter()
+                .chain(redirects)
+                .find_map(|host| neon_pooler_host(&host))
+        })
+        .or_else(|| options.get_options().and_then(pooler_endpoint))
 }
 
 /// Whether `host` (a host name, a comma-separated host list, or anything
@@ -311,6 +375,117 @@ mod tests {
             ),
             endpoint("ep-x-pooler")
         );
+    }
+
+    /// `neon_pooler_url(url, &connect_options(url))`.
+    fn detected_in_url(url: &str) -> Option<PoolerRef> {
+        let options = connect_options(url).unwrap_or_else(|refusal| panic!("{url}: {refusal}"));
+        neon_pooler_url(url, &options)
+    }
+
+    /// An ambiguous URL names a pooler where sqlx will not dial it: in the
+    /// authority (as is, or percent-encoded) while `?host=`/`?hostaddr=`
+    /// redirects the connection, or in a `host` value a later `host` or
+    /// `hostaddr` overrides. tapper's and lumen's migrate refusal cases, with
+    /// the control on each: `neon_pooler` (the dialled host only) finds
+    /// nothing. A `hostaddr` cannot name one: it must be an IP address.
+    #[test]
+    fn a_pooler_named_anywhere_in_the_url_is_detected() {
+        for (url, label) in [
+            (
+                "postgres://u:p@ep-x-pooler.example.com/db?host=127.0.0.1",
+                "ep-x-pooler",
+            ),
+            (
+                "postgres://u:p@ep-x-pooler.example.com/db?hostaddr=127.0.0.1",
+                "ep-x-pooler",
+            ),
+            (
+                "postgres://u:p@EP-X%2DPOOLER.example.com/db?host=127.0.0.1",
+                "ep-x-pooler",
+            ),
+            (
+                "postgres://u:p@ep-x.example.com/db?host=ep-y-pooler.example.com&host=127.0.0.1",
+                "ep-y-pooler",
+            ),
+            (
+                "postgres://u:p@ep-x.example.com/db?host=ep-y-pooler.example.com&hostaddr=127.0.0.1",
+                "ep-y-pooler",
+            ),
+        ] {
+            assert_eq!(detected_in_url(url), host(label), "{url}");
+            assert_eq!(detected(url), None, "the control: sqlx dials no pooler: {url}");
+        }
+        assert_eq!(
+            connect_options("postgres://u:p@ep-x.example.com/db?hostaddr=ep-y-pooler.example.com")
+                .err(),
+            Some(crate::UrlRefusal::InvalidValue("hostaddr"))
+        );
+    }
+
+    /// Everything `neon_pooler` finds, `neon_pooler_url` finds too (the
+    /// dialled host, then the startup options), and the dialled host is the
+    /// one reported when the URL names two poolers.
+    #[test]
+    fn neon_pooler_url_finds_what_neon_pooler_finds() {
+        for (url, found) in [
+            (
+                "postgres://u:p@ep-cool-name-123456-pooler.us-east-2.aws.neon.tech/neondb\
+                 ?sslmode=require",
+                host("ep-cool-name-123456-pooler"),
+            ),
+            (
+                "postgresql://u:p@EP-X-POOLER.example.com:5432/db",
+                host("ep-x-pooler"),
+            ),
+            ("postgres://u:p@db-pooler/db", host("db-pooler")),
+            (
+                "postgres://u:p@ep-x%2Dpooler.example.com/db",
+                host("ep-x-pooler"),
+            ),
+            (
+                "postgres://u:p@ep-x.example.com/db?host=ep-x-pooler.example.com",
+                host("ep-x-pooler"),
+            ),
+            (
+                "postgres://u:p@ep-a-pooler.example.com/db?host=ep-b-pooler.example.com",
+                host("ep-b-pooler"),
+            ),
+            (
+                "postgres://u:p@203.0.113.7/db?options=endpoint%3Dep-x-pooler",
+                endpoint("ep-x-pooler"),
+            ),
+            (
+                "postgres://u:p@203.0.113.7/db?options=-c%20application_name%3Dsvc\
+                 &options=endpoint%3Dep-x-pooler",
+                endpoint("ep-x-pooler"),
+            ),
+        ] {
+            assert_eq!(detected_in_url(url), found, "{url}");
+        }
+    }
+
+    /// The direct endpoint, local hosts, names that merely contain "pooler",
+    /// and a direct authority redirected to another direct host name no
+    /// pooler anywhere; neither does an endpoint without the suffix.
+    #[test]
+    fn a_url_that_names_no_pooler_is_not_one() {
+        for url in [
+            "postgres://u:p@ep-cool-name-123456.us-east-2.aws.neon.tech/neondb?sslmode=require",
+            "postgres://dev:dev@localhost:5432/app",
+            "postgresql://dev:dev@127.0.0.1/app",
+            "postgres://u:p@pooler.example.com/db",
+            "postgres://u:p@my-pooler-db.example.com/db",
+            "postgres://u:p@ep-x.example.com/pooler-db",
+            "postgres://u:p@ep-x.example.com/db?host=127.0.0.1&hostaddr=192.0.2.7",
+            "postgres://u:p@ep-x.example.com/db?options=endpoint%3Dep-x\
+             &application_name=svc-pooler",
+        ] {
+            assert_eq!(detected_in_url(url), None, "{url}");
+        }
+        // A URL that does not parse adds nothing to what the options show.
+        let options = connect_options("postgres://u:p@ep-x.example.com/db").expect("a URL");
+        assert_eq!(neon_pooler_url("not a url ep-y-pooler", &options), None);
     }
 
     /// The text names the label or the id, never the URL or its password;

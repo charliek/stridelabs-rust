@@ -16,7 +16,7 @@
 //! | [`connect_options`] | a URL checked, then parsed into sqlx's options: a query-parameter allow-list, no `search_path`, no NUL byte, no password file; refusals ([`UrlRefusal`]) never print a value |
 //! | [`error_summary`] | a `sqlx::Error` as its SQLSTATE and a fixed description, or a fixed class name |
 //! | [`lazy_pool`] | a pool built from checked options with [`PoolSettings`], without connecting |
-//! | [`neon_pooler`] | whether options reach Neon's pooled endpoint ([`PoolerRef`]) |
+//! | [`neon_pooler`] | whether options reach Neon's pooled endpoint ([`PoolerRef`]); [`neon_pooler_url`] also reads the URL's undialled hosts, for a refusal |
 //! | [`LOG_CAPS`] | the sqlx targets that log a raw error, a server notice or a URL value, to cap off |
 //!
 //! # Feature topology
@@ -34,7 +34,7 @@ mod summary;
 
 pub use connect::{connect_options, UrlRefusal, IGNORED_URL_PARAMETERS, SUPPORTED_URL_PARAMETERS};
 pub use pool::{lazy_pool, PoolSettings};
-pub use pooler::{neon_pooler, neon_pooler_host, PoolerRef};
+pub use pooler::{neon_pooler, neon_pooler_host, neon_pooler_url, PoolerRef};
 pub use summary::{error_summary, ErrorSummary};
 
 use tracing::level_filters::LevelFilter;
