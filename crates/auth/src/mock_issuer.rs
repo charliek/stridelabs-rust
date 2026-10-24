@@ -67,3 +67,13 @@ pub(crate) async fn issuer_then(first: ResponseTemplate, then: ResponseTemplate)
 pub(crate) fn jwks_url_of(server: &MockServer) -> String {
     format!("{}/jwks", server.uri())
 }
+
+/// Requests the mock issuer has answered so far — checked mid-test, where
+/// `expect(n)` only checks the total when the server drops.
+pub(crate) async fn requests(server: &MockServer) -> usize {
+    server
+        .received_requests()
+        .await
+        .expect("wiremock records requests by default")
+        .len()
+}

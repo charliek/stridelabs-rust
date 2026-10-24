@@ -22,7 +22,7 @@ use futures_util::future::FutureExt as _;
 
 use super::*;
 use crate::mock_issuer::{
-    issuer, issuer_then, jwks_body, jwks_url_of, primary_body, primary_issuer,
+    issuer, issuer_then, jwks_body, jwks_url_of, primary_body, primary_issuer, requests,
 };
 use crate::test_support::{test_jwks_json, TestKey, PRIMARY_KID, SECONDARY_KID};
 
@@ -113,6 +113,7 @@ impl JwksCache {
         *state = State {
             cached: Some(Fetched {
                 set: Arc::new(set),
+                unusable: Arc::default(),
                 fetched_at: now,
                 id: u64::MAX,
             }),
@@ -193,16 +194,6 @@ fn assert_unseen(result: Result<Arc<JwkSet>, AuthError>, context: &str) {
         Ok(_) => panic!("{context}: served a set; expected UnseenKid"),
         Err(other) => panic!("{context}: expected UnseenKid, got {other}"),
     }
-}
-
-/// Requests the mock issuer has answered so far — checked mid-test, where
-/// `expect(n)` only checks the total when the server drops.
-async fn requests(server: &MockServer) -> usize {
-    server
-        .received_requests()
-        .await
-        .expect("wiremock records requests by default")
-        .len()
 }
 
 /// Spawn one lookup per kid, every one before awaiting any, and collect each
@@ -416,6 +407,10 @@ struct Row {
     failures: u32,
     /// The kids earlier fetched sets held.
     seen: &'static [&'static str],
+    /// The cached set holds the primary kid with no usable key.
+    unusable: bool,
+    /// The cache reports unusable keys ([`JwksCache::report_unusable_keys`]).
+    report: bool,
     expect: &'static str,
 }
 
@@ -428,6 +423,8 @@ const ROW: Row = Row {
     since_end: None,
     failures: 0,
     seen: &[],
+    unusable: false,
+    report: true,
     expect: "",
 };
 
@@ -439,6 +436,7 @@ fn kind(decision: &Decision<'_>) -> &'static str {
         Decision::Start => "start",
         Decision::UnknownKid => "unknown-kid",
         Decision::UnseenKid => "unseen-kid",
+        Decision::Unusable(_) => "unusable",
         Decision::Suppressed => "suppressed",
         Decision::TooSoon => "too-soon",
     }
@@ -455,6 +453,12 @@ fn run_row(row: &Row) -> &'static str {
     let state = State {
         cached: row.age.map(|age| Fetched {
             set: Arc::new(TestKey::primary().jwks()),
+            unusable: Arc::new(
+                row.unusable
+                    .then(|| (PRIMARY_KID.to_owned(), UnusableReason::Use))
+                    .into_iter()
+                    .collect(),
+            ),
             fetched_at: ago(age),
             id: 0,
         }),
@@ -469,7 +473,7 @@ fn run_row(row: &Row) -> &'static str {
         seen: Seen(row.seen.iter().map(|kid| (*kid).to_owned()).collect()),
         ..State::default()
     };
-    kind(&decide(&state, row.kid, now, &row.tuning))
+    kind(&decide(&state, row.kid, now, &row.tuning, row.report))
 }
 
 #[test]
@@ -552,6 +556,25 @@ fn decide_follows_its_table_at_every_edge() {
         // No attempt behind a gate: it is open.
         Row { age: Some(secs(1)), kid: "other", expect: "start", ..ROW },
         Row { age: Some(r), expect: "serve+refresh", ..ROW },
+        // A kid the set holds with no usable key (a cache that reports
+        // unusable keys): never served, refreshed ahead or not; the kid gate
+        // as for a kid the set lacks, and closed, `unusable` from memory,
+        // though the kid is seen; past the TTL, the expiry gate, as ever.
+        Row { age: Some(secs(1)), unusable: true, in_flight: true, expect: "join", ..ROW },
+        Row { age: Some(r), since_end: Some(r), unusable: true, since_start: Some(f), expect: "start", ..ROW },
+        Row { age: Some(t - NANO), unusable: true, since_start: Some(f), expect: "start", ..ROW },
+        Row { age: Some(t - NANO), unusable: true, since_start: Some(f - NANO), seen: &[PRIMARY_KID], expect: "unusable", ..ROW },
+        Row { age: Some(secs(1)), unusable: true, since_start: Some(f - NANO), expect: "unusable", ..ROW },
+        Row { tuning: NO_THROTTLE, age: Some(secs(1)), unusable: true, since_start: Some(Duration::ZERO), expect: "start", ..ROW },
+        Row { age: Some(t), unusable: true, since_end: Some(secs(1) - NANO), failures: 1, expect: "suppressed", ..ROW },
+        Row { age: Some(t), unusable: true, since_start: Some(t), since_end: Some(t), expect: "start", ..ROW },
+        // Reporting off: the same set serves the kid, refreshed ahead as any.
+        Row { age: Some(secs(1)), unusable: true, report: false, since_start: Some(f - NANO), expect: "serve", ..ROW },
+        Row { age: Some(r), since_end: Some(r), unusable: true, report: false, expect: "serve+refresh", ..ROW },
+        // Only the kid it records: a kid the set lacks is still unseen or
+        // unknown.
+        Row { age: Some(secs(1)), unusable: true, kid: "other", since_start: Some(f - NANO), expect: "unseen-kid", ..ROW },
+        Row { age: Some(secs(1)), unusable: true, kid: "other", since_start: Some(f - NANO), seen: &["other"], expect: "unknown-kid", ..ROW },
     ];
 
     let mut wrong = Vec::new();
@@ -1364,6 +1387,144 @@ async fn inside_the_floor_a_retired_kid_is_unknown_and_a_never_seen_one_unseen()
     assert_eq!(requests(&server).await, 3);
 }
 
+// --- report_unusable_keys (rule 5) ----------------------------------------
+
+/// The primary key's JWKS with its `use` set to `enc`: the kid is held, and
+/// no key under it can verify RS256.
+fn primary_for_encryption() -> String {
+    let mut set: serde_json::Value =
+        serde_json::from_str(test_jwks_json()).expect("the committed JWKS");
+    set["keys"][0]["use"] = serde_json::json!("enc");
+    set.to_string()
+}
+
+#[track_caller]
+fn assert_unusable(
+    result: Result<Arc<JwkSet>, AuthError>,
+    expected: UnusableReason,
+    context: &str,
+) {
+    match result {
+        Err(AuthError::UnusableKey(reason)) => assert_eq!(reason, expected, "{context}"),
+        Ok(_) => panic!("{context}: served a set; expected UnusableKey({expected})"),
+        Err(other) => panic!("{context}: expected UnusableKey({expected}), got {other}"),
+    }
+}
+
+/// An issuer that answers its first `unusable` requests with the primary
+/// key labelled for encryption, and every one after that with the usable
+/// primary key: a broken key, then the issuer's fix.
+async fn unusable_then_fixed(unusable: u64, fixed: u64) -> MockServer {
+    let server = MockServer::start().await;
+    for (body, times) in [
+        (jwks_body(&primary_for_encryption()), unusable),
+        (primary_body(), fixed),
+    ] {
+        wiremock::Mock::given(wiremock::matchers::path("/jwks"))
+            .respond_with(body)
+            .up_to_n_times(times)
+            .expect(times)
+            .mount(&server)
+            .await;
+    }
+    server
+}
+
+/// Rule 5: a kid the set holds with no usable key is `UnusableKey`, with
+/// the reason, from the fetch that found it and then from memory inside the
+/// floor; each floor buys one refetch, and the refetch that finds a usable
+/// key under the kid serves it.
+#[tokio::test]
+async fn an_unusable_kid_refetches_once_per_floor_and_picks_up_a_fixed_key() {
+    let server = unusable_then_fixed(2, 1).await;
+    let cache = cache(&server, BOUNDED).report_unusable_keys(true);
+    assert!(cache.reports_unusable_keys());
+
+    assert_unusable(
+        cache.jwks_for_kid(PRIMARY_KID).await,
+        UnusableReason::Use,
+        "the cold fetch",
+    );
+    assert_eq!(requests(&server).await, 1);
+    cache.advance_for_test(secs(30) - NANO);
+    for _ in 0..3 {
+        assert_unusable(
+            cache.jwks_for_kid(PRIMARY_KID).await,
+            UnusableReason::Use,
+            "inside the floor",
+        );
+    }
+    assert_eq!(requests(&server).await, 1, "answered from memory");
+
+    cache.advance_for_test(NANO);
+    assert_unusable(
+        cache.jwks_for_kid(PRIMARY_KID).await,
+        UnusableReason::Use,
+        "the floor's one refetch, still unusable",
+    );
+    assert_eq!(requests(&server).await, 2);
+    assert_unusable(
+        cache.jwks_for_kid(PRIMARY_KID).await,
+        UnusableReason::Use,
+        "inside the floor that refetch opened",
+    );
+    assert_eq!(requests(&server).await, 2, "answered from memory");
+
+    // 60 s on the clock: the refetched set (30 s old) is inside its TTL.
+    cache.advance_for_test(secs(30));
+    cache
+        .jwks_for_kid(PRIMARY_KID)
+        .await
+        .expect("the next floor's refetch finds the fixed key");
+    assert_eq!(requests(&server).await, 3);
+    cache
+        .jwks_for_kid(PRIMARY_KID)
+        .await
+        .expect("served from memory");
+    assert_eq!(requests(&server).await, 3);
+}
+
+/// The control: off (the default), the same set is served for the kid it
+/// holds, as through v0.9.0, and never refetched for it.
+#[tokio::test]
+async fn without_report_unusable_keys_a_held_kid_is_served_whatever_its_key() {
+    let server = issuer(jwks_body(&primary_for_encryption()), 1).await;
+    let cache = cache(&server, BOUNDED);
+    assert!(!cache.reports_unusable_keys());
+
+    for _ in 0..3 {
+        let set = cache
+            .jwks_for_kid(PRIMARY_KID)
+            .await
+            .expect("a set holding the kid");
+        assert!(set.find(PRIMARY_KID).is_some());
+    }
+}
+
+/// A herd for an unusable kid inside the TTL, its floor open, shares the one
+/// refetch the floor allows, and every lookup gets the reason.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_herd_for_an_unusable_kid_makes_one_refetch() {
+    let server = MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::path("/jwks"))
+        .respond_with(jwks_body(&primary_for_encryption()).set_delay(millis(100)))
+        .expect(2)
+        .mount(&server)
+        .await;
+    let cache = Arc::new(cache(&server, BOUNDED).report_unusable_keys(true));
+    assert_unusable(
+        cache.jwks_for_kid(PRIMARY_KID).await,
+        UnusableReason::Use,
+        "the cold fetch",
+    );
+    cache.advance_for_test(secs(30));
+
+    for (result, _) in herd(&cache, 16).await {
+        assert_unusable(result, UnusableReason::Use, "a herd member");
+    }
+    assert_eq!(requests(&server).await, 2, "one refetch for the herd");
+}
+
 /// A set of `count` copies of the primary key, kids `{prefix}0` and up.
 fn set_of(prefix: &str, count: usize) -> JwkSet {
     let key = TestKey::primary().jwks().keys.remove(0);
@@ -1708,14 +1869,14 @@ async fn a_stale_guard_never_clears_or_charges_a_newer_reservation() {
         assert_eq!(state.last_end, ended, "nor stamped its end");
         assert!(state.cached.is_none(), "nor cached anything");
     }
-    stale().complete(Ok(TestKey::primary().jwks()));
+    stale().complete(Ok((TestKey::primary().jwks(), HashMap::new())));
     assert!(
         cache.inner.state().cached.is_none(),
         "a stale success caches nothing"
     );
 
     // Attempt 1's own guard finishes it.
-    guard(1, second.sender).complete(Ok(TestKey::primary().jwks()));
+    guard(1, second.sender).complete(Ok((TestKey::primary().jwks(), HashMap::new())));
     let state = cache.inner.state();
     assert!(state.in_flight.is_none());
     assert_eq!(state.failures, 0);

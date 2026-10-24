@@ -1,19 +1,24 @@
 //! Access-token verification: the thing this crate exists for.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine as _;
+use jsonwebtoken::errors::ErrorKind;
 use jsonwebtoken::jwk::{
-    AlgorithmParameters, Jwk, JwkSet, KeyAlgorithm, KeyOperations, PublicKeyUse,
+    AlgorithmParameters, Jwk, JwkSet, KeyAlgorithm, KeyOperations, PublicKeyUse, RSAKeyParameters,
 };
-use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
+use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 
 use crate::config::{redact_issuer, SlauthConfig};
-use crate::error::{invalid_token, AuthError};
+use crate::error::{invalid_token, AuthError, UnusableReason};
 use crate::jwks::JwksCache;
+use crate::screen::{kid_for_lookup, ScreenPolicy};
 
 /// The clock-skew leeway a [`ClaimChecks`] applies to `exp` (and to `nbf`,
 /// when it is checked) unless [`ClaimChecks::with_leeway`] replaces it:
@@ -50,6 +55,18 @@ pub enum Audience {
     /// `aud` must be present, and equal this value or, as an array, contain
     /// it. What [`Verifier::new`] applies, with `SlauthConfig::audience`.
     Required(String),
+    /// `aud` is checked **only when present**: absent, it passes; a string
+    /// must equal this value; an array must contain it and hold nothing but
+    /// strings. Any other `aud` (a number, a boolean, an object, `null`, an
+    /// array holding a non-string) is refused ("audience is not accepted").
+    ///
+    /// For a resource server whose issuer leaves `aud` out of some tokens
+    /// meant for it. **Safe only when the issuer names the audience in every
+    /// token it mints for another service**: a token without `aud` is
+    /// accepted from the exact `iss` the [`ClaimChecks`] require, whoever it
+    /// was minted for. Hydra (slauth) stamps the audiences a client asked
+    /// for, and an empty array, which this refuses, when it asked for none.
+    IfPresent(String),
     /// `aud` is **not checked**: absent, present, or naming another service
     /// altogether, it passes.
     ///
@@ -70,8 +87,9 @@ pub enum Audience {
 /// `nbf` is checked.
 ///
 /// - `exp` and `iss` are always required; `aud` only under
-///   [`Audience::Required`]. A token missing one is rejected ("a required
-///   claim is missing"), never let through unchecked.
+///   [`Audience::Required`] ([`Audience::IfPresent`] checks it when it is
+///   there). A token missing one is rejected ("a required claim is
+///   missing"), never let through unchecked.
 /// - `iss` must equal the issuer **exactly**: a trailing-slash mismatch is a
 ///   rejected token, not a near miss. (Like every jsonwebtoken check, an
 ///   `iss` *array* that contains the issuer passes too; RFC 7519 makes `iss`
@@ -185,7 +203,10 @@ impl ClaimChecks {
                 validation.set_audience(&[audience]);
                 validation.set_required_spec_claims(&["exp", "iss", "aud"]);
             }
-            Audience::NotValidated => {
+            // `IfPresent` is checked by `audience_if_present` instead:
+            // jsonwebtoken lets an `aud` it cannot parse (a number, an array
+            // holding one) through when `aud` is not required.
+            Audience::NotValidated | Audience::IfPresent(_) => {
                 // Off, not merely unset: with no audience configured,
                 // jsonwebtoken rejects every token that carries one.
                 validation.validate_aud = false;
@@ -193,6 +214,51 @@ impl ClaimChecks {
             }
         }
         validation
+    }
+
+    /// Every check on a token whose signature `key` verifies: jsonwebtoken's
+    /// [`ClaimChecks::validation`], then, under [`Audience::IfPresent`],
+    /// [`audience_if_present`].
+    fn claims<C: DeserializeOwned>(&self, token: &str, key: &DecodingKey) -> Result<C, AuthError> {
+        let claims = decode::<C>(token, key, &self.validation())
+            .map(|data| data.claims)
+            .map_err(|err| invalid_token(&err))?;
+        if let Audience::IfPresent(audience) = &self.audience {
+            if !audience_if_present(token, audience) {
+                return Err(invalid_token(&ErrorKind::InvalidAudience.into()));
+            }
+        }
+        Ok(claims)
+    }
+}
+
+/// [`Audience::IfPresent`]'s rule, on the payload of a token jsonwebtoken has
+/// just verified, read again with its own payload decoding.
+fn audience_if_present(token: &str, audience: &str) -> bool {
+    /// The `aud` member, `null` included: `Some(Value::Null)` is not absent.
+    #[derive(Deserialize)]
+    struct AudMember {
+        #[serde(default, deserialize_with = "present")]
+        aud: Option<serde_json::Value>,
+    }
+
+    fn present<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<serde_json::Value>, D::Error> {
+        serde_json::Value::deserialize(deserializer).map(Some)
+    }
+
+    // "Insecure" only in that it checks nothing: `decode` just did.
+    let member = jsonwebtoken::dangerous::insecure_decode_claims::<AudMember>(token).ok();
+    match member.map(|member| member.aud) {
+        None => false,
+        Some(None) => true,
+        Some(Some(serde_json::Value::String(aud))) => aud == audience,
+        Some(Some(serde_json::Value::Array(auds))) => {
+            auds.iter().all(serde_json::Value::is_string)
+                && auds.iter().any(|aud| aud.as_str() == Some(audience))
+        }
+        Some(Some(_)) => false,
     }
 }
 
@@ -242,7 +308,8 @@ pub struct VerifiedIdentity {
 
 /// Verifies access tokens against a cached JWKS: slauth's
 /// ([`Verifier::new`]), or another issuer's under rules of the consumer's
-/// choosing ([`Verifier::for_issuer`]).
+/// choosing ([`Verifier::for_issuer`], or [`Verifier::with_cache`] over a
+/// cache the consumer built).
 ///
 /// Cheap to clone (one `Arc`), and **meant to be cloned rather than rebuilt**:
 /// the key cache lives inside, so a verifier constructed per request would
@@ -251,6 +318,9 @@ pub struct VerifiedIdentity {
 #[derive(Debug, Clone)]
 pub struct Verifier {
     inner: Arc<Inner>,
+    /// What is checked before the key lookup: outside the `Arc`, so that
+    /// [`Verifier::screen`] can set it on a verifier already built.
+    screen: ScreenPolicy,
 }
 
 // `Debug` stays derived here and on `Verifier`: every URL either holds is
@@ -284,12 +354,17 @@ impl Verifier {
     pub fn new(config: SlauthConfig, http: reqwest::Client) -> Verifier {
         let jwks = JwksCache::new(config.jwks_url.clone(), http);
         let checks = ClaimChecks::slauth(&config.issuer, &config.audience);
+        Verifier::from_parts(config, checks, jwks)
+    }
+
+    fn from_parts(config: SlauthConfig, checks: ClaimChecks, jwks: JwksCache) -> Verifier {
         Verifier {
             inner: Arc::new(Inner {
                 config,
                 checks,
                 jwks,
             }),
+            screen: ScreenPolicy::default(),
         }
     }
 
@@ -319,49 +394,101 @@ impl Verifier {
         jwks_ttl: Option<Duration>,
         http: reqwest::Client,
     ) -> Verifier {
-        let jwks_url = jwks_url.into();
-        let mut jwks = JwksCache::new(jwks_url.clone(), http);
+        let mut jwks = JwksCache::new(jwks_url, http);
         if let Some(ttl) = jwks_ttl {
             jwks = jwks.with_ttl(ttl);
         }
+        Verifier::with_cache(checks, jwks)
+    }
+
+    /// Build a verifier for tokens from `checks`' issuer, under `checks`'
+    /// rules, with keys from `cache`: [`Verifier::for_issuer`] over a
+    /// [`JwksCache`] the consumer built, so that its refetch interval, its
+    /// HTTP client and its opt-in settings
+    /// ([`JwksCache::report_unusable_keys`]) are the consumer's.
+    ///
+    /// **Pairing the cache with the rules is the caller's job here**: a cache
+    /// reading one issuer's key set under `checks` for another is a hole no
+    /// verification logic closes, which is why [`Verifier::new`] and
+    /// [`Verifier::for_issuer`] build theirs from the URL they are given.
+    /// Build the cache from the same configuration as the issuer, and hand
+    /// it to one verifier: the verifier owns it from here on.
+    ///
+    /// [`Verifier::config`] on the result is synthesized, as for
+    /// [`Verifier::for_issuer`], with the cache's JWKS URL.
+    ///
+    /// ```no_run
+    /// # async fn example(http: reqwest::Client, token: &str)
+    /// # -> Result<(), stridelabs_auth::AuthError> {
+    /// use std::time::Duration;
+    ///
+    /// use stridelabs_auth::{Audience, ClaimChecks, JwksCache, ScreenPolicy, Verifier};
+    ///
+    /// let cache = JwksCache::new("https://auth.example.com/.well-known/jwks.json", http)
+    ///     .with_ttl(Duration::from_secs(3600))
+    ///     .report_unusable_keys(true);
+    /// let checks = ClaimChecks::new(
+    ///     "https://auth.example.com",
+    ///     Audience::IfPresent("my-service".into()),
+    /// )
+    /// .with_leeway(Duration::ZERO);
+    /// let verifier = Verifier::with_cache(checks, cache).screen(ScreenPolicy::Strict);
+    ///
+    /// let claims: serde_json::Value = verifier.verify_bearer_claims(token).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_cache(checks: ClaimChecks, cache: JwksCache) -> Verifier {
         let config = SlauthConfig {
             issuer: checks.issuer.clone(),
-            jwks_url,
+            jwks_url: cache.jwks_url().to_owned(),
             audience: match &checks.audience {
-                Audience::Required(audience) => audience.clone(),
+                Audience::Required(audience) | Audience::IfPresent(audience) => audience.clone(),
                 Audience::NotValidated => NOT_VALIDATED_AUDIENCE.to_owned(),
             },
             pat_validate_url: None,
         };
-        Verifier {
-            inner: Arc::new(Inner {
-                config,
-                checks,
-                jwks,
-            }),
-        }
+        Verifier::from_parts(config, checks, cache)
+    }
+
+    /// This verifier with `policy` deciding what is checked before a token's
+    /// key is looked up ([`ScreenPolicy::Basic`] by default, what every
+    /// verifier has always done). [`ScreenPolicy::Strict`] refuses a
+    /// malformed, oversized, `crit`-bearing or non-RS256 token, or one with
+    /// an empty or oversized `kid`, before the lookup, so with no fetch and
+    /// never with an outage's error ([`crate::screen`]).
+    #[must_use]
+    pub fn screen(mut self, policy: ScreenPolicy) -> Verifier {
+        self.screen = policy;
+        self
+    }
+
+    /// What this verifier checks before a key lookup ([`Verifier::screen`]).
+    pub fn screen_policy(&self) -> ScreenPolicy {
+        self.screen
     }
 
     /// The configuration this verifier was built with.
     ///
-    /// For a [`Verifier::for_issuer`] verifier, which takes no
-    /// [`SlauthConfig`], one synthesized from its arguments, and
-    /// **informational only**: its issuer and JWKS URL, no
-    /// `pat_validate_url`, and `audience` the [`Audience::Required`] value,
-    /// or under [`Audience::NotValidated`] a sentinel no issuer mints (the
-    /// string `"\0audience not validated"`, which starts with a NUL
-    /// character; never empty). It does not hold this verifier's rules; read
-    /// [`Verifier::claim_checks`] for those.
+    /// For a [`Verifier::for_issuer`] or [`Verifier::with_cache`] verifier,
+    /// which takes no [`SlauthConfig`], one synthesized from its arguments,
+    /// and **informational only**: its issuer and JWKS URL, no
+    /// `pat_validate_url`, and `audience` the [`Audience::Required`] or
+    /// [`Audience::IfPresent`] value, or under [`Audience::NotValidated`] a
+    /// sentinel no issuer mints (the string `"\0audience not validated"`,
+    /// which starts with a NUL character; never empty). It does not hold this
+    /// verifier's rules; read [`Verifier::claim_checks`] for those.
     ///
     /// **Do not rebuild a `for_issuer` verifier with `Verifier::new(config)`.**
     /// That applies slauth's rules ([`Verifier::new`]): `aud` required, a
     /// 60 s leeway and `nbf` unchecked, not this verifier's leeway or `nbf`
-    /// setting. Under [`Audience::Required`] the result can accept tokens
-    /// this verifier refuses: up to 60 s past their `exp` where this one's
-    /// leeway is smaller, or with an `nbf` still ahead where this one checks
-    /// it. Under [`Audience::NotValidated`] the sentinel makes it refuse
-    /// every token a real issuer mints, so that mistake fails closed, but it
-    /// is still not this verifier. Clone the verifier instead.
+    /// setting. Under [`Audience::Required`] or [`Audience::IfPresent`] the
+    /// result can accept tokens this verifier refuses: up to 60 s past their
+    /// `exp` where this one's leeway is smaller, or with an `nbf` still ahead
+    /// where this one checks it. Under [`Audience::NotValidated`] the
+    /// sentinel makes it refuse every token a real issuer mints, so that
+    /// mistake fails closed, but it is still not this verifier. Clone the
+    /// verifier instead.
     pub fn config(&self) -> &SlauthConfig {
         &self.inner.config
     }
@@ -398,11 +525,18 @@ impl Verifier {
     /// of [`Verifier::verify_bearer`]'s identity checks.
     ///
     /// The cryptographic and spec-claim checks are the same ones, from the
-    /// same code: key selection by `kid` (a token without one is
-    /// [`AuthError::MissingKid`]), the RS256 signature, then this verifier's
+    /// same code: this verifier's [`ScreenPolicy`] ([`Verifier::screen`]; by
+    /// default a header that parses and carries a `kid`, else
+    /// [`AuthError::MalformedToken`] or [`AuthError::MissingKid`]), key
+    /// selection by `kid`, the RS256 signature, then this verifier's
     /// [`ClaimChecks`] ([`Verifier::claim_checks`]): for a
     /// [`Verifier::new`] verifier, `exp`, `iss` and `aud`, all three
-    /// required. What is **not** checked is anything about `email` or `sub`:
+    /// required. Over a cache that reports unusable keys
+    /// ([`JwksCache::report_unusable_keys`]), a key is selected only if it
+    /// can verify RS256 (its labels, and `n` and `e` as aws-lc-rs accepts them), and a
+    /// kid with no such key is [`AuthError::UnusableKey`]; otherwise the
+    /// selection is [`Verifier::claims_with_jwks_checked`]'s. What is **not**
+    /// checked is anything about `email` or `sub`:
     /// those are [`VerifiedIdentity`]'s contract, and a token for another
     /// purpose (an MCP access token, whose audience is a resource URL and
     /// whose email is optional) has different claim rules. The caller owns
@@ -417,12 +551,16 @@ impl Verifier {
         &self,
         token: &str,
     ) -> Result<C, AuthError> {
-        let header = decode_header(token).map_err(|_| AuthError::MalformedToken)?;
-        let kid = header.kid.ok_or(AuthError::MissingKid)?;
+        let kid = kid_for_lookup(token, self.screen)?;
 
         let jwks = self.inner.jwks.jwks_for_kid(&kid).await?;
 
-        Verifier::claims_with_jwks_checked(token, &jwks, &kid, &self.inner.checks)
+        let key = if self.inner.jwks.reports_unusable_keys() {
+            usable_key(&jwks, &kid)?
+        } else {
+            fit_key(&jwks, &kid)?
+        };
+        self.inner.checks.claims(token, &key)
     }
 
     /// The whole of verification, minus the network.
@@ -478,9 +616,10 @@ impl Verifier {
     /// allow it); the key is usable; RS256 signature (no other algorithm,
     /// `none` and HS256 included); `exp` and, if `checks` says so, `nbf`,
     /// with its leeway; `iss` equals its issuer exactly; under
-    /// [`Audience::Required`], `aud` contains the audience. `exp` and `iss`
-    /// must be present, and `aud` under [`Audience::Required`]. Nothing about
-    /// `email` or `sub` — the caller owns those (see
+    /// [`Audience::Required`], `aud` contains the audience, and under
+    /// [`Audience::IfPresent`], a present `aud` does. `exp` and `iss` must be
+    /// present, and `aud` under [`Audience::Required`]. Nothing about `email`
+    /// or `sub` — the caller owns those (see
     /// [`Verifier::verify_bearer_claims`]). [`ClaimChecks`] has the details.
     ///
     /// Failures are [`AuthError::UnknownKid`] (no key fit for RS256 under
@@ -493,34 +632,86 @@ impl Verifier {
         kid: &str,
         checks: &ClaimChecks,
     ) -> Result<C, AuthError> {
-        // Only a key the issuer published for RS256 signatures may verify one.
-        // `DecodingKey::from_jwk` ignores the JWK's `alg`, `use` and `key_ops`,
-        // so without this an RSA key labelled for encryption (`use: enc`,
-        // `alg: RSA-OAEP`, or a label jsonwebtoken 11 parses as
-        // `UNKNOWN_ALGORITHM` where 9 rejected the whole set) would verify a
-        // token naming its kid. A kid with no fit key is `UnknownKid` (401),
-        // not `Jwks` (500): there is no signature-verification key by that
-        // name, the same verdict as a kid missing from the set; and the kid is
-        // the caller's choice, so a 500 would let anyone raise this service's
-        // error rate against an issuer that publishes encryption keys
-        // alongside its signing keys. Keys sharing a kid are all considered,
-        // so an encryption key listed first does not hide the signing key.
-        let jwk = jwks
-            .keys
-            .iter()
-            .filter(|jwk| jwk.common.key_id.as_deref() == Some(kid))
-            .find(|jwk| verifies_rs256(jwk))
-            .ok_or(AuthError::UnknownKid)?;
-        // A key the issuer published but we can't build a verifier from is the
-        // issuer's problem, not the caller's — hence `Jwks`, which maps to a
-        // 5xx, and not a 401 blaming a token that never got to be checked.
-        let key = DecodingKey::from_jwk(jwk)
-            .map_err(|_| AuthError::Jwks("key set contains an unusable signing key".into()))?;
-
-        decode::<C>(token, &key, &checks.validation())
-            .map(|data| data.claims)
-            .map_err(|err| invalid_token(&err))
+        let key = fit_key(jwks, kid)?;
+        checks.claims(token, &key)
     }
+}
+
+/// The key under `kid` that may verify an RS256 signature, as every verifier
+/// has always chosen it ([`Verifier::claims_with_jwks_checked`]).
+fn fit_key(jwks: &JwkSet, kid: &str) -> Result<DecodingKey, AuthError> {
+    // Only a key the issuer published for RS256 signatures may verify one.
+    // `DecodingKey::from_jwk` ignores the JWK's `alg`, `use` and `key_ops`,
+    // so without this an RSA key labelled for encryption (`use: enc`,
+    // `alg: RSA-OAEP`, or a label jsonwebtoken 11 parses as
+    // `UNKNOWN_ALGORITHM` where 9 rejected the whole set) would verify a
+    // token naming its kid. A kid with no fit key is `UnknownKid` (401),
+    // not `Jwks` (500): there is no signature-verification key by that
+    // name, the same verdict as a kid missing from the set; and the kid is
+    // the caller's choice, so a 500 would let anyone raise this service's
+    // error rate against an issuer that publishes encryption keys
+    // alongside its signing keys. Keys sharing a kid are all considered,
+    // so an encryption key listed first does not hide the signing key.
+    // (A cache that reports unusable keys answers that case itself, once
+    // per refetch floor at most: `usable_key`.)
+    let jwk = keys_under(jwks, kid)
+        .find(|jwk| rs256_parameters(jwk).is_ok())
+        .ok_or(AuthError::UnknownKid)?;
+    // A key the issuer published but we can't build a verifier from is the
+    // issuer's problem, not the caller's — hence `Jwks`, which maps to a
+    // 5xx, and not a 401 blaming a token that never got to be checked.
+    DecodingKey::from_jwk(jwk)
+        .map_err(|_| AuthError::Jwks("key set contains an unusable signing key".into()))
+}
+
+/// The first key under `kid` that can verify an RS256 signature
+/// ([`first_rs256_key`]), over a cache that reports unusable keys: that cache
+/// served this set because it holds one, so a kid with none is
+/// [`AuthError::UnusableKey`] (the first key's reason) only defensively.
+fn usable_key(jwks: &JwkSet, kid: &str) -> Result<DecodingKey, AuthError> {
+    first_rs256_key(keys_under(jwks, kid))
+        .map_err(|reason| reason.map_or(AuthError::UnknownKid, AuthError::UnusableKey))
+}
+
+/// The kids in `set` under which no key can verify an RS256 signature, each
+/// with the first key's [`UnusableReason`]: what a cache that reports
+/// unusable keys refuses ([`JwksCache::report_unusable_keys`]). Computed once
+/// per fetched set, off the cache's lock.
+pub(crate) fn unusable_kids(set: &JwkSet) -> HashMap<String, UnusableReason> {
+    let mut by_kid: HashMap<&str, Vec<&Jwk>> = HashMap::new();
+    for jwk in &set.keys {
+        if let Some(kid) = jwk.common.key_id.as_deref() {
+            by_kid.entry(kid).or_default().push(jwk);
+        }
+    }
+    by_kid
+        .into_iter()
+        .filter_map(|(kid, keys)| Some((kid.to_owned(), first_rs256_key(keys).err()??)))
+        .collect()
+}
+
+/// The keys `jwks` publishes under `kid`, in order.
+fn keys_under<'a>(jwks: &'a JwkSet, kid: &'a str) -> impl Iterator<Item = &'a Jwk> {
+    jwks.keys
+        .iter()
+        .filter(move |jwk| jwk.common.key_id.as_deref() == Some(kid))
+}
+
+/// The first of `keys` that can verify an RS256 signature ([`rs256_key`]),
+/// or, when none can, the first one's reason (`None`: no keys at all).
+fn first_rs256_key<'a>(
+    keys: impl IntoIterator<Item = &'a Jwk>,
+) -> Result<DecodingKey, Option<UnusableReason>> {
+    let mut first_reason = None;
+    for jwk in keys {
+        match rs256_key(jwk) {
+            Ok(key) => return Ok(key),
+            Err(reason) => {
+                first_reason.get_or_insert(reason);
+            }
+        }
+    }
+    Err(first_reason)
 }
 
 /// [`VerifiedIdentity`]'s claim rules, applied to claims that already passed
@@ -548,36 +739,116 @@ fn identity_from(claims: Claims) -> Result<VerifiedIdentity, AuthError> {
     })
 }
 
-/// Whether `jwk` is an RSA key its issuer allows for RS256 signature
-/// verification. An absent `alg`, `use` or `key_ops` allows it (RFC 7517 makes
-/// all three optional); a present one must say RS256, say `sig`, or include
-/// `verify`. Anything else, an unrecognised label included, rules the key out.
-fn verifies_rs256(jwk: &Jwk) -> bool {
+/// `jwk`'s RSA parameters, if it is an RSA key its issuer allows for RS256
+/// signature verification, else why its type or a label rules that out. An
+/// absent `alg`, `use` or `key_ops` allows it (RFC 7517 makes all three
+/// optional); a present one must say RS256, say `sig`, or include `verify`.
+/// Anything else, an unrecognised label included, rules the key out. An RSA
+/// key jsonwebtoken could not parse as one, because its `n` or `e` is missing
+/// or not a string, is [`UnusableReason::MalformedComponents`], not `NotRsa`.
+fn rs256_parameters(jwk: &Jwk) -> Result<&RSAKeyParameters, UnusableReason> {
     let common = &jwk.common;
-    matches!(jwk.algorithm, AlgorithmParameters::RSA(_))
-        && common
-            .key_algorithm
-            .is_none_or(|alg| alg == KeyAlgorithm::RS256)
-        && common
-            .public_key_use
-            .as_ref()
-            .is_none_or(|key_use| *key_use == PublicKeyUse::Signature)
-        && common
-            .key_operations
-            .as_ref()
-            .is_none_or(|ops| ops.contains(&KeyOperations::Verify))
+    let rsa = match &jwk.algorithm {
+        AlgorithmParameters::RSA(rsa) => rsa,
+        // jsonwebtoken's untagged catch-all: an RSA key that lacks `n` or `e`,
+        // or has one that is not a string, parses as `Other`, not as a
+        // failure of the whole set.
+        AlgorithmParameters::Other(other)
+            if other.fields.get("kty").and_then(serde_json::Value::as_str) == Some("RSA") =>
+        {
+            return Err(UnusableReason::MalformedComponents);
+        }
+        _ => return Err(UnusableReason::NotRsa),
+    };
+    if !common
+        .key_algorithm
+        .is_none_or(|alg| alg == KeyAlgorithm::RS256)
+    {
+        return Err(UnusableReason::Alg);
+    }
+    if !common
+        .public_key_use
+        .as_ref()
+        .is_none_or(|key_use| *key_use == PublicKeyUse::Signature)
+    {
+        return Err(UnusableReason::Use);
+    }
+    if !common
+        .key_operations
+        .as_ref()
+        .is_none_or(|ops| ops.contains(&KeyOperations::Verify))
+    {
+        return Err(UnusableReason::KeyOps);
+    }
+    Ok(rsa)
+}
+
+/// The modulus sizes the RS256 verifier accepts, in bits (aws-lc-rs's
+/// `RSA_PKCS1_2048_8192_SHA256`): a key outside them can never verify.
+const RS256_MODULUS_BITS: std::ops::RangeInclusive<usize> = 2048..=8192;
+
+/// The public exponent sizes aws-lc accepts, in bits: at least 2 (so no
+/// `e = 1`), at most 33 (its limit against slow verification).
+const RS256_EXPONENT_BITS: std::ops::RangeInclusive<usize> = 2..=33;
+
+/// `jwk` as an RS256 decoding key, or why it can never be one: what a cache
+/// that reports unusable keys checks ([`first_rs256_key`]).
+///
+/// [`rs256_parameters`] first, then the components must be what the RS256
+/// verifier (aws-lc-rs 1.18, on aws-lc) accepts, or verification would
+/// refuse every signature as invalid, blaming the token for the key:
+///
+/// - `n` and `e` unpadded base64url (the decoding `DecodingKey::from_jwk`
+///   runs);
+/// - each non-empty with no leading zero octet: aws-lc-rs refuses any other
+///   encoding of a public component (`public_component_to_bn`), and RFC 7518
+///   §6.3.1 requires the minimal form;
+/// - `e` odd and 2 to 33 bits long (aws-lc's
+///   `is_public_component_of_rsa_key_good`), so 0, 1 and any even exponent
+///   never verify;
+/// - `n` 2048 to 8192 bits long ([`UnusableReason::ModulusSize`] otherwise)
+///   and odd.
+///
+/// Everything but the size is [`UnusableReason::MalformedComponents`].
+fn rs256_key(jwk: &Jwk) -> Result<DecodingKey, UnusableReason> {
+    let rsa = rs256_parameters(jwk)?;
+    let (Ok(modulus), Ok(exponent)) = (
+        URL_SAFE_NO_PAD.decode(&rsa.n),
+        URL_SAFE_NO_PAD.decode(&rsa.e),
+    ) else {
+        return Err(UnusableReason::MalformedComponents);
+    };
+    // The bit length of a minimal big-endian integer; `None` for one that is
+    // empty or starts with a zero octet.
+    let bits = |octets: &[u8]| match octets.first() {
+        Some(&first) if first != 0 => Some(octets.len() * 8 - first.leading_zeros() as usize),
+        _ => None,
+    };
+    let odd = |octets: &[u8]| octets.last().is_some_and(|last| last & 1 == 1);
+    let (Some(modulus_bits), Some(exponent_bits)) = (bits(&modulus), bits(&exponent)) else {
+        return Err(UnusableReason::MalformedComponents);
+    };
+    if !odd(&exponent) || !RS256_EXPONENT_BITS.contains(&exponent_bits) {
+        return Err(UnusableReason::MalformedComponents);
+    }
+    if !RS256_MODULUS_BITS.contains(&modulus_bits) {
+        return Err(UnusableReason::ModulusSize);
+    }
+    if !odd(&modulus) {
+        return Err(UnusableReason::MalformedComponents);
+    }
+    Ok(DecodingKey::from_rsa_raw_components(&modulus, &exponent))
 }
 
 #[cfg(test)]
 mod tests {
-    use jsonwebtoken::errors::ErrorKind;
-    use jsonwebtoken::{encode, EncodingKey, Header};
+    use jsonwebtoken::{decode_header, encode, EncodingKey, Header};
     use serde_json::{json, Value};
     use wiremock::{MockServer, ResponseTemplate};
 
     use super::*;
     use crate::mock_issuer::{
-        issuer, issuer_then, jwks_body, jwks_url_of, primary_body, primary_issuer,
+        issuer, issuer_then, jwks_body, jwks_url_of, primary_body, primary_issuer, requests,
     };
     use crate::test_support::{TestClaims, TestKey, AUDIENCE, ISSUER, PRIMARY_KID};
 
@@ -1094,8 +1365,8 @@ mod tests {
     }
 
     /// The primary key's JWK with `changes` applied (a `null` removes the
-    /// member), as JWKS text, the form the cache fetches.
-    fn primary_jwks_json_with(changes: Value) -> String {
+    /// member).
+    fn primary_key_with(changes: &Value) -> Value {
         let mut key = key_json(TestKey::primary());
         let members = key.as_object_mut().expect("a JWK is an object");
         for (name, value) in changes.as_object().expect("changes are an object") {
@@ -1105,7 +1376,12 @@ mod tests {
                 members.insert(name.clone(), value.clone());
             }
         }
-        json!({ "keys": [key] }).to_string()
+        key
+    }
+
+    /// [`primary_key_with`] as JWKS text, the form the cache fetches.
+    fn primary_jwks_json_with(changes: Value) -> String {
+        json!({ "keys": [primary_key_with(&changes)] }).to_string()
     }
 
     fn parse(jwks_json: &str) -> JwkSet {
@@ -1292,28 +1568,15 @@ mod tests {
         .expect("sign")
     }
 
-    /// RFC 4648 base64url, unpadded: for assembling the header of a token
-    /// jsonwebtoken cannot produce.
-    fn base64url(bytes: &[u8]) -> String {
-        const ALPHABET: &[u8; 64] =
-            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-        let mut out = String::new();
-        for chunk in bytes.chunks(3) {
-            let bits = chunk.iter().enumerate().fold(0u32, |bits, (i, &byte)| {
-                bits | (u32::from(byte) << (16 - 8 * i))
-            });
-            for i in 0..=chunk.len() {
-                out.push(char::from(ALPHABET[((bits >> (18 - 6 * i)) & 63) as usize]));
-            }
-        }
-        out
-    }
-
     /// `claims` under a hand-written `header` (JSON text), with an empty
-    /// signature.
+    /// signature: a token jsonwebtoken cannot produce.
     fn unsigned(header: &str, claims: TestClaims) -> String {
         let payload = serde_json::to_vec(&claims.build()).expect("claims serialize");
-        format!("{}.{}.", base64url(header.as_bytes()), base64url(&payload))
+        format!(
+            "{}.{}.",
+            URL_SAFE_NO_PAD.encode(header),
+            URL_SAFE_NO_PAD.encode(payload)
+        )
     }
 
     /// An `alg: none` token naming the primary kid.
@@ -1326,16 +1589,6 @@ mod tests {
 
     #[test]
     fn the_hand_assembled_header_is_one_jsonwebtoken_reads() {
-        // The encoder against RFC 4648's vectors and the URL-safe alphabet.
-        for (input, expected) in [
-            (&b"f"[..], "Zg"),
-            (b"fo", "Zm8"),
-            (b"foo", "Zm9v"),
-            (b"foobar", "Zm9vYmFy"),
-            (&[0xfb, 0xff], "-_8"),
-        ] {
-            assert_eq!(base64url(input), expected);
-        }
         // The control for `alg_none`: the same assembly with a real
         // algorithm parses, kid and all, so `none` is what is refused.
         let token = unsigned(
@@ -1919,5 +2172,583 @@ mod tests {
                 "{name} names the JWKS endpoint, redacted: {rendered}"
             );
         }
+    }
+
+    // --- `Audience::IfPresent` ----------------------------------------------
+
+    fn if_present() -> ClaimChecks {
+        ClaimChecks::new(ISSUER, Audience::IfPresent(AUDIENCE.into()))
+    }
+
+    /// A good token whose `aud` is `aud`.
+    fn with_aud(aud: Value) -> String {
+        mint(claims().claim("aud", aud))
+    }
+
+    #[test]
+    fn if_present_accepts_no_aud_its_own_or_an_array_holding_it() {
+        for (case, token) in [
+            ("no aud", mint(claims().without_audience())),
+            ("the audience", with_aud(json!(AUDIENCE))),
+            ("an array holding it", with_aud(json!(["other", AUDIENCE]))),
+            ("an array of it alone", with_aud(json!([AUDIENCE]))),
+        ] {
+            checked(&token, &if_present()).unwrap_or_else(|err| panic!("{case}: {err}"));
+        }
+    }
+
+    #[test]
+    fn if_present_refuses_another_audience_and_a_malformed_aud() {
+        let cases = [
+            ("another audience", json!("some-other-app")),
+            ("the audience and a space", json!(format!("{AUDIENCE} "))),
+            ("an array without it", json!(["some-other-app"])),
+            ("an empty array", json!([])),
+            ("a number", json!(5)),
+            ("null", json!(null)),
+            ("a boolean", json!(true)),
+            ("an object", json!({ "aud": AUDIENCE })),
+            ("an array holding it and a number", json!([AUDIENCE, 1])),
+            ("an array holding it and null", json!([AUDIENCE, null])),
+            ("an array holding it nested", json!([[AUDIENCE]])),
+        ];
+        for (case, aud) in &cases {
+            assert_rejected(
+                checked(&with_aud(aud.clone()), &if_present()),
+                "audience is not accepted",
+                case,
+            );
+        }
+        // The control: not checking `aud` at all, every one of these
+        // verifies, so the refusal is `IfPresent`'s rule.
+        let not_validated = ClaimChecks::new(ISSUER, Audience::NotValidated);
+        for (case, aud) in &cases {
+            checked(&with_aud(aud.clone()), &not_validated)
+                .unwrap_or_else(|err| panic!("{case}, not validated: {err}"));
+        }
+    }
+
+    /// `IfPresent` changes the `aud` rule alone: `exp` and `iss` are still
+    /// required, `iss` still exact, and the signature still checked.
+    #[test]
+    fn if_present_keeps_every_other_check() {
+        for (case, token, reason) in [
+            (
+                "no exp",
+                mint_without(claims().without_audience(), "exp"),
+                "a required claim is missing",
+            ),
+            (
+                "no iss",
+                mint_without(claims().without_audience(), "iss"),
+                "a required claim is missing",
+            ),
+            (
+                "another issuer",
+                mint(TestClaims::new("https://evil.example", AUDIENCE)),
+                "issuer is not accepted",
+            ),
+            (
+                "expired",
+                mint(claims().without_audience().expires_in(-3600)),
+                "token has expired",
+            ),
+            (
+                "another key's signature",
+                TestKey::secondary().mint_with_kid(PRIMARY_KID, &claims().build()),
+                "signature is invalid",
+            ),
+        ] {
+            assert_rejected(checked(&token, &if_present()), reason, case);
+        }
+    }
+
+    // --- `Verifier::with_cache` ---------------------------------------------
+
+    #[test]
+    fn a_with_cache_verifiers_config_is_synthesized_from_its_cache() {
+        let cache = JwksCache::new("https://jwks.test/jwks", reqwest::Client::new());
+        let verifier = Verifier::with_cache(if_present(), cache);
+
+        assert_eq!(verifier.claim_checks(), &if_present());
+        assert_eq!(verifier.screen_policy(), ScreenPolicy::Basic);
+        let config = verifier.config();
+        assert_eq!(config.issuer, ISSUER);
+        assert_eq!(config.jwks_url, "https://jwks.test/jwks");
+        assert_eq!(config.audience, AUDIENCE);
+        assert_eq!(config.pat_validate_url, None);
+    }
+
+    /// The cache is the consumer's, tuning and all: with its refetch
+    /// interval at zero, an unknown kid refetches on every lookup, where the
+    /// cache `Verifier::for_issuer` builds would answer the second from
+    /// memory (`UnseenKid`) inside its 30 s floor.
+    #[tokio::test]
+    async fn a_with_cache_verifier_keeps_its_caches_refetch_interval() {
+        // The warm-up, then one refetch per unknown-kid lookup.
+        let server = primary_issuer(3).await;
+        let cache = JwksCache::new(jwks_url_of(&server), reqwest::Client::new())
+            .with_min_refetch_interval(Duration::ZERO);
+        let verifier = Verifier::with_cache(
+            ClaimChecks::new(ISSUER, Audience::Required(AUDIENCE.into())),
+            cache,
+        );
+
+        verifier
+            .verify_bearer_claims::<Value>(&mint(claims()))
+            .await
+            .expect("warm cache");
+        let forged = TestKey::primary().mint_with_kid("no-such-kid", &claims().build());
+        for lookup in ["first", "second"] {
+            let err = verifier
+                .verify_bearer_claims::<Value>(&forged)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, AuthError::UnknownKid),
+                "{lookup}: refetched, and the issuer's verdict: {err}"
+            );
+        }
+    }
+
+    /// The shape tapper adopts (plan 016 C-5): its own cache reporting
+    /// unusable keys, `aud` checked if present, no leeway, the strict screen,
+    /// and its claims read as JSON for its own identity rules.
+    #[tokio::test]
+    async fn tappers_verifier_shape_verifies_and_refuses() {
+        let server = primary_issuer(1).await;
+        let cache = JwksCache::new(jwks_url_of(&server), reqwest::Client::new())
+            .with_ttl(Duration::from_secs(3600))
+            .report_unusable_keys(true);
+        let verifier = Verifier::with_cache(
+            ClaimChecks::new(ISSUER, Audience::IfPresent("tapper".into()))
+                .with_leeway(Duration::ZERO),
+            cache,
+        )
+        .screen(ScreenPolicy::Strict);
+        assert_eq!(verifier.screen_policy(), ScreenPolicy::Strict);
+        let tapper = || TestClaims::new(ISSUER, "tapper");
+
+        for (case, claims) in [
+            ("no aud", tapper().without_audience()),
+            ("aud tapper", tapper()),
+            (
+                "aud an array",
+                tapper().claim("aud", json!(["tapper", "other"])),
+            ),
+        ] {
+            let read: Value = verifier
+                .verify_bearer_claims(&mint(claims))
+                .await
+                .unwrap_or_else(|err| panic!("{case}: {err}"));
+            assert_eq!(read["iss"], json!(ISSUER), "{case}");
+        }
+        for (case, token, reason) in [
+            (
+                "another service's aud",
+                mint(TestClaims::new(ISSUER, "other")),
+                "audience is not accepted",
+            ),
+            (
+                "a second past exp",
+                mint(tapper().expires_in(-1)),
+                "token has expired",
+            ),
+            (
+                "HS256, refused by the screen",
+                hs256(tapper()),
+                "algorithm is not accepted",
+            ),
+        ] {
+            assert_rejected(verifier.verify_bearer_claims(&token).await, reason, case);
+        }
+    }
+
+    // --- a cache that reports unusable keys ---------------------------------
+
+    fn reporting_verifier(server: &MockServer) -> Verifier {
+        Verifier::with_cache(
+            ClaimChecks::new(ISSUER, Audience::Required(AUDIENCE.into())),
+            JwksCache::new(jwks_url_of(server), reqwest::Client::new()).report_unusable_keys(true),
+        )
+    }
+
+    /// Each way the issuer's only key under the token's kid can be unusable,
+    /// as the change that makes it so and the reason reported.
+    /// `modulus` (base64url) with a zero octet in front: the same integer,
+    /// not in minimal form.
+    fn with_leading_zero(modulus: &str) -> String {
+        let mut octets = vec![0];
+        octets.extend(URL_SAFE_NO_PAD.decode(modulus).expect("base64url"));
+        URL_SAFE_NO_PAD.encode(octets)
+    }
+
+    /// `modulus` (base64url) with its lowest bit cleared.
+    fn made_even(modulus: &str) -> String {
+        let mut octets = URL_SAFE_NO_PAD.decode(modulus).expect("base64url");
+        *octets.last_mut().expect("a modulus") &= 0xFE;
+        URL_SAFE_NO_PAD.encode(octets)
+    }
+
+    fn unusable_changes() -> Vec<(&'static str, Value, UnusableReason)> {
+        use UnusableReason::*;
+        let modulus = key_json(TestKey::primary())["n"]
+            .as_str()
+            .expect("the test key's n")
+            .to_owned();
+        vec![
+            (
+                "no n (parsed as `Other`)",
+                json!({ "n": null }),
+                MalformedComponents,
+            ),
+            ("no e", json!({ "e": null }), MalformedComponents),
+            (
+                "an n that is a number",
+                json!({ "n": 65537 }),
+                MalformedComponents,
+            ),
+            (
+                "an n that is not base64url",
+                json!({ "n": "not!base64url" }),
+                MalformedComponents,
+            ),
+            (
+                "a padded n",
+                json!({ "n": format!("{modulus}==") }),
+                MalformedComponents,
+            ),
+            ("an empty e", json!({ "e": "" }), MalformedComponents),
+            // What aws-lc-rs refuses at verification: the key's own `n` with
+            // a leading zero octet (it signed the token, so only the encoding
+            // stops it), and exponents it never accepts.
+            (
+                "the key's n with a leading zero octet",
+                json!({ "n": with_leading_zero(&modulus) }),
+                MalformedComponents,
+            ),
+            ("e zero (`AA`)", json!({ "e": "AA" }), MalformedComponents),
+            ("e one", json!({ "e": "AQ" }), MalformedComponents),
+            (
+                "e 65537 with a leading zero octet",
+                json!({ "e": "AAEAAQ" }),
+                MalformedComponents,
+            ),
+            ("an even e", json!({ "e": "AQAA" }), MalformedComponents),
+            (
+                "an e of 41 bits",
+                json!({ "e": "AQAAAAAB" }),
+                MalformedComponents,
+            ),
+            (
+                "an even n",
+                json!({ "n": made_even(&modulus) }),
+                MalformedComponents,
+            ),
+            (
+                "a 1024-bit modulus",
+                json!({ "n": URL_SAFE_NO_PAD.encode([0xC5_u8; 128]) }),
+                ModulusSize,
+            ),
+            ("an unknown key type", json!({ "kty": "XYZ" }), NotRsa),
+            ("alg RS512", json!({ "alg": "RS512" }), Alg),
+            ("use enc", json!({ "use": "enc" }), Use),
+            (
+                "key_ops without verify",
+                json!({ "key_ops": ["encrypt"] }),
+                KeyOps,
+            ),
+        ]
+    }
+
+    #[tokio::test]
+    async fn over_a_reporting_cache_an_unusable_key_is_refused_with_its_reason() {
+        let token = mint(claims());
+        for (case, change, reason) in unusable_changes() {
+            let server = issuer(jwks_body(&primary_jwks_json_with(change)), 1).await;
+
+            let err = reporting_verifier(&server)
+                .verify_bearer_claims::<Value>(&token)
+                .await
+                .unwrap_err();
+
+            assert!(
+                matches!(err, AuthError::UnusableKey(got) if got == reason),
+                "{case}: expected UnusableKey({reason}), got {err}"
+            );
+            for rendered in [err.to_string(), format!("{err:?}")] {
+                assert!(!rendered.contains(PRIMARY_KID), "{case}: {rendered}");
+            }
+        }
+        for (case, foreign) in [
+            (
+                "an EC key",
+                json!({ "kty": "EC", "crv": "P-256", "x": "MKBCTNIcKUSDii11ySs3526iDZ8AiTo7Tu6KPAqv7D4", "y": "4Etl6SRW2YiLUrN5vfvVHuhp7x8PxltmWWlbbM4IFyM", "kid": PRIMARY_KID }),
+            ),
+            (
+                "a symmetric key",
+                json!({ "kty": "oct", "k": "cHVibGljIGtleSBtYXRlcmlhbA", "kid": PRIMARY_KID }),
+            ),
+        ] {
+            let server = issuer(jwks_body(&json!({ "keys": [foreign] }).to_string()), 1).await;
+            let err = reporting_verifier(&server)
+                .verify_bearer_claims::<Value>(&token)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, AuthError::UnusableKey(UnusableReason::NotRsa)),
+                "{case}: {err}"
+            );
+        }
+    }
+
+    /// The control: over a cache that does not report them (the default),
+    /// the same keys are refused as through v0.9.0, never as `UnusableKey`.
+    #[tokio::test]
+    async fn without_reporting_an_unusable_key_is_refused_as_before() {
+        let token = mint(claims());
+        for (case, change, _) in unusable_changes() {
+            let server = issuer(jwks_body(&primary_jwks_json_with(change)), 1).await;
+
+            let err = verifier_against(&server)
+                .verify_bearer_claims::<Value>(&token)
+                .await
+                .unwrap_err();
+
+            assert!(!matches!(err, AuthError::UnusableKey(_)), "{case}: {err}");
+        }
+    }
+
+    /// Keys sharing a kid are all considered, so a key that cannot verify,
+    /// listed first, does not hide the usable one behind it.
+    #[tokio::test]
+    async fn over_a_reporting_cache_an_unusable_key_does_not_hide_a_usable_one() {
+        for (case, change, _) in unusable_changes() {
+            let mut first = primary_key_with(&change);
+            first["kid"] = json!(PRIMARY_KID);
+            let set = json!({ "keys": [first, key_json(TestKey::primary())] }).to_string();
+            let server = issuer(jwks_body(&set), 1).await;
+
+            reporting_verifier(&server)
+                .verify_bearer_claims::<Value>(&mint(claims()))
+                .await
+                .unwrap_or_else(|err| panic!("{case}: {err}"));
+        }
+    }
+
+    #[test]
+    fn unusable_kids_lists_each_kid_with_no_usable_key_and_its_first_reason() {
+        let under = |kid: &str, change: Value| {
+            let mut key = primary_key_with(&change);
+            key["kid"] = json!(kid);
+            key
+        };
+        let set = parse(
+            &json!({ "keys": [
+                under("broken", json!({ "use": "enc" })),
+                under("broken", json!({ "alg": "RS512" })),
+                under("fixed-later", json!({ "key_ops": ["sign"] })),
+                under("fixed-later", json!({})),
+                under("fine", json!({})),
+                under("fine", json!({ "alg": "RS512" })),
+                primary_key_with(&json!({ "kid": null, "use": "enc" })),
+            ] })
+            .to_string(),
+        );
+
+        assert_eq!(
+            unusable_kids(&set),
+            HashMap::from([("broken".to_owned(), UnusableReason::Use)])
+        );
+        assert!(unusable_kids(&TestKey::primary().jwks()).is_empty());
+    }
+
+    /// [`rs256_key`]'s component rules, at their edges: what aws-lc-rs
+    /// accepts. Building a `DecodingKey` copies bytes and checks nothing, so
+    /// the tokens through the reporting verifier above are what show a
+    /// refused key never reaches verification.
+    #[test]
+    fn the_components_are_minimal_with_an_odd_modulus_and_a_small_odd_exponent() {
+        use UnusableReason::{MalformedComponents, ModulusSize};
+        let with = |n: Vec<u8>, e: Vec<u8>| {
+            let key = primary_key_with(&json!({
+                "n": URL_SAFE_NO_PAD.encode(n),
+                "e": URL_SAFE_NO_PAD.encode(e),
+            }));
+            rs256_key(&serde_json::from_value(key).expect("a JWK")).map(|_| ())
+        };
+        // `top`, then `rest` octets of 0xFF: odd, `8 × rest` bits plus top's.
+        let modulus = |top: u8, rest: usize| {
+            let mut octets = vec![top];
+            octets.extend(std::iter::repeat_n(0xFF, rest));
+            octets
+        };
+        let zero_then = |octets: Vec<u8>| [vec![0], octets].concat();
+        let f4 = || vec![1, 0, 1];
+
+        for (case, n, e) in [
+            ("2048 bits", modulus(0x80, 255), f4()),
+            ("8192 bits", modulus(0xFF, 1023), f4()),
+            ("e 3", modulus(0x80, 255), vec![3]),
+            ("e of 33 bits", modulus(0x80, 255), vec![1, 0, 0, 0, 1]),
+        ] {
+            assert_eq!(with(n, e), Ok(()), "{case}");
+        }
+        let mut even = modulus(0x80, 255);
+        *even.last_mut().expect("octets") = 0xFE;
+        for (case, n, reason) in [
+            ("2047 bits", modulus(0x7F, 255), ModulusSize),
+            ("8193 bits", modulus(0x01, 1024), ModulusSize),
+            (
+                "2048 bits after a zero octet",
+                zero_then(modulus(0x80, 255)),
+                MalformedComponents,
+            ),
+            (
+                "2047 bits after a zero octet",
+                zero_then(modulus(0x7F, 255)),
+                MalformedComponents,
+            ),
+            ("all zeros", vec![0; 256], MalformedComponents),
+            ("empty", Vec::new(), MalformedComponents),
+            ("even", even, MalformedComponents),
+        ] {
+            assert_eq!(with(n, f4()), Err(reason), "n {case}");
+        }
+        for (case, e) in [
+            ("zero", vec![0]),
+            ("one", vec![1]),
+            ("even", vec![1, 0, 0]),
+            ("34 bits", vec![2, 0, 0, 0, 1]),
+            ("65537 after a zero octet", zero_then(f4())),
+            ("empty", Vec::new()),
+        ] {
+            assert_eq!(
+                with(modulus(0x80, 255), e),
+                Err(MalformedComponents),
+                "e {case}"
+            );
+        }
+    }
+
+    /// The review's case, end to end: a key aws-lc-rs refuses is a bad
+    /// signature to the default verifier (the premise: it does reach
+    /// verification there and fail, a 401) and `UnusableKey` to a reporting
+    /// one, which then lets a usable key under the same kid verify.
+    #[tokio::test]
+    async fn a_key_aws_lc_rs_refuses_is_unusable_not_a_bad_signature() {
+        let token = mint(claims());
+        let modulus = key_json(TestKey::primary())["n"]
+            .as_str()
+            .expect("the test key's n")
+            .to_owned();
+        for (case, change) in [
+            (
+                "a leading zero octet in n",
+                json!({ "n": with_leading_zero(&modulus) }),
+            ),
+            ("e zero", json!({ "e": "AA" })),
+        ] {
+            let alone = primary_jwks_json_with(change.clone());
+
+            let server = issuer(jwks_body(&alone), 1).await;
+            assert_rejected(
+                verifier_against(&server).verify_bearer_claims(&token).await,
+                "signature is invalid",
+                &format!("{case}, default selection"),
+            );
+
+            let server = issuer(jwks_body(&alone), 1).await;
+            let err = reporting_verifier(&server)
+                .verify_bearer_claims::<Value>(&token)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    AuthError::UnusableKey(UnusableReason::MalformedComponents)
+                ),
+                "{case}, reporting: {err}"
+            );
+
+            let pair = json!({ "keys": [primary_key_with(&change), key_json(TestKey::primary())] });
+            let server = issuer(jwks_body(&pair.to_string()), 1).await;
+            reporting_verifier(&server)
+                .verify_bearer_claims::<Value>(&token)
+                .await
+                .unwrap_or_else(|err| panic!("{case}, then a usable key: {err}"));
+        }
+    }
+
+    // --- report_unusable_keys set after the cache fetched -------------------
+
+    fn required() -> ClaimChecks {
+        ClaimChecks::new(ISSUER, Audience::Required(AUDIENCE.into()))
+    }
+
+    /// Reporting turned on after the cache fetched holds at once: the set
+    /// fetched without it was checked like any other, so its held kid with no
+    /// usable key is `UnusableKey` from memory inside the floor, and once the
+    /// floor opens the recovery refetch picks up the fixed key.
+    #[tokio::test]
+    async fn reporting_turned_on_after_a_fetch_applies_to_the_set_held() {
+        let broken = primary_jwks_json_with(json!({ "use": "enc" }));
+        let server = issuer_then(jwks_body(&broken), primary_body()).await;
+        let cache = JwksCache::new(jwks_url_of(&server), reqwest::Client::new());
+        cache
+            .jwks_for_kid(PRIMARY_KID)
+            .await
+            .expect("served while reporting is off");
+        let verifier = Verifier::with_cache(required(), cache.report_unusable_keys(true));
+        let token = mint(claims());
+
+        let err = verifier
+            .verify_bearer_claims::<Value>(&token)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, AuthError::UnusableKey(UnusableReason::Use)),
+            "{err}"
+        );
+        assert_eq!(requests(&server).await, 1, "from memory, inside the floor");
+
+        verifier
+            .inner
+            .jwks
+            .advance_for_test(crate::MIN_REFETCH_INTERVAL);
+        verifier
+            .verify_bearer_claims::<Value>(&token)
+            .await
+            .expect("the floor's recovery refetch finds the fixed key");
+        assert_eq!(requests(&server).await, 2);
+    }
+
+    /// And turned off after the cache fetched: the set held is served for the
+    /// kid again, and the default selection decides (no fit key under it:
+    /// `UnknownKid`), from memory.
+    #[tokio::test]
+    async fn reporting_turned_off_after_a_fetch_no_longer_applies() {
+        let broken = primary_jwks_json_with(json!({ "use": "enc" }));
+        let server = issuer(jwks_body(&broken), 1).await;
+        let cache =
+            JwksCache::new(jwks_url_of(&server), reqwest::Client::new()).report_unusable_keys(true);
+        let err = cache.jwks_for_kid(PRIMARY_KID).await.unwrap_err();
+        assert!(
+            matches!(err, AuthError::UnusableKey(UnusableReason::Use)),
+            "while reporting: {err}"
+        );
+        let verifier = Verifier::with_cache(required(), cache.report_unusable_keys(false));
+
+        let err = verifier
+            .verify_bearer_claims::<Value>(&mint(claims()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AuthError::UnknownKid), "{err}");
+        verifier
+            .inner
+            .jwks
+            .jwks_for_kid(PRIMARY_KID)
+            .await
+            .expect("the set held serves the kid");
     }
 }

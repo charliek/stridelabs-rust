@@ -11,6 +11,99 @@ for a consumer's pin.
 
 ## [Unreleased]
 
+The workspace version is 0.10.0 from here on (`[workspace.package].version`
+and `Cargo.lock`): tapper plan 016 C-1 bumps it for the v0.10.0 cycle
+(lumen-rust confirmed the number is free), and C-2 and C-3 land on it.
+
+### Added
+
+- `stridelabs-auth`: four opt-in additions for a resource server that keeps
+  claim rules of its own (tapper plan 016 C-1, so that tapper-rs can replace
+  its hand-written verifier with this crate's at C-5, keeping its behaviour).
+  A consumer that uses none of them sees no change: v0.9.0's tests pass
+  unchanged, and `for_issuer`, now built on `with_cache`, builds the same
+  verifier.
+  - **`Audience::IfPresent(String)`**, on the `#[non_exhaustive]` enum: an
+    absent `aud` passes; a string must equal the value; an array must
+    contain it and hold nothing but strings. A malformed `aud` (a number, a
+    boolean, an object, `null`, an array holding a non-string) is refused,
+    "audience is not accepted". jsonwebtoken lets an `aud` it cannot parse
+    through when `aud` is not required, so the crate checks `IfPresent`
+    itself, after the signature and the other claims; `exp` and `iss` stay
+    required. Safe only when the issuer names the audience in every token
+    it mints for another service (Hydra stamps an empty array, which this
+    refuses, when a client asked for none).
+  - **`Verifier::with_cache(checks, cache: JwksCache)`**: `for_issuer` over a
+    cache the consumer built, so its TTL, its refetch interval (tapper's
+    suites run with none), its HTTP client and `report_unusable_keys` are the
+    consumer's. Pairing the cache with the rules is then the caller's job.
+    `config()` is synthesized as for `for_issuer`, from the cache's URL
+    (under `IfPresent`, its audience is the value).
+  - **`JwksCache::report_unusable_keys(bool)`** (off by default: v0.9.0's
+    behaviour) and `reports_unusable_keys()`. On, a set inside its TTL
+    answers a lookup for a kid it holds only if some key under the kid can
+    verify RS256: an RSA key whose `alg`, `use` and `key_ops`, where present,
+    allow it, and whose `n` and `e` are what aws-lc-rs, the RS256 verifier,
+    accepts: unpadded base64url, minimal big-endian octets (no leading zero
+    octet, as RFC 7518 also requires), an odd `e` of 2 to 33 bits (so not 0
+    or 1), and an odd modulus of 2048 to 8192 bits. Otherwise the
+    lookup is **`AuthError::UnusableKey(UnusableReason)`**, a new variant on
+    the `#[non_exhaustive]` `AuthError` that carries no kid (the crate's
+    error rule) but the first key's reason: `UnusableReason`
+    (`#[non_exhaustive]`, `Copy`) is `NotRsa`, `MalformedComponents` (`n` or
+    `e` missing, not a string, not unpadded base64url, or not one aws-lc-rs
+    accepts), `ModulusSize`, `Alg`, `Use` or `KeyOps`, each a fixed phrase.
+    Such a kid
+    takes the unknown kid's refetch floor: **one refetch per floor**, so a
+    usable key the issuer rotates in under it is picked up, and from memory
+    inside the floor, so a persistently broken key costs one fetch per floor,
+    not one per request. The verdicts are worked out once for every fetched
+    set, on the fetch's task, never under the cache's lock, and the setting
+    is read at each lookup, so it holds from the moment it is set, for a set
+    fetched before it included. A verifier over such a
+    cache selects only a key that passes the same checks; the default
+    selection is unchanged (a kid with no fit key is `UnknownKid`, a fit key
+    that cannot be built is `Jwks`). The `http` bridge maps `UnusableKey`
+    where it maps `Jwks`, to `AppError::Internal` (a 500), and
+    stridelabs-mcp's `From<AuthError> for VerifyError` to `Unavailable`
+    (neither path can produce it today: both verifiers build their own
+    caches).
+
+    **Consumers that map `Jwks` to 503 should map `UnusableKey` to 503
+    too**: the issuer published that kid, so a broken key entry is the
+    issuer's defect, and a 401 would sign out every holder of a valid token
+    until the set's next refresh. A `match` on `AuthError` already has a
+    wildcard arm (it is `#[non_exhaustive]` since v0.9.0), so nothing breaks
+    to compile; without the arm, `UnusableKey` goes wherever the wildcard
+    sends it (a 401 in lumen's mapping), and only from a cache that turned
+    reporting on.
+  - **`Verifier::screen(ScreenPolicy)`** and `screen_policy()`, with a new
+    public `screen` module: `ScreenPolicy` (`#[non_exhaustive]`, also at the
+    crate root), `MAX_TOKEN_BYTES` (16 KiB) and `MAX_KID_BYTES` (256).
+    `ScreenPolicy::Basic`, the default, is what every verifier has always
+    checked before the key lookup: a header that parses and carries a `kid`.
+    `ScreenPolicy::Strict` also refuses, still before the lookup (so with no
+    fetch, and never with `Jwks`, `UnseenKid` or `UnusableKey` while the
+    issuer is down): a token over 16 KiB, not exactly three non-empty
+    unpadded-base64url segments, with a header jsonwebtoken cannot parse, or
+    a payload that is not UTF-8 throughout or not a JSON object
+    (`MalformedToken`); a `crit` header
+    parameter in any form, `[]` and `null` included (`InvalidToken`); an
+    `alg` other than RS256 (`InvalidToken("algorithm is not accepted")`); a
+    missing or empty `kid` (`MissingKid`); a `kid` over 256 bytes
+    (`InvalidToken("key id is too long")`). Every refusal is a 401 in the
+    house mappings, and its reason (a fixed phrase) is logged at `debug`.
+    Ported from tapper-rs's pre-lookup screen, with its test cases, so
+    tapper's swap keeps its behaviour.
+  - `Verifier`'s `Debug` adds its `screen`, and `JwksCache`'s its
+    `report_unusable_keys`.
+  - `base64` (0.22, jsonwebtoken's own) is a direct dependency now, for the
+    screen, `IfPresent` and the key checks: `Cargo.lock` gains the edge, and
+    no crate joins the graph.
+  - lumen-rs (rev `6d08a4a`: `for_issuer`) and parcel (through
+    stridelabs-mcp) are not covered by `scripts/downstream-check.sh`; the
+    paths they use are unchanged.
+
 ## [0.9.0] - 2026-10-22
 
 A joint release: slaudio's port gaps and their curation (plan 024's #44, plan 025's L1 #48 and L2 #50), lumen's S1

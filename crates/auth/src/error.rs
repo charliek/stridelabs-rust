@@ -36,11 +36,15 @@ pub enum AuthError {
     /// No `Authorization: Bearer …` header on the request.
     #[error("missing bearer token")]
     MissingToken,
-    /// Not a JWT at all — the header couldn't be decoded.
+    /// Not a JWT at all — the header couldn't be decoded; or, under
+    /// [`crate::ScreenPolicy::Strict`], the token failed one of its
+    /// structural checks (its size, its three segments, the header, the
+    /// payload). Either way no key was looked up.
     #[error("malformed token")]
     MalformedToken,
     /// The JWT header has no `kid`, so there is no way to say which of the
-    /// issuer's keys should have signed it. slauth always sets one.
+    /// issuer's keys should have signed it. slauth always sets one. Under
+    /// [`crate::ScreenPolicy::Strict`] an empty `kid` is missing too.
     #[error("token is missing a key id")]
     MissingKid,
     /// The token's `kid` is not in a JWKS still inside its TTL — one just
@@ -84,6 +88,54 @@ pub enum AuthError {
     /// `without_url()`.
     #[error("JWKS unavailable: {0}")]
     Jwks(String),
+    /// Only from a [`crate::JwksCache`] built with
+    /// [`report_unusable_keys(true)`](crate::JwksCache::report_unusable_keys):
+    /// the issuer's key set, inside its TTL, holds the token's `kid`, but no
+    /// key under it can verify an RS256 signature, for the reason given (that
+    /// of the first key under the kid). It is refused before any signature
+    /// check, after at most one refetch per refetch floor (see
+    /// [`crate::jwks`]).
+    ///
+    /// The issuer published that kid, so the defect is the issuer's, not the
+    /// token's: map it where [`AuthError::Jwks`] goes (a 5xx), as the house
+    /// mappings do, so a broken key entry does not sign out every holder of
+    /// a valid token. Like every variant it carries no kid, although this kid
+    /// is the issuer's own value: log the reason, and find the key in the
+    /// issuer's set.
+    #[error("no key under the token's key id can verify RS256: {0}")]
+    UnusableKey(UnusableReason),
+}
+
+/// Why no key under a kid can verify an RS256 signature
+/// ([`AuthError::UnusableKey`]): the first key's reason, a fixed phrase.
+///
+/// `#[non_exhaustive]`: a new reason is a new variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, thiserror::Error)]
+#[non_exhaustive]
+pub enum UnusableReason {
+    /// Not an RSA key: an EC, OKP or `oct` key, or a key type jsonwebtoken
+    /// does not model.
+    #[error("not an RSA key")]
+    NotRsa,
+    /// An RSA key whose `n` or `e` is missing, not a string, not unpadded
+    /// base64url, empty, or not in minimal form (a leading zero octet); whose
+    /// `e` is even, 1, or over 33 bits; or whose `n` is even. The RS256
+    /// verifier (aws-lc-rs) refuses each.
+    #[error("its n or e is missing or malformed")]
+    MalformedComponents,
+    /// An RSA key whose modulus is outside 2048–8192 bits, the sizes the
+    /// RS256 verifier accepts.
+    #[error("its modulus is not 2048 to 8192 bits")]
+    ModulusSize,
+    /// An `alg` other than `RS256`.
+    #[error("its alg is not RS256")]
+    Alg,
+    /// A `use` other than `sig`.
+    #[error("its use is not sig")]
+    Use,
+    /// A `key_ops` without `verify`.
+    #[error("its key_ops exclude verify")]
+    KeyOps,
 }
 
 /// Classify a `jsonwebtoken` failure into an [`AuthError::InvalidToken`].
@@ -122,6 +174,8 @@ pub(crate) fn invalid_token(err: &jsonwebtoken::errors::Error) -> AuthError {
 ///   token. It becomes `AppError::Internal`, so the detail is logged and the
 ///   client gets a 500 with a fixed body. So does [`AuthError::UnseenKid`]:
 ///   a refetch this service suppressed is no verdict on the token either.
+///   And so does [`AuthError::UnusableKey`]: a key the issuer published but
+///   nobody can verify with is the issuer's defect.
 /// - Everything else becomes `AppError::Unauthorized` with a **single generic
 ///   message**, deliberately not the specific reason. `AppError`'s contract is
 ///   that a non-`Internal` payload is returned to the client verbatim, and
@@ -136,7 +190,7 @@ impl From<AuthError> for stridelabs_http::AppError {
             AuthError::Jwks(detail) => {
                 stridelabs_http::AppError::Internal(anyhow::anyhow!("slauth JWKS: {detail}"))
             }
-            AuthError::UnseenKid => {
+            AuthError::UnseenKid | AuthError::UnusableKey(_) => {
                 stridelabs_http::AppError::Internal(anyhow::anyhow!("slauth JWKS: {err}"))
             }
             _ => stridelabs_http::AppError::Unauthorized("invalid or missing credentials".into()),
@@ -175,6 +229,23 @@ mod http_tests {
         assert_eq!(
             detail.to_string(),
             "slauth JWKS: token signed by a key not seen yet; refetch suppressed"
+        );
+    }
+
+    /// An unusable published key goes where `Jwks` goes: the issuer's
+    /// defect, not the caller's token.
+    #[test]
+    fn an_unusable_key_is_a_server_error_too() {
+        let app: AppError = AuthError::UnusableKey(UnusableReason::ModulusSize).into();
+
+        assert_eq!(app.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let AppError::Internal(detail) = app else {
+            panic!("an unusable key is Internal");
+        };
+        assert_eq!(
+            detail.to_string(),
+            "slauth JWKS: no key under the token's key id can verify RS256: \
+             its modulus is not 2048 to 8192 bits"
         );
     }
 

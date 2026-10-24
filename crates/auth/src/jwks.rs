@@ -3,8 +3,9 @@
 //! # Contract
 //!
 //! [`JwksCache::jwks_for_kid`] returns a [`JwkSet`] that **contains** the
-//! requested `kid`, or an error. It never returns a set the caller then has to
-//! re-check, and **it never returns a set past its TTL**.
+//! requested `kid` (under [`JwksCache::report_unusable_keys`], a key under it
+//! that can verify RS256: rule 5), or an error. It never returns a set the
+//! caller then has to re-check, and **it never returns a set past its TTL**.
 //!
 //! A set's *age* is the time since its last **successful** fetch. Every bound
 //! below is per cache instance and read off that instance's monotonic clock.
@@ -59,6 +60,18 @@
 //!    is `Jwks`, because "unknown key" would blame the caller's token for
 //!    this service's outage. A kid still absent after an actual refetch is
 //!    `UnknownKid`.
+//! 5. **Unusable keys, when asked.** Under
+//!    [`JwksCache::report_unusable_keys`] (off by default), a set holds a kid
+//!    only if some key under it can verify an RS256 signature (the reasons
+//!    are [`crate::UnusableReason`]'s, worked out once per fetched set
+//!    whatever the setting, which is read at each lookup). A
+//!    kid the set holds with no such key takes rule 4's gate: one refetch
+//!    per floor, so a usable key rotated in under it is picked up, and
+//!    inside the floor, or still unusable after the refetch,
+//!    [`AuthError::UnusableKey`], from memory, rather than `UnknownKid` or
+//!    `UnseenKid`. The issuer published the kid, so this is no verdict on
+//!    the token: a consumer maps it where `Jwks` goes. Off, such a set is
+//!    served, and the verifier's own key selection decides.
 //!
 //! The **refetch floor** `F` is `min(min_refetch_interval, max(ttl, 1 s))`:
 //! [`MIN_REFETCH_INTERVAL`] (30 s) at the defaults; the TTL, when that is
@@ -129,7 +142,7 @@
 //! meant two verifiers in one process — the shape every test that wanted an
 //! isolated cache needs — silently shared one key set.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 use std::time::{Duration, Instant};
@@ -140,7 +153,8 @@ use tokio::sync::oneshot;
 use tracing::Instrument as _;
 
 use crate::config::redact_url;
-use crate::error::AuthError;
+use crate::error::{AuthError, UnusableReason};
+use crate::verify::unusable_kids;
 
 /// How long a fetched key set is served: the most it is ever served for,
 /// counted from its last successful fetch (module docs, rule 3).
@@ -216,6 +230,8 @@ const ABORTED: &str = "refetch aborted";
 /// `<locked>` if another thread holds it at that instant).
 pub struct JwksCache {
     tuning: Tuning,
+    /// [`JwksCache::report_unusable_keys`]: off by default.
+    report_unusable: bool,
     inner: Arc<Inner>,
 }
 
@@ -243,7 +259,8 @@ impl fmt::Debug for JwksCache {
             // Never the client itself: reqwest::Client's Debug prints its
             // default headers, and an injected client may carry credentials.
             .field("http", &format_args!("reqwest::Client {{ .. }}"))
-            .field("tuning", &self.tuning);
+            .field("tuning", &self.tuning)
+            .field("report_unusable_keys", &self.report_unusable);
         // `try_lock`: a `Debug` reached while this thread holds the state (a
         // log line formatting the cache) must not deadlock on it.
         match self.inner.state.try_lock() {
@@ -432,9 +449,31 @@ impl State {
 #[derive(Debug, Clone)]
 struct Fetched {
     set: Arc<JwkSet>,
+    /// The set's kids under which no key can verify RS256, with the first
+    /// key's reason: computed for every fetched set, on the fetch's task, so
+    /// a lookup under the lock reads a map rather than decoding keys.
+    /// Consulted only while the cache reports unusable keys, read at each
+    /// lookup, so [`JwksCache::report_unusable_keys`] holds from the moment
+    /// it is set, whatever the cache had fetched before.
+    unusable: Arc<HashMap<String, UnusableReason>>,
     fetched_at: Instant,
     /// The attempt that fetched it.
     id: u64,
+}
+
+impl Fetched {
+    /// Why no key under `kid` can verify, if the cache reports unusable keys
+    /// (`report`) and this set holds the kid only under such keys.
+    fn unusable(&self, kid: &str, report: bool) -> Option<UnusableReason> {
+        self.unusable.get(kid).copied().filter(|_| report)
+    }
+
+    /// Whether this set answers a lookup for `kid`: it holds the kid, and,
+    /// when the cache reports unusable keys (`report`), a key under it that
+    /// can verify.
+    fn serves(&self, kid: &str, report: bool) -> bool {
+        self.set.find(kid).is_some() && self.unusable(kid, report).is_none()
+    }
 }
 
 /// One fetch attempt as every waiter sees it: the outcome its task sends,
@@ -468,13 +507,15 @@ struct InFlight {
 /// | `age < R` | any | yes | — | `Serve` |
 /// | `R ≤ age < T` | any | yes | none in flight and `last_end + B(n)` | open: `ServeAndRefresh`; closed: `Serve` |
 /// | `age < T` | yes | no | — | `Join` |
-/// | `age < T` | no | no | `last_start + F` | open: `Start`; closed: `UnknownKid` for a seen kid, `UnseenKid` for one never seen |
+/// | `age < T` | no | no | `last_start + F` | open: `Start`; closed: `Unusable` for a kid the set holds unusable, else `UnknownKid` for a seen kid, `UnseenKid` for one never seen |
 /// | none, or `age ≥ T` | yes | any | — | `Join` (never the expired set) |
 /// | none, or `age ≥ T` | no | any | `last_end + B(n)` | open: `Start`; closed: `Suppressed`, or `TooSoon` with no failure |
 ///
 /// `T` is the TTL, `R` the age the refresh window opens at, `F` the refetch
 /// floor, `B(n)` the backoff ([`Tuning`]), and `n` the failure count;
-/// `B(0) = F`.
+/// `B(0) = F`. "Has the kid" is [`Fetched::serves`]: while the cache reports
+/// unusable keys, a kid the set holds only under keys that cannot verify is
+/// "no", so it takes the unknown kid's gate.
 enum Decision<'a> {
     Serve(&'a Arc<JwkSet>),
     ServeAndRefresh(&'a Arc<JwkSet>),
@@ -482,15 +523,22 @@ enum Decision<'a> {
     Start,
     UnknownKid,
     UnseenKid,
+    Unusable(UnusableReason),
     Suppressed,
     TooSoon,
 }
 
-/// Pure: the state, the kid, one reading of the clock and the tuning in, a
-/// [`Decision`] out. Every gate is `elapsed >= spacing` on a saturating
-/// `elapsed`, so no instant arithmetic can overflow, and a gate with no
-/// attempt behind it is open.
-fn decide<'a>(state: &'a State, kid: &str, now: Instant, tuning: &Tuning) -> Decision<'a> {
+/// Pure: the state, the kid, one reading of the clock, the tuning and
+/// whether unusable keys are reported in, a [`Decision`] out. Every gate is
+/// `elapsed >= spacing` on a saturating `elapsed`, so no instant arithmetic
+/// can overflow, and a gate with no attempt behind it is open.
+fn decide<'a>(
+    state: &'a State,
+    kid: &str,
+    now: Instant,
+    tuning: &Tuning,
+    report_unusable: bool,
+) -> Decision<'a> {
     let since =
         |at: Option<Instant>| at.map_or(Duration::MAX, |at| now.saturating_duration_since(at));
     let valid = state
@@ -499,7 +547,7 @@ fn decide<'a>(state: &'a State, kid: &str, now: Instant, tuning: &Tuning) -> Dec
         .map(|cached| (cached, now.saturating_duration_since(cached.fetched_at)))
         .filter(|&(_, age)| age < tuning.ttl);
     match (valid, &state.in_flight) {
-        (Some((cached, age)), in_flight) if cached.set.find(kid).is_some() => {
+        (Some((cached, age)), in_flight) if cached.serves(kid, report_unusable) => {
             let refresh = age >= tuning.refresh_at()
                 && in_flight.is_none()
                 && since(state.last_end) >= tuning.backoff(state.failures);
@@ -511,8 +559,11 @@ fn decide<'a>(state: &'a State, kid: &str, now: Instant, tuning: &Tuning) -> Dec
         }
         (_, Some(in_flight)) => Decision::Join(in_flight),
         (Some(_), None) if since(state.last_start) >= tuning.floor() => Decision::Start,
-        (Some(_), None) if state.seen.contains(kid) => Decision::UnknownKid,
-        (Some(_), None) => Decision::UnseenKid,
+        (Some((cached, _)), None) => match cached.unusable(kid, report_unusable) {
+            Some(reason) => Decision::Unusable(reason),
+            None if state.seen.contains(kid) => Decision::UnknownKid,
+            None => Decision::UnseenKid,
+        },
         (None, None) if since(state.last_end) >= tuning.backoff(state.failures) => Decision::Start,
         (None, None) if state.failures == 0 => Decision::TooSoon,
         (None, None) => Decision::Suppressed,
@@ -545,6 +596,7 @@ impl JwksCache {
     pub fn new(jwks_url: impl Into<String>, http: reqwest::Client) -> JwksCache {
         JwksCache {
             tuning: Tuning::default(),
+            report_unusable: false,
             inner: Arc::new(Inner {
                 jwks_url: jwks_url.into(),
                 http,
@@ -591,6 +643,39 @@ impl JwksCache {
         self
     }
 
+    /// Whether a kid whose keys cannot verify RS256 is refused as
+    /// [`AuthError::UnusableKey`] (module docs, rule 5). Off by default: the
+    /// cache serves any set holding the kid, and a [`crate::Verifier`] over
+    /// it then finds no fit key ([`AuthError::UnknownKid`]) or fails to build
+    /// one ([`AuthError::Jwks`]), as through v0.9.0.
+    ///
+    /// On, a set holding the kid is served only if some key under the kid
+    /// can verify an RS256 signature: an RSA key whose `alg`, `use` and
+    /// `key_ops`, where present, allow it, and whose `n` and `e` are what the
+    /// RS256 verifier (aws-lc-rs) accepts (unpadded base64url, minimal
+    /// big-endian octets, an odd `e` from 3 to 33 bits, an odd modulus of
+    /// 2048 to 8192 bits). Otherwise the lookup refetches at most once per
+    /// refetch floor, so a usable key rotated in under the kid is picked up
+    /// and a persistently broken one costs one fetch per floor, and is
+    /// refused with the first key's [`crate::UnusableReason`] until then. Map
+    /// that error where [`AuthError::Jwks`] goes: the issuer published the
+    /// kid, so the defect is the issuer's.
+    ///
+    /// The setting is read at each lookup, and every fetched set is checked
+    /// whatever it is, so it holds from the moment it is set, a set the
+    /// cache fetched before included.
+    #[must_use]
+    pub fn report_unusable_keys(mut self, report: bool) -> JwksCache {
+        self.report_unusable = report;
+        self
+    }
+
+    /// Whether this cache refuses a kid with no usable key
+    /// ([`JwksCache::report_unusable_keys`]).
+    pub fn reports_unusable_keys(&self) -> bool {
+        self.report_unusable
+    }
+
     /// The endpoint this cache reads from.
     pub fn jwks_url(&self) -> &str {
         &self.inner.jwks_url
@@ -607,6 +692,10 @@ impl JwksCache {
     ///   seen in an earlier set (a retired key);
     /// - [`AuthError::UnseenKid`]: within the floor, for a kid no fetched set
     ///   has held (refetch suppressed: possibly a rotation not fetched yet);
+    /// - [`AuthError::UnusableKey`], only under
+    ///   [`JwksCache::report_unusable_keys`]: a set inside its TTL holds the
+    ///   kid, but no key under it can verify RS256, just refetched or within
+    ///   the floor (module docs, rule 5);
     /// - [`AuthError::Jwks`]: the endpoint could not be reached, answered
     ///   non-2xx, sent a body over [`MAX_JWKS_BYTES`] or answered with
     ///   something that isn't a JWKS; or, with no set inside its TTL, a
@@ -629,7 +718,7 @@ impl JwksCache {
         let (attempt, retry) = {
             let state = self.inner.state();
             let now = self.inner.now();
-            match decide(&state, kid, now, &self.tuning) {
+            match decide(&state, kid, now, &self.tuning, self.report_unusable) {
                 Decision::Serve(set) => return Ok(Arc::clone(set)),
                 Decision::ServeAndRefresh(set) => {
                     let set = Arc::clone(set);
@@ -647,6 +736,13 @@ impl JwksCache {
                         "JWKS kid never seen, inside the refetch floor; refetch suppressed"
                     );
                     return Err(AuthError::UnseenKid);
+                }
+                Decision::Unusable(reason) => {
+                    tracing::debug!(
+                        %reason,
+                        "JWKS kid held with no usable key, inside the refetch floor"
+                    );
+                    return Err(AuthError::UnusableKey(reason));
                 }
                 Decision::Suppressed => {
                     tracing::debug!("suppressing JWKS refetch after a recent failure");
@@ -704,6 +800,9 @@ impl JwksCache {
                 "JWKS set expired before the lookup that waited for it could use it"
             );
             return Err(AuthError::Jwks(EXPIRED_BEFORE_USE.into()));
+        }
+        if let Some(reason) = fetched.unusable(kid, self.report_unusable) {
+            return Err(AuthError::UnusableKey(reason));
         }
         match fetched.set.find(kid) {
             Some(_) => Ok(fetched.set),
@@ -807,7 +906,13 @@ impl JwksCache {
 async fn run(guard: SlotGuard, timeout: Duration) {
     #[cfg(test)]
     guard.inner.panic_if_asked();
-    let result = guard.inner.fetch(timeout).await;
+    // The unusable kids are worked out here, on the fetch's task and off the
+    // lock, once per set and whatever the cache reports now: the setting is
+    // read at each lookup, so it can change without a refetch.
+    let result = guard.inner.fetch(timeout).await.map(|set| {
+        let unusable = unusable_kids(&set);
+        (set, unusable)
+    });
     guard.complete(result);
 }
 
@@ -834,13 +939,14 @@ struct SlotGuard {
 impl SlotGuard {
     /// Record the outcome and clear the slot in one critical section, then
     /// hand the outcome to the waiters.
-    fn complete(mut self, result: Result<JwkSet, AuthError>) {
+    fn complete(mut self, result: Result<(JwkSet, HashMap<String, UnusableReason>), AuthError>) {
         let outcome = {
             let mut state = self.inner.state();
             let now = self.inner.now();
             let outcome = match result {
-                Ok(set) => Ok(Fetched {
+                Ok((set, unusable)) => Ok(Fetched {
                     set: Arc::new(set),
+                    unusable: Arc::new(unusable),
                     fetched_at: now,
                     id: self.id,
                 }),
