@@ -64,7 +64,17 @@
 //! **[`Audience::NotValidated`] skips the `aud` check, and is safe only when
 //! the issuer binds the audience some other way**, as WorkOS's per-client
 //! `iss` does. Against an issuer shared by several services it accepts a
-//! token minted for any of them.
+//! token minted for any of them. [`Audience::IfPresent`] checks `aud` only
+//! when the token carries one.
+//!
+//! [`Verifier::with_cache`] is [`Verifier::for_issuer`] over a [`JwksCache`]
+//! the consumer built (its refetch interval and client), and pairing the two
+//! is then the consumer's job. Two opt-in settings harden a verifier for a
+//! service that wants them: [`JwksCache::report_unusable_keys`] (a published
+//! kid whose keys cannot verify is [`AuthError::UnusableKey`], the issuer's
+//! defect, rather than a verdict on the token) and
+//! [`Verifier::screen`] with [`ScreenPolicy::Strict`] (a malformed token is
+//! refused before its key is looked up: [`screen`]).
 //!
 //! ```no_run
 //! # async fn example(http: reqwest::Client) -> Result<(), stridelabs_auth::AuthError> {
@@ -177,6 +187,7 @@ pub mod config;
 pub mod error;
 pub mod jwks;
 pub mod pat;
+pub mod screen;
 pub mod slauth_pat;
 pub mod verify;
 
@@ -197,11 +208,12 @@ mod test_support;
 mod mock_issuer;
 
 pub use config::SlauthConfig;
-pub use error::AuthError;
+pub use error::{AuthError, UnusableReason};
 pub use jwks::{JwksCache, JWKS_TTL, MIN_REFETCH_INTERVAL};
 // `pat::hash` is deliberately not re-exported here: a bare `hash` at a crate
 // root says nothing about *what* it hashes.
 pub use pat::{GeneratedToken, PatFormat, PatFormatError, MAX_PREFIX_LEN};
+pub use screen::ScreenPolicy;
 pub use slauth_pat::{
     is_slauth_pat, PatValidationError, PatValidator, PAT_VALIDATION_TIMEOUT, SLAUTH_PAT_PREFIX,
 };

@@ -41,6 +41,10 @@ jsonwebtoken = { workspace = true }
 reqwest = { workspace = true, features = ["json"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# Decodes a token's segments for `ScreenPolicy::Strict` and `Audience::IfPresent`,
+# and a JWK's `n`/`e` for `JwksCache::report_unusable_keys`: jsonwebtoken's own
+# base64 (0.22, URL_SAFE_NO_PAD), so no crate joins the graph.
+base64 = { workspace = true }
 sha2 = { workspace = true }
 rand = { workspace = true }
 thiserror = { workspace = true }

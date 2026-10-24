@@ -9,7 +9,7 @@ resolver = "2"
 # Lockstep versioning: every crate in this workspace ships at the same
 # version, bumped together at release time regardless of which crate(s)
 # changed. Consumers pin a single git rev/tag for the whole set.
-version = "0.9.0"
+version = "0.10.0"
 edition = "2021"
 rust-version = "1.97"
 license = "MIT"
@@ -143,8 +143,9 @@ redis = { version = "1", default-features = false, features = ["tokio-comp"] }
 jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_rs"] }
 sha2 = "0.11"
 # stridelabs-gcp decodes a base64 service-account key (the GOOGLE_CREDENTIALS
-# convention) and Vertex `inlineData` image bytes. 0.22, the major
-# jsonwebtoken 11 and wiremock already lock, so no second copy.
+# convention) and Vertex `inlineData` image bytes; stridelabs-auth a token's
+# segments and a JWK's `n`/`e`. 0.22, the major jsonwebtoken 11 and wiremock
+# already lock, so no second copy.
 base64 = "0.22"
 
 # Misc

@@ -86,14 +86,16 @@ impl VerifyError {
     }
 }
 
-/// [`AuthError::Jwks`] is the server's outage, and [`AuthError::UnseenKid`]
-/// a refetch the server suppressed, so both are `Unavailable`; everything
-/// else is a verdict on the token. `AuthError`'s messages are already
-/// redaction-safe (fixed phrases, URL-free), so they are kept.
+/// [`AuthError::Jwks`] is the server's outage, [`AuthError::UnseenKid`] a
+/// refetch the server suppressed, and [`AuthError::UnusableKey`] (only from
+/// a cache that reports unusable keys) the issuer's broken key, so all three
+/// are `Unavailable`; everything else is a verdict on the token.
+/// `AuthError`'s messages are already redaction-safe (fixed phrases,
+/// URL-free, no kid), so they are kept.
 impl From<AuthError> for VerifyError {
     fn from(err: AuthError) -> VerifyError {
         match err {
-            AuthError::Jwks(_) | AuthError::UnseenKid => {
+            AuthError::Jwks(_) | AuthError::UnseenKid | AuthError::UnusableKey(_) => {
                 VerifyError::Unavailable(err.to_string().into())
             }
             _ => VerifyError::Invalid(err.to_string().into()),
@@ -501,14 +503,15 @@ mod tests {
         assert!(!err.to_string().contains(&server.uri()), "{err}");
     }
 
-    /// The mapping itself: an outage and a suppressed refetch are
-    /// `Unavailable`, a verdict on the token (an unknown or retired key
-    /// included) is `Invalid`.
+    /// The mapping itself: an outage, a suppressed refetch and an unusable
+    /// published key are `Unavailable`, a verdict on the token (an unknown or
+    /// retired key included) is `Invalid`.
     #[test]
     fn auth_errors_map_to_unavailable_or_invalid() {
         for err in [
             AuthError::Jwks("endpoint returned 503".into()),
             AuthError::UnseenKid,
+            AuthError::UnusableKey(stridelabs_auth::UnusableReason::Use),
         ] {
             let reason = err.to_string();
             assert_eq!(

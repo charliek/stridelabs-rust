@@ -114,9 +114,10 @@ let identity = verifier.verify_bearer(token).await?;   // -> VerifiedIdentity
 `Verifier` is cheap to clone (one `Arc`) and **must be built once**, not per
 request: the key cache lives inside it. Put it in `AppState`.
 
-`Verifier::new` builds the `JwksCache` itself, from `config.jwks_url`. There
-is no constructor that accepts a cache — a cache pointed at one issuer and a
-config naming another is a hole no amount of verification logic can close.
+`Verifier::new` builds the `JwksCache` itself, from `config.jwks_url`: a
+cache pointed at one issuer and a config naming another is a hole no amount
+of verification logic can close. (`Verifier::with_cache`, below, takes a
+cache you built, and leaves that pairing to you.)
 
 `Verifier::verify_with_jwks(token, &jwks, kid, issuer, audience)` is the same
 logic with the network removed: an associated function, public, so a consumer
@@ -200,7 +201,7 @@ the signature:
 |---|---|---|
 | `iss` equals the issuer, exactly (a trailing slash is a mismatch) | always; `iss` required | — |
 | `exp` | always; required | — |
-| `aud` | `Audience::Required(aud)`: required, and equal to `aud` or an array containing it. `Audience::NotValidated`: not checked, whatever the token carries | the `Audience` you pass |
+| `aud` | `Audience::Required(aud)`: required, and equal to `aud` or an array containing it. `Audience::IfPresent(aud)`: absent passes; present, it must equal `aud` or be an array of strings containing it, and any other `aud` (a number, `null`, an array holding a non-string) is refused. `Audience::NotValidated`: not checked, whatever the token carries | the `Audience` you pass |
 | Leeway on `exp` and `nbf` | 60 s (`DEFAULT_LEEWAY`) | `.with_leeway(Duration)` — whole seconds (a fraction is dropped), at most a day |
 | `nbf`, when present | checked; never required | `.with_nbf_validation(false)` |
 
@@ -219,6 +220,14 @@ pins the client. Against an issuer that serves several services under one
 `iss` (slauth, any shared OIDC provider) it accepts a token minted for any of
 them. There is no `Default` for `Audience` and no conversion into
 `NotValidated`: a consumer has to write it out, where a reviewer will see it.
+
+**`Audience::IfPresent` accepts a token without `aud`**, so it is safe only
+when the issuer names the audience in every token it mints for another
+service: a token with no `aud` from the exact issuer you require passes,
+whoever it was minted for. Hydra (slauth) stamps the audiences a client asked
+for, and an empty array (which `IfPresent` refuses) when it asked for none.
+jsonwebtoken lets an `aud` it cannot parse through when `aud` is not
+required, so this crate checks `IfPresent` itself, after the signature.
 
 Everything else is `Verifier::new`'s, from the same code: RS256 only (`none`
 and HS256 refused before the signature), a `kid` required
@@ -263,11 +272,48 @@ On a `for_issuer` verifier:
 `TestClaims::not_before_in(secs)` one with an `nbf` (feature
 `test-support`, below).
 
+### Your own cache: `Verifier::with_cache` (v0.10.0)
+
+`Verifier::with_cache(checks, cache)` is `for_issuer` over a `JwksCache` you
+built: its TTL, its refetch interval (a test suite that wants none, say), its
+HTTP client and its opt-in `report_unusable_keys` are yours. **Pairing the
+cache with the rules is then your job**: build both from the same issuer
+configuration, and hand the cache to one verifier. `config()` is synthesized
+as for `for_issuer`, with the cache's JWKS URL. Two opt-in settings go with
+it, both off by default:
+
+- `JwksCache::report_unusable_keys(true)`: a kid the issuer publishes with no
+  key that can verify RS256 is `AuthError::UnusableKey(reason)`, a 5xx at the
+  consumer, rather than a 401 (below, "Unusable keys").
+- `Verifier::screen(ScreenPolicy::Strict)`: a malformed, oversized,
+  `crit`-bearing or non-RS256 token, or one with an empty or oversized `kid`,
+  is refused before the key lookup (below, "Before the key lookup").
+
+```rust
+use std::time::Duration;
+use stridelabs_auth::{Audience, ClaimChecks, JwksCache, ScreenPolicy, Verifier};
+
+let cache = JwksCache::new(jwks_url, http_client.clone())
+    .with_ttl(Duration::from_secs(3600))
+    .report_unusable_keys(true);
+let checks = ClaimChecks::new(issuer, Audience::IfPresent("my-service".into()))
+    .with_leeway(Duration::ZERO);
+let verifier = Verifier::with_cache(checks, cache).screen(ScreenPolicy::Strict);
+
+let claims: serde_json::Value = verifier.verify_bearer_claims(token).await?;
+// …then the service's own rules on `sub`, `email` and the rest.
+```
+
+`report_unusable_keys` is on the cache, so `Verifier::new` and
+`for_issuer`, which build theirs, never report; `screen` works on any
+verifier.
+
 ## Security notes
 
 ### What is checked
 
-In order: the issuer's key set has a key under the token's `kid` that is
+In order, after the screen ("Before the key lookup", below): the issuer's
+key set has a key under the token's `kid` that is
 **fit for RS256 signatures**; the key is usable; the **RS256** signature;
 `exp`; `iss` equals the configured issuer; `aud` contains the configured
 audience; a **non-empty `email`** claim; a **non-empty `sub`**. (That is
@@ -283,7 +329,11 @@ kid. A kid with only unfit keys is `UnknownKid` (401), not `Jwks` (500): there
 is no verification key by that name, and the kid is the caller's to choose, so
 a 500 would hand anyone a way to raise the error rate whenever the issuer
 publishes encryption keys next to its signing keys. Keys sharing a kid are all
-considered, so a listed-first encryption key cannot hide the signing key.
+considered, so a listed-first encryption key cannot hide the signing key. A
+cache built with `report_unusable_keys(true)` answers that case itself
+instead, as `UnusableKey`, at most one refetch per refetch floor (below):
+for a service whose issuer publishes no encryption keys under its signing
+kids, a broken signing key is better a retryable 5xx than a sign-out.
 
 Pinning the algorithm to RS256 is what rules out the two classic forgeries
 (`alg: none`, and HS256 signed with the issuer's public key as an HMAC
@@ -291,6 +341,40 @@ secret). Both are covered by tests. `jsonwebtoken` cannot mint an `alg: none`
 token, so its test assembles the header by hand: `Algorithm` has no such
 variant, so the header fails to parse (`AuthError::MalformedToken`) before any
 check runs.
+
+### Before the key lookup: `ScreenPolicy`
+
+Before it asks the cache for the token's key (which may fetch), a verifier
+screens the token. `ScreenPolicy::Basic`, the default and what every verifier
+has always done: the header must parse, else `MalformedToken`, and carry a
+`kid`, else `MissingKid`. `Verifier::screen(ScreenPolicy::Strict)` adds,
+still before the lookup:
+
+| Check | Refusal |
+|---|---|
+| at most `screen::MAX_TOKEN_BYTES` (16 KiB) | `MalformedToken` |
+| exactly three dot-separated segments, none empty, each unpadded base64url | `MalformedToken` |
+| a header jsonwebtoken parses | `MalformedToken` |
+| no `crit` header parameter, whatever its value (`[]` and `null` included) | `InvalidToken("critical header parameters are not supported")` |
+| a payload that is UTF-8 throughout and a JSON object | `MalformedToken` |
+| `alg` RS256 | `InvalidToken("algorithm is not accepted")` |
+| a `kid`, not empty | `MissingKid` |
+| a `kid` of at most `screen::MAX_KID_BYTES` (256 bytes) | `InvalidToken("key id is too long")` |
+
+So a token that cannot verify costs no lookup, and can neither make the cache
+fetch nor be answered with an outage's error (`Jwks`, `UnseenKid`,
+`UnusableKey`) while the issuer is down: every refusal is the token's, a 401
+in the house mappings. `crit` is refused in any form because RFC 7515
+§4.1.11 has a recipient refuse a `crit` naming an extension it does not
+support, and this crate supports none. The checks are tapper-rs's pre-lookup
+screen, moved here (plan 016 C-1), with its test cases.
+
+`screen::check(token, policy)` runs the same screen with no verifier, key or
+I/O, from the same code: `Ok(())` exactly when a verifier with that policy
+would go on to its key lookup, else that verifier's refusal. For a service
+that answers some tokens before it has a verifier (an issuer not configured
+yet) and still wants a malformed token to be a 401, not the 503 an outage
+gets.
 
 `sub` is treated as an **opaque** OIDC subject. In a slauth deployment it
 happens to be the Kratos identity UUID and services key their user rows on it,
@@ -306,8 +390,9 @@ replaced:
 
 ### The JWKS cache: never past the TTL, refreshed ahead of it
 
-`JwksCache::jwks_for_kid(kid)` returns a key set that *contains* `kid`, or an
-error, and **never a set past its TTL**. A set's age counts from its last
+`JwksCache::jwks_for_kid(kid)` returns a key set that *contains* `kid` (with
+`report_unusable_keys`, a key under it that can verify), or an error, and
+**never a set past its TTL**. A set's age counts from its last
 *successful* fetch; every bound below is per cache instance, on its own
 monotonic clock.
 
@@ -357,6 +442,27 @@ monotonic clock.
 
   Only a set inside its TTL gives either verdict: without one the error is
   `Jwks`, not a 401 blaming the caller's token for an outage.
+- **Unusable keys, when asked** (`JwksCache::report_unusable_keys(true)`,
+  off by default). A set holds a kid only if some key under it can verify
+  an RS256 signature: an RSA key whose `alg`, `use` and `key_ops`, where
+  present, allow it, and whose `n` and `e` are what aws-lc-rs, the RS256
+  verifier, accepts: unpadded base64url, minimal big-endian octets (no
+  leading zero octet), an odd `e` of 2 to 33 bits (so 3 or more), an odd
+  modulus of 2048 to 8192 bits. Any other key would reach verification and
+  fail it, a 401
+  blaming the token. Every fetched set is checked, and the setting is read
+  at each lookup, so it holds from the moment it is set. A kid the set holds with no
+  such key takes the unknown kid's floor: one refetch per floor, so a usable
+  key the issuer rotates in under it is picked up, and otherwise
+  `AuthError::UnusableKey(UnusableReason)` (the first key's reason: not RSA,
+  `n`/`e` missing or malformed, the modulus size, or ruled out by `alg`,
+  `use` or `key_ops`), from memory inside the floor. The issuer published
+  that kid, so this is the issuer's defect and no verdict on the token: map
+  it where `Jwks` goes (the house mappings do), or a broken key entry signs
+  out every holder of a valid token until the set's next refresh. It
+  carries no kid, like every `AuthError`. Off, the set is served and the
+  verifier's key selection decides, as through v0.9.0: a kid with no fit key
+  is `UnknownKid`, and a fit key that cannot be built is `Jwks`.
 - **The body is capped.** A fetch reads at most `jwks::MAX_JWKS_BYTES`
   (1 MiB; an issuer's set is a few keys of under 2 KiB each), chunk by
   chunk and inside `FETCH_TIMEOUT`. A larger body, a valid key set
@@ -418,6 +524,7 @@ without sleeping. The defaults are the contract: a zero interval turns all
 rate limiting off, and `Verifier::new` always builds its cache with the
 defaults. `Verifier::for_issuer` takes an optional TTL (`with_ttl`'s
 semantics) and leaves the refetch interval at its default.
+`Verifier::with_cache` takes the cache as you built it.
 
 The cache is an **instance** holding an **injected, shared** `reqwest::Client`.
 The original was a process-global `OnceLock` that built and discarded a fresh
@@ -455,6 +562,7 @@ With the `http` feature:
 |---|---|---|
 | `Jwks(_)` | `Internal(anyhow)` | 500 |
 | `UnseenKid` | `Internal(anyhow)` | 500 |
+| `UnusableKey(_)` | `Internal(anyhow)` | 500 |
 | everything else | `Unauthorized("invalid or missing credentials")` | 401 |
 
 A JWKS failure is *this service's* outage and says nothing about the caller's
@@ -465,7 +573,9 @@ each: their detail, `slauth JWKS: … refetch suppressed`, is distinct from a
 fetch failure's, so 5xx alerting can exclude it, and a consumer that cares
 about the volume rate-limits unauthenticated traffic. `AuthError` is
 `#[non_exhaustive]`: a consumer mapping it itself needs a wildcard arm, and
-should send `UnseenKid` where it sends `Jwks`. Every other
+should send `UnseenKid` and `UnusableKey` where it sends `Jwks` (an unusable
+published key is the issuer's defect; it only arises from a cache built with
+`report_unusable_keys(true)`). Every other
 failure collapses to one generic 401 message: `AppError`'s contract is that a
 non-`Internal` payload reaches the client verbatim, and telling a caller which
 check failed ("audience is not accepted" vs "signature is invalid") is a free
