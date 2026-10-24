@@ -225,6 +225,25 @@ and `Cargo.lock`): tapper plan 016 C-1 bumps it for the v0.10.0 cycle
     refuses a pooler named where sqlx would not dial it (an authority
     redirected by `?host=`). `PoolerRef` (`Host`, `Endpoint`) holds only a
     label or an endpoint id (letters, digits, `-`) or a fixed placeholder.
+  - **`neon_pooler_url(url, &PgConnectOptions) -> Option<PoolerRef>`**
+    (lumen-rust's consumer check, so tapper's and lumen's migrate refusal
+    becomes a deletion): `neon_pooler`, plus every host the URL names that
+    sqlx will not dial, so an AMBIGUOUS URL is detected too: a `-pooler`
+    label in the authority (as is or percent-decoded) while `?host=` or
+    `?hostaddr=` redirects the connection, or in a `host` value a later one
+    overrides. The dialled host is reported first, then the URL's other
+    hosts, then a startup-options endpoint, as both apps do. It takes the
+    options `connect_options(url)` returned rather than parsing them again,
+    so the refusal is one `match` after the `connect_options` call both
+    apps already make. Both apps also read `hostaddr` values, which
+    `connect_options` only accepts as IP addresses (no label), so this one
+    reads `host` values only; a test pins that premise. It is strictly
+    broader than either app's check, never narrower: a `host` value is
+    percent-decoded once more before its labels are read (so a doubly
+    encoded `ep-x%252Dpooler` is detected, where both apps accept it), and
+    the startup options are also read with PostgreSQL's tokeniser (lumen
+    `0e05591` reads Neon's only; tapper reads both). A URL either app
+    accepts can therefore be refused after the swap, never the reverse.
   - **`LOG_CAPS`**: `sqlx_core::pool`, `sqlx_postgres::options`,
     `sqlx::postgres::notice` and `sqlx_postgres::message`, each `OFF`, as
     plain `(target, LevelFilter)` pairs to fold into a

@@ -61,7 +61,8 @@ if let Some(pool) = &pool {
 | `lazy_pool(options, PoolSettings) -> PgPool` | The pool, built without connecting (inside a Tokio runtime). |
 | `PoolSettings` | `max_connections`, `acquire_timeout`, `idle_timeout`, `max_lifetime`, `test_before_acquire`; defaults are sqlx 0.9's own, pinned. `pool_options()` hands sqlx's `PgPoolOptions` to a consumer that needs more (an `after_connect` hook). |
 | `neon_pooler(&PgConnectOptions) -> Option<PoolerRef>` | Whether the options reach Neon's pooled endpoint: by a `-pooler` host label, or by `endpoint=…-pooler` in the startup options (`options=` or `PGOPTIONS`). Detection only. |
-| `neon_pooler_host(&str) -> Option<PoolerRef>` | The host half, for a caller that also refuses a pooler named in a part of the URL sqlx would not dial (an authority redirected by `?host=`). |
+| `neon_pooler_url(url, &PgConnectOptions) -> Option<PoolerRef>` | `neon_pooler`, plus the hosts the URL names that sqlx will not dial (its authority while `?host=`/`?hostaddr=` redirects, an overridden `host` value): an ambiguous URL, which a migration runner refuses too. Pass the options `connect_options(url)` returned; the refusal is then one `match` (`Some(pooler) => Err(…)`, `None => Ok(options)`). |
+| `neon_pooler_host(&str) -> Option<PoolerRef>` | The host half: whether one host string has a `-pooler` label, as is or percent-decoded. |
 | `LOG_CAPS` | `sqlx_core::pool`, `sqlx_postgres::options`, `sqlx::postgres::notice` and `sqlx_postgres::message`, each `OFF`, to fold into the consumer's log caps. |
 
 **Never log the options themselves**: sqlx's derived `Debug` of

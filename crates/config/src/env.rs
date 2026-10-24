@@ -64,6 +64,11 @@ pub fn env_or(key: &str, default: &str) -> String {
 /// [`env_or`] over the lookup `get` instead of the process environment:
 /// `default` when `get` has nothing for `key`, or an empty value.
 ///
+/// An empty value is treated as unset, as [`env_or`] treats it. A consumer
+/// for whom empty and unset mean different things (an empty value that
+/// deliberately switches something off) reads that setting with its raw
+/// lookup instead.
+///
 /// ```
 /// use stridelabs_config::env_or_from;
 ///
@@ -118,6 +123,10 @@ fn reject_non_unicode(key: &str) -> Result<(), EnvError> {
 /// naming `key`, whose message is [`VALUE_DOES_NOT_PARSE`], never the value
 /// or the parser's text. (A lookup has no "not Unicode" case: that is the
 /// lookup's to decide, e.g. by returning `None`.)
+///
+/// An empty value is treated as unset (it yields `default`). A consumer for
+/// whom empty and unset mean different things reads that setting with its
+/// raw lookup instead.
 ///
 /// ```
 /// use stridelabs_config::{env_parse_from, VALUE_DOES_NOT_PARSE};
@@ -176,6 +185,10 @@ pub fn parse_string_array(key: &str) -> Result<Vec<String>, EnvError> {
 /// error: missing or blank yields `[]`; anything but a JSON array of strings
 /// is an [`EnvError`] naming `key`, whose message is [`NOT_A_STRING_ARRAY`],
 /// never the value or serde_json's text.
+///
+/// An empty or whitespace-only value is treated as unset (it yields `[]`).
+/// A consumer for whom empty and unset mean different things reads that
+/// setting with its raw lookup instead.
 ///
 /// ```
 /// use stridelabs_config::{parse_string_array_from, NOT_A_STRING_ARRAY};
