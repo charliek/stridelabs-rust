@@ -1,5 +1,10 @@
 //! `authorized_user` credentials: a gcloud user login (`gcloud auth
 //! application-default login`), exchanged with its refresh token.
+//!
+//! **Unscoped:** the exchange sends no `scope`, so a token carries every
+//! scope the login was granted, whatever the provider asked for (see the
+//! `auth` module docs). Deliberate, and documented rather than changed:
+//! imgmcp's local development runs on it.
 
 use std::fmt;
 
@@ -42,7 +47,8 @@ impl AuthorizedUser {
 
     /// The refresh-token grant (RFC 6749 §6). No `scope` parameter: a user
     /// credential's scopes were fixed at login, and google-auth sends none
-    /// for ADC either.
+    /// for ADC either. So the token is NOT limited to the provider's
+    /// scopes.
     pub(crate) async fn fetch(
         &self,
         http: &reqwest::Client,

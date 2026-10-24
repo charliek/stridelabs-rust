@@ -12,7 +12,9 @@ pub const DEFAULT_METADATA_BASE_URL: &str = "http://metadata.google.internal";
 const TOKEN_PATH: &str = "/computeMetadata/v1/instance/service-accounts/default/token";
 
 /// The request that both proves the caller is on the instance and names the
-/// scopes. Without the header the server answers 403.
+/// scopes. Without the header the server answers 403. No `enforce_scopes`:
+/// the server downscopes only when the instance or project enforces it (the
+/// `auth` module docs).
 pub(crate) async fn fetch(
     http: &reqwest::Client,
     scopes: &[String],

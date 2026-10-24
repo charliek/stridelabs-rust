@@ -43,6 +43,41 @@
 //! endpoint — a `token_uri` in the file is ignored, as google-auth ignores
 //! it). Every other type is [`GcpAuthError::Unsupported`].
 //!
+//! # `authorized_user` tokens are NOT limited to your scopes
+//!
+//! **A user credential ignores `scopes`.** Its refresh-token grant sends no
+//! `scope` (google-auth sends none for ADC either), so the token carries
+//! every scope the gcloud login was granted, typically `cloud-platform`,
+//! whatever the provider was built with. Two providers built from one user
+//! credential with different scopes (a read-only storage token, a Vertex
+//! token) mint equally powerful tokens: a least-privilege split by scope
+//! does not exist under a user login. This is deliberate and unchanged
+//! (imgmcp's local development relies on it). A service whose security
+//! depends on its scopes must refuse [`CredentialKind::AuthorizedUser`]
+//! itself (check [`TokenProvider::kind`] at startup) and run on a
+//! service-account key, whose tokens are minted for the scopes asked for.
+//!
+//! **The metadata server is not a scope boundary by itself either.** This
+//! crate sends the scopes in `?scopes=` but not `enforce_scopes=true`, and
+//! without one or the other Compute Engine answers with a token carrying
+//! every scope the instance was given, whatever was asked for: it
+//! downscopes only when the request says `enforce_scopes=true` or the
+//! instance or project sets the `enable-access-token-enforce-scopes`
+//! metadata key to `true` (Google's "Obtain specific OAuth2 access tokens").
+//! A service that relies on the metadata server's scopes should set that
+//! key, or give the instance only the scopes it needs. The request is left
+//! as it is: adding `enforce_scopes=true` makes a request for scopes outside
+//! the instance's an error, a compatibility decision of its own.
+//!
+//! # Checking a key offline
+//!
+//! With `service-account-key`, `ServiceAccountKey::from_json(json)?.validate()`
+//! checks a key file at startup, with nothing sent: it parses, its key signs
+//! a throwaway assertion, and its `token_uri` is `https` (or `http` to a
+//! loopback host) with no userinfo, query or fragment. Building a provider
+//! checks only the parse; the rest would otherwise surface at the first
+//! token request.
+//!
 //! # Quota project
 //!
 //! A file's `quota_project_id`, overridden by `GOOGLE_CLOUD_QUOTA_PROJECT`,
@@ -118,8 +153,12 @@ pub use adc::{
 };
 pub use error::GcpAuthError;
 pub use metadata::DEFAULT_METADATA_BASE_URL;
+#[cfg(feature = "service-account-key")]
+pub use sa::{KeyDefect, ServiceAccountKey};
 
-use crate::util::{is_code, read_error_body, read_limited, redact_url, Category, Failed};
+use crate::util::{
+    listed_code, read_error_body, read_limited, redact_url, url_origin, Category, Failed,
+};
 
 /// Full access to every Google Cloud API the identity's IAM roles allow —
 /// what Vertex AI requires.
@@ -238,7 +277,9 @@ impl fmt::Display for CredentialSource {
 pub enum CredentialKind {
     /// A `service_account` key file.
     ServiceAccount,
-    /// An `authorized_user` file: a gcloud user login.
+    /// An `authorized_user` file: a gcloud user login. Its tokens carry the
+    /// login's scopes, not the provider's ([the module
+    /// docs](self#authorized_user-tokens-are-not-limited-to-your-scopes)).
     AuthorizedUser,
     /// The metadata server's attached service account.
     MetadataServer,
@@ -257,7 +298,11 @@ impl fmt::Display for CredentialKind {
 /// Endpoints and timeouts a [`TokenProvider`] uses — the defaults, unless a
 /// test points them at a mock.
 ///
-/// `Debug` prints the two URLs as `scheme://host[:port]/path`.
+/// `Debug` prints the token endpoint as its origin, `scheme://host[:port]`
+/// (a token endpoint's path can hold a secret), and the metadata base URL as
+/// `scheme://host[:port]/path`: a base URL, like `GcsClient`'s and
+/// `VertexClient`'s, is configuration rather than a token path, so it keeps
+/// its path.
 #[derive(Clone)]
 pub struct TokenOptions {
     metadata_base_url: String,
@@ -277,7 +322,7 @@ impl fmt::Debug for TokenOptions {
         } = self;
         f.debug_struct("TokenOptions")
             .field("metadata_base_url", &redact_url(metadata_base_url))
-            .field("default_token_uri", &redact_url(default_token_uri))
+            .field("default_token_uri", &url_origin(default_token_uri))
             .field("metadata_timeout", metadata_timeout)
             .field("token_timeout", token_timeout)
             .finish()
@@ -481,6 +526,11 @@ impl TokenProvider {
     /// anything — empty included — is configured, so map an empty env var of
     /// your own to `None` before calling.
     ///
+    /// The chain can select an `authorized_user` login, whose tokens ignore
+    /// `scopes` ([the module
+    /// docs](self#authorized_user-tokens-are-not-limited-to-your-scopes)):
+    /// check [`TokenProvider::kind`] if your scopes matter.
+    ///
     /// # Errors
     ///
     /// [`GcpAuthError::InvalidCredentials`] or [`GcpAuthError::Unsupported`]
@@ -556,6 +606,10 @@ impl TokenProvider {
 
     /// From `authorized_user` JSON (what `gcloud auth application-default
     /// login` writes).
+    ///
+    /// **`scopes` does not limit its tokens**: the refresh-token grant sends
+    /// no scope, so every token carries whatever the login was granted
+    /// ([the module docs](self#authorized_user-tokens-are-not-limited-to-your-scopes)).
     ///
     /// # Errors
     ///
@@ -829,10 +883,7 @@ impl TokenProvider {
         if provider.kind() == expected {
             Ok(provider)
         } else {
-            Err(GcpAuthError::Unsupported(format!(
-                "expected {expected} credentials, got {}",
-                provider.kind()
-            )))
+            Err(wrong_kind(expected, provider.kind()))
         }
     }
 }
@@ -959,6 +1010,11 @@ impl Inner {
     }
 }
 
+/// The refusal of a typed constructor handed another supported kind.
+fn wrong_kind(expected: CredentialKind, got: CredentialKind) -> GcpAuthError {
+    GcpAuthError::Unsupported(format!("expected {expected} credentials, got {got}"))
+}
+
 fn owned(scopes: &[&str]) -> Vec<String> {
     scopes.iter().map(|scope| (*scope).to_owned()).collect()
 }
@@ -983,7 +1039,7 @@ pub(crate) async fn exchange(
     endpoint: &str,
     timeout: Duration,
 ) -> Result<Fetched, Failed<GcpAuthError>> {
-    let endpoint = redact_url(endpoint);
+    let endpoint = url_origin(endpoint);
     let request_failed = |category: Category| GcpAuthError::Request {
         endpoint: endpoint.clone(),
         reason: category.label().to_owned(),
@@ -1054,15 +1110,34 @@ fn lifetime(expires_in: Option<&Value>) -> Result<Duration, &'static str> {
     }
 }
 
-/// The RFC 6749 §5.2 `error` code of an error body, when it is a plain code
-/// ([`is_code`]); empty otherwise. `error_description` and everything else
+/// The OAuth `error` codes a [`GcpAuthError::Status`] may carry: RFC 6749
+/// §5.2's token-endpoint codes, and the three other codes it registers
+/// (§4.1.2.1) that a token endpoint is known to answer with. Any other
+/// `error` is stored as `other`.
+const OAUTH_ERROR_CODES: [&str; 9] = [
+    "invalid_request",
+    "invalid_client",
+    "invalid_grant",
+    "unauthorized_client",
+    "unsupported_grant_type",
+    "invalid_scope",
+    "access_denied",
+    "server_error",
+    "temporarily_unavailable",
+];
+
+/// The RFC 6749 `error` code of an error body as a [`GcpAuthError::Status`]
+/// stores it: one of [`OAUTH_ERROR_CODES`], `other` for any other non-empty
+/// string, empty when there is none. `error_description` and everything else
 /// are dropped: free text a server may fill with anything.
 fn oauth_error_code(body: &[u8]) -> String {
     let Ok(Value::Object(object)) = serde_json::from_slice::<Value>(body) else {
         return String::new();
     };
     match object.get("error") {
-        Some(Value::String(code)) if is_code(code) => code.clone(),
+        Some(Value::String(code)) if !code.is_empty() => {
+            listed_code(code, &OAUTH_ERROR_CODES).to_owned()
+        }
         _ => String::new(),
     }
 }
@@ -1105,19 +1180,41 @@ mod tests {
         }
     }
 
+    /// The stored `detail`: a listed code as itself, any other `error`
+    /// string as `other` (a short plain code included: before v0.10.0 any
+    /// `[A-Za-z0-9_.-]{1,64}` passed through), and nothing for a body with no
+    /// `error` string.
     #[test]
-    fn an_oauth_error_body_is_reduced_to_a_plain_error_code() {
+    fn an_oauth_error_body_is_reduced_to_a_listed_error_code() {
         assert_eq!(
             oauth_error_code(
                 br#"{"error":"invalid_grant","error_description":"CANARY-DESCRIPTION","access_token":"CANARY"}"#
             ),
             "invalid_grant"
         );
+        for code in OAUTH_ERROR_CODES {
+            let body = format!(r#"{{"error":"{code}"}}"#);
+            assert_eq!(oauth_error_code(body.as_bytes()), code);
+        }
+        for body in [
+            &br#"{"error":"CANARY_code"}"#[..],
+            br#"{"error":"INVALID_GRANT"}"#,
+            br#"{"error":"not a code CANARY"}"#,
+            br#"{"error":"CANARY\nforged log line"}"#,
+        ] {
+            assert_eq!(
+                oauth_error_code(body),
+                crate::util::OTHER_CODE,
+                "{}",
+                String::from_utf8_lossy(body)
+            );
+        }
+        let long = format!(r#"{{"error":"{}"}}"#, "x".repeat(65));
+        assert_eq!(oauth_error_code(long.as_bytes()), crate::util::OTHER_CODE);
         for body in [
             &b"<html>CANARY</html>"[..],
             br#"{"error":{"nested":"CANARY"}}"#,
-            br#"{"error":"not a code CANARY"}"#,
-            br#"{"error":"CANARY\nforged log line"}"#,
+            br#"{"error":""}"#,
             br#"{"error_description":"CANARY"}"#,
         ] {
             assert_eq!(
@@ -1127,8 +1224,6 @@ mod tests {
                 String::from_utf8_lossy(body)
             );
         }
-        let long = format!(r#"{{"error":"{}"}}"#, "x".repeat(65));
-        assert_eq!(oauth_error_code(long.as_bytes()), "");
     }
 
     #[test]
@@ -1144,15 +1239,21 @@ mod tests {
         }
     }
 
+    /// The token endpoint shows as its origin alone, its path included in
+    /// what is dropped (v0.10.0; the path was shown before); the metadata
+    /// base URL keeps its path, and loses its userinfo and query.
     #[test]
     fn token_options_debug_redacts_its_urls() {
         let options = TokenOptions::default()
-            .metadata_base_url("http://user:CANARY@metadata.test:8080/?key=CANARY")
-            .default_token_uri("https://CANARY@token.test/token?secret=CANARY#CANARY");
+            .metadata_base_url("http://user:CANARY@metadata.test:8080/base?key=CANARY")
+            .default_token_uri("https://CANARY@token.test/token/PATH-CANARY?secret=CANARY#CANARY");
         for rendered in [format!("{options:?}"), format!("{options:#?}")] {
             assert!(!rendered.contains("CANARY"), "{rendered}");
-            assert!(rendered.contains("metadata.test:8080"), "{rendered}");
-            assert!(rendered.contains("https://token.test/token"), "{rendered}");
+            assert!(
+                rendered.contains(r#""http://metadata.test:8080/base""#),
+                "{rendered}"
+            );
+            assert!(rendered.contains(r#""https://token.test""#), "{rendered}");
         }
     }
 

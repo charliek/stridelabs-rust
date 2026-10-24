@@ -53,8 +53,9 @@
 //! image is about 13.4 MiB of base64, plus JSON) and is
 //! [`VertexError::TooLarge`] past that
 //! ([`VertexClient::with_max_response_bytes`]). An error body is read only as
-//! far as its first 16 KiB, and only Google's `error.status` and
-//! `error.message` (at most 200 characters) are kept from it.
+//! far as its first 16 KiB, and only Google's `error.status` (one of
+//! google.rpc.Code's names, else `other`) and `error.message` (at most 200
+//! characters) are kept from it.
 //!
 //! # Privacy
 //!
@@ -596,8 +597,10 @@ pub enum VertexError {
     Status {
         /// The HTTP status code.
         status: u16,
-        /// Google's `error.status` (`RESOURCE_EXHAUSTED`, …), when the body
-        /// is Google's envelope and it is a plain code. Safe to log.
+        /// Google's `error.status`, when the body is Google's envelope and
+        /// carries one: one of google.rpc.Code's 17 names
+        /// (`RESOURCE_EXHAUSTED`, …), or `other` for any other string. Safe
+        /// to log.
         google_status: Option<String>,
         /// Google's `error.message`: Vertex can quote the prompt in it, so
         /// it is user data and not for routine logging. Its `Debug` prints

@@ -6,20 +6,28 @@
 //! refresh token or client secret, not an access token, not a URL's query
 //! string or userinfo. These strings end up in logs.
 //!
+//! Every rule holds for what a variant **stores**, not only for its
+//! `Display`: upstream text is reduced when the error is constructed, so the
+//! derived `Debug` (`?error`) has nothing more to show.
+//!
 //! - A credential file that fails to parse is described by *where* it came
 //!   from and *which field* is wrong, never by its content. serde_json's
 //!   `Display` can quote the offending value (`invalid type: string "…"`), so
 //!   a parse failure is reported as its category and position only. An
-//!   unsupported `type` is quoted only when it is a plain `[a-z_]{1,64}` name.
+//!   unsupported `type` is named only when google-auth knows it
+//!   (`external_account`, `impersonated_service_account`, …); any other is
+//!   `other`.
 //! - A token endpoint's answer is never quoted. A success body *is* an access
-//!   token. A failure is reported as its status plus the RFC 6749 §5.2
-//!   `error` code — only when it is a plain code (`[A-Za-z0-9_.-]{1,64}`).
-//!   `error_description` is free text a server may fill with anything, so it
-//!   is dropped, along with the rest of the body.
-//! - Endpoints appear as `scheme://host[:port]/path`. A `reqwest::Error` is
-//!   reduced to a fixed category (`timed out`, `connection failed`, …) and
-//!   its text is never formatted: `without_url()` strips only the outer URL,
-//!   and the source chain can carry another one.
+//!   token. A failure is reported as its status plus the RFC 6749 `error`
+//!   code, only when it is one RFC 6749 registers (`invalid_grant`, …); any
+//!   other is `other`. `error_description` is free text a server may
+//!   fill with anything, so it is dropped, along with the rest of the body.
+//! - Endpoints appear as their origin, `scheme://host[:port]`: never the
+//!   path, which for a service account is its key file's `token_uri`,
+//!   verbatim, and can hold a secret. A `reqwest::Error` is reduced to a
+//!   fixed category (`timed out`, `connection failed`, …) and its text is
+//!   never formatted: `without_url()` strips only the outer URL, and the
+//!   source chain can carry another one.
 
 use crate::util::detail_suffix;
 
@@ -36,6 +44,10 @@ pub enum GcpAuthError {
     /// `impersonated_service_account`, …), or a `service_account` key in a
     /// build without the `service-account-key` feature. Never a fallthrough
     /// to the next source.
+    ///
+    /// The message is the crate's own. It names the `type` found only when
+    /// google-auth knows it, and says `other` for any other, so a file whose
+    /// `type` is not a credential type is never echoed.
     #[error("unsupported credentials: {0}")]
     Unsupported(String),
 
@@ -57,7 +69,8 @@ pub enum GcpAuthError {
     /// a body that could not be read.
     #[error("access token request to {endpoint} failed: {reason}")]
     Request {
-        /// The endpoint, as `scheme://host[:port]/path`.
+        /// The endpoint's origin, `scheme://host[:port]`: never its path,
+        /// query, fragment or userinfo.
         endpoint: String,
         /// The transport failure's fixed category (`timed out`,
         /// `connection failed`, …), never its text.
@@ -67,12 +80,14 @@ pub enum GcpAuthError {
     /// The token endpoint answered with a non-2xx status.
     #[error("access token request to {endpoint} answered HTTP {status}{}", detail_suffix(.detail))]
     Status {
-        /// The endpoint, as `scheme://host[:port]/path`.
+        /// The endpoint's origin, `scheme://host[:port]`: never its path,
+        /// query, fragment or userinfo.
         endpoint: String,
         /// The HTTP status code.
         status: u16,
-        /// The OAuth `error` code (`invalid_grant`, …) when the body carried
-        /// a plain one; otherwise empty.
+        /// The OAuth `error` code when the body carried one: a code RFC
+        /// 6749 registers (`invalid_grant`, …), or `other` for any other.
+        /// Empty when the body carried no `error` string.
         detail: String,
     },
 
@@ -82,7 +97,8 @@ pub enum GcpAuthError {
     /// is never cached.
     #[error("access token response from {endpoint} is unusable: {reason}")]
     InvalidResponse {
-        /// The endpoint, as `scheme://host[:port]/path`.
+        /// The endpoint's origin, `scheme://host[:port]`: never its path,
+        /// query, fragment or userinfo.
         endpoint: String,
         /// A fixed phrase; the body is never quoted (a 2xx body carries the
         /// token).
