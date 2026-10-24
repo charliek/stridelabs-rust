@@ -44,13 +44,13 @@ Pin the tag:
 
 ```toml
 [dependencies]
-stridelabs-observability = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.9.0" }
+stridelabs-observability = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.10.0" }
 
 # with Prometheus wiring:
-stridelabs-observability = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.9.0", features = ["prometheus"] }
+stridelabs-observability = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.10.0", features = ["prometheus"] }
 
 # with the peer-address fallback for request logs (and Prometheus wiring):
-stridelabs-observability = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.9.0", features = ["axum", "prometheus"] }
+stridelabs-observability = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.10.0", features = ["axum", "prometheus"] }
 ```
 
 (During development against an unreleased commit, pin `rev = "<sha>"` instead

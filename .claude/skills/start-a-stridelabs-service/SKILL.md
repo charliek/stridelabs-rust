@@ -96,14 +96,14 @@ an ancestor path. A service scaffolded inside an existing monorepo, at
   skill uses; otherwise pin the exact commit `rev`. See the root README's
   "Consuming these crates" section for the exact `tag =` / `rev =` forms.
 
-  **Today that means `tag = "v0.9.0"`**, the latest tag: it contains Step 3's
+  **Today that means `tag = "v0.10.0"`**, the latest tag: it contains Step 3's
   logging defaults (`LogFormat::from_environment`, `RequestLogLayer`), which
   `v0.4.0` lacks, so a `v0.4.0` scaffold does not compile. Pin one tag for all
   five crates (they are versioned in lockstep).
 
   ```toml
   [dependencies]
-  stridelabs-config = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.9.0" }
+  stridelabs-config = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.10.0" }
   # ... the same git =/tag = for the other four crates, feature flags as below
   ```
 

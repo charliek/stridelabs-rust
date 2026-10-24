@@ -51,7 +51,7 @@ crypto provider").
 
 ```toml
 [dependencies]
-stridelabs-gcp = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.9.0", features = ["service-account-key", "vertex"] }
+stridelabs-gcp = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.10.0", features = ["service-account-key", "vertex"] }
 ```
 
 (`v0.7.0` is the first release with this crate; `upload_with` and
@@ -308,9 +308,9 @@ upstream text is reduced when the error is built, so the derived `Debug`
   the RFC 6749 `error` code, and only one of RFC 6749's `invalid_request`,
   `invalid_client`, `invalid_grant`, `unauthorized_client`,
   `unsupported_grant_type`, `invalid_scope`, `access_denied`, `server_error`
-  or `temporarily_unavailable`; any other `error` string is stored as
-  `other`, and a body with none leaves `detail` empty. `error_description`
-  is free text that a server may fill with anything, so it is dropped.
+  or `temporarily_unavailable`; any other `error` string (Google's
+  `invalid_rapt`, for example) is stored as `other`, and a body with none leaves
+  `detail` empty. `error_description` is free text that a server may fill with anything, so it is dropped.
 - Endpoints are rendered as their **origin**, `scheme://host[:port]`: never
   the path, which for a service account is its key file's `token_uri`,
   verbatim, and a broker's path can hold a secret
