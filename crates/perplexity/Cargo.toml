@@ -1,0 +1,49 @@
+[package]
+name = "stridelabs-perplexity"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "A policy-free Perplexity Agent API web-search client for StrideLabs services: one bounded, classified, log-safe search on the consumer's reqwest::Client"
+publish = false
+
+# No features. The crate never builds a client of its own, so it never needs
+# a TLS stack: every constructor takes the consumer's `reqwest::Client`, and
+# the TLS (and the process's rustls provider) stay the consumer's, as with
+# stridelabs-gcp and stridelabs-inworld's core.
+
+[lints]
+workspace = true
+
+[dependencies]
+# No features: the request body is serialized here (`serde_json::to_vec`) and
+# the response is read chunk by chunk (`Response::chunk`, in reqwest's core),
+# so neither `json` nor `stream` is needed, and no TLS feature (above).
+reqwest = { workspace = true }
+serde = { workspace = true }
+# `raw_value`: each lenient position captures its value as a borrowed
+# `&RawValue` before reading it, so a number serde_json cannot represent
+# (`1e400`) is left out at that position instead of failing the whole body
+# (`Lenient` in src/response.rs). A feature of a crate already in the graph,
+# with no dependency of its own: Cargo.lock does not change.
+serde_json = { workspace = true, features = ["raw_value"] }
+thiserror = { workspace = true }
+# `url::Host`, to tell a loopback IP literal (the plain-`http` test seam) from
+# a name, and the scheme and host checks of `SearchAnswer::sources`. The `url`
+# reqwest itself is built on, so nothing is added to the lock.
+url = { workspace = true }
+
+[dev-dependencies]
+# The workspace pin carries `full`: `net` and `io-util` for the raw TCP
+# servers the bounds and redaction tests stall, cut and stream from, `time`
+# for their sleeps.
+tokio = { workspace = true }
+wiremock = { workspace = true }
+# `http2`, for `http2_prior_knowledge()`: the redaction tests speak h2c to a
+# raw server that answers with a GOAWAY whose debug data is a canary, the
+# provider-controlled text h2 renders in its errors. Dev-only, so no
+# consumer's graph and no `cargo build` gets it; h2 is already in the lock
+# (wiremock's hyper, stridelabs-inworld's dev-dependencies).
+reqwest = { workspace = true, features = ["http2"] }

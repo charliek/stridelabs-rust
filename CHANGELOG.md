@@ -3,7 +3,7 @@
 All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
-Versioning is lockstep across all ten crates in this workspace (one
+Versioning is lockstep across all eleven crates in this workspace (one
 `[workspace.package].version`, bumped together regardless of which crate(s)
 changed) rather than independent per-crate versioning —
 see the root README's "Consuming these crates" section for what that means
@@ -309,6 +309,73 @@ and `Cargo.lock`): tapper plan 016 C-1 bumps it for the v0.10.0 cycle
   seed windows and budgets the dev stack would read). Neither connects.
   lumen-rs (rev `6d08a4a`) and parcel are not covered by
   `scripts/downstream-check.sh`.
+
+- `stridelabs-perplexity`, a new crate (lumen plan 002 W4b-1): a
+  policy-free web-search client for Perplexity's Agent API on the consumer's
+  `reqwest::Client`, which it never retries or logs through. Perplexity
+  retired Sonar chat completions on 2026-09-27; lumen's `web_search` moves to
+  it first, and tapper can adopt it in place of its own Sonar parse. No
+  features: its `reqwest` has none, so it picks no TLS stack.
+  - `PerplexityClient::builder(http, api_key)` → `PerplexityClientBuilder`
+    (`base_url`, `timeout` (30 s), `max_response_bytes` (2 MiB),
+    `max_input_chars` (2,000), `effort` (`Effort::Fast`; also `Low`,
+    `Medium`, `High`, `XHigh`, `#[non_exhaustive]`), `max_output_tokens`
+    (unset)) → `build()`, refusing a base URL that is not `https://` (plain
+    `http://` only to a loopback IP literal, the test seam) or carries
+    userinfo, a query or a fragment (`BuildError::InvalidBaseUrl`), a key
+    that is empty after trimming or no header can carry
+    (`EmptyApiKey`, `InvalidApiKey`), and a zero timeout or bound
+    (`ZeroTimeout`, `ZeroMaxResponseBytes`, `ZeroMaxInputChars`,
+    `ZeroMaxOutputTokens`). A base URL's path prefix is kept and a trailing
+    slash tolerated. The client must follow no redirects and must not retry,
+    and should decode no body (a decoder drops `Content-Length`, defeating
+    the pre-check) and use no proxy it did not choose; its own timeout does
+    not matter.
+  - `search(&str)` sends one `POST {base}/v1/agent` with exactly `{effort,
+    input, max_output_tokens?}` and `Authorization: Bearer <key>` (trimmed,
+    verbatim, marked sensitive), the input bound checked first
+    (`PerplexityError::InputTooLong`). The status is classified before any
+    body is read: `408`, `429` and `500`–`999` are `Unavailable(Status)`,
+    every other non-`2xx` (a `3xx` included) `Rejected { status }`; a
+    timeout is `Unavailable(Timeout(Phase))` and a transport failure
+    `Unavailable(Transport { phase, io })`, `Phase` being `Connect`,
+    `Headers` or `Body`. The body is read chunk by chunk under the bound
+    (refused unread on a `Content-Length` over it), must be UTF-8 throughout,
+    and only a `completed` response is an answer: any other status, or a
+    `message` item's own `status` other than `completed`, is `Incomplete {
+    status: ResponseStatus }`, with no partial text returned, and a
+    top-level `status` that comes twice is refused whatever its order.
+    `Malformed(MalformedReason)` is `BodyTooLarge`, `NotUtf8`, `NotJson`,
+    `MissingStatus`, `DuplicateStatus` or `MissingAnswer`.
+  - The answer is a faithful `SearchAnswer` (`#[non_exhaustive]`): `text`
+    (every `output_text` of every assistant `message` item, concatenated; a
+    message whose `role` is present and not `assistant`, such as an echo of
+    the query, contributes none), `results`
+    (every entry of every `search_results` item, in order, `SearchResult {
+    id, url, title?, date?, last_updated?, snippet?, source? }`, ids as given
+    so a citation `[id]` resolves across batches; an entry with no integer
+    `id` or no `url` is skipped, a non-array `results` gives nothing),
+    `status`, and `usage: Option<Usage>` (token counts, `total_cost`,
+    `currency`; a malformed `usage` never fails the answer). It is read
+    straight into those fields by serde visitors, everything else skipped
+    with `IgnoredAny`, so the response bound is also the memory bound; each
+    value read is captured first as a borrowed `RawValue` (serde_json's
+    `raw_value` feature, no new crate), so a number serde_json cannot
+    represent (`1e400`) is left out at its own position instead of failing
+    the body. `SearchAnswer::from_json(&[u8])` runs the same parse on a body
+    the caller has (a recorded response, a consumer's formatting tests).
+    `SearchAnswer::sources(max, title_chars)` is an optional display helper:
+    http(s) URLs only, no userinfo, the first of a duplicate URL, capped,
+    titles cut at a char boundary, `www.` dropped from the domain; `results`
+    is untouched.
+  - No error keeps a `reqwest::Error`, a body, the key or the input, and
+    every `source()` is `None`; the `Debug` of the client, the builder and
+    every result type shows lengths and counts, never the key, the text,
+    titles or URLs. Canary tests cover body echoes (the response's `error`
+    and an undocumented status string included), malformed headers, URL
+    credentials, an HTTP/2 GOAWAY's debug data, and every `Debug`; raw TCP
+    servers cover the stream bounds. The fixture
+    `tests/fixtures/agent_response.json` is one recorded billed response.
 
 ### Changed
 

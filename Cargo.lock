@@ -2915,6 +2915,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "stridelabs-perplexity"
+version = "0.10.0"
+dependencies = [
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "url",
+ "wiremock",
+]
+
+[[package]]
 name = "stridelabs-postgres"
 version = "0.10.0"
 dependencies = [
