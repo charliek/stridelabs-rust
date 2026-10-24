@@ -4,28 +4,30 @@ Shared Rust crates for StrideLabs services — the Rust twin of
 [stridelabs-python](https://github.com/charliek/stridelabs-python). Common
 patterns and practices live here once, so services stay consistent.
 
-**Status: all nine crates implemented.** The workspace scaffold (Cargo
+**Status: all ten crates implemented.** The workspace scaffold (Cargo
 workspace, CI, toolchain pins) and `stridelabs-config`,
 `stridelabs-observability`, `stridelabs-http`, `stridelabs-auth`,
 `stridelabs-testing`, `stridelabs-mcp`, `stridelabs-redis`,
-`stridelabs-gcp` and `stridelabs-inworld` are all in place. See each crate's own README for its full
+`stridelabs-gcp`, `stridelabs-inworld` and `stridelabs-postgres` are all in
+place. See each crate's own README for its full
 API and feature topology.
 
 ## Crates
 
 | Crate | Status | Contents | Seeded from |
 |---|---|---|---|
-| `stridelabs-config` | Implemented | Env-var config helpers + layered file loading with field-pathed errors | Two existing services' config loaders |
+| `stridelabs-config` | Implemented | Env-var config helpers with a public lookup seam whose errors never carry a value, layered file loading with field-pathed errors (feature `file`, on by default), a validation/startup-refusal accumulator | Two existing services' config loaders |
 | `stridelabs-observability` | Implemented | tracing init (text/JSON/Cloud Logging, per-target level caps that hold under `RUST_LOG`), request-ID and request-logging tower layers, Prometheus wiring | A production reverse proxy's `observability` module; Python `stridelabs-logging`'s Cloud Logging format and request middleware |
 | `stridelabs-http` | Implemented | `AppError`→`IntoResponse` convention, security-headers + CORS layers, graceful shutdown, reverse-proxy primitives (feature `proxy`), an SSRF-hardened outbound fetch (feature `ssrf`), the process-wide rustls provider install (feature `tls`), OpenAPI spec mechanics (feature `openapi`), URL redaction for log lines (feature `redact-url`) | An existing service's `error.rs`, a reverse proxy's HTTP layer, the `http/openapi.rs` and `tls.rs` of slauth, the StrideLabs auth service, and Python `stridelabs.mcp.ssrf` |
 | `stridelabs-auth` | Implemented | Resource-server token verification: slauth's access tokens, and other issuers' (e.g. WorkOS, whose tokens carry no `aud`) under claim rules the consumer chooses (`Verifier::for_issuer`, or `Verifier::with_cache` over the consumer's own cache); rate-limited JWKS cache, RS256 verification, opt-in unusable-key reporting and a strict pre-lookup screen, bearer extraction, slauth PAT validation, PAT hashing, offline test-key minting | An existing service's `auth/` module; Python `stridelabs-auth`'s `PATValidator` |
-| `stridelabs-testing` | Implemented | Fail-loud real-Postgres pool and real-Redis probe, `oneshot` axum router-test helpers, a one-line wiremock JSON stub | Existing integration-test idioms, hardened |
+| `stridelabs-testing` | Implemented | Fail-loud real-Postgres pool and real-Redis probe, a guard that keeps a suite's test URL on this machine (and, opt-in, off Redis database 0), `oneshot` axum router-test helpers, a one-line wiremock JSON stub | Existing integration-test idioms, hardened; tapper's and slaudio's test-URL guards |
 | `stridelabs-mcp` | Implemented | The middle of an MCP server on rmcp: RFC 9728 protected-resource metadata, slauth bearer verification at the MCP boundary (audience = the resource URL, 503 on an issuer outage), a stateless Streamable HTTP router, a scoped, rate-limited, audited tool boundary, and slauth PATs as a credential; behind features, a Redis-backed limiter and PAT cache, an SSRF-hardened image fetch and a CORS preset | Python `stridelabs-mcp` (itself extracted from slaudio's MCP surface) |
 | `stridelabs-redis` | Implemented | A lazy, single-flight Redis handle: an atomic fixed-window counter that is never replayed, idempotent `GET` / `SET EX`, `EVAL` under a caller-chosen replay policy, `PING` | tapper's hardened rate-limiter connection slot |
 | `stridelabs-gcp` | Implemented | Policy-free Google Cloud building blocks on the consumer's `reqwest::Client`: an ADC access-token provider, a small GCS JSON-API client, Vertex AI `generateContent` (feature `vertex`) | tapper's and parcel's GCS clients; google-auth's ADC chain and google-genai's Vertex rules, as imgmcp used them |
 | `stridelabs-inworld` | Implemented | A policy-free Inworld text-to-speech client on the consumer's `reqwest::Client`: one bounded, classified, log-safe synthesis (whole-exchange timeout, streamed response cap, pre-decode base64 guard, decoded-audio and text bounds, an optional MP3 shape check) | tapper's and lumen's `voice/inworld.rs`; slaudio's Python Inworld adapter |
+| `stridelabs-postgres` | Implemented | Postgres connection hygiene on sqlx: a `DATABASE_URL` allow-list whose refusals never print a value (no `search_path`, no NUL byte, no password file), value-free `sqlx::Error` summaries, a lazy pool, Neon pooler detection, the sqlx log targets to cap; no TLS stack of its own | tapper's `db.rs` (hardened from lumen-rs's), checked against slaudio's `parse_connect_options` |
 
-See [§ Feature topology](#feature-topology-all-nine-crates) below for what
+See [§ Feature topology](#feature-topology-all-ten-crates) below for what
 each crate turns on by default versus behind a feature flag.
 
 ## Conventions
@@ -77,7 +79,7 @@ stridelabs-config = { git = "https://github.com/charliek/stridelabs-rust.git", r
 released and tagged, bump the consumer back to `tag = "vX.Y.Z"` so its
 manifest reads the same way for everyone, forever. Every crate is versioned
 in lockstep (one `[workspace.package].version` for the whole workspace), so a
-consumer pins **one** tag/rev for however many of the nine crates it uses.
+consumer pins **one** tag/rev for however many of the ten crates it uses.
 
 ### MSRV policy
 
@@ -117,6 +119,7 @@ stridelabs-mcp = { path = "../stridelabs-rust/crates/mcp" }
 stridelabs-redis = { path = "../stridelabs-rust/crates/redis" }
 stridelabs-gcp = { path = "../stridelabs-rust/crates/gcp" }
 stridelabs-inworld = { path = "../stridelabs-rust/crates/inworld" }
+stridelabs-postgres = { path = "../stridelabs-rust/crates/postgres" }
 ```
 
 `[patch]` keys the whole *source* (the git URL), not one crate — list every
@@ -125,7 +128,7 @@ or transitively (e.g. `stridelabs-auth`'s `http` feature depends on
 `stridelabs-http`, so the consumer's `[patch]` block needs both if it uses
 that feature). A patch entry for a crate the consumer doesn't depend on is
 harmless — Cargo only applies the ones that match a real dependency — so
-listing all nine up front, as above, is the simplest thing that stays correct
+listing all ten up front, as above, is the simplest thing that stays correct
 as a consumer's dependency set grows. The `[patch]` key must match the
 `https://…` source URL the consumer's `[dependencies]` actually used.
 
@@ -155,19 +158,21 @@ slaudio NOT RUN). lumen (informational) is not given a ref automatically: pass `
 or set `DOWNSTREAM_LUMEN_REF`. Its tests read `LUMEN_RS_TEST_DATABASE_URL`, `LUMEN_RS_TEST_REDIS_URL` and `LUMEN_RS_TEST_GCS_URL` (default `http://localhost:54443`, lumen's own
 fake-gcs; never tapper's 4443).
 
-### Feature topology (all nine crates)
+### Feature topology (all ten crates)
 
 Every crate that defines optional features defaults to `default = []` — a
 consumer opts into the heavier parts of its dependency graph (a TLS stack, a
 database driver, a metrics exporter) explicitly, one feature at a time.
-`stridelabs-config` is the exception: it has no feature flags at all, since
-everything it provides is unconditional. Full detail — including *why* each
+`stridelabs-config` is the exception: its `file` feature is on by default,
+because file loading was unconditional before the feature existed; a
+consumer configured from its environment alone turns it off
+(`default-features = false`) to keep YAML out of its graph. Full detail — including *why* each
 gate exists — lives in each crate's own README; this is the map of what turns
 on what.
 
 | Crate | Feature | Default | Adds |
 |---|---|---|---|
-| `stridelabs-config` | *(none — everything is unconditional)* | — | — |
+| `stridelabs-config` | `file` | **on** | `load_yaml`/`load_json`/`Loaded`/`FileError`, via `yaml_serde`, `serde_path_to_error` and `serde`; off, the crate is the env helpers and `Errors` only |
 | `stridelabs-observability` | `prometheus` | off | `metrics` + `metrics-exporter-prometheus`: recorder install, `status_class`, `DURATION_BUCKETS` |
 | `stridelabs-observability` | `axum` | off | `RequestLogLayer`'s peer-address fallback for `remoteIp`, read from axum's `ConnectInfo<SocketAddr>` |
 | `stridelabs-http` | `cors` | off | `cors_layer`, via `tower-http/cors` |
@@ -181,8 +186,8 @@ on what.
 | `stridelabs-auth` | `axum` | off | `bearer_token(&Parts)`, via the `http` types crate |
 | `stridelabs-auth` | `http` | off | `From<AuthError> for stridelabs_http::AppError` |
 | `stridelabs-auth` | `test-support` | off | offline JWT minting against two committed throwaway keypairs |
-| `stridelabs-testing` | `postgres` | off | `require_postgres` and `require_postgres_at`, via `sqlx`'s Postgres driver + `url` |
-| `stridelabs-testing` | `redis` | off | `require_redis`, via redis-rs (no TLS) + `url` |
+| `stridelabs-testing` | `postgres` | off | `require_postgres` and `require_postgres_at`, via `sqlx`'s Postgres driver |
+| `stridelabs-testing` | `redis` | off | `require_redis`, `require_local_redis_url` and `RedisDbPolicy`, via redis-rs (no TLS) |
 | `stridelabs-mcp` | `test-support` | off | MCP access-token minting for a `ProtectedResource` (via `stridelabs-auth/test-support`) and the committed `tools/list` freshness check; with `image-fetch`, also stridelabs-http's `ssrf-test-support` |
 | `stridelabs-mcp` | `cors` | off | `cors_layer()`, the app-wide CORS preset, via `tower-http/cors` |
 | `stridelabs-mcp` | `redis` | off | `RedisRateLimiter` and `RedisPatCache`, via `stridelabs-redis` |
@@ -192,10 +197,11 @@ on what.
 | `stridelabs-gcp` | `service-account-key` | off | `service_account` credentials: RS256 assertion signing via jsonwebtoken's `use_pem` |
 | `stridelabs-gcp` | `vertex` | off | the `vertex` module (no extra dependency) |
 | `stridelabs-inworld` | `client-builder` | off | `client_builder()`, a `reqwest::ClientBuilder` with the rustls backend, no proxy and no redirects, via `reqwest` (with `rustls`: the aws-lc-rs provider and the OS trust store) |
+| `stridelabs-postgres` | `live-tests` | off | **not for consumers**: compiles the crate's real-Postgres suite (everything else is unconditional; sqlx is required, with `postgres` and `runtime-tokio` only) |
 
-`stridelabs-testing`'s `oneshot` and `wiremock` modules have no feature gate
-of their own — both are cheap and every consumer of the crate wants them; only
-the Postgres driver and the Redis client are worth gating.
+`stridelabs-testing`'s `oneshot`, `wiremock` and `local` modules have no
+feature gate of their own — all are cheap and every consumer of the crate
+wants them; only the Postgres driver and the Redis client are worth gating.
 
 `stridelabs-http`'s `proxy` and `ssrf` and `stridelabs-inworld`'s
 `client-builder` are the only features anywhere here that turn on reqwest's
@@ -209,7 +215,9 @@ have none — they take the consumer's `reqwest::Client`, so the TLS stack and
 the process's rustls provider stay the consumer's choice (and
 `stridelabs-mcp` builds rmcp with no HTTP-client feature) — and
 `stridelabs-testing`'s Postgres pool and Redis probe talk to their servers in
-the clear.
+the clear. `stridelabs-postgres` names no sqlx TLS feature either: the
+consumer's own sqlx dependency picks it (`tls-rustls-aws-lc-rs`, below), and
+Cargo unifies it into the crate's sqlx.
 
 ### One crypto provider: aws-lc-rs
 

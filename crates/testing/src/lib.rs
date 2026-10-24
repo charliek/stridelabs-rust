@@ -1,5 +1,6 @@
 //! Test-only helpers for StrideLabs services: a fail-loud Postgres pool
-//! (feature `postgres`), a fail-loud Redis probe (feature `redis`),
+//! (feature `postgres`), a fail-loud Redis probe (feature `redis`), a guard
+//! that keeps a suite's test URL on this machine ([`require_local_url`]),
 //! `tower::ServiceExt::oneshot` helpers for axum `Router`s, and a one-line
 //! wiremock JSON stub.
 //!
@@ -12,8 +13,9 @@
 //!
 //! # Feature topology
 //!
-//! `default = []`. `oneshot` and `wiremock` are unconditional — both are tiny
-//! and neither pulls in anything a test binary doesn't already need.
+//! `default = []`. `oneshot`, `wiremock` and `local` are unconditional — all
+//! are small and none pulls in anything a test binary doesn't already need
+//! (`local` reads URLs with the `url` crate wiremock already brings).
 //!
 //! Note that feature-gated items are named in plain code spans, never
 //! intra-doc links: they are off by default, so a link would be an
@@ -24,8 +26,8 @@
 //!
 //! | Feature | Default | Adds |
 //! |---|---|---|
-//! | `postgres` | off | `postgres::require_postgres` and `postgres::require_postgres_at`, via `sqlx`/`url` |
-//! | `redis` | off | `redis::require_redis` and its `RedisServer`, via `redis`/`url` |
+//! | `postgres` | off | `postgres::require_postgres` and `postgres::require_postgres_at`, via `sqlx` |
+//! | `redis` | off | `redis::require_redis` and its `RedisServer`, and `redis::require_local_redis_url` with its `RedisDbPolicy`, via `redis` |
 //!
 //! `postgres` is gated because `sqlx`'s Postgres driver drags in a real
 //! network stack; a consumer whose tests never touch a database shouldn't
@@ -49,6 +51,7 @@
 //! crate README for the pattern a consumer builds on top (migrations,
 //! seeding).
 
+pub mod local;
 pub mod oneshot;
 pub mod wiremock;
 
@@ -61,9 +64,18 @@ pub mod redis;
 mod redact;
 
 #[cfg(feature = "redis")]
-pub use crate::redis::{require_redis, RedisServer};
+pub use crate::redis::{require_local_redis_url, require_redis, RedisDbPolicy, RedisServer};
 #[cfg(feature = "postgres")]
 pub use postgres::{require_postgres, require_postgres_at};
 
+pub use local::require_local_url;
 pub use oneshot::{body_json, get, post_json, req};
 pub use wiremock::serve_json;
+
+/// A fake environment for the `*_from` lookup seams' tests: the pairs given,
+/// nothing else.
+#[cfg(test)]
+fn lookup<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+    let map: std::collections::HashMap<&str, &str> = pairs.iter().copied().collect();
+    move |key| map.get(key).map(|value| value.to_string())
+}

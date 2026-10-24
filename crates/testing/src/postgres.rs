@@ -205,6 +205,7 @@ fn connection_failure_message(url: &str, err: &sqlx::Error, source: UrlSource) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lookup;
 
     /// The URL the compose file and CI's Postgres service both serve:
     /// `docker-compose.yml` maps port 5438, `POSTGRES_PASSWORD=localdev`,
@@ -213,11 +214,6 @@ mod tests {
     /// env-reading entry point rather than the `_at` form — the one place in
     /// this crate's own tests where that's the point.
     const COMPOSE_URL: &str = "postgres://postgres:localdev@localhost:5438/stridelabs_test";
-
-    fn lookup<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
-        let map: std::collections::HashMap<&str, &str> = pairs.iter().copied().collect();
-        move |key| map.get(key).map(|value| value.to_string())
-    }
 
     /// The database the tests reach: `DATABASE_URL` (read, never written)
     /// or the compose URL, by `require_postgres`'s own precedence.

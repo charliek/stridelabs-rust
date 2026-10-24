@@ -78,6 +78,88 @@ impl fmt::Debug for RedisServer {
     }
 }
 
+/// Which database number a test Redis URL may select, for
+/// [`require_local_redis_url`].
+///
+/// Allowing database 0 is the default: a suite that isolates itself by key
+/// prefix (slaudio's does) can share it with a dev stack safely.
+/// [`RedisDbPolicy::RefuseZero`] is for a suite that seeds state the code
+/// under test reads back by fixed key shape (a full rate-limit window, a
+/// spent budget): in database 0, which a running dev stack counts into, that
+/// would refuse a developer's real requests.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RedisDbPolicy {
+    /// Any database, 0 included.
+    #[default]
+    AllowZero,
+    /// Database 0 is refused, whether the URL selects it explicitly
+    /// (`/0`) or by naming no database at all.
+    RefuseZero,
+}
+
+/// The Redis URL in `var`, which must be set, name a server on this machine
+/// ([`require_local_url`](crate::require_local_url)'s rule), be one redis-rs
+/// can open, and select a database `policy` allows; or a panic saying what
+/// to fix. No connection is made: build the code under test from the URL,
+/// and probe it however the suite does.
+///
+/// The database is the one redis-rs itself parses out of the URL, whatever
+/// form selects it.
+///
+/// # Panics
+///
+/// On every refusal of [`require_local_url`](crate::require_local_url), on a
+/// URL redis-rs refuses (a `rediss://` URL needs a redis-rs TLS feature this
+/// crate does not turn on), and under [`RedisDbPolicy::RefuseZero`] on a URL
+/// that selects database 0. The message never shows the value.
+///
+/// ```no_run
+/// use stridelabs_testing::{require_local_redis_url, RedisDbPolicy};
+///
+/// // e.g. `export MYAPP_TEST_REDIS_URL=redis://localhost:6379/1`
+/// let url = require_local_redis_url("MYAPP_TEST_REDIS_URL", RedisDbPolicy::RefuseZero);
+/// # let _ = url;
+/// ```
+pub fn require_local_redis_url(var: &str, policy: RedisDbPolicy) -> String {
+    require_local_redis_url_from(var, policy, |name| std::env::var(name).ok())
+}
+
+/// The env-injectable seam behind [`require_local_redis_url`].
+fn require_local_redis_url_from(
+    var: &str,
+    policy: RedisDbPolicy,
+    get: impl Fn(&str) -> Option<String>,
+) -> String {
+    checked_local_redis_url(var, get(var).as_deref(), policy)
+        .unwrap_or_else(|refusal| panic!("{refusal}"))
+}
+
+fn checked_local_redis_url(
+    var: &str,
+    value: Option<&str>,
+    policy: RedisDbPolicy,
+) -> Result<String, String> {
+    let url = crate::local::checked_local_url(var, value)?;
+    let Ok(client) = ::redis::Client::open(url.as_str()) else {
+        return Err(crate::local::refusal(
+            var,
+            "is not a Redis URL this build of redis-rs can open",
+        ));
+    };
+    if policy == RedisDbPolicy::RefuseZero
+        && client.get_connection_info().redis_settings().db() == 0
+    {
+        return Err(crate::local::refusal(
+            var,
+            "selects database 0, explicitly or by naming no database; this suite must never \
+             share the database a running dev stack counts into, so select another \
+             (`redis://localhost:6379/1`)",
+        ));
+    }
+    Ok(url)
+}
+
 /// Connect to Redis for a test, or panic with an actionable message.
 ///
 /// Reads `REDIS_URL` from the environment; if it is unset (or empty),
@@ -186,19 +268,13 @@ fn failure_summary(err: &::redis::RedisError) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use super::*;
+    use crate::lookup;
 
     /// The URL `docker-compose.yml`'s `redis` service serves (host port
     /// 6390, no password). CI exports the same string as `REDIS_URL`, so the
     /// happy path below goes through the public, env-reading entry point.
     const COMPOSE_URL: &str = "redis://localhost:6390/0";
-
-    fn lookup<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
-        let map: HashMap<&str, &str> = pairs.iter().copied().collect();
-        move |key| map.get(key).map(|value| value.to_string())
-    }
 
     #[tokio::test]
     async fn require_redis_connects_to_the_compose_redis() {
@@ -410,6 +486,79 @@ mod tests {
                 "{url}: {message}"
             );
         }
+    }
+
+    const VAR: &str = "STRIDELABS_TESTING_REDIS_URL";
+
+    /// `RefuseZero` refuses database 0 in every form redis-rs reads as 0
+    /// (explicit, or no database named); a non-zero database passes it, and
+    /// the default policy allows 0 (slaudio's prefix-isolated suites).
+    #[test]
+    fn refuse_zero_refuses_database_zero_in_every_form() {
+        for url in [
+            "redis://localhost:6390/0",
+            "redis://localhost:6390",
+            "redis://localhost:6390/",
+            "redis://:hunter2@127.0.0.1:6390/0",
+        ] {
+            let message =
+                checked_local_redis_url(VAR, Some(url), RedisDbPolicy::RefuseZero).expect_err(url);
+            assert!(
+                message.contains(&format!("{VAR} selects database 0")),
+                "{url}: {message}"
+            );
+            assert!(!message.contains("hunter2"), "{url}: {message}");
+            assert_eq!(
+                checked_local_redis_url(VAR, Some(url), RedisDbPolicy::default()).as_deref(),
+                Ok(url),
+                "the default allows database 0"
+            );
+        }
+        for url in ["redis://localhost:6390/1", "redis://:hunter2@[::1]:6390/15"] {
+            assert_eq!(
+                checked_local_redis_url(VAR, Some(url), RedisDbPolicy::RefuseZero).as_deref(),
+                Ok(url)
+            );
+        }
+        assert_eq!(RedisDbPolicy::default(), RedisDbPolicy::AllowZero);
+    }
+
+    /// The local rule comes first (a remote server is refused whatever its
+    /// database), and a URL redis-rs cannot open is refused without being
+    /// shown.
+    #[test]
+    fn a_remote_or_unopenable_url_is_refused_before_the_database_is_read() {
+        for (url, problem) in [
+            (
+                "redis://:hunter2@cache.example.com:6379/1",
+                "names a host that is not loopback",
+            ),
+            // (Not `rediss://`: whether redis-rs opens one depends on a TLS
+            // feature some other crate in the build may turn on.)
+            (
+                "http://hunter2@localhost:6390/1",
+                "is not a Redis URL this build of redis-rs can open",
+            ),
+        ] {
+            for policy in [RedisDbPolicy::AllowZero, RedisDbPolicy::RefuseZero] {
+                let message = checked_local_redis_url(VAR, Some(url), policy).expect_err(url);
+                assert!(
+                    message.contains(&format!("{VAR} {problem}")),
+                    "{url}: {message}"
+                );
+                assert!(!message.contains("hunter2"), "{url}: {message}");
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "STRIDELABS_TESTING_REDIS_URL selects database 0")]
+    fn require_local_redis_url_panics_with_the_refusal() {
+        let _ = require_local_redis_url_from(
+            VAR,
+            RedisDbPolicy::RefuseZero,
+            lookup(&[(VAR, "redis://localhost:6390")]),
+        );
     }
 
     #[tokio::test]

@@ -1,8 +1,10 @@
 # stridelabs-testing
 
 Test-only helpers for StrideLabs services: a fail-loud real-Postgres pool, a
-fail-loud real-Redis probe, a `tower::ServiceExt::oneshot` wrapper for axum
-`Router`s, and a one-line wiremock JSON stub. Extracted from the ad hoc
+fail-loud real-Redis probe, a guard that keeps a suite's test URL on this
+machine (with an opt-in Redis database-0 refusal), a
+`tower::ServiceExt::oneshot` wrapper for axum `Router`s, and a one-line
+wiremock JSON stub. Extracted from the ad hoc
 idioms duplicated across an existing service's integration tests.
 
 This crate is meant to sit in a consumer's **`[dev-dependencies]`**, never
@@ -10,13 +12,14 @@ This crate is meant to sit in a consumer's **`[dev-dependencies]`**, never
 
 ## Feature topology
 
-`default = []`. `oneshot` and `wiremock` are unconditional; one feature gates
-each server helper:
+`default = []`. `oneshot`, `wiremock` and `require_local_url` are
+unconditional (`require_local_url` reads URLs with the `url` crate wiremock
+already brings); one feature gates each server helper:
 
 | Feature | Default | Adds |
 |---|---|---|
-| `postgres` | off | [`require_postgres`] and [`require_postgres_at`], via `sqlx`'s Postgres driver + `url` |
-| `redis` | off | [`require_redis`] and its `RedisServer`, via redis-rs (`tokio-comp`, no TLS) + `url` |
+| `postgres` | off | [`require_postgres`] and [`require_postgres_at`], via `sqlx`'s Postgres driver |
+| `redis` | off | [`require_redis`] and its `RedisServer`, and `require_local_redis_url` with its `RedisDbPolicy`, via redis-rs (`tokio-comp`, no TLS) |
 
 `postgres` is gated because `sqlx`'s driver pulls in a real network stack — a
 consumer whose tests never touch a database shouldn't compile it just to get
@@ -138,6 +141,34 @@ which is the same reason `stridelabs-config` routes its env helpers through
 an injectable lookup. Only the happy path reads `DATABASE_URL` for real, by
 calling `require_postgres`.
 
+## `require_local_url` — a test URL on this machine only
+
+```rust,no_run
+use stridelabs_testing::require_local_url;
+
+// e.g. `export MYAPP_TEST_DATABASE_URL=postgres://dev:dev@localhost:5432/myapp_test`
+let url = require_local_url("MYAPP_TEST_DATABASE_URL");
+```
+
+A suite that writes to its server (creates and drops databases, seeds
+counters, deletes keys) must never be pointed at a shared or remote one by a
+variable left over in a shell. `require_local_url(var)` reads the suite's
+**own** variable (never `DATABASE_URL` or `REDIS_URL`, which a shell set up
+for a running app may carry) and **panics** before anything connects unless:
+
+- it is set and non-empty (there is no default: a default is the dev
+  stack's server);
+- it is a URL whose host is loopback: `localhost` (any case), `127.0.0.0/8`,
+  `::1` (bracketed or not, or IPv4-mapped); a URL with no host (a Unix
+  socket) is refused;
+- every `host` or `hostaddr` query parameter is loopback too (libpq and sqlx
+  dial those instead of the authority).
+
+It returns the URL as given. The panic names the variable, the problem and
+the fix, never the value (a URL can carry a password). Pair it with
+`require_postgres_at` to probe the server, or, for Redis, use
+`require_local_redis_url` (below).
+
 ## `redis` — fail loud, never skip
 
 ```rust,no_run
@@ -200,6 +231,26 @@ As with Postgres, the env read sits in front of two private seams — one that
 takes the lookup as a closure, and one that takes the URL — so this crate's own
 tests exercise the precedence and the panic path without mutating
 `REDIS_URL`.
+
+### `require_local_redis_url` and `RedisDbPolicy`
+
+```rust,no_run
+use stridelabs_testing::{require_local_redis_url, RedisDbPolicy};
+
+// e.g. `export MYAPP_TEST_REDIS_URL=redis://localhost:6379/1`
+let url = require_local_redis_url("MYAPP_TEST_REDIS_URL", RedisDbPolicy::RefuseZero);
+```
+
+`require_local_url`'s rule, then two more, all before any connection: the
+URL must be one redis-rs can open, and its database number (as redis-rs
+itself parses it) must be one `policy` allows. `RedisDbPolicy::AllowZero`,
+the default, allows any: a suite that isolates itself by key prefix can
+share database 0 with a dev stack. `RedisDbPolicy::RefuseZero` refuses
+database 0, named explicitly or by naming no database at all, for a suite
+that seeds state the code under test reads back by fixed key shape (a full
+rate-limit window, a spent budget), which in the dev stack's database would
+refuse a developer's real requests. It returns the URL and connects to
+nothing: build the code under test from it.
 
 ## `oneshot` — driving a `Router` without a socket
 

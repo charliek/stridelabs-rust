@@ -37,8 +37,12 @@ stridelabs-auth = { path = "crates/auth" }
 stridelabs-redis = { path = "crates/redis" }
 # Only the real-Redis tests use it (stridelabs-redis's and stridelabs-mcp's):
 # a dev-dependency whose `redis` feature each crate's `live-tests` feature
-# switches on.
+# switches on. stridelabs-postgres's real-Postgres suite, the same way with
+# `postgres`.
 stridelabs-testing = { path = "crates/testing" }
+# stridelabs-postgres's docs fold its `LOG_CAPS` into a `TargetCaps`: a
+# dev-dependency only, so that crate depends on no logging setup.
+stridelabs-observability = { path = "crates/observability" }
 
 # HTTP client (proxy primitives, the SSRF-guarded fetch, JWKS fetch, PAT
 # validation, GCP calls). Deliberately NO TLS feature here: whatever is listed
@@ -98,18 +102,23 @@ tracing-log = "0.2"
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
 
-# Database. Deliberately NO `tls-*` feature: stridelabs-testing's pool talks to
-# a local/CI Postgres without TLS, and any TLS feature here would unify into a
-# consumer's test graph (`ring` next to reqwest 0.13's aws-lc-rs makes
-# `rustls::ClientConfig::builder()` panic). CI's "Guard: stridelabs-testing
-# pulls no ring" step fails if a TLS feature brings `ring` back.
+# Database. Only the driver and the runtime here: whatever is listed at
+# workspace level reaches every member's graph (the reqwest reason above), so
+# each member adds what it needs. stridelabs-testing adds `uuid`, `time`,
+# `migrate` and `macros` (crates/testing/Cargo.toml); stridelabs-postgres adds
+# nothing, so its consumers' graphs get no `macros` and no `time` from it.
+#
+# Deliberately NO `tls-*` feature, here or in any member: stridelabs-testing's
+# pool talks to a local/CI Postgres without TLS, and any TLS feature would
+# unify into a consumer's test graph (`ring` next to reqwest 0.13's aws-lc-rs
+# makes `rustls::ClientConfig::builder()` panic). stridelabs-postgres leaves
+# the TLS stack to the consumer's own sqlx (crates/postgres/Cargo.toml says
+# why). CI's "Guard: stridelabs-testing pulls no ring" and "Guard:
+# stridelabs-postgres picks no TLS stack" steps fail if a TLS feature comes
+# back.
 sqlx = { version = "0.9", default-features = false, features = [
     "runtime-tokio",
     "postgres",
-    "uuid",
-    "time",
-    "migrate",
-    "macros",
 ] }
 
 # Redis (stridelabs-redis's lazy handle, stridelabs-testing's `require_redis`).

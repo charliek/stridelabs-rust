@@ -1,0 +1,70 @@
+[package]
+name = "stridelabs-postgres"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Postgres connection hygiene on sqlx for StrideLabs services: a DATABASE_URL allow-list whose refusals never print a value, value-free error summaries, a lazy pool, Neon pooler detection and the sqlx log targets to cap"
+publish = false
+
+[features]
+default = []
+# NOT for consumers: it compiles this crate's own real-Postgres suite
+# (`tests/live.rs`), which needs the compose Postgres (`docker compose up -d`)
+# or CI's Postgres service, and panics without one rather than skipping. A
+# feature, not an always-on test target, so `cargo test --workspace` keeps
+# needing no services; `--all-features` (CI's all-features lane) turns it on.
+# It enables a DEV-dependency's feature, as stridelabs-redis's does.
+live-tests = ["stridelabs-testing/postgres"]
+
+[lints]
+workspace = true
+
+[[test]]
+name = "live"
+required-features = ["live-tests"]
+
+[dependencies]
+# The workspace entry: the Postgres driver and the Tokio runtime, nothing
+# else. No `macros` and no `time` (nothing here is checked against a database
+# at compile time or binds a time type), and no `migrate` (migration runners
+# stay with the consumers).
+#
+# **No TLS feature, on purpose.** Like stridelabs-auth and stridelabs-gcp,
+# which take the consumer's HTTP client, this crate picks no TLS stack: the
+# consumer's own sqlx dependency does (tapper, lumen and slaudio all name
+# `tls-rustls-aws-lc-rs`), and Cargo unifies it into this crate's sqlx. Two
+# reasons. A TLS feature here would put its rustls provider next to whatever
+# the consumer chose (a `tls-rustls-ring` consumer would then have two, and
+# every `rustls::ClientConfig::builder()` that relies on the process default
+# panics). And it would unify into stridelabs-testing's sqlx in this
+# workspace's all-features lane, where that crate's own test pins that its
+# pool has no TLS. A consumer that turns none on gets sqlx's own refusal, at
+# connect, of an `sslmode` that needs TLS ("built without TLS support"),
+# never a silent downgrade.
+sqlx = { workspace = true }
+# `connect_options` reads the URL's parts with the `url` crate, the one sqlx
+# parses it with (already in sqlx's graph).
+url = { workspace = true }
+# A pooler label hidden behind a percent-escape in the host. Already in every
+# graph through `url`.
+percent-encoding = { workspace = true }
+thiserror = { workspace = true }
+# `LOG_CAPS`' `LevelFilter`. Already in every graph through sqlx-core, which
+# logs through it.
+tracing = { workspace = true }
+
+[dev-dependencies]
+# `require_postgres`, the fail-loud probe for the live suite. Its `postgres`
+# feature is switched on by `live-tests` above, never here: dev-dependency
+# features unify into every `cargo test --workspace`, and that lane must need
+# no Postgres.
+stridelabs-testing = { workspace = true }
+# A lazy pool needs a runtime to be built in; the live suite drives it.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# Records the targets sqlx logs under, to pin `LOG_CAPS` to them.
+tracing-subscriber = { workspace = true }
+# `LOG_CAPS`' doc example folds the pairs into a `TargetCaps`.
+stridelabs-observability = { workspace = true }

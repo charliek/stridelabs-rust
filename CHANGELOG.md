@@ -3,7 +3,7 @@
 All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
-Versioning is lockstep across all nine crates in this workspace (one
+Versioning is lockstep across all ten crates in this workspace (one
 `[workspace.package].version`, bumped together regardless of which crate(s)
 changed) rather than independent per-crate versioning —
 see the root README's "Consuming these crates" section for what that means
@@ -103,6 +103,136 @@ and `Cargo.lock`): tapper plan 016 C-1 bumps it for the v0.10.0 cycle
   - lumen-rs (rev `6d08a4a`: `for_issuer`) and parcel (through
     stridelabs-mcp) are not covered by `scripts/downstream-check.sh`; the
     paths they use are unchanged.
+- `stridelabs-postgres`, a new crate (tapper plan 016 C-3): Postgres
+  connection hygiene on sqlx, promoted from tapper-rs's `db.rs` (itself
+  hardened from lumen-rs's copy) and checked against slaudio's
+  `parse_connect_options`, so tapper (at C-5) and lumen can replace their
+  copies with it. lumen-rust asked that it keep lumen-rs's semantics, so that
+  lumen's swap is a deletion; it does, with the two differences listed last.
+  sqlx is a required dependency with `postgres` and `runtime-tokio` only (no
+  `macros`, no `time`, no `migrate`) and **no TLS feature**: the consumer's
+  own sqlx picks the stack (tapper, lumen and slaudio all name
+  `tls-rustls-aws-lc-rs`), as stridelabs-auth and stridelabs-gcp leave the
+  HTTP client's TLS to the consumer. A TLS feature here would put a second
+  rustls provider next to a `tls-rustls-ring` consumer's, and would unify
+  into stridelabs-testing's TLS-free pool in this workspace's all-features
+  lane. A new CI guard, "Guard: stridelabs-postgres picks no TLS stack", holds
+  that (no rustls, ring, aws-lc-rs, native TLS, `sqlx-macros` or `time` in its
+  graph).
+  - **`connect_options(url) -> Result<PgConnectOptions, UrlRefusal>`**: the
+    URL checked before sqlx parses it. A query-parameter allow-list
+    (`SUPPORTED_URL_PARAMETERS`; `IGNORED_URL_PARAMETERS` accepted, validated
+    and not passed on), because sqlx's parser logs an
+    unrecognised parameter with its value and its errors quote a bad value; a
+    `search_path` in the startup options refused, read with PostgreSQL's own
+    `pg_split_opts` tokenisation (the vertical tab included) and `getopt`
+    rules, names compared exactly (so `myapp.search_path_hint` passes); a
+    percent-decoded NUL refused in every startup and authentication field,
+    in what sqlx parsed (its `PG*` defaults included) and in `PGUSER`,
+    `PGDATABASE`, `PGAPPNAME`, `PGOPTIONS`, `PGHOST`, `PGHOSTADDR` and
+    `PGPASSWORD`, read through a private lookup seam so the tests set no
+    variable; and no password file ever read (an explicitly empty password
+    when nothing supplies one). **`UrlRefusal`** (`#[non_exhaustive]`:
+    `NotAUrl`, `Scheme`, `UnsupportedParameters { named, unnamed }`,
+    `InvalidValue`, `Unparseable`, `SearchPath`, `NulByte`) never prints a
+    value, and names only parameters from the crate's own lists (lumen's
+    requirement); an unknown name is counted, never printed.
+  - **`error_summary(&sqlx::Error) -> ErrorSummary`**: a SQLSTATE (five
+    ASCII digits or capitals, else not printed) and a fixed description, or
+    a fixed class name; never the server's message. Its `Debug` is its
+    `Display`.
+  - **`lazy_pool(options, PoolSettings)`**: the pool, built from checked
+    options without connecting. `PoolSettings` (`#[non_exhaustive]`, `Copy`)
+    carries `max_connections`, `acquire_timeout`, `idle_timeout`,
+    `max_lifetime` and `test_before_acquire`, with sqlx 0.9's own defaults
+    pinned and `with_*` setters; `pool_options()` hands sqlx's
+    `PgPoolOptions` to a consumer that needs more (slaudio's
+    `test_before_acquire` and lifetimes fit it).
+  - **`neon_pooler(&PgConnectOptions) -> Option<PoolerRef>`**: whether the
+    options reach Neon's pooled endpoint, by a `-pooler` host label (as is or
+    percent-decoded) or by `endpoint=…-pooler` / `project=…-pooler` in the
+    startup options (`options=` or `PGOPTIONS`), read through both Neon's and
+    PostgreSQL's tokenisers. Detection only: refusing stays with the
+    consumer (tapper's and lumen's migrate commands refuse).
+    `neon_pooler_host(&str)` is the host half, for a consumer that also
+    refuses a pooler named where sqlx would not dial it (an authority
+    redirected by `?host=`). `PoolerRef` (`Host`, `Endpoint`) holds only a
+    label or an endpoint id (letters, digits, `-`) or a fixed placeholder.
+  - **`LOG_CAPS`**: `sqlx_core::pool`, `sqlx_postgres::options`,
+    `sqlx::postgres::notice` and `sqlx_postgres::message`, each `OFF`, as
+    plain `(target, LevelFilter)` pairs to fold into a
+    stridelabs-observability `TargetCaps` (or any other filter), rather than
+    a `TargetCaps` behind a feature: the crate then depends on no logging
+    setup. The first two log a raw error and a URL parameter's value; the
+    notice target logs every server notice verbatim from a connection that
+    succeeds (an `application_name` past 63 bytes, which `connect_options`
+    accepts, is truncated with a NOTICE quoting it: found by the astra
+    review); the message target logs a misbehaving peer's `CopyDone` body.
+    tapper's own `log_caps()` caps only the first two, so its C-5 swap
+    gains the other two. The tests pin the first three to where sqlx 0.9
+    logs, the notice one with a real truncation notice from the compose
+    Postgres; every other sqlx 0.9 log call is listed as uncapped, with the
+    reason, in `LOG_CAPS`' docs.
+  - Differences from lumen-rs's copy: the pooler check reads the startup
+    options through PostgreSQL's tokeniser as well as Neon's (tapper's plan
+    015 C-3 hardening; strictly broader), and `sqlx::Error::Migrate` renders
+    as `database client error` rather than `migration error` (the crate does
+    not turn on sqlx's `migrate`, so it cannot name the variant; neither app
+    passes one to `error_summary`). Neither app's URL normaliser moves here:
+    `channel_binding` is refused by name, as both apps' allow-lists refuse
+    it after normalising.
+  - lumen-rs (rev `6d08a4a`) and parcel are not covered by
+    `scripts/downstream-check.sh`; neither uses the crate yet. The script's
+    crate list (and CI's limen patch) gains `postgres`.
+- `stridelabs-config` (tapper plan 016 C-3; lumen's plan-002 candidates
+  adopt the seam): the lookup seam is public. **`env_or_from`,
+  `env_parse_from` and `parse_string_array_from`** take an
+  `impl Fn(&str) -> Option<String>`, the seam a consumer's
+  `Config::from_lookup` builds on, and their errors are **value-free**: an
+  `EnvError` from `env_parse_from` or `parse_string_array_from` names the
+  variable and a fixed reason (the new `VALUE_DOES_NOT_PARSE` and
+  `NOT_A_STRING_ARRAY`), never the value or the parser's text (serde_json's
+  `invalid type: string "…"`, a `FromStr` error that echoes its input), so
+  they are safe for a secret and for printed startup refusals.
+  `env_parse_from` asks nothing of `T::Err` (it never renders it). The plain
+  `env_or`, `env_parse` and `parse_string_array` are unchanged, parser text
+  included. No `Refusals` type: `Errors` already accumulates, and its rustdoc
+  and the README now show it collecting startup refusals. lumen-rs (rev
+  `6d08a4a`) and parcel are not covered by `scripts/downstream-check.sh`.
+- `stridelabs-config`: a **`file` feature, on by default**, gating
+  `load_yaml`, `load_json`, `Loaded` and `FileError` (tapper plan 016 C-3).
+  A consumer that names the crate with no `features` keeps everything; one
+  that sets `default-features = false` gets the env helpers and `Errors`
+  with no `yaml_serde`, `libyaml-rs`, `serde_path_to_error` or `serde` in
+  its graph (tapper, which dropped the crate at its plan 015 C-2, would
+  re-adopt it only without YAML in its graph). A new CI guard, "Guard:
+  stridelabs-config without `file` pulls no YAML", holds that, and the
+  per-feature lane builds and lints the crate with and without it.
+- `stridelabs-testing`: **`require_local_url(var)`**, unconditional (tapper
+  plan 016 C-3, modelled on tapper-rs's `tests/test_redis` reader and
+  slaudio's harness guards): the URL in the suite's own variable, which must
+  be set (no default: a default is the dev stack's server) and whose host,
+  and every `host`/`hostaddr` query parameter, must be loopback
+  (`localhost`, `127.0.0.0/8`, `::1`); otherwise a panic naming the
+  variable, the problem and the fix, never the value. With feature `redis`,
+  **`require_local_redis_url(var, RedisDbPolicy)`** adds that redis-rs can
+  open the URL and that its database is one the policy allows:
+  **`RedisDbPolicy`** (`#[non_exhaustive]`) is `AllowZero` by default
+  (slaudio's suites share database 0 under a key prefix) or the opt-in
+  `RefuseZero`, which refuses database 0 named or implied (tapper's suites
+  seed windows and budgets the dev stack would read). Neither connects.
+  lumen-rs (rev `6d08a4a`) and parcel are not covered by
+  `scripts/downstream-check.sh`.
+
+### Changed
+
+- `stridelabs-testing` (manifest only; no behaviour or graph change): `url`
+  is a non-optional dependency (wiremock already puts it in every
+  consumer's test graph), so the `postgres` and `redis` features no longer
+  name `dep:url`. The workspace's `sqlx` entry is now the driver and the
+  runtime only, and stridelabs-testing names `uuid`, `time`, `migrate` and
+  `macros` itself, so its sqlx is built exactly as before while
+  stridelabs-postgres's stays minimal.
 
 ## [0.9.0] - 2026-10-22
 

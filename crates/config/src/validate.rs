@@ -30,6 +30,52 @@ impl fmt::Display for ValidationError {
 
 /// Accumulates validation errors so a caller can report every problem found
 /// in a config, not just the first.
+///
+/// # Startup refusals
+///
+/// This is also the accumulator for a service that refuses to start: read
+/// every setting through one lookup seam, push each refusal, and print them
+/// all at once. Read through the `_from` helpers, whose errors name the
+/// setting and a fixed reason, never its value, so the refusals are safe to
+/// print even for a setting that holds a secret. Write your own messages the
+/// same way: name the setting and the rule. ([`validate_socket_addr`] and
+/// [`validate_fraction`] quote the value they refuse, so keep them for
+/// settings that are not secret.)
+///
+/// ```
+/// use stridelabs_config::{env_parse_from, parse_string_array_from, Errors, ValidationError};
+///
+/// /// Every refusal at once, from any lookup (the process environment in
+/// /// `main`, a map in tests).
+/// fn startup_check(get: impl Fn(&str) -> Option<String>) -> Result<(), Vec<ValidationError>> {
+///     let mut refusals = Errors::new();
+///     if let Err(refusal) = env_parse_from::<u16>("PORT", 8080, &get) {
+///         refusals.push(refusal.var, refusal.message);
+///     }
+///     if let Err(refusal) = parse_string_array_from("CORS_ORIGINS", &get) {
+///         refusals.push(refusal.var, refusal.message);
+///     }
+///     if get("ENVIRONMENT").as_deref() != Some("development")
+///         && get("SERVICE_KEY").is_some_and(|key| key.len() < 32)
+///     {
+///         refusals.push("SERVICE_KEY", "must be at least 32 bytes outside development");
+///     }
+///     refusals.into_result()
+/// }
+///
+/// let get = |key: &str| match key {
+///     "PORT" => Some("80a0".to_string()),
+///     "SERVICE_KEY" => Some("short-secret".to_string()),
+///     _ => None,
+/// };
+/// let refusals = startup_check(get).unwrap_err();
+/// assert_eq!(refusals.len(), 2);
+/// for refusal in &refusals {
+///     // e.g. `refusing to start: PORT: does not parse as the expected type (value not shown)`
+///     let line = format!("refusing to start: {refusal}");
+///     assert!(!line.contains("80a0") && !line.contains("short-secret"));
+/// }
+/// ```
 #[derive(Debug, Default)]
 pub struct Errors(Vec<ValidationError>);
 

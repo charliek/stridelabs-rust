@@ -142,6 +142,10 @@ jobs:
         run: |
           set -euo pipefail
           for entry in \
+            stridelabs-config: \
+            stridelabs-config:file \
+            stridelabs-postgres: \
+            stridelabs-testing: \
             stridelabs-gcp: \
             stridelabs-gcp:service-account-key \
             stridelabs-gcp:vertex \
@@ -300,6 +304,70 @@ jobs:
             exit 1
           fi
           echo "ok: rustls absent with every feature on, jsonwebtoken and reqwest present"
+
+      # stridelabs-postgres sits in consumers' PRODUCTION graphs and, like
+      # stridelabs-auth and stridelabs-gcp, picks no TLS stack: the consumer's
+      # own sqlx names one (`tls-rustls-aws-lc-rs`) and Cargo unifies it in. A
+      # TLS feature on the crate's sqlx would put a rustls provider next to the
+      # consumer's choice, and would unify into stridelabs-testing's TLS-free
+      # pool in this workspace's all-features lane. Its sqlx is also minimal:
+      # no `macros` (sqlx-macros) and no `time`. Every feature on (features
+      # only add crates); sqlx and sqlx-postgres are the positive controls.
+      - name: "Guard: stridelabs-postgres picks no TLS stack"
+        run: |
+          set -euo pipefail
+          pkgs="$(mktemp)"
+          trap 'rm -f "$pkgs"' EXIT
+          cargo tree --locked --target all -e normal -p stridelabs-postgres --all-features \
+            --prefix none --format '{p}' | awk '{print $1}' | sort -u > "$pkgs"
+          echo "$(wc -l < "$pkgs") packages in stridelabs-postgres[all features]'s normal graph"
+          if [ ! -s "$pkgs" ]; then
+            echo "::error::the stridelabs-postgres package listing is empty; the guard proved nothing"
+            exit 1
+          fi
+          for control in sqlx sqlx-postgres; do
+            if ! grep -qx "$control" "$pkgs"; then
+              echo "::error::positive control failed: $control is not in stridelabs-postgres[all features]'s graph, so this listing is not the one the guard means to inspect"
+              exit 1
+            fi
+          done
+          for forbidden in rustls ring aws-lc-rs native-tls openssl sqlx-macros time; do
+            if grep -qx "$forbidden" "$pkgs"; then
+              echo "::error::$forbidden is in stridelabs-postgres's graph; the crate's sqlx must stay postgres + runtime-tokio, with the TLS stack left to the consumer"
+              cargo tree --locked --target all -e normal -p stridelabs-postgres --all-features -i "$forbidden" || true
+              exit 1
+            fi
+          done
+          echo "ok: no TLS stack, no sqlx macros, no time; sqlx and sqlx-postgres present"
+
+      # stridelabs-config's `file` feature (on by default) is its YAML/JSON
+      # file loading; a consumer that turns default features off must get no
+      # YAML parser from it. serde_json (the env helpers' JSON arrays) is the
+      # positive control.
+      - name: "Guard: stridelabs-config without `file` pulls no YAML"
+        run: |
+          set -euo pipefail
+          pkgs="$(mktemp)"
+          trap 'rm -f "$pkgs"' EXIT
+          cargo tree --locked --target all -e normal -p stridelabs-config --no-default-features \
+            --prefix none --format '{p}' | awk '{print $1}' | sort -u > "$pkgs"
+          echo "$(wc -l < "$pkgs") packages in stridelabs-config[no default features]'s normal graph"
+          if [ ! -s "$pkgs" ]; then
+            echo "::error::the stridelabs-config package listing is empty; the guard proved nothing"
+            exit 1
+          fi
+          if ! grep -qx serde_json "$pkgs"; then
+            echo "::error::positive control failed: serde_json is not in stridelabs-config[no default features]'s graph, so this listing is not the one the guard means to inspect"
+            exit 1
+          fi
+          for forbidden in yaml_serde libyaml-rs serde_path_to_error; do
+            if grep -qx "$forbidden" "$pkgs"; then
+              echo "::error::$forbidden is in stridelabs-config's graph without the \`file\` feature; file loading must stay behind it"
+              cargo tree --locked --target all -e normal -p stridelabs-config --no-default-features -i "$forbidden" || true
+              exit 1
+            fi
+          done
+          echo "ok: no YAML without \`file\`; serde_json present"
 
       # stridelabs-inworld is handed the consumer's `reqwest::Client`, so its
       # core (no features: its reqwest has none at all) must pick no TLS
@@ -748,7 +816,7 @@ jobs:
           set -euo pipefail
           patch="$RUNNER_TEMP/stridelabs-patch.toml"
           echo '[patch."https://github.com/charliek/stridelabs-rust.git"]' > "$patch"
-          for c in config observability http auth testing mcp redis gcp inworld; do
+          for c in config observability http auth testing mcp redis gcp inworld postgres; do
             echo "stridelabs-$c = { path = \"$GITHUB_WORKSPACE/stridelabs-rust/crates/$c\" }" >> "$patch"
           done
           cat "$patch"
