@@ -369,6 +369,13 @@ in the house mappings. `crit` is refused in any form because RFC 7515
 support, and this crate supports none. The checks are tapper-rs's pre-lookup
 screen, moved here (plan 016 C-1), with its test cases.
 
+`screen::check(token, policy)` runs the same screen with no verifier, key or
+I/O, from the same code: `Ok(())` exactly when a verifier with that policy
+would go on to its key lookup, else that verifier's refusal. For a service
+that answers some tokens before it has a verifier (an issuer not configured
+yet) and still wants a malformed token to be a 401, not the 503 an outage
+gets.
+
 `sub` is treated as an **opaque** OIDC subject. In a slauth deployment it
 happens to be the Kratos identity UUID and services key their user rows on it,
 but nothing here parses or validates its shape.
@@ -440,8 +447,9 @@ monotonic clock.
   an RS256 signature: an RSA key whose `alg`, `use` and `key_ops`, where
   present, allow it, and whose `n` and `e` are what aws-lc-rs, the RS256
   verifier, accepts: unpadded base64url, minimal big-endian octets (no
-  leading zero octet), an odd `e` of 2 to 33 bits, an odd modulus of 2048
-  to 8192 bits. Any other key would reach verification and fail it, a 401
+  leading zero octet), an odd `e` of 2 to 33 bits (so 3 or more), an odd
+  modulus of 2048 to 8192 bits. Any other key would reach verification and
+  fail it, a 401
   blaming the token. Every fetched set is checked, and the setting is read
   at each lookup, so it holds from the moment it is set. A kid the set holds with no
   such key takes the unknown kid's floor: one refetch per floor, so a usable

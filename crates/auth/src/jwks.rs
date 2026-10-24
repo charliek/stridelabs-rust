@@ -652,14 +652,14 @@ impl JwksCache {
     /// On, a set holding the kid is served only if some key under the kid
     /// can verify an RS256 signature: an RSA key whose `alg`, `use` and
     /// `key_ops`, where present, allow it, and whose `n` and `e` are what the
-    /// RS256 verifier (aws-lc-rs) accepts (unpadded base64url, minimal
-    /// big-endian octets, an odd `e` from 3 to 33 bits, an odd modulus of
-    /// 2048 to 8192 bits). Otherwise the lookup refetches at most once per
-    /// refetch floor, so a usable key rotated in under the kid is picked up
-    /// and a persistently broken one costs one fetch per floor, and is
-    /// refused with the first key's [`crate::UnusableReason`] until then. Map
-    /// that error where [`AuthError::Jwks`] goes: the issuer published the
-    /// kid, so the defect is the issuer's.
+    /// RS256 verifier (aws-lc-rs) accepts: unpadded base64url, minimal
+    /// big-endian octets, an odd `e` of 2 to 33 bits (so 3 or more), an odd
+    /// modulus of 2048 to 8192 bits. Otherwise the lookup refetches at most
+    /// once per refetch floor, so a usable key rotated in under the kid is
+    /// picked up and a persistently broken one costs one fetch per floor, and
+    /// is refused with the first key's [`crate::UnusableReason`] until then.
+    /// Map that error where [`AuthError::Jwks`] goes: the issuer published
+    /// the kid, so the defect is the issuer's.
     ///
     /// The setting is read at each lookup, and every fetched set is checked
     /// whatever it is, so it holds from the moment it is set, a set the

@@ -11,6 +11,9 @@
 //!
 //! Neither policy decides whether the token is good: the signature and the
 //! claims are checked once a key is in hand, as before.
+//!
+//! [`check`] runs the same screen on its own, for a consumer with no
+//! verifier at hand.
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
@@ -72,7 +75,38 @@ pub enum ScreenPolicy {
     Strict,
 }
 
-/// `token`'s `kid`, if `policy` lets it through to the key lookup.
+/// Whether `token` passes `policy`'s screen: exactly what a
+/// [`crate::Verifier`] with that policy ([`crate::Verifier::screen`]) checks
+/// before it looks the token's key up, from the same code, and nothing more:
+/// no key, no signature, no claims, no I/O.
+///
+/// For a consumer that answers some tokens with no verifier at hand (an
+/// issuer not configured yet, say) and wants a verifier's order: a token
+/// this refuses is the token's fault, a 401, whatever the issuer is doing,
+/// and only one that passes can be the occasion for an outage's 503. The
+/// errors are the screen's ([`ScreenPolicy`] lists them per policy), and a
+/// [`ScreenPolicy::Strict`] refusal's reason is logged at `debug`, as a
+/// verifier logs it.
+///
+/// ```
+/// use stridelabs_auth::{screen, AuthError, ScreenPolicy};
+///
+/// // A payload of `{"x":"\xff"}`: not UTF-8, which only the strict screen reads.
+/// let token = "eyJhbGciOiJSUzI1NiIsImtpZCI6ImsifQ.eyJ4Ijoi_yJ9.AA";
+///
+/// assert!(matches!(
+///     screen::check(token, ScreenPolicy::Strict),
+///     Err(AuthError::MalformedToken)
+/// ));
+/// // The basic screen reads the header alone, which parses and names a kid.
+/// assert!(screen::check(token, ScreenPolicy::Basic).is_ok());
+/// ```
+pub fn check(token: &str, policy: ScreenPolicy) -> Result<(), AuthError> {
+    kid_for_lookup(token, policy).map(|_kid| ())
+}
+
+/// `token`'s `kid`, if `policy` lets it through to the key lookup: the one
+/// implementation of the screen, behind both [`check`] and the verifier.
 pub(crate) fn kid_for_lookup(token: &str, policy: ScreenPolicy) -> Result<String, AuthError> {
     match policy {
         ScreenPolicy::Basic => {

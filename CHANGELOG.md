@@ -45,8 +45,8 @@ and `Cargo.lock`): tapper plan 016 C-1 bumps it for the v0.10.0 cycle
     verify RS256: an RSA key whose `alg`, `use` and `key_ops`, where present,
     allow it, and whose `n` and `e` are what aws-lc-rs, the RS256 verifier,
     accepts: unpadded base64url, minimal big-endian octets (no leading zero
-    octet, as RFC 7518 also requires), an odd `e` of 2 to 33 bits (so not 0
-    or 1), and an odd modulus of 2048 to 8192 bits. Otherwise the
+    octet, as RFC 7518 also requires), an odd `e` of 2 to 33 bits (so 3 or
+    more: not 0 or 1), and an odd modulus of 2048 to 8192 bits. Otherwise the
     lookup is **`AuthError::UnusableKey(UnusableReason)`**, a new variant on
     the `#[non_exhaustive]` `AuthError` that carries no kid (the crate's
     error rule) but the first key's reason: `UnusableReason`
@@ -87,22 +87,33 @@ and `Cargo.lock`): tapper plan 016 C-1 bumps it for the v0.10.0 cycle
     issuer is down): a token over 16 KiB, not exactly three non-empty
     unpadded-base64url segments, with a header jsonwebtoken cannot parse, or
     a payload that is not UTF-8 throughout or not a JSON object
-    (`MalformedToken`); a `crit` header
-    parameter in any form, `[]` and `null` included (`InvalidToken`); an
+    (`MalformedToken`); a `crit` header parameter in any form, `[]` and
+    `null` included (`InvalidToken`); an
     `alg` other than RS256 (`InvalidToken("algorithm is not accepted")`); a
     missing or empty `kid` (`MissingKid`); a `kid` over 256 bytes
     (`InvalidToken("key id is too long")`). Every refusal is a 401 in the
     house mappings, and its reason (a fixed phrase) is logged at `debug`.
     Ported from tapper-rs's pre-lookup screen, with its test cases, so
     tapper's swap keeps its behaviour.
+  - **`screen::check(token, ScreenPolicy) -> Result<(), AuthError>`**: the
+    screen alone, with no verifier, no key and no I/O, from the same code a
+    verifier with that policy runs before its key lookup, so the two cannot
+    drift (a test holds them to the same answer on every case of the strict
+    table, under both policies). For a consumer that answers some tokens
+    with no verifier at hand (lumen-rust's review: its unconfigured-issuer
+    path refuses a malformed token with a 401 before it answers 503). It is
+    reached through the public `screen` module, not re-exported at the
+    crate root, where a bare `check` would not say what it checks.
   - `Verifier`'s `Debug` adds its `screen`, and `JwksCache`'s its
     `report_unusable_keys`.
   - `base64` (0.22, jsonwebtoken's own) is a direct dependency now, for the
     screen, `IfPresent` and the key checks: `Cargo.lock` gains the edge, and
     no crate joins the graph.
-  - lumen-rs (rev `6d08a4a`: `for_issuer`) and parcel (through
-    stridelabs-mcp) are not covered by `scripts/downstream-check.sh`; the
-    paths they use are unchanged.
+  - Downstream: `scripts/downstream-check.sh` passed for tapper (required),
+    and for lumen, an informational case (#49), against lumen `0e05591`
+    (785 passed, 0 failed, 11 ignored). lumen-rs's own pin (rev `6d08a4a`)
+    uses `for_issuer`, which is unchanged. parcel (through stridelabs-mcp)
+    is not covered by the script; the paths it uses are unchanged.
 
 ## [0.9.0] - 2026-10-22
 

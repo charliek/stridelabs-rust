@@ -470,3 +470,101 @@ fn skipping_members_does_not_validate_utf8_so_the_screen_does() {
         "k"
     );
 }
+
+// --- `check`: the screen without a verifier ---------------------------------
+
+/// Tokens that pass either screen to the key lookup.
+fn well_formed() -> Vec<(&'static str, String)> {
+    let key = TestKey::primary();
+    vec![
+        ("a minted token", key.mint(&claims())),
+        (
+            "an unseen kid",
+            key.mint_with_kid("never-published", &claims()),
+        ),
+        (
+            "a kid of exactly the bound",
+            key.mint_with_kid(&"k".repeat(MAX_KID_BYTES), &claims()),
+        ),
+    ]
+}
+
+#[test]
+fn check_strict_refuses_each_case_and_passes_a_well_formed_token() {
+    let mut wrong = Vec::new();
+    for (case, token, expected) in strict_refusals() {
+        match check(&token, ScreenPolicy::Strict) {
+            Err(err) if err.to_string() == expected => {}
+            other => wrong.push(format!("{case}: {other:?}, expected {expected}")),
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    for (case, token) in well_formed() {
+        check(&token, ScreenPolicy::Strict).unwrap_or_else(|err| panic!("{case}: {err}"));
+    }
+}
+
+#[test]
+fn check_basic_refuses_an_unparseable_header_or_no_kid_and_passes_the_rest() {
+    let alg_none = format!(
+        "{}.{}.",
+        URL_SAFE_NO_PAD.encode(json!({ "alg": "none", "kid": PRIMARY_KID }).to_string()),
+        URL_SAFE_NO_PAD.encode(claims().to_string())
+    );
+    for (case, token, expected) in [
+        ("not a token at all", "garbage".to_owned(), malformed()),
+        ("alg: none", alg_none, malformed()),
+        ("no kid", signed_as(Algorithm::RS256, None), missing_kid()),
+    ] {
+        let refused = check(&token, ScreenPolicy::Basic).expect_err(case);
+        assert_eq!(refused.to_string(), expected, "{case}");
+    }
+    // What only the strict screen refuses passes the basic one.
+    let only_strict = [
+        ("HS256", signed_as(Algorithm::HS256, Some(PRIMARY_KID))),
+        ("an empty kid", signed_as(Algorithm::RS256, Some(""))),
+        (
+            "a payload that is not UTF-8",
+            "eyJhbGciOiJSUzI1NiIsImtpZCI6ImsifQ.eyJ4Ijoi_yJ9.AA".to_owned(),
+        ),
+    ];
+    for (case, token) in well_formed().into_iter().chain(only_strict) {
+        check(&token, ScreenPolicy::Basic).unwrap_or_else(|err| panic!("{case}: {err}"));
+    }
+}
+
+/// `check` and a verifier agree, under both policies, on every case of the
+/// strict table and on the well-formed tokens: where `check` refuses, the
+/// verifier refuses with the same error and no fetch; where it passes, the
+/// verifier goes on to the key lookup (one fetch, and the down issuer's
+/// `Jwks`). Every disagreement is reported.
+#[tokio::test]
+async fn check_and_a_verifier_agree_on_every_case() {
+    let server = issuer_down().await;
+    let cases = strict_refusals()
+        .into_iter()
+        .map(|(case, token, _)| (case, token))
+        .chain(well_formed());
+
+    let mut wrong = Vec::new();
+    for (case, token) in cases {
+        for policy in [ScreenPolicy::Basic, ScreenPolicy::Strict] {
+            let checked = check(&token, policy);
+            let (err, fetches) = outcome(&server, policy, &token).await;
+            let agree = match &checked {
+                Err(refusal) => refusal.to_string() == err.to_string() && fetches == 0,
+                Ok(()) => fetches == 1 && matches!(err, AuthError::Jwks(_)),
+            };
+            if !agree {
+                wrong.push(format!(
+                    "{case}, {policy:?}: check {checked:?}; verifier {err} after {fetches} fetch(es)"
+                ));
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "check and the verifier disagree:\n{}",
+        wrong.join("\n")
+    );
+}
