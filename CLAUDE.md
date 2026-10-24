@@ -20,6 +20,38 @@ the fail-loud Postgres and Redis tests (`stridelabs-testing`'s, and
 `stridelabs-redis`'s and `stridelabs-mcp`'s live suites) something real to
 fail loudly against.
 
+## What belongs here
+
+These crates are shared by the StrideLabs apps that adopt them. Keep them
+strong and following best practice across apps, but pragmatic: the library
+must never be what holds an app's work back.
+
+- **What earns a place.** Either reason is enough:
+  1. it codifies a convention apps should share, such as config, logging, CI
+     guards, error shapes or auth;
+  2. it is a specific capability two or more apps reuse, even when it is not
+     a convention (`stridelabs-inworld` is the example).
+
+  Judge a reused client by its reuse, not by how specific it looks. Evidence
+  from production apps outweighs evidence from experimental ones.
+- **What stays in the app.** Code only one app needs stays in that app,
+  written so it can be lifted later: an internal crate with a narrow API, no
+  dependency on the app's config, database or types, and its own tests. Moving
+  it here is then a copy, not a refactor.
+- **Additive and opt-in.** A change made for one app must not limit another.
+  New behaviour goes behind a feature (most crates are `default = []`), and
+  policy stays with the consumer. Auth in particular stays
+  deployment-flexible: no baked-in hosting shape, issuer setup or transport.
+- **Curate.** This workspace follows the same rules. Patterns only one app
+  uses, and complexity that exists to reproduce a legacy implementation
+  rather than a standard, get trimmed. Prefer deleting code to adding
+  machinery.
+- **Contributing from an app.** An app that finds a general gap fixes it here,
+  with this file's gate, a CHANGELOG entry under `[Unreleased]` and a review.
+  The app pins the merged commit by `rev` until a release tag includes it. If
+  the change would block the app's own milestone, the app implements it
+  locally first and upstreams it in parallel.
+
 ## Versioning and consumption
 
 - **Lockstep versioning**: every crate in the workspace ships at the same
@@ -34,6 +66,18 @@ fail loudly against.
   with `--locked` (`downstream-limen` alone re-resolves limen's lock, on
   purpose) so a consumer's build is never surprised by a dependency it didn't
   review.
+- **Releases.** Tag at good milestones, when consumers benefit.
+  - **First, coordinate:** check with the active consumers and with anyone
+    who has unreleased work on `main`, and don't take a version number
+    someone else has planned.
+  - **Prerequisite:** `[workspace.package].version` (and so `Cargo.lock`)
+    must already read `X.Y.Z`. The first change of a cycle usually bumps it;
+    if none did, the release commit bumps it.
+  - **The release itself:** on a `release/vX.Y.Z` branch, a release commit
+    (date the CHANGELOG section; move every README `tag = "vX.Y.Z"` snippet;
+    otherwise docs-only), a merge commit into `main`, then an annotated tag on
+    that merge.
+  - **Afterwards,** tell consumers the tag.
 
 ## Toolchain
 
