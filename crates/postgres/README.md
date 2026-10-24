@@ -17,14 +17,14 @@ refused.
 
 ```toml
 [dependencies]
-stridelabs-postgres = { git = "https://github.com/charliek/stridelabs-rust.git", rev = "<sha>" }
+stridelabs-postgres = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.10.0" }
 # Your own sqlx picks the TLS stack (see "Feature topology"):
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "postgres", "tls-rustls-aws-lc-rs"] }
 ```
 
-The crate is unreleased: pin `rev = "<sha>"` until a tag contains it, then
-`tag = "vX.Y.Z"`. See the workspace root README for the local `[patch]`
-co-development snippet.
+New in v0.10.0. During development against an unreleased commit, pin
+`rev = "<sha>"` instead of `tag`; see the workspace root README for the local
+`[patch]` co-development snippet.
 
 ## Using it
 

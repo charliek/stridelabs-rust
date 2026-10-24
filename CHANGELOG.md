@@ -11,9 +11,19 @@ for a consumer's pin.
 
 ## [Unreleased]
 
-The workspace version is 0.10.0 from here on (`[workspace.package].version`
-and `Cargo.lock`): tapper plan 016 C-1 bumps it for the v0.10.0 cycle
-(lumen-rust confirmed the number is free), and C-2 and C-3 land on it.
+## [0.10.0] - 2026-10-23
+
+A joint release: tapper plan 016 C-1 (stridelabs-auth's opt-in strict screen, `Audience::IfPresent`, `Verifier::with_cache`
+and unusable-key reporting), C-2 (stridelabs-gcp's sanitised errors, offline key validation and opt-in crc32c) and C-3
+(a new crate, `stridelabs-postgres`; the `stridelabs-config` lookup seam and `file` feature; `stridelabs-testing`'s
+local-only guards) with its `neon_pooler_url` follow-up, lumen plan 002's new crate, `stridelabs-perplexity`, and a
+lock-only advisory fix (ctutils 0.4.5, RUSTSEC-2026-0385). **Changed:** `stridelabs-gcp`'s error payloads and text (a
+test that asserts the old text fails; match on variants, never on text), `stridelabs-config`'s `file` feature (default
+on, so no change for a current user) and the workspace's trimmed `sqlx` entry (no consumer-visible change).
+Everything else is additive or opt-in. Downstream-checked against each merge: tapper and lumen (informational) and
+slaudio (informational) passed, with tapper's one expected premise-test failure from C-2
+(`google_credentials::tests::only_a_service_account_key_is_accepted` asserts v0.9.0's credential-type leak), which
+tapper updates on adoption; parcel is not covered. Details below.
 
 ### Added
 
@@ -393,7 +403,8 @@ and `Cargo.lock`): tapper plan 016 C-1 bumps it for the v0.10.0 cycle
   - **The OAuth `error`** (`GcpAuthError::Status`, `detail`) is one of
     RFC 6749's six token-endpoint codes or `access_denied`, `server_error`
     or `temporarily_unavailable`, `"other"` for any other non-empty `error`
-    string (one that is not a plain code was `""` before), or `""` when the
+    string (one that is not a plain code was `""` before; an unlisted code,
+    Google's `invalid_rapt` for example, reads `other`), or `""` when the
     body has none. `Display`: `…answered HTTP 400: invalid_grant` or
     `…: other`.
   - **A token endpoint** (`GcpAuthError::{Request, Status,
@@ -449,6 +460,11 @@ and `Cargo.lock`): tapper plan 016 C-1 bumps it for the v0.10.0 cycle
   runtime only, and stridelabs-testing names `uuid`, `time`, `migrate` and
   `macros` itself, so its sqlx is built exactly as before while
   stridelabs-postgres's stays minimal.
+
+### Fixed
+
+- `Cargo.lock`: ctutils 0.4.3 → 0.4.5, reached through sha2 → digest in stridelabs-auth (RUSTSEC-2026-0385), so `cargo audit`
+  is green. Lock-only; no manifest or code change.
 
 ## [0.9.0] - 2026-10-22
 

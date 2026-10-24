@@ -81,10 +81,10 @@ jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_r
 
 ```toml
 [dependencies]
-stridelabs-auth = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.9.0", features = ["axum", "http"] }
+stridelabs-auth = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.10.0", features = ["axum", "http"] }
 
 [dev-dependencies]
-stridelabs-auth = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.9.0", features = ["test-support"] }
+stridelabs-auth = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.10.0", features = ["test-support"] }
 ```
 
 `PatValidator` (slauth PAT validation, below) is new in v0.7.0: pin

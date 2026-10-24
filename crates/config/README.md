@@ -15,11 +15,10 @@ turns it off and gets the env helpers and the validation accumulator with no
 YAML parser in its graph:
 
 ```toml
-stridelabs-config = { git = "https://github.com/charliek/stridelabs-rust.git", rev = "<sha>", default-features = false }
+stridelabs-config = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.10.0", default-features = false }
 ```
 
-(The feature is unreleased: pin `rev = "<sha>"` until a tag contains it,
-then `tag = "vX.Y.Z"`.)
+(The `file` feature is new in v0.10.0.)
 
 (`cargo tree -e normal -p stridelabs-config --no-default-features` shows
 `serde_json` and `thiserror` only.)
@@ -28,7 +27,7 @@ then `tag = "vX.Y.Z"`.)
 
 ```toml
 [dependencies]
-stridelabs-config = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.9.0" }
+stridelabs-config = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.10.0" }
 ```
 
 (During development against an unreleased commit, pin `rev = "<sha>"`
