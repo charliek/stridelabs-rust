@@ -11,7 +11,9 @@
 //! - [`metadata_router`] — the RFC 9728 protected-resource metadata document
 //!   at both origin-root well-known paths.
 //! - [`McpVerifier`] — slauth RS256 JWTs with audience = the resource URL
-//!   (scopes from `scope` and Hydra's `scp`), plus app-verified credentials
+//!   (scopes from `scope` and Hydra's `scp`, as the [`ScopeSource`] says;
+//!   the REST API's claim rules with [`McpVerifier::with_cache`]), plus
+//!   app-verified credentials
 //!   selected by prefix ([`CredentialVerifier`]); an issuer outage is
 //!   [`VerifyError::Unavailable`], never a rejection.
 //! - [`McpAuthLayer`] — the HTTP boundary: RFC 6750 `401`s carrying
@@ -165,7 +167,9 @@ pub use tool::{
     DEFAULT_TOOL_TIMEOUT, MAX_LIMIT,
 };
 pub use tools_json::canonical_tools_json;
-pub use verifier::{CredentialVerifier, McpVerifier, VerifyError, VerifyFuture};
+pub use verifier::{
+    ClaimChecksError, CredentialVerifier, McpVerifier, ScopeSource, VerifyError, VerifyFuture,
+};
 
 #[cfg(feature = "cors")]
 pub use crate::cors::cors_layer;

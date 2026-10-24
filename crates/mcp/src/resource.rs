@@ -46,6 +46,7 @@
 use std::net::Ipv6Addr;
 
 use serde::{Deserialize, Serialize};
+use stridelabs_auth::{Audience, ClaimChecks};
 
 /// Where RFC 9728 puts protected-resource metadata, at the origin root.
 pub const METADATA_PATH: &str = "/.well-known/oauth-protected-resource";
@@ -194,6 +195,15 @@ impl ProtectedResource {
     /// The authorization server's issuer.
     pub fn issuer(&self) -> &str {
         &self.issuer
+    }
+
+    /// Claim rules for tokens minted for this resource, to adjust and hand to
+    /// [`crate::McpVerifier::with_cache`]: the issuer, exactly, and `aud`
+    /// required and equal to the resource URL, with
+    /// [`ClaimChecks::new`]'s defaults otherwise (a 60 s leeway, `nbf`
+    /// checked).
+    pub fn claim_checks(&self) -> ClaimChecks {
+        ClaimChecks::new(&self.issuer, Audience::Required(self.url.clone()))
     }
 
     /// The scopes the metadata document lists.

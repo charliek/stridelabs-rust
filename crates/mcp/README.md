@@ -15,7 +15,8 @@ The app writes its tools as an rmcp `ServerHandler`. This crate supplies:
   both origin-root well-known paths (one resource per origin: the bare path
   can only name one).
 - **`McpVerifier`**: slauth RS256 JWTs with **audience = the resource URL**
-  (scopes from `scope` and Hydra's `scp`), plus app-verified credentials
+  (scopes from `scope` and Hydra's `scp`; opt-in, the REST API's claim rules
+  and `scope`-over-`scp` precedence), plus app-verified credentials
   selected by prefix (`CredentialVerifier`: slauth `slp_live_` PATs, the
   app's own API tokens). An issuer outage is `Unavailable` (503), never a
   rejection.
@@ -201,6 +202,38 @@ construction. Then: `sub` non-empty; scopes = the union of `scope` and
 `scp`, either a space-separated string or an array; `client_id` from
 `client_id`, else `azp`; `email` and `name` optional (empty = absent).
 `Principal`'s `Debug` never prints the email or name.
+
+`McpVerifier::new` keeps `Verifier::new`'s time rules: a 60 s leeway on
+`exp`, `nbf` not checked. Two opt-ins, both off by default:
+
+- **The REST API's claim rules.** `McpVerifier::with_cache(&resource,
+  checks, cache)` is `Verifier::with_cache` for the MCP endpoint: the
+  consumer's `ClaimChecks` (e.g. a zero leeway, `nbf` checked) and its own
+  `JwksCache` (`report_unusable_keys`, TTL, refetch interval).
+  `resource.claim_checks()` starts from the resource's issuer and
+  `Audience::Required(resource.url())`; checks for any other issuer or
+  audience (`IfPresent` and `NotValidated` included) are a
+  `ClaimChecksError`, so the audience still cannot drift. `.screen(policy)`
+  sets the pre-lookup `ScreenPolicy` on either constructor's verifier.
+- **Scope precedence.** `.with_scope_source(ScopeSource::ScopeThenScp)`
+  reads `scope` when the token carries it (even empty) and `scp` only when
+  it does not, as fastmcp does; the default, `ScopeSource::Union`, grants
+  both. Under either, a malformed `scope` or `scp` is a `401`, and `null`
+  counts as absent.
+
+```rust
+use std::time::Duration;
+use stridelabs_auth::{JwksCache, ScreenPolicy};
+use stridelabs_mcp::{McpVerifier, ScopeSource};
+
+let verifier = McpVerifier::with_cache(
+    &resource,
+    resource.claim_checks().with_leeway(Duration::ZERO),   // nbf checked
+    JwksCache::new(&config.slauth_jwks_url, http.clone()).report_unusable_keys(true),
+)?
+.screen(ScreenPolicy::Strict)
+.with_scope_source(ScopeSource::ScopeThenScp);
+```
 
 ### Stateless transport
 
@@ -546,8 +579,9 @@ let token = access_token(&resource).subject("user-1").scopes(["parcel:read"]).mi
 
 (`serve_json` answers every path; with `wiremock` directly, answer
 `GET /jwks` with `jwks_json()` as `application/json`.) The rejection shapes
-are one call each: `.expires_in(-3600)` (jsonwebtoken allows 60 s of
-leeway, so a token a few seconds past `exp` still verifies),
+are one call each: `.expires_in(-3600)` (`McpVerifier::new` allows 60 s of
+leeway, so a token a few seconds past `exp` still verifies; under
+`with_cache` and a zero leeway, `expires_in(-1)` is refused),
 `.signed_by_untrusted_key()`, `.claim("aud", json!("other"))`,
 `.subject("")`.
 
