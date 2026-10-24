@@ -151,6 +151,7 @@ jobs:
             stridelabs-gcp:vertex \
             stridelabs-inworld: \
             stridelabs-inworld:client-builder \
+            stridelabs-perplexity: \
             stridelabs-http:tls \
             stridelabs-http:redact-url \
             stridelabs-http:ssrf \
@@ -447,6 +448,37 @@ jobs:
           fi
           echo "ok: [client-builder] rustls present, ring and native TLS absent, provider features: $(echo $providers)"
 
+      # stridelabs-perplexity is handed the consumer's `reqwest::Client` and
+      # has no features (its reqwest has none at all), so, like
+      # stridelabs-inworld's core, it must pick no TLS stack: no rustls and no
+      # native TLS (`native-tls`, `openssl`, `openssl-sys`, `hyper-tls`,
+      # `tokio-native-tls`) in its normal graph, with reqwest as the positive
+      # control.
+      - name: "Guard: stridelabs-perplexity pulls no TLS"
+        run: |
+          set -euo pipefail
+          listing="$(mktemp)"
+          trap 'rm -f "$listing"' EXIT
+          cargo tree --locked --target all -e normal -p stridelabs-perplexity --no-default-features \
+            --prefix none --format '{p}' | awk '{print $1}' | sort -u > "$listing"
+          echo "$(wc -l < "$listing") packages in stridelabs-perplexity's normal graph"
+          if [ ! -s "$listing" ]; then
+            echo "::error::the stridelabs-perplexity package listing is empty; the guard proved nothing"
+            exit 1
+          fi
+          if ! grep -qx reqwest "$listing"; then
+            echo "::error::positive control failed: reqwest is not in stridelabs-perplexity's graph, so this listing is not the one the guard means to inspect"
+            exit 1
+          fi
+          for crate in rustls native-tls openssl openssl-sys hyper-tls tokio-native-tls; do
+            if grep -qx "$crate" "$listing"; then
+              echo "::error::$crate is in stridelabs-perplexity's graph; a TLS feature on its reqwest picks a TLS stack for every consumer"
+              cargo tree --locked --target all -e normal -p stridelabs-perplexity --no-default-features -i "$crate" || true
+              exit 1
+            fi
+          done
+          echo "ok: rustls and native TLS absent, reqwest present"
+
       # stridelabs-mcp sits in consumers' production graphs too, and its core
       # has the same reason to pick no TLS stack: its reqwest (no features) is
       # only the `reqwest::Client` type `McpVerifier::new` takes from the
@@ -678,7 +710,7 @@ jobs:
           status=0
           failed=""
           checked=0
-          for crate in stridelabs-config stridelabs-observability stridelabs-http stridelabs-auth stridelabs-testing stridelabs-mcp stridelabs-redis stridelabs-gcp stridelabs-inworld; do
+          for crate in stridelabs-config stridelabs-observability stridelabs-http stridelabs-auth stridelabs-testing stridelabs-mcp stridelabs-redis stridelabs-gcp stridelabs-inworld stridelabs-perplexity; do
             if ! git cat-file -e "$baseline:crates/${crate#stridelabs-}/Cargo.toml" 2>/dev/null; then
               echo "::notice::$crate is new since $baseline (no crates/${crate#stridelabs-}/Cargo.toml there), so it has no baseline API to check; it is checked from the next tag on"
               continue
@@ -816,7 +848,7 @@ jobs:
           set -euo pipefail
           patch="$RUNNER_TEMP/stridelabs-patch.toml"
           echo '[patch."https://github.com/charliek/stridelabs-rust.git"]' > "$patch"
-          for c in config observability http auth testing mcp redis gcp inworld postgres; do
+          for c in config observability http auth testing mcp redis gcp inworld postgres perplexity; do
             echo "stridelabs-$c = { path = \"$GITHUB_WORKSPACE/stridelabs-rust/crates/$c\" }" >> "$patch"
           done
           cat "$patch"

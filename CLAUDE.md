@@ -124,10 +124,11 @@ will not silently skip.
 
 ## Crate map
 
-All ten crates are implemented: `stridelabs-config`,
+All eleven crates are implemented: `stridelabs-config`,
 `stridelabs-observability`, `stridelabs-http`, `stridelabs-auth`,
 `stridelabs-testing`, `stridelabs-mcp`, `stridelabs-redis`,
-`stridelabs-gcp`, `stridelabs-inworld` and `stridelabs-postgres`.
+`stridelabs-gcp`, `stridelabs-inworld`, `stridelabs-postgres` and
+`stridelabs-perplexity`.
 
 | Crate | Status | Contents |
 |---|---|---|
@@ -141,6 +142,7 @@ All ten crates are implemented: `stridelabs-config`,
 | `stridelabs-gcp` | Implemented | Policy-free Google Cloud building blocks on the consumer's `reqwest::Client`: an ADC access-token provider with a single-flight cache (`service_account` keys behind feature `service-account-key`), offline service-account key validation (`ServiceAccountKey::validate`), a small GCS JSON-API client (opt-in crc32c on uploads), Vertex AI `generateContent` (feature `vertex`); errors keep only allow-listed upstream codes and token-endpoint origins |
 | `stridelabs-inworld` | Implemented | A policy-free Inworld text-to-speech client on the consumer's `reqwest::Client`: one bounded synthesis (whole-exchange timeout, streamed response cap with a `Content-Length` pre-check, pre-decode base64 guard, decoded-audio and text bounds), errors classified as unavailable/rejected/malformed and safe to log, an optional MP3 shape check; `client_builder()` (feature `client-builder`) |
 | `stridelabs-postgres` | Implemented | Postgres connection hygiene on sqlx (no TLS feature of its own; the consumer picks): `connect_options` with a query-parameter allow-list, `search_path`/NUL refusals and no password file, refusals that never print a value; `error_summary` (SQLSTATE + fixed description); `lazy_pool`; Neon pooler detection; `LOG_CAPS` for sqlx's targets that log raw errors, URL values or server notices |
+| `stridelabs-perplexity` | Implemented | A policy-free Perplexity Agent API web-search client on the consumer's `reqwest::Client`: one bounded search (whole-exchange timeout, streamed response cap with a `Content-Length` pre-check, input bound), only a `completed` response an answer, errors classified as unavailable/rejected/incomplete/malformed and safe to log, a faithful `SearchAnswer` (assistant text, every result with its citation id, usage; `SearchAnswer::from_json` for a body already in hand) and an optional `sources` display helper; no features, no TLS |
 
 Each crate documents its own **feature topology** in its README — most are
 `default = []` so a consumer's dependency graph stays as lean as it wants.
