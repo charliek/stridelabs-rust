@@ -58,6 +58,15 @@ provider, no client of any kind).
 | `test-support` | tests | the `testing` module (the scripted adapters), and the test seams, none of them API without it: `TtsBudget::with_clock` / `StreamBudget::with_clock` (a fixed or moving clock, for the UTC boundaries), `TtsCaps::unchecked` / `StreamCaps::unchecked` (caps the rule refuses), `StreamBudget::acquire_under` (the real acquire under another replay policy), `Voice::with_relay_settings_unchecked` (clocks shorter than `RelaySettings::check` allows; only a zero is refused), and with `axum` `Voice::live_session_count` and each enabled adapter's mock provider (`muse::mock::MockMuse`, `inworld::mock::MockInworld`: loopback servers on axum, so `axum`'s `http1` comes on with it) |
 | `live-tests` | this crate only | its real-Redis suites (`tests/budget.rs`, `tests/lease.rs`, the relay's `tests/relay.rs` and `tests/stt_contract.rs`, the text-to-speech flow's `tests/tts.rs`, and with an adapter `tests/muse_relay.rs` and `tests/inworld_speak.rs`), which turn `axum` on; never for consumers |
 
+The features' dependencies are the narrowest that compile: tokio is `time`,
+`sync` and `rt` for the core (`sync` and `rt` also come with tokio-util's
+`rt`, which the shutdown token and the drain tracker need), plus `macros` and
+`rt` behind `axum` (`select!`, `join!`, `spawn`, the cooperative budget) and
+`net` behind `muse`; never the workspace's `full`. Nothing here selects a
+crypto provider or builds a client: `muse`'s rustls and tokio-tungstenite
+have no provider feature, and both adapters take what the app builds. Three
+CI guards and two source scans hold that (see "Build guards" below).
+
 ## Using it
 
 ```rust,no_run
@@ -533,7 +542,8 @@ the two prefixes; besides those, whatever its connection sends on its own
   body per sentence, with no context across sentences.
 - **Pacing**: a provider that must be fed below real time plus the installed
   clients' 3 s pre-`ready` burst (Deepgram's 1.25×) is unsupported in
-  revision 1 of the protocol.
+  revision 1 of the protocol; a protocol revision that lengthens the end
+  grace (an advertised grace the clients honour) or drops the burst lifts it.
 - **Providers**: one with no endpointing needs an adapter-side voice
   activity detector, or is unsupported; a request/response speech-to-text
   service's failed turn ends the session; a provider's billing unit can
@@ -544,8 +554,54 @@ the two prefixes; besides those, whatever its connection sends on its own
   protocol revision.
 - **A server shutdown discards late final transcripts** (the client keeps
   its last partial).
+- **One-body text to speech, no context across sentences**: the trait
+  returns one body per sentence; a provider's streaming and its request
+  stitching or previous/next text have no place in `SynthesisRequest`, which
+  carries the sentence and the voice only (no user, key or history reaches a
+  provider).
+- **A request/response speech-to-text adapter's obligations** (a service
+  that transcribes one uploaded turn per call, such as OpenAI's file
+  transcription): one call in flight per session, in turn order, each under
+  a 15 s deadline; the open turn's buffer capped at 9 minutes of audio (a
+  forced boundary); at most two closed turns waiting, a third makes
+  `send_audio` fail with `overload`; `send_audio` never waits (append and
+  voice activity detection); every event of turn n before any of turn n+1;
+  `SpeechEnd` held and yielded immediately before the turn's `EndOfTurn`;
+  `Finished` after the last response. The installed clients flush a segment
+  1 s after `speech_end` and 10 s after `speech_start` without its
+  `end_of_turn`, so a turn longer than about 10 s minus the call's latency
+  still trips the 10 s timer (its late `end_of_turn` posts once).
+- **Unconfirmed provider facts** (in the appendix's tables, marked
+  UNCONFIRMED), each to be confirmed against a live account before an
+  adapter is written: Deepgram's close code after `CloseStream`, its upgrade
+  statuses and message cap; ElevenLabs' `Content-Type` per format and its
+  counting rule for characters.
 
 ## Tests
+
+Every test target and what it needs (`[[test]] required-features` in
+`Cargo.toml`, so `cargo test --workspace` at default features builds exactly
+the service-free ones):
+
+| Target | Required features | Needs | Holds |
+|---|---|---|---|
+| `tests/golden.rs` | none | nothing | the golden fixture's bytes and SHA-256 |
+| `tests/guards.rs` | none | nothing | the source scans (below) and their controls |
+| `tests/voice_new.rs` | `test-support` | nothing | `Voice::new`'s refusals |
+| `tests/budget.rs` | `live-tests` | Redis | the text budget's scripts, ACLs, idempotency |
+| `tests/lease.rs` | `live-tests` | Redis | the lease, fence, meter, ACL cases |
+| `tests/tts.rs` | `live-tests` | Redis | `Voice::speak` against `ScriptedTts` |
+| `tests/relay.rs` | `live-tests` | Redis | the relay against `ScriptedStt`, over real sockets |
+| `tests/stt_contract.rs` | `live-tests` | Redis | the contract's cases, the run cap |
+| `tests/muse.rs` | `muse`, `axum`, `test-support` | loopback | `MuseStt` against `MockMuse` |
+| `tests/muse_relay.rs` | `live-tests`, `muse` | Redis | one relay session through `MockMuse` |
+| `tests/inworld.rs` | `inworld`, `axum`, `test-support` | loopback | `InworldTts` against `MockInworld` |
+| `tests/inworld_speak.rs` | `live-tests`, `inworld` | Redis | `Voice::speak` through `InworldTts`: the charge that stands |
+
+CI runs the suites per feature set as well as in the workspace's default and
+all-features lanes: `--no-default-features --features axum,test-support,live-tests`
+(the core's suites with no adapter compiled), `muse,axum,test-support` and
+`inworld,axum,test-support` (each adapter's suites alone).
 
 `cargo test -p stridelabs-voice` runs the unit tests (the windows, the
 verdicts, the caps rule, the key shapes and the scripts' SHA-1s; the events'
@@ -588,3 +644,214 @@ upgrade's release, how the client left, usage) and `tests/stt_contract.rs`
 (the core's side of every rule in `stt`'s module docs, the provider-run cap
 on a current-thread and a multi-thread runtime, each under an external
 watchdog).
+
+## Build guards
+
+What keeps the core provider-neutral and the crate client-free is checked, not
+promised:
+
+- **The core names no provider** (`tests/guards.rs`, every lane): no source
+  outside `muse.rs` and `inworld.rs` contains `muse`, `inworld` or `meta.ai`
+  (any case, comments and strings included), and none uses tungstenite's
+  `Message` (a `use` item that names `tungstenite` and `Message` on any
+  number of lines, with comments or an alias, a `tungstenite` glob, or a
+  path to it). The one exception to the names is `lib.rs`'s own lines that
+  declare the two adapter modules and gate `LOG_CAPS` (and its test) on
+  `any(axum, muse)`, each listed as a whole line with the number of times it
+  must stand (a stale or duplicated entry fails too). The crate docs, which
+  name the features, come from this README: the scan reads source files.
+- **The crate builds no client of its own** (the same test, over all of
+  `src/`), read as tokens, not lines (comments gone, whitespace and newlines
+  collapsed), so an alias, a multi-line `use` list or an imported
+  constructor is as visible as the plain call: no `ClientBuilder`,
+  `ClientConfig`, `client_builder`, `connect_async` or
+  `connect_async_with_config` identifier anywhere (an import, aliased or
+  not, included), no `reqwest::Client` path or `use`, no `Client::new`,
+  `Client::builder` or `Client::default`, no `InworldClient::builder`, no
+  glob import of `reqwest` or `tokio_tungstenite`, and no `Connector`
+  variant (`Plain`, `Rustls`) outside a module gated for tests (`mod`
+  preceded by `#[cfg(test)]`, `feature = "test-support"` or an `any`/`all`
+  of those, found by balanced braces; a module is never exempt by its
+  name). That the Muse dial uses the connector it is handed is a behaviour
+  test (`the_dial_uses_the_injected_connector`, `tests/muse.rs`).
+- **No provider in the core build** (a CI step): `--no-default-features
+  --features axum,test-support` compiles the crate with exactly those
+  features, and neither `stridelabs-inworld` nor `reqwest` is compiled or in
+  its graph.
+- **No crypto provider selected** (a CI step): for the core, `axum`, `muse`,
+  `inworld` and all of them with `openapi`, `cargo tree -e features,no-dev
+  -i rustls` names no `aws_lc_rs`, `aws-lc-rs` or `ring` feature and the
+  graph holds no `ring`, `aws-lc-rs` or `aws-lc-sys` package; the same query
+  with dev edges (the tests' `wss://` fixture is on aws-lc-rs) does list
+  `aws_lc_rs`, so the query is known to see provider features. The workspace's
+  "compiles no ring" guard covers `--all-features`, dev edges included.
+
+Each scan is a pure function over the source, with controls in the test file
+that plant a violation in each form (a string, a comment, an identifier, the
+allowed line in the wrong file) and watch it found.
+
+## Appendix: a second provider, on paper
+
+The core was checked against two providers it does not ship an adapter for,
+from their public documentation alone (read 2026-10-25; no account, no request
+to any provider), so that the traits and the protocol's constants do not
+silently fit only Muse and Inworld. The speech-to-text side took **Deepgram**
+live streaming (`wss://api.deepgram.com/v1/listen`) and, as the dissimilar
+case, **OpenAI file transcription** (`POST /v1/audio/transcriptions`, model
+`gpt-transcribe`, `stream=false`): no streaming input, no session, no endpointing
+(the adapter's own voice activity detector makes every turn boundary, buffers
+the turn's audio, wraps it as WAV and posts it once per turn) and final-only
+text, so it tests that `partial` is optional, that `open`, `end_input` and
+`close` assume no provider socket, and that a 15-minute session can span many
+provider calls. (OpenAI's Realtime transcription and AWS Transcribe were
+considered: the first stays adapter-endpointed but streams revisable deltas
+and takes 24 kHz only, so it needs the adapter to resample to advertise both
+rates; the second endpoints on the server and would not exercise the
+endpointing contract.) Text to speech took **ElevenLabs**
+(`POST /v1/text-to-speech/{voice_id}`, the one-body endpoint).
+
+The dispositions: **maps** (the item holds as pinned), **adapter** (the
+adapter's own concern), **CHANGE** (a trait or protocol change the walkthrough
+made), **LIMIT** (a named limit above or here), **n/a**. A fact marked
+UNCONFIRMED was not found in the documentation and is to be confirmed against
+a live account before an adapter is written. Facts re-read against the pages
+when this appendix was written: Deepgram's 1.25× real-time ceiling, OpenAI's
+25 MB upload bound, its accepted formats (WAV, not raw PCM), `whisper-1`'s
+deprecation (shutdown 2027-02-26) and that `gpt-transcribe` with `stream=true`
+streams the transcript's output deltas only (the upload is still one file), and
+ElevenLabs' MP3 `output_format` values (default `mp3_44100_128`) and request
+fields.
+
+### Speech to text: every server trait item and client constant
+
+| # | Our item | Deepgram live | OpenAI file transcription | Disposition |
+|---|---|---|---|---|
+| 1 | `configured()` | key set (`Authorization: Token`) and the URL accepted | key set (`Authorization: Bearer`) and the base URL accepted | maps |
+| 2 | `formats()`: PCM s16le mono | `encoding=linear16` with `sample_rate`; raw audio needs both | raw PCM is not accepted: the adapter prepends a 44-byte WAV header per turn | maps / adapter (the WAV wrap) |
+| 3 | `formats()`: rates (revision 1: BOTH 24,000 and 16,000) | any real rate (no range documented, UNCONFIRMED beyond "set the real rate") | none documented (UNCONFIRMED); Realtime runner-up: 24 kHz only, so it needs resampling | maps; the runner-up only with adapter resampling |
+| 4 | `pacing_lead()` and the provider's send rate | at most 1.25x real time; the lead is an allowance, not a rate limit, and the installed clients' 3 s pre-`ready` burst reaches the provider faster than that; a queue that paced it would complete writes on enqueue and could not drain inside the 2 s end grace | audio buffered locally, no provider pacing; 5,000 ms | **LIMIT: unsupported in revision 1** (a protocol revision that lengthens the end grace or drops the burst lifts it) |
+| 5 | `open(format, deadline)` | dial the WebSocket with the query (`encoding`, `sample_rate`, `channels=1`, `model`, `interim_results`, `endpointing`, `utterance_end_ms`, `vad_events`, `smart_format`) through the app's connector; the open socket is "ready" | no dial: `open` spawns the session's poster task | maps |
+| 6 | `OpenLabel::{Dial, Refused, OpenTimeout}` | a failed handshake is 4xx/5xx with a `dg-error` header: `401`/`402`/`403`/`429` are `Refused` with class `http <status>` (never the header or body); a connect error is `Dial`; the core's deadline is `OpenTimeout` | n/a at open (errors arrive per turn, row 13) | maps |
+| 7 | `SpeechStart` | `SpeechStarted` (`vad_events`), or synthesised at a turn's first non-empty result | the adapter's VAD onset, held until the previous turn's `EndOfTurn` was yielded | maps / adapter |
+| 8 | `Partial` (cumulative, optional) | interims replace the previous interim; finals are segments, not cumulative: cumulative = the turn's finals plus the latest interim | none (final-only) | maps; CHANGE: `partial` is explicitly optional |
+| 9 | `SpeechEnd` | no such event: yielded at the turn's end | held: yielded immediately before the turn's `EndOfTurn`, so the client's 1 s flush timer starts once the text is there | maps / adapter |
+| 10 | `EndOfTurn(text)` | at `speech_final`, at `UtteranceEnd` with text pending, or at the close after `CloseStream` with text pending; "do not use `speech_final` alone" is why finals are accumulated | the text of the turn's response | maps; CHANGE: the turn-order rule |
+| 11 | `Ignored` | `Metadata`, the non-fatal `Error`, `ConfigureSuccess`, a duplicate final, an empty interim, an `UtteranceEnd` with nothing pending | n/a | maps |
+| 12 | `Finished` | `CloseStream` flushes finals, then `Metadata`, then the close; the close code is UNCONFIRMED: a close after `CloseStream` is `Finished`, after any pending text's `EndOfTurn` | after `end_input`, the last turn's response has arrived and its events were yielded | maps / adapter |
+| 13 | `Err(SttError)` | close `1008` is `data`, `1011` is `net`; a writer failure; transport errors by class | a turn's failure (`429`, `500`, `503` as `http <status>`), a call past its deadline (`timeout`), the backlog over its cap (`overload`): each ends the session (the core has no "skip a turn" event) | maps; LIMIT: a request/response provider's one failed turn ends the session (`error{provider}`, `1011`) and the client reconnects |
+| 14 | `send_audio` | a binary frame, flushed (`SinkExt::send`) | append to the open turn's buffer and feed the VAD: never waits; over the backlog cap, `Err(overload)` | maps (Deepgram within row 4's limit) |
+| 15 | `end_input` | `{"type":"CloseStream"}`, flushed | close the open turn and queue its call if it holds speech | maps |
+| 16 | `close(end_sent)` | `CloseStream` unless sent, a normal close, read to the peer's close | drop the poster task (an in-flight call is abandoned) | maps |
+| 17 | keepalive | not needed: the relay's idle rule (10 s) ends a session before Deepgram's no-audio timeout | none | maps |
+| 18 | cancel-safety, interleaving, write completion | the stream half is read in `poll_next`; writes are flushed sends on the sink half | calls run in a session-owned task and `poll_next` reads results from a channel: dropping `next()` loses nothing, `send_audio` never waits on a read | maps |
+| 19 | no starvation | events are bounded by audio sent | at most one response per turn | maps |
+| 20 | fixed error classes | `dg-error`, `err_msg`, `description` are provider text: never carried | `error.message` is provider text: never carried | maps |
+| 21 | billing unit (budget: relay-measured audio) | per second of processed audio (silence sent counts: implied, UNCONFIRMED), so close to the relay's measure | per minute of uploaded audio: only speech turns are uploaded, so the budget over-counts the bill | LIMIT: the budget is conservative for OpenAI (a cost note per adapter) |
+| 22 | frames: even, up to 64 KiB | no maximum message size documented (UNCONFIRMED); a client frame is split into 100 ms chunks | n/a (buffered) | maps |
+| 23 | endpointing | server-side (`endpointing`, `speech_final`, `UtteranceEnd`) | none: the adapter's VAD | maps; LIMIT: no endpointing and no adapter VAD is unsupported |
+| 24 | turn order (every event of turn n before any of turn n+1) | `speech_final` precedes the next `SpeechStarted` | the adapter holds all of turn n+1's events until turn n's text is yielded | CHANGE: the turn-order rule |
+| 25 | keywords / biasing | `keyterm` or `keywords`: adapter configuration from the app | `prompt` / `keywords` (some characters reject the request) | adapter |
+| 26 | auth | `Authorization: Token` at the upgrade, through the app's connector | `Authorization: Bearer` on each call, through the app's `reqwest::Client` | adapter (no own client: both take the app's) |
+| 27 | session length, request limits, queue bounds | no maximum documented (UNCONFIRMED) | each upload up to 25 MB (about 9 minutes at 24 kHz): a forced boundary before it; two turns waiting at most; a 15 s deadline | maps / LIMIT (the adapter's obligations, under Named limits) |
+| 28 | concurrency | 150 streams on pay-as-you-go; over it, `429` at the upgrade (UNCONFIRMED where), so `Refused` | one call in flight per session; per-minute request limits are row 13 | maps |
+| 29 | client: `rates` | `[24000, 16000]` | `[24000, 16000]` (Realtime runner-up: `[24000]`) | maps |
+| 30 | client: `lead_ms` | 5,000 (a client lead of 4 s); the send rate is row 4's limit | 5,000 | maps (Deepgram: row 4) |
+| 31 | client: `encoding` | `pcm_s16le` (other encodings unused) | `pcm_s16le`, wrapped as WAV by the adapter | maps; LIMIT: a PCM-only core (a compressed upload would extend `Encoding`, additively) |
+| 32 | the end grace (`end_timeout`, the client's `endWait`) | the flush after `CloseStream` is prompt | the last turn's call after `end` can take longer than 2 s | LIMIT: `RelaySettings::check` caps `end_timeout` at 2 s because the installed clients' wait is a fixed 2 s; a provider whose final lags needs a protocol revision |
+| 33 | the open latency against the client's `ready` wait | connect, TLS and the upgrade: well inside the default 8 s | instant | maps: `open_timeout + close_timeout` is at most 10 s, inside the installed clients' 12 s |
+| 34 | the client's turn-assembly timers | finals arrive with `speech_final`, inside a second of the end of speech | the text arrives a call's latency after the VAD's end of speech | LIMIT: see "A request/response speech-to-text adapter's obligations" and "Client timing" under Named limits |
+
+**Deepgram's turn logic**, pinned for the revision that lifts row 4. Every
+result carries words with `start` and `end` (seconds of stream audio), and
+turns are owned by time, never by "whatever text is pending". The adapter
+keeps `finals` (the open turn's finalized words), `interim` (the latest
+interim's words; each replaces it), `committed_until` (the audio time up to
+which words belong to closed turns) and `in_speech`. An interim sets `interim`
+to its words with `end > committed_until` and yields a cumulative `Partial`.
+A final adds its words with `end > committed_until` and `end >` the last
+final's end (a duplicate, or words already committed through an
+`UtteranceEnd`, are dropped); with `speech_final`, the turn ends at the last
+word's end. `UtteranceEnd{last_word_end: t}` ends the turn at `t` (ignored
+for `-1` or when it owns nothing): the turn owns `finals` and the interim
+words ending by `t`, and interim words after `t` are speech after the gap and
+begin the next turn. A close after `CloseStream` ends a turn with pending text
+before `Finished`. Ending a turn yields `SpeechEnd`, then `EndOfTurn`, and
+starts the next turn if interim words remain. The adapter's required tests
+are the five cases of that logic: `UtteranceEnd` committing only the words
+before its gap ("what's the" then "weather" is two turns, "weather" in
+exactly one), an `UtteranceEnd` ending a turn with no `speech_final`,
+`speech_final` then `UtteranceEnd` being one turn, close-time finals ending
+the turn before `Finished`, and committed words not being emitted again.
+
+### Text to speech: every server trait item and client constant
+
+| # | Our item | ElevenLabs | Disposition |
+|---|---|---|---|
+| 1 | `configured()` | `xi-api-key` set and the base URL accepted (regional hosts exist: the app's configuration) | maps |
+| 2 | `media_type()` in the allowed set | `output_format`: default `mp3_44100_128`; MP3 variants `mp3_22050_32`, `mp3_24000_48`, `mp3_44100_32/64/96/128` (`192` needs a higher tier). The adapter asks for an MP3 format (such as `mp3_24000_48`, the closest to a 24 kHz, 64 kbit/s stream) and declares `audio/mpeg`; the response's own `Content-Type` per format is UNCONFIRMED, so it is not trusted and the MP3's shape is checked (as `stridelabs-inworld`'s `mp3_check`) | maps |
+| 3 | other formats | `pcm_*`, `wav_*`, `opus_48000_*`, `ulaw_8000`, `alaw_8000` | LIMIT: revision 1's allowed set is `audio/mpeg`; another type is a protocol revision and client support first |
+| 4 | `max_text_chars()` of at least 600 | per request: `eleven_flash_v2_5` 40,000, `eleven_multilingual_v2` 10,000, `eleven_v3` 5,000; the app chooses its own bound (lumen and tapper: 600) | maps; CHANGE: the body limit scales with the bound (`protocol::tts_body_limit`), so an app that raises it does not trip `413` on non-ASCII text |
+| 5 | `knows_voice()` | voice ids are opaque and listed by a search endpoint; no startup call, so `None` (or `Some` against an app allowlist) | maps |
+| 6 | `synthesize(SynthesisRequest { text, provider_voice })` | `POST .../{provider_voice}?output_format=...` with `text`, `model_id` and optional `voice_settings`, `language_code`; model and settings are adapter configuration | maps / adapter |
+| 7 | `Audio { bytes, media_type }` | one body (the non-streaming endpoint) | maps |
+| 8 | `TtsFailure::Unavailable` (`503`, `Retry-After: 5`) | `429` (`rate_limit_exceeded`, `concurrent_limit_exceeded`, `system_busy`), `503`, `500` (retryability not stated: treated as unavailable, as Inworld's `5xx`), a timeout or a broken connection | maps |
+| 9 | `TtsFailure::Permanent` (`502`) | `400`, `401`, `402`, `403`, `404`, `422` (the reference documents a `detail` list, the errors page an object: the adapter reads neither into a log) | maps |
+| 10 | one bounded synthesis | the adapter applies the app's bounds (time, response size, audio size) on the app's client | maps |
+| 11 | streamed audio | a chunked `/stream` endpoint and WebSocket input streaming exist | LIMIT: one-body text to speech (the adapter uses the one-body endpoint, or collects `/stream` whole) |
+| 12 | cross-sentence context | `previous_text`/`next_text`, `previous_request_ids` | LIMIT: `SynthesisRequest` carries the sentence and the voice only, by design |
+| 13 | billing unit (budget: Unicode scalars of the trimmed text) | credits per character; whether spaces count and whether failed requests bill is UNCONFIRMED | LIMIT: the budget counts what is sent; the provider's count may differ slightly (a cost note) |
+| 14 | idempotency | no idempotency key documented (UNCONFIRMED that none exists) | maps: the crate's key protects the budget, not provider spend (as for Inworld) |
+| 15 | concurrency | per plan; over the limit, queued or `429` `concurrent_limit_exceeded` | maps (row 8) |
+| 16 | client: allowed media types | `audio/mpeg` | maps |
+| 17 | client: `TTS_MIN_TEXT_CHARS` and `X-Voice-Tts-Max-Chars` | at least 5,000 per model; the app advertises its own bound | maps |
+| 18 | client: the voice catalog | app ids mapped to opaque ids in the app's configuration; stored settings unchanged by a swap | maps (the catalog rule exists for exactly this) |
+| 19 | client: typed audio | `audio/mpeg` is `.mp3` | maps |
+
+The speech-to-text client constants (`rates`, `lead_ms`, `encoding`, the end
+grace) do not apply to a text-to-speech provider, and the text-to-speech
+constants (allowed types, text minimum, voice catalog) do not apply to a
+speech-to-text one.
+
+### What the walkthrough changed
+
+All additive: none touches a script, a key or an existing wire field.
+
+1. `partial` is explicitly optional (`PROTOCOL.md`): OpenAI.
+2. The turn-order rule, every event of turn n before any of turn n+1: OpenAI.
+3. `MIN_PACING_LEAD` is 5 s (revision 1: the installed clients' burst and
+   lead), the lead stated as an allowance, writes complete when flushed (never
+   on enqueue), and the client trims its pre-`ready` buffer to its lead (a
+   no-op at 5 s): Deepgram's 1.25x, which makes such a provider unsupported in
+   revision 1.
+4. `PROTOCOL_DEFAULT_RATES`: a provider must take BOTH 24 and 16 kHz (installed
+   clients never read `ready.rates` and switch only after a microphone
+   failure), with the client package's rate fallback (`PROTOCOL.md`).
+5. `RelaySettings::end_timeout` is separate from `close_timeout`, and
+   `RelaySettings::check` enforces revision 1's bounds: non-zero durations,
+   `open_timeout + close_timeout` at most 10 s, `admit_interval` and
+   `end_timeout` at most 2 s, `idle_timeout` at least 10 s, `pong_deadline`
+   above `ping_interval`, and the lease's margin (`open_timeout +
+   close_timeout + refresh_interval` below the lease, `3 x refresh_interval`
+   within it): OpenAI's latency and the installed clients' timers.
+6. `stt::MAX_SILENT_FRAMES_PER_POLL`: the adapters' absorption loops are
+   bounded.
+7. `protocol::tts_body_limit` scales with the text bound, with its basis stated
+   in `PROTOCOL.md`: ElevenLabs' larger per-request limits.
+
+The recorded limits are under Named limits above.
+
+### Sources (read 2026-10-25, the load-bearing facts re-read when this appendix was written)
+
+- Deepgram: `developers.deepgram.com/reference/speech-to-text-api/listen-streaming`
+  and the pages on authenticating, endpointing and interim results, utterance
+  end, start-of-speech detection, audio keep-alive, close stream, finalize,
+  WebSocket errors, recovering from connection errors (the 1.25x ceiling),
+  encoding, sample rate, keyterm and keywords, API rate limits, and pricing.
+- OpenAI: `developers.openai.com/api/docs/guides/speech-to-text`, the
+  transcription create reference, the error-codes, model (`gpt-transcribe`) and
+  deprecations pages, and the realtime transcription guide.
+- AWS Transcribe: the streaming partial-results page and
+  `StartStreamTranscription`.
+- ElevenLabs: the text-to-speech convert and stream references, the
+  WebSocket guide, authentication, models, errors, voices search, pricing and
+  request stitching.

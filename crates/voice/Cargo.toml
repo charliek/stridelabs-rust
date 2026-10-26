@@ -16,7 +16,13 @@ default = []
 # text-to-speech flow (`Voice::speak`, `TtsReply`, `tts::read_request`),
 # `VoiceRefusal::into_response_with` (a refusal rendered through the app's
 # own envelope) and `LOG_CAPS`.
-axum = ["dep:axum", "dep:tungstenite", "dep:futures-util"]
+axum = [
+    "dep:axum",
+    "dep:tungstenite",
+    "dep:futures-util",
+    "tokio/rt",
+    "tokio/macros",
+]
 # The Muse speech-to-text adapter (`muse`): `MuseStt` and its session, dialled
 # through the CONNECTOR THE APP HANDS IN (the crate builds none), and
 # `LOG_CAPS`. tokio-tungstenite's `rustls-tls-native-roots` only compiles its
@@ -27,6 +33,7 @@ muse = [
     "dep:rustls",
     "dep:url",
     "dep:futures-util",
+    "tokio/net",
 ]
 # The Inworld text-to-speech adapter (`inworld`): `InworldTts` over the
 # `InworldClient` the app built (on its own `reqwest::Client`, with its own
@@ -185,7 +192,13 @@ thiserror = { workspace = true }
 # one too; the scripted adapters' timers are tokio's; the relay's clocks and
 # the cooperative budget it spends per provider event
 # (`tokio::task::coop::consume_budget`, `rt`).
-tokio = { workspace = true }
+#
+# Not the workspace's `full`: only `time` is the core's own. `axum` adds `rt`
+# (`spawn`, `coop`) and `macros` (`select!`, `join!`), `muse` adds `net` (its
+# `TcpStream`); `sync` and `rt` come in any case with tokio-util's `rt`
+# below, and are named here for what the crate uses of them. The adapters'
+# mock servers and the suites' runtimes are the dev-dependency's.
+tokio = { version = "1", default-features = false, features = ["time", "sync", "rt"] }
 # The app's shutdown, as the relay sees it: the token every session selects
 # on (`CancellationToken`) and the tracker its drain waits on (`TaskTracker`,
 # `rt`). Already in the lock, with these features.
@@ -207,8 +220,20 @@ stridelabs-testing = { workspace = true }
 redis = { workspace = true }
 # `join_all`: concurrent charges, and the fault relay's control replies.
 futures = { workspace = true }
-# The scripted adapters' timing tests run on tokio's paused clock.
-tokio = { workspace = true, features = ["test-util"] }
+# The scripted adapters' timing tests run on tokio's paused clock
+# (`test-util`); the suites use `#[tokio::test]` (`macros`), a multi-thread
+# runtime for the run cap's second case (`rt-multi-thread`), and loopback
+# sockets (`net`, `io-util`).
+tokio = { version = "1", default-features = false, features = [
+    "test-util",
+    "macros",
+    "rt-multi-thread",
+    "net",
+    "io-util",
+    "time",
+    "sync",
+    "rt",
+] }
 # `the_scripts_are_the_extraction_bases`: the SHA-1 of the exact bytes each
 # script sends. Already in the lock (0.11.0), so nothing is added to it.
 sha1 = "0.11"

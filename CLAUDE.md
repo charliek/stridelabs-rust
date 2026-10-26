@@ -113,7 +113,7 @@ mise exec -- cargo test --workspace
 **DB- and Redis-touching tests need `docker compose up -d` (or `make up`)
 running first.** `cargo test --workspace` (default features) never needs it —
 `stridelabs-testing`'s `postgres` and `redis` features and the `live-tests`
-features of `stridelabs-redis` and `stridelabs-mcp` are off by default, so
+features of `stridelabs-redis`, `stridelabs-mcp` and `stridelabs-voice` are off by default, so
 those tests don't even compile into that run. They *do* compile and run under
 `mise exec -- make test-all-features` (`cargo test --workspace
 --all-features`), which is why that's the lane to run before trusting a
@@ -124,11 +124,11 @@ will not silently skip.
 
 ## Crate map
 
-All eleven crates are implemented: `stridelabs-config`,
+All twelve crates are implemented: `stridelabs-config`,
 `stridelabs-observability`, `stridelabs-http`, `stridelabs-auth`,
 `stridelabs-testing`, `stridelabs-mcp`, `stridelabs-redis`,
-`stridelabs-gcp`, `stridelabs-inworld`, `stridelabs-postgres` and
-`stridelabs-perplexity`.
+`stridelabs-gcp`, `stridelabs-inworld`, `stridelabs-postgres`,
+`stridelabs-perplexity` and `stridelabs-voice`.
 
 | Crate | Status | Contents |
 |---|---|---|
@@ -143,6 +143,7 @@ All eleven crates are implemented: `stridelabs-config`,
 | `stridelabs-inworld` | Implemented | A policy-free Inworld text-to-speech client on the consumer's `reqwest::Client`: one bounded synthesis (whole-exchange timeout, streamed response cap with a `Content-Length` pre-check, pre-decode base64 guard, decoded-audio and text bounds), errors classified as unavailable/rejected/malformed and safe to log, an optional MP3 shape check; `client_builder()` (feature `client-builder`) |
 | `stridelabs-postgres` | Implemented | Postgres connection hygiene on sqlx (no TLS feature of its own; the consumer picks): `connect_options` with a query-parameter allow-list, `search_path`/NUL refusals and no password file, refusals that never print a value; `error_summary` (SQLSTATE + fixed description); `lazy_pool`; Neon pooler detection; `LOG_CAPS` for sqlx's targets that log raw errors, URL values or server notices |
 | `stridelabs-perplexity` | Implemented | A policy-free Perplexity Agent API web-search client on the consumer's `reqwest::Client`: one bounded search (whole-exchange timeout, streamed response cap with a `Content-Length` pre-check, input bound), only a `completed` response an answer, errors classified as unavailable/rejected/incomplete/malformed and safe to log, a faithful `SearchAnswer` (assistant text, every result with its citation id, usage; `SearchAnswer::from_json` for a body already in hand) and an optional `sources` display helper; no features, no TLS |
+| `stridelabs-voice` | Implemented | The provider-neutral voice core: the client protocol (revision 1, `PROTOCOL.md` + a golden fixture), the speech-to-text and text-to-speech provider traits, the UTC windows, the text-to-speech character budget and the speech-to-text audio budget with a fenced lease (Redis scripts, byte for byte tapper's extraction base), `Voice` and its `VoiceRefusal`s; behind `axum` the relay, the stream's admission and `Voice::speak`; the `muse` and `inworld` adapters behind features (the app injects the `Connector` and the `InworldClient`: no client and no crypto provider built here, guarded in CI); `test-support` scripted adapters and mock providers, `openapi` schemas |
 
 Each crate documents its own **feature topology** in its README — most are
 `default = []` so a consumer's dependency graph stays as lean as it wants.

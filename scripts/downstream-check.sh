@@ -187,7 +187,7 @@ else
   SCRATCH=''
 fi
 LIB_URL='https://github.com/charliek/stridelabs-rust.git'
-CRATES='config observability http auth testing mcp redis gcp inworld postgres perplexity'
+CRATES='config observability http auth testing mcp redis gcp inworld postgres perplexity voice'
 KNOWN_CONSUMERS='tapper slauth limen imgmcp spendwise slaudio lumen parcel'
 
 usage() {
