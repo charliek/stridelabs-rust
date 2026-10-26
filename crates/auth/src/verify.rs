@@ -41,6 +41,10 @@ const MAX_LEEWAY: Duration = Duration::from_secs(24 * 60 * 60);
 /// any token with `aud: ""` under slauth's laxer time rules.
 const NOT_VALIDATED_AUDIENCE: &str = "\0audience not validated";
 
+/// The [`AuthError::InvalidToken`] reason under
+/// [`ClaimChecks::with_integer_time_claims`].
+const NOT_WHOLE_SECONDS: &str = "a time claim is not a whole number of seconds";
+
 /// Whether, and against what, a token's `aud` claim is checked.
 ///
 /// There is deliberately no `Default`, and no conversion produces
@@ -100,11 +104,14 @@ pub enum Audience {
 ///   it is not yet valid while `nbf > now + leeway`. An absent `nbf` is fine
 ///   either way; a present one that is not a number is "token is malformed"
 ///   while `nbf` is checked.
+/// - Under [`ClaimChecks::with_integer_time_claims`] (off by default), each
+///   of `exp`, `nbf` and `iat` that is present must also be a non-negative
+///   JSON integer ([`time_claims_are_whole_seconds`]).
 ///
 /// [`ClaimChecks::new`] starts from a 60 s leeway ([`DEFAULT_LEEWAY`]) with
-/// `nbf` checked. [`Verifier::new`]'s rules, kept as they have always been,
-/// differ in one respect: `nbf` is not checked (see
-/// [`Verifier::claim_checks`]).
+/// `nbf` checked and integer time claims not required. [`Verifier::new`]'s
+/// rules, kept as they have always been, differ in one respect: `nbf` is not
+/// checked (see [`Verifier::claim_checks`]).
 ///
 /// `Debug` prints the issuer exactly as configured, as [`SlauthConfig`]'s
 /// does: seeing it exactly is what debugging a trailing-slash mismatch
@@ -120,6 +127,7 @@ pub struct ClaimChecks {
     /// Whole seconds, at most [`MAX_LEEWAY`]: exactly what is applied.
     leeway: Duration,
     validate_nbf: bool,
+    integer_time_claims: bool,
 }
 
 impl ClaimChecks {
@@ -131,6 +139,7 @@ impl ClaimChecks {
             audience,
             leeway: DEFAULT_LEEWAY,
             validate_nbf: true,
+            integer_time_claims: false,
         }
     }
 
@@ -156,6 +165,32 @@ impl ClaimChecks {
         self
     }
 
+    /// Whether each present `exp`, `nbf` and `iat` must be a whole number of
+    /// seconds: a non-negative JSON integer ([`time_claims_are_whole_seconds`]).
+    /// Off by default, and on [`Verifier::new`],
+    /// [`Verifier::claims_with_jwks`] and [`Verifier::verify_with_jwks`],
+    /// which build their own checks.
+    ///
+    /// jsonwebtoken reads `exp` and `nbf` as any finite non-negative number
+    /// and rounds a fraction to the nearest second, and never reads `iat`.
+    /// On, a token is refused, as [`AuthError::InvalidToken`] ("a time claim
+    /// is not a whole number of seconds"), whose `exp`, `nbf` or `iat` is a
+    /// fraction, a whole float (`3600.0`), an exponent form (`1.8e9`), a
+    /// negative number, a boolean, a string (a numeric one included) or
+    /// `null`. An absent `nbf` or `iat` still passes, and `exp` stays
+    /// required. A time claim jsonwebtoken already refuses keeps its own
+    /// reason ("a required claim is missing" for a malformed `exp`, "token
+    /// is malformed" for a malformed `nbf` while it is checked); the check
+    /// runs after every other one. A payload naming `exp`, `nbf` or `iat`
+    /// twice is refused ("claims are malformed"). Each claim's type is read
+    /// from the payload's JSON text, never through a `serde_json::Value`
+    /// ([`time_claims_are_whole_seconds`] says why).
+    #[must_use]
+    pub fn with_integer_time_claims(mut self, on: bool) -> ClaimChecks {
+        self.integer_time_claims = on;
+        self
+    }
+
     /// The `iss` a token must carry, exactly.
     pub fn issuer(&self) -> &str {
         &self.issuer
@@ -174,6 +209,12 @@ impl ClaimChecks {
     /// Whether a present `nbf` is checked.
     pub fn validates_nbf(&self) -> bool {
         self.validate_nbf
+    }
+
+    /// Whether each present time claim must be a whole number of seconds
+    /// ([`ClaimChecks::with_integer_time_claims`]).
+    pub fn requires_integer_time_claims(&self) -> bool {
+        self.integer_time_claims
     }
 
     /// [`Verifier::new`]'s rules, unchanged since before `ClaimChecks`
@@ -218,7 +259,8 @@ impl ClaimChecks {
 
     /// Every check on a token whose signature `key` verifies: jsonwebtoken's
     /// [`ClaimChecks::validation`], then, under [`Audience::IfPresent`],
-    /// [`audience_if_present`].
+    /// [`audience_if_present`], then, when required,
+    /// [`time_claims_are_whole_seconds`].
     fn claims<C: DeserializeOwned>(&self, token: &str, key: &DecodingKey) -> Result<C, AuthError> {
         let claims = decode::<C>(token, key, &self.validation())
             .map(|data| data.claims)
@@ -228,7 +270,185 @@ impl ClaimChecks {
                 return Err(invalid_token(&ErrorKind::InvalidAudience.into()));
             }
         }
+        if self.integer_time_claims {
+            // "Insecure" only in that it checks nothing: `decode` just did.
+            // Read from the payload's bytes into `TimeClaims`, never through
+            // a `serde_json::Value`, which can change a value's JSON type.
+            let time = jsonwebtoken::dangerous::insecure_decode_claims::<TimeClaims>(token)
+                .map_err(|_| AuthError::InvalidToken("claims are malformed".into()))?;
+            if !time.are_whole_seconds() {
+                return Err(AuthError::InvalidToken(NOT_WHOLE_SECONDS.into()));
+            }
+        }
         Ok(claims)
+    }
+}
+
+/// Whether each registered time claim in a token's payload (`exp`, `nbf`,
+/// `iat`) is absent or a whole number of seconds: a non-negative JSON
+/// integer. `payload_json` is the payload's JSON text, its second segment
+/// base64url-decoded.
+///
+/// The rule [`ClaimChecks::with_integer_time_claims`] applies, public for a
+/// verifier that reads a token's claims some other way and wants the same
+/// one. A fraction (`3600.0` and `1.8e9` included), a negative number, a
+/// boolean, a string, an array, an object and `null` fail; so does a payload
+/// that is not a JSON object, or that names one of the three claims twice
+/// (stricter than a JSON map, which keeps the last). Only the type is
+/// checked: comparing `exp` and `nbf` with the clock is the verifier's job,
+/// and every other claim is ignored.
+///
+/// **Why bytes, not a `serde_json::Value`:** a `Value` does not keep a
+/// claim's JSON type. A struct of `Option`s reads `null` as absent, and with
+/// serde_json's `raw_value` feature on anywhere in the graph (axum turns it
+/// on), the object `{"$serde_json::private::RawValue":"0"}` becomes
+/// `Value::Number(0)`, a whole number to `as_u64`. This reads each claim's
+/// type as the JSON text has it.
+///
+/// ```
+/// use stridelabs_auth::time_claims_are_whole_seconds;
+///
+/// assert!(time_claims_are_whole_seconds(br#"{"exp":1800000000,"iat":0}"#));
+/// assert!(time_claims_are_whole_seconds(br#"{"exp":1800000000,"sub":"s"}"#));
+/// assert!(!time_claims_are_whole_seconds(br#"{"exp":1800000000,"nbf":null}"#));
+/// assert!(!time_claims_are_whole_seconds(br#"{"exp":3600.0}"#));
+/// assert!(!time_claims_are_whole_seconds(br#"{"exp":1,"exp":2}"#));
+/// ```
+pub fn time_claims_are_whole_seconds(payload_json: &[u8]) -> bool {
+    serde_json::from_slice::<TimeClaims>(payload_json).is_ok_and(|time| time.are_whole_seconds())
+}
+
+/// A payload's registered time claims, each as its JSON type: `None` when
+/// absent. Read from a JSON object only (an array in field order, which
+/// serde's derive would take, is an error), with every other member ignored
+/// and a repeated time claim an error.
+#[derive(Default)]
+struct TimeClaims {
+    exp: Option<TimeType>,
+    nbf: Option<TimeType>,
+    iat: Option<TimeType>,
+}
+
+impl TimeClaims {
+    fn are_whole_seconds(&self) -> bool {
+        [self.exp, self.nbf, self.iat]
+            .into_iter()
+            .all(|time| time.is_none_or(|time| time == TimeType::WholeSeconds))
+    }
+}
+
+impl<'de> Deserialize<'de> for TimeClaims {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<TimeClaims, D::Error> {
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = TimeClaims;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a JSON object")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<TimeClaims, A::Error> {
+                let mut time = TimeClaims::default();
+                // An owned key: one with an escape (`"\u0065xp"`) is `exp`.
+                while let Some(key) = map.next_key::<String>()? {
+                    let (name, slot) = match key.as_str() {
+                        "exp" => ("exp", &mut time.exp),
+                        "nbf" => ("nbf", &mut time.nbf),
+                        "iat" => ("iat", &mut time.iat),
+                        _ => {
+                            map.next_value::<serde::de::IgnoredAny>()?;
+                            continue;
+                        }
+                    };
+                    if slot.is_some() {
+                        return Err(serde::de::Error::duplicate_field(name));
+                    }
+                    // `TimeType` itself, not `Option<TimeType>`, which would
+                    // read `null` as absent.
+                    *slot = Some(map.next_value::<TimeType>()?);
+                }
+                Ok(time)
+            }
+        }
+
+        deserializer.deserialize_map(Visitor)
+    }
+}
+
+/// A time claim's JSON type, read from the JSON itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimeType {
+    /// A non-negative integer.
+    WholeSeconds,
+    /// Anything else: a negative integer, a float, a boolean, a string,
+    /// `null`, an array or an object. (With serde_json's
+    /// `arbitrary_precision` on, which nothing here enables, an integer that
+    /// fits a `u64` still arrives as one; a float or a larger integer arrives
+    /// as an object and is refused, so the option still fails closed.)
+    Other,
+}
+
+impl<'de> Deserialize<'de> for TimeType {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<TimeType, D::Error> {
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = TimeType;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("any JSON value")
+            }
+
+            // serde_json reports a non-negative integer here and nowhere else.
+            fn visit_u64<E>(self, _: u64) -> Result<TimeType, E> {
+                Ok(TimeType::WholeSeconds)
+            }
+
+            fn visit_i64<E>(self, _: i64) -> Result<TimeType, E> {
+                Ok(TimeType::Other)
+            }
+
+            fn visit_f64<E>(self, _: f64) -> Result<TimeType, E> {
+                Ok(TimeType::Other)
+            }
+
+            fn visit_bool<E>(self, _: bool) -> Result<TimeType, E> {
+                Ok(TimeType::Other)
+            }
+
+            fn visit_str<E>(self, _: &str) -> Result<TimeType, E> {
+                Ok(TimeType::Other)
+            }
+
+            fn visit_unit<E>(self) -> Result<TimeType, E> {
+                Ok(TimeType::Other)
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<TimeType, A::Error> {
+                while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+                Ok(TimeType::Other)
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<TimeType, A::Error> {
+                while map
+                    .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
+                    .is_some()
+                {}
+                Ok(TimeType::Other)
+            }
+        }
+
+        deserializer.deserialize_any(Visitor)
     }
 }
 
@@ -269,6 +489,7 @@ impl fmt::Debug for ClaimChecks {
             .field("audience", &self.audience)
             .field("leeway", &self.leeway)
             .field("validate_nbf", &self.validate_nbf)
+            .field("integer_time_claims", &self.integer_time_claims)
             .finish()
     }
 }
@@ -2750,5 +2971,498 @@ mod tests {
             .jwks_for_kid(PRIMARY_KID)
             .await
             .expect("the set held serves the kid");
+    }
+
+    // --- integer time claims ------------------------------------------------
+
+    /// A registered time claim, as the integer-time-claims matrix varies it.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum TimeClaim {
+        Exp,
+        Nbf,
+        Iat,
+    }
+
+    impl TimeClaim {
+        const ALL: [TimeClaim; 3] = [TimeClaim::Exp, TimeClaim::Nbf, TimeClaim::Iat];
+
+        fn name(self) -> &'static str {
+            match self {
+                TimeClaim::Exp => "exp",
+                TimeClaim::Nbf => "nbf",
+                TimeClaim::Iat => "iat",
+            }
+        }
+
+        /// E: a valid value at `now`, an hour ahead for `exp`, a minute
+        /// behind for `nbf`.
+        fn valid(self, now: u64) -> u64 {
+            match self {
+                TimeClaim::Exp => now + 3600,
+                TimeClaim::Nbf => now - 60,
+                TimeClaim::Iat => now,
+            }
+        }
+
+        /// M, for the exponent form `Me3`: a valid value too, rounded to
+        /// thousands away from the clock (`exp` 1 h to about 1 h 17 min
+        /// ahead, `nbf` 60 s to about 17 min behind).
+        fn thousands(self, now: u64) -> u64 {
+            match self {
+                TimeClaim::Exp => self.valid(now).div_ceil(1000),
+                TimeClaim::Nbf | TimeClaim::Iat => self.valid(now) / 1000,
+            }
+        }
+    }
+
+    /// The eight shapes of a time claim the matrix tries.
+    #[derive(Debug, Clone, Copy)]
+    enum TimeShape {
+        Fraction,
+        WholeFloat,
+        Exponent,
+        Negative,
+        Bool,
+        NumericString,
+        String,
+        Null,
+    }
+
+    impl TimeShape {
+        const ALL: [TimeShape; 8] = [
+            TimeShape::Fraction,
+            TimeShape::WholeFloat,
+            TimeShape::Exponent,
+            TimeShape::Negative,
+            TimeShape::Bool,
+            TimeShape::NumericString,
+            TimeShape::String,
+            TimeShape::Null,
+        ];
+
+        /// The claim's value as JSON text.
+        fn text(self, claim: TimeClaim, now: u64) -> String {
+            let e = claim.valid(now);
+            match self {
+                TimeShape::Fraction => format!("{e}.5"),
+                TimeShape::WholeFloat => format!("{e}.0"),
+                TimeShape::Exponent => format!("{}e3", claim.thousands(now)),
+                TimeShape::Negative => "-1".to_owned(),
+                TimeShape::Bool => "true".to_owned(),
+                TimeShape::NumericString => format!("\"{e}\""),
+                TimeShape::String => "\"soon\"".to_owned(),
+                TimeShape::Null => "null".to_owned(),
+            }
+        }
+
+        /// A number serde_json reads as a float, which jsonwebtoken takes
+        /// (rounded) for `exp` and `nbf`.
+        fn is_float(self) -> bool {
+            matches!(
+                self,
+                TimeShape::Fraction | TimeShape::WholeFloat | TimeShape::Exponent
+            )
+        }
+
+        /// The cell's verdict with the option off, then on: `None` passes,
+        /// `Some` is refused with that reason. Off, jsonwebtoken 11.1.0
+        /// takes any float `exp` or `nbf`, refuses anything else as a
+        /// missing `exp` or a malformed `nbf`, and never reads `iat`; on,
+        /// every float and every `iat` cell is refused by the option, and
+        /// jsonwebtoken's refusals come first.
+        fn verdicts(self, claim: TimeClaim) -> (Option<&'static str>, Option<&'static str>) {
+            match (claim, self.is_float()) {
+                (TimeClaim::Iat, _) | (_, true) => (None, Some(NOT_WHOLE_SECONDS)),
+                (TimeClaim::Exp, false) => (
+                    Some("a required claim is missing"),
+                    Some("a required claim is missing"),
+                ),
+                (TimeClaim::Nbf, false) => (Some("token is malformed"), Some("token is malformed")),
+            }
+        }
+    }
+
+    /// `payload`, JSON text, signed RS256 by the primary key under its kid
+    /// exactly as written: no serializer sees it, so `Me3` and `E.0` reach
+    /// the verifier as they read here.
+    fn mint_raw(payload: &str) -> String {
+        let header = format!(r#"{{"alg":"RS256","typ":"JWT","kid":"{PRIMARY_KID}"}}"#);
+        let input = format!(
+            "{}.{}",
+            URL_SAFE_NO_PAD.encode(header),
+            URL_SAFE_NO_PAD.encode(payload)
+        );
+        let key = EncodingKey::from_rsa_pem(TestKey::primary().pem().as_bytes())
+            .expect("committed test key parses");
+        let signature =
+            jsonwebtoken::crypto::sign(input.as_bytes(), &key, Algorithm::RS256).expect("sign");
+        format!("{input}.{signature}")
+    }
+
+    /// A [`client_checks`] token whose `exp`, `nbf` and `iat` are valid
+    /// integers at `now`, except `claim`, which is `text` (absent for
+    /// `None`). The token's own payload segment is decoded and checked to
+    /// carry `claim` exactly as asked.
+    fn time_token(now: u64, claim: TimeClaim, text: Option<&str>) -> String {
+        let mut members = vec![
+            format!(r#""iss":"{CLIENT_ISSUER}""#),
+            r#""sub":"user_01TEST""#.to_owned(),
+        ];
+        for each in TimeClaim::ALL {
+            let value = if each == claim {
+                text.map(str::to_owned)
+            } else {
+                Some(each.valid(now).to_string())
+            };
+            if let Some(value) = value {
+                members.push(format!(r#""{}":{value}"#, each.name()));
+            }
+        }
+        let token = mint_raw(&format!("{{{}}}", members.join(",")));
+
+        let segment = token.split('.').nth(1).expect("a payload segment");
+        let payload =
+            String::from_utf8(URL_SAFE_NO_PAD.decode(segment).expect("base64url")).expect("UTF-8");
+        let member = format!(r#""{}":"#, claim.name());
+        match text {
+            Some(text) => assert!(
+                payload.contains(&format!("{member}{text}")),
+                "the signed payload carries {member}{text}: {payload}"
+            ),
+            None => assert!(
+                !payload.contains(&member),
+                "the signed payload has no {member}: {payload}"
+            ),
+        }
+        token
+    }
+
+    /// The 24 cells (3 claims × 8 shapes) at `now`: a name, the token, and
+    /// the verdicts off and on ([`TimeShape::verdicts`]).
+    #[allow(clippy::type_complexity)]
+    fn time_matrix(now: u64) -> Vec<(String, String, Option<&'static str>, Option<&'static str>)> {
+        TimeClaim::ALL
+            .into_iter()
+            .flat_map(|claim| {
+                TimeShape::ALL.into_iter().map(move |shape| {
+                    let text = shape.text(claim, now);
+                    let (off, on) = shape.verdicts(claim);
+                    (
+                        format!("{} {shape:?} ({text})", claim.name()),
+                        time_token(now, claim, Some(&text)),
+                        off,
+                        on,
+                    )
+                })
+            })
+            .collect()
+    }
+
+    #[track_caller]
+    fn assert_verdict(result: Result<Value, AuthError>, verdict: Option<&str>, case: &str) {
+        match verdict {
+            None => {
+                result.unwrap_or_else(|err| panic!("{case}: refused, expected to pass: {err}"));
+            }
+            Some(reason) => assert_rejected(result, reason, case),
+        }
+    }
+
+    fn integer_time_checks() -> ClaimChecks {
+        client_checks().with_integer_time_claims(true)
+    }
+
+    #[test]
+    fn integer_time_claims_are_off_by_default_and_debug_prints_them() {
+        let default = ClaimChecks::new(CLIENT_ISSUER, Audience::NotValidated);
+        assert!(!default.requires_integer_time_claims());
+        assert!(!ClaimChecks::slauth(ISSUER, AUDIENCE).requires_integer_time_claims());
+        let config = SlauthConfig {
+            issuer: ISSUER.into(),
+            jwks_url: "https://jwks.test/jwks".into(),
+            audience: AUDIENCE.into(),
+            pat_validate_url: None,
+        };
+        assert!(!Verifier::new(config, reqwest::Client::new())
+            .claim_checks()
+            .requires_integer_time_claims());
+
+        let on = default.clone().with_integer_time_claims(true);
+        assert!(on.requires_integer_time_claims());
+        assert_ne!(on, default);
+        assert_eq!(on.clone().with_integer_time_claims(false), default);
+
+        assert!(
+            format!("{default:?}").contains("integer_time_claims: false"),
+            "{default:?}"
+        );
+        assert!(
+            format!("{on:?}").contains("integer_time_claims: true"),
+            "{on:?}"
+        );
+    }
+
+    /// The design's matrix (plan 003 D2 §8): every cell off, then on.
+    /// Off, every float `exp` and `nbf` passes, so each derived value is a
+    /// valid time and the option is what refuses it; 14 cells change.
+    #[test]
+    fn the_time_claim_matrix_without_and_with_integer_time_claims() {
+        let now = jsonwebtoken::get_current_timestamp();
+        let matrix = time_matrix(now);
+        assert_eq!(matrix.len(), 24);
+        assert_eq!(
+            matrix.iter().filter(|(_, _, off, on)| off != on).count(),
+            14,
+            "3 float cells each of exp and nbf, and all 8 of iat"
+        );
+
+        for (case, token, off, on) in &matrix {
+            assert_verdict(
+                checked(token, &client_checks()),
+                *off,
+                &format!("off, {case}"),
+            );
+            assert_verdict(
+                checked(token, &integer_time_checks()),
+                *on,
+                &format!("on, {case}"),
+            );
+        }
+    }
+
+    #[test]
+    fn integer_time_claims_pass_integers_and_absent_nbf_or_iat_and_still_require_exp() {
+        let now = jsonwebtoken::get_current_timestamp();
+        let integers = time_token(now, TimeClaim::Exp, Some(&(now + 3600).to_string()));
+        for checks in [&client_checks(), &integer_time_checks()] {
+            let claims = checked(&integers, checks).expect("integer exp, nbf and iat");
+            assert_eq!(claims["exp"], json!(now + 3600));
+            checked(&time_token(now, TimeClaim::Nbf, None), checks).expect("no nbf");
+            checked(&time_token(now, TimeClaim::Iat, None), checks).expect("no iat");
+            assert_rejected(
+                checked(&time_token(now, TimeClaim::Exp, None), checks),
+                "a required claim is missing",
+                "no exp",
+            );
+        }
+        // The builder's tokens are integers throughout.
+        checked(
+            &mint(client_claims().not_before_in(-60)),
+            &integer_time_checks(),
+        )
+        .expect("a TestClaims token");
+    }
+
+    /// A payload that is not a JSON object never reaches the option's map
+    /// read: jsonwebtoken refuses it first, with or without the option.
+    #[test]
+    fn a_payload_that_is_not_an_object_is_refused_before_the_option() {
+        let exp = jsonwebtoken::get_current_timestamp() + 3600;
+        for payload in [
+            format!(r#"[{exp},null,"user_01TEST","{CLIENT_ISSUER}","aud"]"#),
+            format!("{exp}"),
+            r#""claims""#.to_owned(),
+            "null".to_owned(),
+        ] {
+            let token = mint_raw(&payload);
+            let off = checked(&token, &client_checks()).expect_err(&payload);
+            let on = checked(&token, &integer_time_checks()).expect_err(&payload);
+            assert_eq!(on.to_string(), off.to_string(), "{payload}");
+            assert_ne!(
+                on.to_string(),
+                format!("token rejected: {NOT_WHOLE_SECONDS}"),
+                "{payload}"
+            );
+        }
+    }
+
+    /// Both verifiers built from a consumer's `ClaimChecks` apply the
+    /// option through `verify_bearer_claims`, over the whole matrix.
+    #[tokio::test]
+    async fn for_issuer_and_with_cache_verifiers_apply_integer_time_claims() {
+        // One fetch per verifier: each holds its own cache.
+        let server = primary_issuer(3).await;
+        let for_issuer = |checks: ClaimChecks| {
+            Verifier::for_issuer(checks, jwks_url_of(&server), None, reqwest::Client::new())
+        };
+        let off = for_issuer(client_checks());
+        let on = for_issuer(integer_time_checks());
+        let with_cache = Verifier::with_cache(
+            integer_time_checks(),
+            JwksCache::new(jwks_url_of(&server), reqwest::Client::new()),
+        );
+        assert!(!off.claim_checks().requires_integer_time_claims());
+        assert!(on.claim_checks().requires_integer_time_claims());
+        assert!(with_cache.claim_checks().requires_integer_time_claims());
+
+        for (case, token, off_verdict, on_verdict) in
+            time_matrix(jsonwebtoken::get_current_timestamp())
+        {
+            for (verifier, name, verdict) in [
+                (&off, "for_issuer off", off_verdict),
+                (&on, "for_issuer on", on_verdict),
+                (&with_cache, "with_cache on", on_verdict),
+            ] {
+                assert_verdict(
+                    verifier.verify_bearer_claims(&token).await,
+                    verdict,
+                    &format!("{name}, {case}"),
+                );
+            }
+        }
+    }
+
+    /// `claims_with_jwks` and `verify_with_jwks` build slauth's checks
+    /// themselves, so the option is never on there.
+    #[test]
+    fn claims_with_jwks_and_verify_with_jwks_never_require_integer_time_claims() {
+        let now = jsonwebtoken::get_current_timestamp();
+        let token = mint_raw(&format!(
+            r#"{{"iss":"{ISSUER}","aud":"{AUDIENCE}","sub":"s","email":"u@example.com","exp":{}.0,"iat":{now}.5}}"#,
+            now + 3600
+        ));
+
+        Verifier::claims_with_jwks::<Value>(
+            &token,
+            &TestKey::primary().jwks(),
+            PRIMARY_KID,
+            ISSUER,
+            AUDIENCE,
+        )
+        .expect("claims_with_jwks: a float exp and iat pass");
+        verify(&token).expect("verify_with_jwks: a float exp and iat pass");
+        // The control: the same rules with the option on refuse this token.
+        assert_rejected(
+            checked(
+                &token,
+                &ClaimChecks::slauth(ISSUER, AUDIENCE).with_integer_time_claims(true),
+            ),
+            NOT_WHOLE_SECONDS,
+            "slauth's rules with the option on",
+        );
+    }
+
+    #[test]
+    fn time_claims_are_whole_seconds_reads_types_not_values() {
+        let read = |text: &str| time_claims_are_whole_seconds(text.as_bytes());
+        for passes in [
+            r#"{}"#,
+            r#"{"exp":0,"nbf":0,"iat":0}"#,
+            r#"{"exp":18446744073709551615}"#,
+            r#"{"exp":1,"auth_time":1.5,"other":null,"nested":{"iat":1.5}}"#,
+            r#"{"\u0065xp":1}"#,
+            r#"{"sub":"s","sub":"t"}"#,
+        ] {
+            assert!(read(passes), "{passes}");
+        }
+        for fails in [
+            r#"{"\u0065xp":1.5}"#,
+            r#"{"exp":1,"exp":2}"#,
+            r#"{"iat":1,"\u0069at":2}"#,
+            r#"[1]"#,
+            r#"1"#,
+            r#"null"#,
+            r#"{"exp":1} trailing"#,
+            r#"{"iat":{"$serde_json::private::RawValue":"0"}}"#,
+            r#"{"iat":{"$serde_json::private::Number":"0"}}"#,
+            r#"{"exp":18446744073709551616}"#,
+            r#"{"exp":1e3}"#,
+            r#"{"exp":1000.0}"#,
+            r#"{"exp":-0}"#,
+            r#"{"nbf":null}"#,
+            r#"{"iat":"1"}"#,
+            r#"{"iat":false}"#,
+            r#"{"iat":[1]}"#,
+            r#"{"iat":{"s":1}}"#,
+        ] {
+            assert!(!read(fails), "{fails}");
+        }
+    }
+
+    /// The payload text a `serde_json::Value` misreads when serde_json's
+    /// `raw_value` feature is on: an object holding the private `RawValue`
+    /// token becomes the number inside it.
+    fn raw_value_iat_payload(now: u64) -> String {
+        format!(
+            r#"{{"iss":"{CLIENT_ISSUER}","sub":"user_01TEST","exp":{},"iat":{{"$serde_json::private::RawValue":"0"}}}}"#,
+            now + 3600
+        )
+    }
+
+    /// The rule as first written, over a `serde_json::Value` map (tapper's
+    /// `whole_seconds_or_absent`): the control the new reading must beat.
+    fn value_map_rule(payload: &str) -> bool {
+        let claims: serde_json::Map<String, Value> =
+            serde_json::from_str(payload).expect("a JSON object");
+        ["exp", "nbf", "iat"].into_iter().all(|claim| {
+            claims
+                .get(claim)
+                .is_none_or(|value| value.as_u64().is_some())
+        })
+    }
+
+    /// An object-valued `iat` is refused with the option on, in this test
+    /// build, where serde_json's `raw_value` is on (axum, a dev-dependency,
+    /// turns it on) and a `Value` reads that object as `0`.
+    #[test]
+    fn a_raw_value_object_is_not_a_whole_number_of_seconds() {
+        // Not vacuous: `raw_value` is on here, so a `Value` normalises the
+        // object to a number and the rule over it accepts the payload.
+        assert_eq!(
+            serde_json::from_str::<Value>(r#"{"$serde_json::private::RawValue":"0"}"#)
+                .expect("parses"),
+            json!(0),
+            "serde_json's raw_value is on in this build"
+        );
+        let payload = raw_value_iat_payload(jsonwebtoken::get_current_timestamp());
+        assert!(value_map_rule(&payload), "a Value map misreads the object");
+
+        let token = mint_raw(&payload);
+        checked(&token, &client_checks()).expect("off: jsonwebtoken never reads iat");
+        let err = checked(&token, &integer_time_checks()).expect_err("on: refused");
+        // The reason's literal text, not the constant.
+        assert_eq!(
+            err.to_string(),
+            "token rejected: a time claim is not a whole number of seconds"
+        );
+        assert!(!time_claims_are_whole_seconds(payload.as_bytes()));
+    }
+
+    /// A time claim named twice is no claim to judge: with the option on, a
+    /// repeated `iat` (which jsonwebtoken never reads) is malformed, and a
+    /// repeated `exp` or `nbf` jsonwebtoken refuses itself, either way.
+    #[test]
+    fn a_repeated_time_claim_is_malformed() {
+        let now = jsonwebtoken::get_current_timestamp();
+        let exp = now + 3600;
+        let iat_twice = mint_raw(&format!(
+            r#"{{"iss":"{CLIENT_ISSUER}","sub":"user_01TEST","exp":{exp},"iat":{now},"iat":{now}}}"#
+        ));
+        checked(&iat_twice, &client_checks()).expect("off: jsonwebtoken never reads iat");
+        assert_rejected(
+            checked(&iat_twice, &integer_time_checks()),
+            "claims are malformed",
+            "iat twice, on",
+        );
+
+        for (case, payload) in [
+            (
+                "exp twice",
+                format!(
+                    r#"{{"iss":"{CLIENT_ISSUER}","sub":"user_01TEST","exp":{exp},"exp":{exp}}}"#
+                ),
+            ),
+            (
+                "nbf twice",
+                format!(
+                    r#"{{"iss":"{CLIENT_ISSUER}","sub":"user_01TEST","exp":{exp},"nbf":{now},"nbf":{now}}}"#
+                ),
+            ),
+        ] {
+            let token = mint_raw(&payload);
+            let off = checked(&token, &client_checks()).expect_err(case);
+            let on = checked(&token, &integer_time_checks()).expect_err(case);
+            assert_eq!(on.to_string(), off.to_string(), "{case}");
+        }
     }
 }
