@@ -63,3 +63,5 @@ time = { workspace = true, features = ["parsing"] }
 # Test-only strict JSON reading that rejects duplicate keys, which
 # `serde_json::Value` silently collapses.
 serde = { workspace = true }
+# A never-ending stream for the server-sent-events test's body.
+futures-util = { workspace = true }

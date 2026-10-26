@@ -58,8 +58,8 @@ pub use logging::{
 };
 pub use request_id::{RequestId, RequestIdLayer, RequestIdService, REQUEST_ID_HEADER};
 pub use request_log::{
-    RequestLogConfig, RequestLogLayer, RequestLogService, DEFAULT_REDACTED_QUERY_PARAMS,
-    REQUEST_LOG_TARGET,
+    RequestLogConfig, RequestLogLayer, RequestLogLevel, RequestLogService,
+    DEFAULT_REDACTED_QUERY_PARAMS, REQUEST_LOG_TARGET,
 };
 
 #[cfg(feature = "prometheus")]

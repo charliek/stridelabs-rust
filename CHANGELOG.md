@@ -13,6 +13,24 @@ for a consumer's pin.
 
 ### Added
 
+- `stridelabs-observability`: **`RequestLogLevel(pub tracing::Level)`**, a
+  response extension that lowers the level of `RequestLogLayer`'s entry for
+  that request (re-exported beside `RequestLogLayer`). A handler, an
+  extractor's rejection or an inner layer inserts it into the response's
+  extensions; the entry takes it only when it is less severe than the
+  status's (`ERROR` ≥ 500, `WARN` ≥ 400, else `INFO`), and a raise or an
+  equal level is ignored, so an app can quieten an expected,
+  attacker-driven 5xx it chose to return but can never re-rank an entry
+  upward or hide a 5xx it didn't decide on. An inner `Err` (500 `ERROR`), a
+  panic (500 `ERROR`) and a dropped future (499 `WARN`) never consult it.
+  Status, message and `httpRequest` are unchanged; under `CloudLayer`,
+  `DEBUG` and `TRACE` both write `"severity":"DEBUG"`. No feature flag:
+  nothing changes unless a response carries the extension. Requested by
+  tapper (plan 017: a token naming an unseen key id, refused inside the
+  JWKS refetch floor, should be one `INFO` entry, not an `ERROR`) and lumen
+  (forged-kid requests produce one `ERROR` entry per request today).
+  `scripts/downstream-check.sh` checks tapper; lumen is informational there,
+  and parcel is not covered (it does not use `RequestLogLayer`).
 - `stridelabs-mcp`: two opt-ins for `McpVerifier`, so an MCP endpoint can
   check JWTs as the app's REST API (and its Python MCP server) does
   (slaudio plan 027). A consumer that uses neither sees no change:
