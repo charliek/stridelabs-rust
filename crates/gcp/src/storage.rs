@@ -1,6 +1,6 @@
 //! A small Google Cloud Storage client over the JSON API: media upload,
-//! multipart upload with object metadata, media download, delete, a bucket
-//! probe, and the public object URL.
+//! multipart upload with object metadata, media download, delete, an
+//! existence probe, a bucket probe, and the public object URL.
 //!
 //! Policy-free: no object naming, no bucket from the environment, no
 //! metadata of its own choosing. The service decides those. Every default is
@@ -39,8 +39,9 @@
 //! - **Objects under [`ObjectNamePolicy::Literal`]** go to GCS as given:
 //!   GCS's own literal addressing, for a service whose existing objects
 //!   carry names `Strict` refuses and must stay addressable. Uploads send
-//!   every name, a download or a delete refuses only `""`, `.` and `..` (no
-//!   URL path segment can carry them), and [`public_url_with`] refuses none.
+//!   every name, a download, an existence probe or a delete refuses only
+//!   `""`, `.` and `..` (no URL path segment can carry them), and
+//!   [`public_url_with`] refuses none.
 //!   It is a transport policy, not validation: whatever else GCS refuses
 //!   comes back as its `400`.
 //!
@@ -294,7 +295,7 @@ pub fn validate_bucket_name(bucket: &str) -> Result<(), StorageError> {
 ///
 /// The difference is where a name may be one that a URL cannot carry:
 ///
-/// | | `upload`, `upload_with` | `download`, `delete` | `public_url_with` |
+/// | | `upload`, `upload_with` | `download`, `exists`, `delete` | `public_url_with` |
 /// |---|---|---|---|
 /// | `Strict` | refuses a name that is empty, starts or ends with `/`, or has an empty, `.` or `..` segment | the same | the same |
 /// | `Literal` | sends every name | refuses only `""`, `.` and `..` | refuses no name |
@@ -314,9 +315,9 @@ pub enum ObjectNamePolicy {
     ///
     /// - `upload` and `upload_with` send every name: there it is a query
     ///   value (`name=`) or a JSON string, which nothing normalizes.
-    /// - `download` and `delete` refuse only the whole names `""`, `.` and
-    ///   `..`, which no URL path segment can carry (`/o/.` is sent as `/o/`,
-    ///   `/o/..` as the bucket itself). Every other name is sent.
+    /// - `download`, `exists` and `delete` refuse only the whole names `""`,
+    ///   `.` and `..`, which no URL path segment can carry (`/o/.` is sent
+    ///   as `/o/`, `/o/..` as the bucket itself). Every other name is sent.
     /// - [`public_url_with`] refuses no name.
     ///
     /// Everything else is GCS's call: CR or LF, a
@@ -367,7 +368,7 @@ pub enum StorageError {
     /// The object name is one the client's [`ObjectNamePolicy`] refuses:
     /// under `Strict`, empty, starting or ending with `/`, or with an empty,
     /// `.` or `..` segment; under `Literal`, `""`, `.` or `..` on a
-    /// download or a delete. Nothing was sent.
+    /// download, an existence probe or a delete. Nothing was sent.
     #[error("invalid GCS object name: {reason}")]
     InvalidObjectName {
         /// Which rule; never the name.
@@ -376,7 +377,7 @@ pub enum StorageError {
     /// No access token.
     #[error("GCS {operation}: {source}")]
     Auth {
-        /// `upload`, `download`, `delete` or `list`.
+        /// `upload`, `download`, `delete`, `exists` or `list`.
         operation: &'static str,
         /// The token provider's error.
         source: GcpAuthError,
@@ -385,7 +386,7 @@ pub enum StorageError {
     /// body.
     #[error("GCS {operation} request failed: {reason}")]
     Request {
-        /// `upload`, `download`, `delete` or `list`.
+        /// `upload`, `download`, `delete`, `exists` or `list`.
         operation: &'static str,
         /// The transport failure's fixed category (`timed out`,
         /// `connection failed`, …), never its text.
@@ -395,7 +396,7 @@ pub enum StorageError {
     /// its last attempt did).
     #[error("GCS {operation} timed out after {timeout:?}")]
     Timeout {
-        /// `upload`, `download`, `delete` or `list`.
+        /// `upload`, `download`, `delete`, `exists` or `list`.
         operation: &'static str,
         /// The bound that elapsed.
         timeout: Duration,
@@ -412,7 +413,7 @@ pub enum StorageError {
     /// GCS answered with a status the operation does not accept.
     #[error("GCS {operation} answered HTTP {status}{}", status_suffix(.google_status))]
     Status {
-        /// `upload`, `download`, `delete` or `list`.
+        /// `upload`, `download`, `delete`, `exists` or `list`.
         operation: &'static str,
         /// The HTTP status code.
         status: u16,
@@ -882,6 +883,51 @@ impl GcsClient {
             encode_component(object)
         );
         let build = || self.http.delete(&url);
+        let build = &build;
+        self.attempts(OP, move |received| async move {
+            let response = self.send(OP, build).await?;
+            let status = response.status();
+            if status == StatusCode::NOT_FOUND {
+                return Ok(false);
+            }
+            if !status.is_success() {
+                return Err(status_failure(OP, response, &received).await);
+            }
+            Ok(true)
+        })
+        .await
+    }
+
+    /// Whether `object` exists in `bucket`
+    /// (`GET {base}/storage/v1/b/{bucket}/o/{object}?fields=name`): `true`
+    /// on any 2xx, `false` on a 404, in one request (a 404 is not retried,
+    /// as in [`GcsClient::download`] and [`GcsClient::delete`]).
+    ///
+    /// The one metadata read here, and it asks for the object's name only:
+    /// a 2xx body is never read, so there is nothing to cap, and no size,
+    /// generation or checksum comes back. It spares a caller that only needs
+    /// to know whether the bytes are already stored the download, or an
+    /// upload that would send them again.
+    ///
+    /// Point-in-time evidence only: the object can be written or deleted a
+    /// moment later. The identity needs `storage.objects.get` on the bucket;
+    /// without it GCS answers `403`, which is an error here, not `false`.
+    ///
+    /// # Errors
+    ///
+    /// An invalid name (nothing sent); any other non-2xx answer is
+    /// [`StorageError::Status`] with operation `exists`.
+    pub async fn exists(&self, bucket: &str, object: &str) -> Result<bool, StorageError> {
+        const OP: &str = "exists";
+        validate_bucket_name(bucket)?;
+        self.names.check(object, Carried::Segment)?;
+        let url = format!(
+            "{}/storage/v1/b/{}/o/{}?fields=name",
+            self.base_url,
+            encode_component(bucket),
+            encode_component(object)
+        );
+        let build = || self.http.get(&url);
         let build = &build;
         self.attempts(OP, move |received| async move {
             let response = self.send(OP, build).await?;

@@ -31,6 +31,19 @@ for a consumer's pin.
   (forged-kid requests produce one `ERROR` entry per request today).
   `scripts/downstream-check.sh` checks tapper; lumen and parcel are
   informational there (parcel does not use `RequestLogLayer`).
+- `stridelabs-testing`: two message hooks for a consumer's own test setup
+  (lumen plan 003). The existing functions and their messages are unchanged
+  byte for byte; they share one validation path with the new ones.
+  - **`require_local_url_hinted(var, hint)`**: `require_local_url` whose
+    refusal for an unset or empty variable reads `<VAR> is not set. <hint>`,
+    the consumer's `hint` verbatim (how to create the test database), then
+    the usual explanation. Every other refusal is `require_local_url`'s.
+  - **`require_local_redis_url_with_example(var, policy, example_url)`**
+    (feature `redis`): `require_local_redis_url` whose refusals that suggest
+    a URL (the database-0 refusal under `RefuseZero`, and the unset one,
+    ``<VAR> is not set. Set it to a local Redis URL such as `<example_url>`.``)
+    name the consumer's `example_url` (`redis://localhost:56379/1`) instead
+    of the fixed `redis://localhost:6379/1`.
 - `stridelabs-mcp`: two opt-ins for `McpVerifier`, so an MCP endpoint can
   check JWTs as the app's REST API (and its Python MCP server) does
   (slaudio plan 027). A consumer that uses neither sees no change:
@@ -55,6 +68,18 @@ for a consumer's pin.
     only `scp` names. Under either, a malformed `scope` or `scp` stays
     `Invalid` (even the one `ScopeThenScp` does not read), and `null`
     counts as absent.
+
+- `stridelabs-gcp`: **`GcsClient::exists(bucket, object) -> Result<bool,
+  StorageError>`** (parcel plan 002), the existence probe a service wants
+  before it stores bytes it may already hold. One metadata `GET
+  {base}/storage/v1/b/{bucket}/o/{object}?fields=name`: `true` on a 2xx
+  (whose body is never read), `false` on a 404 (one request, never retried,
+  as `download` and `delete` treat it), any other status
+  `StorageError::Status { operation: "exists", .. }`. Everything else is the
+  other operations': bucket validation, the client's `ObjectNamePolicy`
+  (refused names fail before a token or a request), its timeout and retry
+  policy, a bounded error body and value-free errors. Additive: no feature,
+  no dependency, no change to an existing call.
 
 ### Changed
 
