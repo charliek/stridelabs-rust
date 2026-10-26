@@ -231,6 +231,34 @@ async fn exists_ignores_a_2xx_body() {
     }
 }
 
+/// A `200` that declares a megabyte of body and never sends it: `exists`
+/// answers `true` on the status line, long before the client's timeout, so
+/// it never waits on a 2xx body (a read of it would stall until the timeout
+/// and fail with `Timeout`).
+#[tokio::test]
+async fn exists_never_reads_a_2xx_body() {
+    let server = RawServer::start(|_, _| {
+        RawReply::Stall(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 1048576\r\n\r\n"
+                .to_vec(),
+        )
+    })
+    .await;
+    let gcs = GcsClient::emulator(never_retrying(), &server.base_url, None)
+        .with_timeout(Duration::from_secs(2));
+
+    let started = Instant::now();
+    let result = tokio::time::timeout(Duration::from_secs(1), gcs.exists(BUCKET, OBJECT)).await;
+    let elapsed = started.elapsed();
+
+    assert!(
+        matches!(result, Ok(Ok(true))),
+        "answered {result:?} after {elapsed:?}"
+    );
+    assert!(elapsed < Duration::from_secs(1), "took {elapsed:?}");
+    assert_eq!(server.requests().len(), 1);
+}
+
 /// A 404 is the answer `false`, in exactly one request, under a retry
 /// policy as without one; the `200` queued behind it is never reached.
 #[tokio::test]
