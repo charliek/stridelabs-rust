@@ -78,7 +78,8 @@ pub enum AuthError {
     /// No `sub` claim, or an empty one.
     #[error("token is missing a subject claim")]
     MissingSubject,
-    /// The issuer's JWKS could not be fetched or parsed, or the cache holds
+    /// The issuer's JWKS could not be fetched or parsed, or held no keys at
+    /// all (an empty set is a failed fetch, never cached), or the cache holds
     /// no set inside its TTL and could not get one for this lookup (each
     /// case is listed on [`crate::JwksCache::jwks_for_kid`]). A set past its
     /// TTL is never served. This is the one failure here that is the

@@ -2022,6 +2022,105 @@ async fn an_unreachable_endpoint_is_a_jwks_error() {
     );
 }
 
+// --- an empty key set (rule 6) ---------------------------------------------
+
+/// A JWKS that parses and holds no keys.
+fn empty_body() -> ResponseTemplate {
+    jwks_body(r#"{"keys": []}"#)
+}
+
+/// A cold cache whose first fetch is an empty set: a failed fetch, so every
+/// lookup that waited on it (here a herd joining one attempt) gets `Jwks`,
+/// not the `UnknownKid` that would sign its caller out; and inside the
+/// backoff that failure opened, a lookup is suppressed as after any outage,
+/// never `UnseenKid` (nothing was fetched, so nothing was seen).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_empty_set_on_a_cold_cache_is_a_failed_fetch() {
+    // Slow, so every other task piles up behind the first one's fetch.
+    let server = issuer(empty_body().set_delay(millis(100)), 1).await;
+    let cache = Arc::new(cache(&server, BOUNDED));
+
+    for (result, _) in herd(&cache, 8).await {
+        assert_jwks(result, NO_KEYS, "the herd on the empty fetch");
+    }
+    cache.assert_one_failed_attempt("the empty fetch");
+    assert!(cache.fetched_at().is_none(), "nothing was cached");
+    assert!(cache.inner.state().seen.0.is_empty(), "nothing was seen");
+
+    for kid in [PRIMARY_KID, "never-seen"] {
+        assert_jwks(
+            cache.jwks_for_kid(kid).await,
+            SUPPRESSED,
+            "inside the backoff",
+        );
+    }
+    assert_eq!(requests(&server).await, 1, "answered from memory");
+}
+
+/// A warm cache whose refetches return an empty set, by both paths that
+/// refetch a set inside its TTL: an unknown kid's refetch, and a
+/// refresh-ahead. Neither replaces the set: it keeps serving the kid it
+/// holds, its age unmoved, and each empty fetch counts as a failure.
+#[tokio::test]
+async fn an_empty_refetch_never_replaces_a_warm_set() {
+    let server = issuer(empty_body(), 2).await;
+    // TTL 120 s, floor 30 s, refresh-ahead from 60 s.
+    let cache = cache(&server, BLIP);
+    cache.seed();
+    let fetched_at = cache.fetched_at();
+
+    // 45 s: outside the floor, before the refresh window. An unknown kid
+    // refetches; the waiting lookup gets the outage, not `UnknownKid`.
+    cache.advance_for_test(secs(45));
+    assert_jwks(
+        cache.jwks_for_kid(SECONDARY_KID).await,
+        NO_KEYS,
+        "the unknown kid's empty refetch",
+    );
+    assert_eq!(cache.failures(), 1, "the empty refetch failed");
+    cache
+        .jwks_for_kid(PRIMARY_KID)
+        .await
+        .expect("the warm set still serves its kid");
+
+    // 75 s: in the refresh window. The lookup is served and refreshes; the
+    // refresh is empty too, and fails.
+    cache.advance_for_test(secs(30));
+    cache
+        .jwks_for_kid(PRIMARY_KID)
+        .await
+        .expect("served while it refreshes");
+    cache.settle().await;
+    assert_eq!(cache.failures(), 2, "the empty refresh failed");
+    cache
+        .jwks_for_kid(PRIMARY_KID)
+        .await
+        .expect("the warm set still serves its kid after the empty refresh");
+    assert_eq!(cache.fetched_at(), fetched_at, "the set was not replaced");
+    assert_eq!(requests(&server).await, 2);
+}
+
+/// An empty set, then the issuer's real one: recovery on the ordinary
+/// backoff, 1 s after the empty fetch completed.
+#[tokio::test]
+async fn a_non_empty_set_after_an_empty_one_recovers() {
+    let server = issuer_then(empty_body(), primary_body()).await;
+    let cache = cache(&server, BOUNDED);
+
+    assert_jwks(
+        cache.jwks_for_kid(PRIMARY_KID).await,
+        NO_KEYS,
+        "the empty fetch",
+    );
+    cache.advance_for_test(secs(1));
+    cache
+        .jwks_for_kid(PRIMARY_KID)
+        .await
+        .expect("recovered with the issuer's set");
+    assert_eq!(cache.failures(), 0, "the success reset the backoff");
+    assert_eq!(requests(&server).await, 2);
+}
+
 // --- the body cap -------------------------------------------------------------
 
 const OVER_THE_CAP: &str = "response body is over 1048576 bytes";
