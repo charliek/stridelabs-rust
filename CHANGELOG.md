@@ -116,6 +116,64 @@ for a consumer's pin.
     only `scp` names. Under either, a malformed `scope` or `scp` stays
     `Invalid` (even the one `ScopeThenScp` does not read), and `null`
     counts as absent.
+- `stridelabs-auth`: **`ClaimChecks::with_integer_time_claims(bool)`** (off by
+  default) and **`ClaimChecks::requires_integer_time_claims()`**: on, each
+  `exp`, `nbf` and `iat` a token carries must be a non-negative JSON integer,
+  so a fraction, a whole float (`3600.0`), an exponent form (`1.8e9`), a
+  negative number, a boolean, a string and `null` are refused as the
+  existing `AuthError::InvalidToken`, reason "a time claim is not a whole
+  number of seconds" (jsonwebtoken rounds a float `exp`/`nbf` and never
+  reads `iat`). Absent `nbf`/`iat` pass; `exp` stays required; a claim
+  jsonwebtoken already refuses keeps its reason, and a payload naming one
+  of the three twice is "claims are malformed". Each claim's type is read
+  from the payload's JSON text, never through a `serde_json::Value` (which
+  reads `null` in an `Option` as absent and, with serde_json's `raw_value`
+  on, the object `{"$serde_json::private::RawValue":"0"}` as `0`). It applies wherever a consumer's
+  `ClaimChecks` do (`Verifier::for_issuer`, `Verifier::with_cache`,
+  `claims_with_jwks_checked`); `Verifier::new`, `claims_with_jwks` and
+  `verify_with_jwks` keep it off. `Debug` prints the field. The rule is
+  also public as **`time_claims_are_whole_seconds(payload_json: &[u8])`**,
+  over the payload's JSON text, for a verifier that reads the payload
+  itself. The rule tapper and slaudio
+  hold app-side (lumen plan 003 W3.5).
+- `stridelabs-auth`: **`ClaimChecks::with_string_issuer(bool)`** (off by
+  default) and **`ClaimChecks::requires_string_issuer()`**: on, a token whose
+  `iss` is not a JSON string is refused as the existing
+  `AuthError::InvalidToken`, reason "the issuer claim is not a string".
+  RFC 7519 §4.1.1 makes `iss` a single StringOrURI, but jsonwebtoken also
+  takes an array that holds the issuer (`["<issuer>"]`, alone or beside
+  other strings); that array is what the option refuses. `iss` stays
+  required and exact-matched; an `iss` jsonwebtoken already refuses keeps
+  its reason (a number, boolean, `null` or object is "a required claim is
+  missing", an array without the issuer "issuer is not accepted"), and a
+  payload naming `iss` twice is "claims are malformed". Builds on
+  `with_integer_time_claims` rather than beside it: S1b's type-preserving
+  reader also reads `iss` when this option is on (a string, escaped or not,
+  versus anything else, the raw-value object included), and one read of the
+  payload serves both options. Each option reads only its own claims: a
+  claim of an option that is off is skipped unread, whatever it holds
+  (`1e400`, a number serde_json cannot read, included) and however often it
+  is named. So `time_claims_are_whole_seconds` reads every payload as it
+  did (an `iss` of any value, repeated or not, is ignored), and this option
+  alone never reads or refuses over a time claim. With both on, the time
+  claims are checked first, so a token both refuse carries "a time claim is
+  not a whole number of seconds" and turning this option on never changes
+  the reason for a token the other already refuses. It applies wherever a
+  consumer's `ClaimChecks` do (`Verifier::for_issuer`, `Verifier::with_cache`,
+  `claims_with_jwks_checked`, `McpVerifier::with_cache`); `Verifier::new`,
+  `claims_with_jwks`, `verify_with_jwks` and `McpVerifier::new` keep it off.
+  `Debug` prints the field. The rule is also public as
+  **`issuer_is_a_string(payload_json: &[u8])`**, beside S1b's predicate,
+  for a verifier that reads the payload itself (an absent `iss` passes it).
+  `stridelabs-mcp` documents both type rules as opt-in on
+  `McpVerifier::new` and `McpVerifier::with_cache`, whose example now turns
+  both on:
+  `resource.claim_checks().with_integer_time_claims(true).with_string_issuer(true)`.
+  No behaviour change there; new tests pin that `new`, and `with_cache` over
+  plain `resource.claim_checks()`, still accept an array issuer and a
+  fractional `exp`. The string-issuer rule is the one slaudio's Python MCP
+  server (fastmcp on PyJWT) applies, held app-side by its Rust endpoint
+  until now (slaudio W3 A1 review).
 
 - `stridelabs-gcp`: **`GcsClient::exists(bucket, object) -> Result<bool,
   StorageError>`** (parcel plan 002), the existence probe a service wants
