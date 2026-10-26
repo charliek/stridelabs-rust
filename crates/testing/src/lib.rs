@@ -27,7 +27,7 @@
 //! | Feature | Default | Adds |
 //! |---|---|---|
 //! | `postgres` | off | `postgres::require_postgres` and `postgres::require_postgres_at`, via `sqlx` |
-//! | `redis` | off | `redis::require_redis` and its `RedisServer`, and `redis::require_local_redis_url` with its `RedisDbPolicy`, via `redis` |
+//! | `redis` | off | `redis::require_redis` and its `RedisServer`, and `redis::require_local_redis_url` (and `_with_example`) with its `RedisDbPolicy`, via `redis` |
 //!
 //! `postgres` is gated because `sqlx`'s Postgres driver drags in a real
 //! network stack; a consumer whose tests never touch a database shouldn't
@@ -64,11 +64,14 @@ pub mod redis;
 mod redact;
 
 #[cfg(feature = "redis")]
-pub use crate::redis::{require_local_redis_url, require_redis, RedisDbPolicy, RedisServer};
+pub use crate::redis::{
+    require_local_redis_url, require_local_redis_url_with_example, require_redis, RedisDbPolicy,
+    RedisServer,
+};
 #[cfg(feature = "postgres")]
 pub use postgres::{require_postgres, require_postgres_at};
 
-pub use local::require_local_url;
+pub use local::{require_local_url, require_local_url_hinted};
 pub use oneshot::{body_json, get, post_json, req};
 pub use wiremock::serve_json;
 
