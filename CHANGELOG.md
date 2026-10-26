@@ -38,6 +38,18 @@ for a consumer's pin.
     `Invalid` (even the one `ScopeThenScp` does not read), and `null`
     counts as absent.
 
+- `stridelabs-gcp`: **`GcsClient::exists(bucket, object) -> Result<bool,
+  StorageError>`** (parcel plan 002), the existence probe a service wants
+  before it stores bytes it may already hold. One metadata `GET
+  {base}/storage/v1/b/{bucket}/o/{object}?fields=name`: `true` on a 2xx
+  (whose body is never read), `false` on a 404 (one request, never retried,
+  as `download` and `delete` treat it), any other status
+  `StorageError::Status { operation: "exists", .. }`. Everything else is the
+  other operations': bucket validation, the client's `ObjectNamePolicy`
+  (refused names fail before a token or a request), its timeout and retry
+  policy, a bounded error body and value-free errors. Additive: no feature,
+  no dependency, no change to an existing call.
+
 ## [0.10.0] - 2026-10-23
 
 A joint release: tapper plan 016 C-1 (stridelabs-auth's opt-in strict screen, `Audience::IfPresent`, `Verifier::with_cache`
