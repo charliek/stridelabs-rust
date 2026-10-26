@@ -53,8 +53,10 @@
 //! leeway, `nbf` not checked. [`Verifier::for_issuer`] takes them as a
 //! [`ClaimChecks`] instead: the issuer (compared exactly), an [`Audience`]
 //! (`Required`, or `NotValidated` for an issuer whose tokens carry none), the
-//! leeway on `exp` and `nbf`, and whether `nbf` is checked (by default it
-//! is). Everything else is [`Verifier::new`]'s, from the same code: RS256
+//! leeway on `exp` and `nbf`, whether `nbf` is checked (by default it is),
+//! and whether each present `exp`, `nbf` and `iat` must be a whole number of
+//! seconds (by default not: [`ClaimChecks::with_integer_time_claims`]).
+//! Everything else is [`Verifier::new`]'s, from the same code: RS256
 //! only, a `kid` required, the key-fitness rules, and a [`JwksCache`] the
 //! verifier builds itself from the URL it is given, with an optional TTL, so
 //! a key set is never served past it. [`Verifier::claims_with_jwks_checked`]
@@ -217,7 +219,10 @@ pub use screen::ScreenPolicy;
 pub use slauth_pat::{
     is_slauth_pat, PatValidationError, PatValidator, PAT_VALIDATION_TIMEOUT, SLAUTH_PAT_PREFIX,
 };
-pub use verify::{Audience, ClaimChecks, Claims, VerifiedIdentity, Verifier, DEFAULT_LEEWAY};
+pub use verify::{
+    time_claims_are_whole_seconds, Audience, ClaimChecks, Claims, VerifiedIdentity, Verifier,
+    DEFAULT_LEEWAY,
+};
 
 #[cfg(feature = "axum")]
 pub use bearer::bearer_token;

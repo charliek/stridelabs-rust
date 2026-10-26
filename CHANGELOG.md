@@ -37,6 +37,26 @@ for a consumer's pin.
     only `scp` names. Under either, a malformed `scope` or `scp` stays
     `Invalid` (even the one `ScopeThenScp` does not read), and `null`
     counts as absent.
+- `stridelabs-auth`: **`ClaimChecks::with_integer_time_claims(bool)`** (off by
+  default) and **`ClaimChecks::requires_integer_time_claims()`**: on, each
+  `exp`, `nbf` and `iat` a token carries must be a non-negative JSON integer,
+  so a fraction, a whole float (`3600.0`), an exponent form (`1.8e9`), a
+  negative number, a boolean, a string and `null` are refused as the
+  existing `AuthError::InvalidToken`, reason "a time claim is not a whole
+  number of seconds" (jsonwebtoken rounds a float `exp`/`nbf` and never
+  reads `iat`). Absent `nbf`/`iat` pass; `exp` stays required; a claim
+  jsonwebtoken already refuses keeps its reason, and a payload naming one
+  of the three twice is "claims are malformed". Each claim's type is read
+  from the payload's JSON text, never through a `serde_json::Value` (which
+  reads `null` in an `Option` as absent and, with serde_json's `raw_value`
+  on, the object `{"$serde_json::private::RawValue":"0"}` as `0`). It applies wherever a consumer's
+  `ClaimChecks` do (`Verifier::for_issuer`, `Verifier::with_cache`,
+  `claims_with_jwks_checked`); `Verifier::new`, `claims_with_jwks` and
+  `verify_with_jwks` keep it off. `Debug` prints the field. The rule is
+  also public as **`time_claims_are_whole_seconds(payload_json: &[u8])`**,
+  over the payload's JSON text, for a verifier that reads the payload
+  itself. The rule tapper and slaudio
+  hold app-side (lumen plan 003 W3.5).
 
 ## [0.10.0] - 2026-10-23
 
