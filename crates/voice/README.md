@@ -10,16 +10,25 @@ Extracted from tapper (`tapper-rs/src/voice/`, at `82be95f`), which had
 hardened lumen's copy; both apps run this crate's scripts and key shapes,
 byte for byte, so either adopts it with no change on the wire.
 
-**What is here today** is the Redis core every voice route stands on:
+**What is here today** is the core every voice route stands on: the client
+protocol, the provider traits, the app's voice catalog and refusals, the
+checked `Voice`, and the Redis budgets:
 
 | Module | Holds |
 |---|---|
+| `protocol` | the client contract, revision 1 ([`PROTOCOL.md`](PROTOCOL.md) is canonical): the relay's events (`RelayEvent`, `ErrorCode`, the advertising `RelayEvent::ready`), both close-code tables (`close_code`, `client_close_code`), `END_FRAME`, `TTS_MIN_TEXT_CHARS` and its header, `IDEMPOTENCY_KEY_HEADER`, `ALLOWED_AUDIO_TYPES`, the `rate`/`encoding` parameters, `tts_body_limit`, the golden fixture and its SHA-256 |
+| `stt` | the speech-to-text provider traits (`SttProvider`, `SttSession`), `SttEvent`, the fixed-class errors (`SttOpenError`, `OpenLabel`, `SttError`), `AudioFormat`, `Encoding`, and revision 1's constants (`PROTOCOL_DEFAULT_RATES`, `MIN_PACING_LEAD`, the sample-rate range, `MAX_SILENT_FRAMES_PER_POLL`); the module docs are the contract an adapter keeps |
+| `tts` | the text-to-speech provider trait (`TtsProvider`, `SynthesisRequest`, `Audio`, `TtsFailure`), the app's `VoiceCatalog` (`CatalogError`), the request's strict parse (`parse_request` → `SpeakRequest`), `charge_key`, `is_json_content_type`; the module docs are the contract |
+| `usage` | the usage seam (`UsageSink`, `VoiceMetric`, `NoUsage`) |
+| `refusal` | every refusal the voice routes answer (`VoiceRefusal`, `RefusalKind`): status, `{"detail"}` body, headers; the budget's `429` body (`VoiceLimitBody`) |
+| the root | `Voice` (built from `VoiceParts`, checked by `Voice::new` → `VoiceSetupError`), `RelaySettings` (the relay's clocks and `RelaySettings::check`), `ErrorClass` |
 | `window` | the UTC day and month a budget counts in: when each ends (`day_end`, `month_end`), `seconds_until` (a `Retry-After` or a TTL, rounded up, never zero), the key stamps, `key_ttls`, the `Clock` |
 | `budget` | the text-to-speech character budget (`TtsBudget`, `TtsCaps`), the per-sentence idempotency key (`ChargeKey`, `Fingerprint`, `Admitted`, `Disposition`), and what both budgets share: the caps rule (`CapsError`, `CapProblem`) and the refusal (`LimitScope`, `Spent`, `LimitReached`) |
 | `lease` | the speech-to-text audio budget (`StreamBudget`, `StreamCaps`): the fenced lease (`issue_ticket`, `acquire` → `Grant`), metering (`meter` → `Metered`), `audio_ms` |
+| `testing` | (`test-support`) the scripted adapters the core is tested against: `ScriptedStt` (its sessions play an `SttScript`, recording into an `SttLog`), `ScriptedTts`, `RecordingUsage`, `MP3_FIXTURE` |
 
-The client protocol, the provider traits, the relay and the text-to-speech
-flow, and the adapters build on it.
+The relay and the text-to-speech flow (`Voice`'s methods, behind `axum`)
+and the provider adapters build on it.
 
 ## Adding the dependency
 
@@ -33,11 +42,13 @@ co-development snippet.
 
 ## Feature topology
 
-`default = []`: the Redis core above, with no feature at all.
+`default = []`: the core above, with no feature at all (no HTTP server, no
+provider, no client of any kind).
 
 | Feature | For | Adds |
 |---|---|---|
-| `test-support` | tests | the test seams, none of them API without it: `TtsBudget::with_clock` / `StreamBudget::with_clock` (a fixed or moving clock, for the UTC boundaries), `TtsCaps::unchecked` / `StreamCaps::unchecked` (caps the rule refuses), `StreamBudget::acquire_under` (the real acquire under another replay policy) |
+| `axum` | apps | `VoiceRefusal::into_response_with` (a refusal rendered through the app's envelope) |
+| `test-support` | tests | the `testing` module (the scripted adapters), and the test seams, none of them API without it: `TtsBudget::with_clock` / `StreamBudget::with_clock` (a fixed or moving clock, for the UTC boundaries), `TtsCaps::unchecked` / `StreamCaps::unchecked` (caps the rule refuses), `StreamBudget::acquire_under` (the real acquire under another replay policy), `Voice::with_relay_settings_unchecked` (clocks shorter than `RelaySettings::check` allows; only a zero is refused) |
 | `live-tests` | this crate only | its real-Redis suites (`tests/budget.rs`, `tests/lease.rs`); never for consumers |
 
 ## Using it
@@ -92,6 +103,83 @@ stream.meter(redis, user, token, 3_000, MeterMode::Release).await?;
 # Ok(())
 # }
 ```
+
+## The client protocol
+
+[`PROTOCOL.md`](PROTOCOL.md) is the wire contract between an app's voice
+client (the Dart package `stridelabs_voice`) and its server (this crate,
+mounted by the app): the relay's upgrade, frames, events and close codes;
+the text-to-speech request, answer and refusals; the advertised facts
+(`ready`'s `rates`, `encoding` and `lead_ms`; `X-Voice-Tts-Max-Chars`); the
+app voice catalog rule; and the compatibility rule (additive and
+presence-based; anything else is a new route). It is revision 1, and it
+holds every server to what the installed clients can do: both 24 and
+16 kHz, a pacing lead of at least 5 s, `ready` within 10 s, an idle timeout
+of at least 10 s, a reopen admitted after at most 2 s, at most 2 s for the
+provider after `end`.
+
+`fixtures/relay_events.json` is the golden fixture: one of every event, in
+the crate's canonical rendering (`RelayEvent::golden_fixture`), SHA-256
+`0437bc8114b0397e3b9734e03c9cb3d72f18ba928f22a160e19fb68f6226ed15`
+(`protocol::GOLDEN_FIXTURE_SHA256`). `tests/golden.rs` compares the file byte
+for byte with that rendering and its hash with the one `PROTOCOL.md`
+records; the client package keeps a byte copy whose test checks the same
+hash. Neither repository reads the other's files: the hash is the drift
+check, and a protocol revision changes `PROTOCOL.md`, the fixture and the
+hash together.
+
+## Providers
+
+A provider is an adapter: a type implementing `stt::SttProvider` (with its
+`SttSession`) or `tts::TtsProvider`, behind a feature of its own. The core
+names no provider and builds no client: the adapter is handed the app's
+client (or connector) and keys. The contract each trait carries (what each
+event means, how a session ends, open, cancel safety, write completion,
+keepalive, no starvation, close; the media type, the text bound, the voices,
+the failure classes, billing) is in the `stt` and `tts` module docs.
+
+An app assembles its `Voice` once, at startup, from its parts:
+
+```rust,no_run
+use std::sync::Arc;
+
+use stridelabs_voice::budget::{TtsBudget, TtsCaps};
+use stridelabs_voice::lease::{StreamBudget, StreamCaps};
+use stridelabs_voice::stt::SttProvider;
+use stridelabs_voice::tts::{TtsProvider, VoiceCatalog};
+use stridelabs_voice::usage::NoUsage;
+use stridelabs_voice::{RelaySettings, Voice, VoiceParts};
+
+fn voice<S: SttProvider, T: TtsProvider>(stt: S, tts: T) -> Arc<Voice<S, T>> {
+    let parts = VoiceParts {
+        stt,
+        tts,
+        // What clients show, store and send, each mapped to a provider voice
+        // (here identity-mapped), and the default.
+        catalog: VoiceCatalog::identity(["Jason", "Hazel"], "Jason").expect("a valid catalog"),
+        tts_budget: TtsBudget::new(
+            "myapp:voice:tts",
+            TtsCaps::new(20_000, 300_000, 300_000).expect("valid caps"),
+        ),
+        stream_budget: StreamBudget::new(
+            "myapp:voice:stream",
+            StreamCaps::from_minutes(120, 1_800, 1_800).expect("valid caps"),
+        ),
+        relay: RelaySettings::default(),
+        usage: Arc::new(NoUsage),
+    };
+    // The checks are code facts (the adapters' constants and the catalog),
+    // not deployment configuration: the app tests that its parts pass, and
+    // expects at startup.
+    Arc::new(Voice::new(parts).expect("revision 1 of the protocol takes these parts"))
+}
+```
+
+`Voice::new` checks the relay's clocks (`RelaySettings::check`), then the
+speech-to-text adapter's facts, then the text-to-speech adapter's against
+the catalog, against revision 1 of the protocol (the two methods' docs list
+every check, in order). An unconfigured adapter is not a startup failure: it
+is the route's `503`.
 
 ## Redis
 
@@ -246,11 +334,16 @@ the two prefixes; besides those, whatever its connection sends on its own
 ## Tests
 
 `cargo test -p stridelabs-voice` runs the unit tests (the windows, the
-verdicts, the caps rule, the key shapes and the scripts' SHA-1s), which need
-nothing. `cargo test -p stridelabs-voice --features live-tests` (and the
-workspace's `--all-features` lane) adds the real-Redis suites against the
-compose Redis (`docker compose up -d redis`, `redis://localhost:6390/0`;
-`REDIS_URL` overrides): every charge, ticket, acquire and meter answer, the
+verdicts, the caps rule, the key shapes and the scripts' SHA-1s; the events'
+wire forms; the refusal bodies, byte for byte; the request's parse, the
+catalog, `RelaySettings::check`) and `tests/golden.rs` (the fixture's bytes
+and hash), which need nothing. `--features test-support` adds the scripted
+adapters' own tests and `tests/voice_new.rs` (`Voice::new`'s refusals),
+which need nothing either.
+`cargo test -p stridelabs-voice --features live-tests` (and the workspace's
+`--all-features` lane) adds the real-Redis suites against the compose Redis
+(`docker compose up -d redis`, `redis://localhost:6390/0`; `REDIS_URL`
+overrides): every charge, ticket, acquire and meter answer, the
 TTLs, the UTC boundaries, each call's replay policy through a fault relay,
 and the ACL cases, each test under a prefix of its own
 (`stridelabs-voice-test:<uuid>:tts` / `:stream`) and each ACL user

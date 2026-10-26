@@ -2,7 +2,51 @@
 
 pub mod budget;
 pub mod lease;
+pub mod protocol;
+pub mod refusal;
+pub mod stt;
+#[cfg(feature = "test-support")]
+pub mod testing;
+pub mod tts;
+pub mod usage;
+mod voice;
 pub mod window;
+
+pub use voice::{RelaySettings, Voice, VoiceParts, VoiceSetupError};
+
+/// A provider failure as a fixed class: safe to log. Never a URL, a key, a
+/// body, a transcript or a provider's own text; never a wrapped transport
+/// error's `Display`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ErrorClass(std::borrow::Cow<'static, str>);
+
+impl ErrorClass {
+    /// A class that is one fixed phrase (`"closed"`, `"an error event"`).
+    #[must_use]
+    pub const fn fixed(class: &'static str) -> ErrorClass {
+        ErrorClass(std::borrow::Cow::Borrowed(class))
+    }
+
+    /// A class composed only of fixed words and numbers (`"http 403"`,
+    /// `"io TimedOut"`). The adapter vouches for what it composes, and its
+    /// redaction test holds it to that.
+    #[must_use]
+    pub fn composed(class: String) -> ErrorClass {
+        ErrorClass(std::borrow::Cow::Owned(class))
+    }
+
+    /// The class.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for ErrorClass {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
 
 /// What holds the crate to its extraction base (tapper `82be95f`): every
 /// script byte for byte, and every key shape under tapper's own prefixes.
@@ -180,5 +224,21 @@ mod extraction_base {
                 "lumen:voice:stream:fence:11111111-2222-3333-4444-555555555555",
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ErrorClass;
+
+    /// A class is its text, however it was made: what the log line shows.
+    #[test]
+    fn an_error_class_is_its_text() {
+        const CLOSED: ErrorClass = ErrorClass::fixed("closed");
+        assert_eq!(CLOSED.as_str(), "closed");
+        assert_eq!(CLOSED.to_string(), "closed");
+        let composed = ErrorClass::composed(format!("http {}", 403));
+        assert_eq!(composed.to_string(), "http 403");
+        assert_eq!(composed, ErrorClass::fixed("http 403"));
     }
 }

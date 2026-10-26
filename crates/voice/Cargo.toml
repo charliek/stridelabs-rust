@@ -6,16 +6,23 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "A provider-neutral voice core for StrideLabs services: the UTC windows, a text-to-speech character budget and a speech-to-text audio budget with a fenced lease, on Redis scripts shared byte for byte by every app"
+description = "A provider-neutral voice core for StrideLabs services: the client protocol, the speech-to-text and text-to-speech provider traits, the UTC windows, a text-to-speech character budget and a speech-to-text audio budget with a fenced lease, on Redis scripts shared byte for byte by every app"
 publish = false
 
 [features]
 default = []
-# The test seams, none of them API without it: `TtsBudget::with_clock` and
-# `StreamBudget::with_clock` (a test's clock, for the UTC boundaries),
-# `TtsCaps::unchecked` and `StreamCaps::unchecked` (caps the startup rule
-# refuses, for a test that needs them), and `StreamBudget::acquire_under` (the
-# real acquire under another replay policy, for the replay-hazard test).
+# The parts that need axum: `VoiceRefusal::into_response_with` (a refusal
+# rendered through the app's own envelope).
+axum = ["dep:axum"]
+# The test seams, none of them API without it: the `testing` module (the
+# scripted adapters `ScriptedStt` and `ScriptedTts`, `RecordingUsage`,
+# `MP3_FIXTURE`), `TtsBudget::with_clock` and `StreamBudget::with_clock` (a
+# test's clock, for the UTC boundaries), `TtsCaps::unchecked` and
+# `StreamCaps::unchecked` (caps the startup rule refuses, for a test that
+# needs them), `StreamBudget::acquire_under` (the real acquire under another
+# replay policy, for the replay-hazard test), and
+# `Voice::with_relay_settings_unchecked` (clocks shorter than revision 1
+# allows, for the relay's suites).
 test-support = []
 # NOT for consumers: it compiles this crate's own real-Redis suites
 # (`tests/budget.rs`, `tests/lease.rs`), which need the compose Redis
@@ -37,22 +44,42 @@ required-features = ["live-tests"]
 name = "lease"
 required-features = ["live-tests"]
 
+# `Voice::new`'s refusals, against the scripted adapters: no service.
+[[test]]
+name = "voice_new"
+required-features = ["test-support"]
+
 [dependencies]
 # Every budget call is one `EVAL` on the consumer's handle, under the replay
 # policy the call needs (the crate docs, "The replay policy"). The handle,
 # its URL and its timeouts are the consumer's.
 stridelabs-redis = { workspace = true }
-# The UTC day and month a budget counts in (`window`).
-chrono = { workspace = true }
+# The UTC day and month a budget counts in (`window`); `serde` for the
+# instant a limit resets at, in the relay's `limit` event and the `429` body
+# (RFC 3339, `Z`).
+chrono = { workspace = true, features = ["serde"] }
 # User ids and session tokens in the keys; `ChargeKey::mint` (`v4`).
 uuid = { workspace = true }
-# `LimitScope`'s wire names (`user_day`, `user_month`, `global_month`).
+# The wire names: `LimitScope`'s, the relay's events, the encoding.
 serde = { workspace = true }
+# The relay's events as text frames, the refusal bodies, the text-to-speech
+# request's strict parse.
+serde_json = { workspace = true }
+# The refusals' status and headers, and the `Idempotency-Key` header read.
+http = { workspace = true }
+# An audio frame and a spoken sentence, without a copy.
+bytes = { workspace = true }
+# `SttSession` is a `Stream` of what the provider heard: the trait alone.
+futures-core = { version = "0.3", default-features = false }
+# `VoiceRefusal::into_response_with` (feature `axum`). No default features:
+# the crate needs the response and body types, not a server.
+axum = { version = "0.8", default-features = false, optional = true }
 # `Fingerprint`: SHA-256 over a sentence, cut to 16 hex characters.
 sha2 = { workspace = true }
 thiserror = { workspace = true }
 # `Grant::origin`, a `tokio::time::Instant`: the monotonic twin of the
-# instant a grant's windows were read at.
+# instant a grant's windows were read at. `SttProvider::open`'s deadline is
+# one too; the scripted adapters' timers are tokio's.
 tokio = { workspace = true }
 
 [dev-dependencies]
@@ -67,8 +94,8 @@ stridelabs-testing = { workspace = true }
 redis = { workspace = true }
 # `join_all`: concurrent charges, and the fault relay's control replies.
 futures = { workspace = true }
-# `the_scopes_serialize_in_snake_case`.
-serde_json = { workspace = true }
+# The scripted adapters' timing tests run on tokio's paused clock.
+tokio = { workspace = true, features = ["test-util"] }
 # `the_scripts_are_the_extraction_bases`: the SHA-1 of the exact bytes each
 # script sends. Already in the lock (0.11.0), so nothing is added to it.
 sha1 = "0.11"

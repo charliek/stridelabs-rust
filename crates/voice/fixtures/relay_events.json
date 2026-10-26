@@ -1,0 +1,13 @@
+[
+  {"type":"ready","rates":[24000,16000],"encoding":"pcm_s16le","lead_ms":5000},
+  {"type":"speech_start"},
+  {"type":"partial","text":"what's the weather"},
+  {"type":"speech_end"},
+  {"type":"end_of_turn","text":"What's the weather in Chicago?"},
+  {"type":"error","code":"provider"},
+  {"type":"error","code":"limit","scope":"user_day","resets_at":"2026-10-25T00:00:00Z"},
+  {"type":"error","code":"limit","scope":"user_month","resets_at":"2026-11-01T00:00:00Z"},
+  {"type":"error","code":"limit","scope":"global_month","resets_at":"2026-11-01T00:00:00Z"},
+  {"type":"error","code":"internal"},
+  {"type":"ready"}
+]
