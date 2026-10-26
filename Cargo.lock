@@ -2932,6 +2932,7 @@ dependencies = [
 name = "stridelabs-postgres"
 version = "0.11.0"
 dependencies = [
+ "futures-util",
  "percent-encoding",
  "sqlx",
  "stridelabs-observability",

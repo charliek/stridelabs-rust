@@ -13,6 +13,54 @@ for a consumer's pin.
 
 ### Added
 
+- `stridelabs-postgres`: **the begin guard**, behind a new feature `guard`
+  (lumen plan 003 S1a: lumen-rs's `begin_on` and release check, upstreamed
+  as a per-pool guard; tapper adopts it later). A consumer that does not
+  turn `guard` on sees no change: `lazy_pool` and `PoolSettings` are
+  untouched.
+  - **`GuardedPool::lazy(options, PoolSettings, BeginGuard)`**: a lazy pool
+    whose `after_release` hook probes released connections with a bounded
+    `ROLLBACK` while the pool's own quarantine window is open (until its
+    deadline has passed AND `max_connections` releases have been probed).
+    Derefs to `PgPool`. **`GuardedPool::acquire(bound)`** →
+    **`GuardedConnection`** (derefs to `PgConnection`; `detach()`),
+    **`GuardedPool::begin(bound, TxBounds)`** and
+    **`GuardedConnection::begin(TxBounds)`**: a plain `BEGIN`, then the
+    bounds statement, in a spawned task (no caller cancellation abandons
+    either), each within `begin_timeout`; a timeout, error or panic opens the
+    window before the connection is dropped. **`GuardedPool::sibling(settings,
+    Option<&str>)`**: a second pool on the same options with its own window
+    and the parent's guard, only `application_name` changeable (printable
+    ASCII, 1–63 bytes, else `UrlRefusal::NulByte` / `InvalidValue`).
+  - **`BeginGuard`** (`new(begin_timeout)`, `with_probe_timeout`,
+    `with_window`; `const fn`s refusing a zero timeout, one over
+    `MAX_TIMEOUT` (10 min) or a window over `MAX_WINDOW` (1 h)) and
+    **`TxBounds`** (`from_millis(lock_ms, statement_ms)`, `const fn`,
+    refusing `lock_ms` 0, `lock_ms >= statement_ms` or over `MAX_MILLIS`;
+    `NONE`; `sql()` renders `SET LOCAL lock_timeout = '…ms'; SET LOCAL
+    statement_timeout = '…ms'`, one simple query).
+  - Two WARN lines under target `stridelabs_postgres::guard`, fixed text,
+    value-free: `a BEGIN was abandoned; probing released connections`
+    (`cause` = `timeout` | `error` | `panic` | `set_local_timeout`) and `a
+    released connection failed its probe; closed` (`error` =
+    `error_summary`). Errors stay `sqlx::Error`.
+  - Feature **`test-support`** (`guard` plus two `#[doc(hidden)]` seams for
+    a consumer's tests: `GuardedPool::set_window_opened_at`,
+    `TxBounds::REFUSED_BY_THE_SERVER`). `live-tests` now also compiles the
+    guard's real-Postgres suite, against a small fault relay. `tokio` (`rt`,
+    `time`) and `futures-util` become optional direct dependencies, under
+    `guard`.
+  - The README states what the guard guarantees (connection ownership, not
+    exclusive transaction entry: `Deref` leaves sqlx's other entry points
+    reachable, a caller precondition a consumer's source scan should
+    enforce), its residuals (the error/panic race, release order, the silent
+    peer, single-occupancy `after_release`), that `sibling` inherits the
+    guard, that the raw-error WARN sqlx logs beside a failed probe is hidden
+    only where `LOG_CAPS` is installed, and the dependency on sqlx's
+    `#[doc(hidden)]` `Transaction::begin`.
+  - `IGNORED_URL_PARAMETERS`' docs no longer say leaving the keepalives to
+    the OS changes nothing: sqlx 0.9 sets no TCP keepalive and has no socket
+    hook, so a silent peer is unbounded.
 - `stridelabs-observability`: **`RequestLogLevel(pub tracing::Level)`**, a
   response extension that lowers the level of `RequestLogLayer`'s entry for
   that request (re-exported beside `RequestLogLayer`). A handler, an
