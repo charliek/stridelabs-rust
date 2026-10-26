@@ -120,10 +120,11 @@ async fn a_default_gcs_client_sends_each_operations_request() {
         .unwrap()
         .is_some());
     assert!(gcs.delete("img-bucket", "a/b c.png").await.unwrap());
+    assert!(gcs.exists("img-bucket", "a/b c.png").await.unwrap());
     gcs.bucket_reachable("img-bucket").await.unwrap();
 
     let sent = received(&raw);
-    let [media_upload, multipart, download, delete, list] = &sent[..] else {
+    let [media_upload, multipart, download, delete, exists, list] = &sent[..] else {
         panic!("{} requests", sent.len());
     };
 
@@ -166,8 +167,12 @@ async fn a_default_gcs_client_sends_each_operations_request() {
         "DELETE /storage/v1/b/img-bucket/o/a%2Fb%20c.png HTTP/1.1",
         None,
     );
+    exists.assert_call(
+        "GET /storage/v1/b/img-bucket/o/a%2Fb%20c.png?fields=name HTTP/1.1",
+        None,
+    );
     list.assert_call("GET /storage/v1/b/img-bucket/o?maxResults=1 HTTP/1.1", None);
-    for request in [download, delete, list] {
+    for request in [download, delete, exists, list] {
         assert!(request.body.is_empty(), "{}", request.line);
     }
 }
