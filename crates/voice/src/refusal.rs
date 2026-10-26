@@ -256,10 +256,12 @@ impl VoiceRefusal {
     }
 }
 
-// The refusals the stream's admission answers (`Voice::open_stream`: the
-// configuration, the upgrade, the rate and the encoding, the admission),
-// which `Voice::speak` shares the first three of. Both flows are behind
-// `axum`; without it only the tests build these.
+// The refusals the two flows answer beyond the request's parse: the stream's
+// admission (`Voice::open_stream`: the configuration, the upgrade, the rate
+// and the encoding, the admission) and the text-to-speech flow
+// (`Voice::speak`: the configuration, the body's type and bound, the key,
+// the budget, the provider). Both flows are behind `axum`; without it only
+// the tests build these.
 #[cfg_attr(
     not(any(test, feature = "axum")),
     expect(
@@ -356,19 +358,7 @@ impl VoiceRefusal {
             &format!("encoding must be {}", VoiceRefusal::one_of(&encodings)),
         )
     }
-}
 
-// The refusals only `Voice::speak` answers (the body's bound and type, the
-// key, the provider). Until it lands only the tests build them, and the
-// expectation fails the build once every one is used.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the text-to-speech flow answers these; until it lands, only the tests build them"
-    )
-)]
-impl VoiceRefusal {
     /// `request body over 4 KiB` at the default bound, else `over <n>
     /// bytes`.
     pub(crate) fn body_too_large(limit: usize) -> VoiceRefusal {
@@ -426,8 +416,14 @@ impl VoiceRefusal {
 // line below is the API's.
 /// A voice budget is spent: which allowance, and when it comes back.
 #[derive(Debug, Serialize)]
+#[cfg_attr(
+    feature = "openapi",
+    derive(utoipa::ToSchema),
+    schema(as = VoiceLimitReached)
+)]
 pub struct VoiceLimitBody {
     /// Always `voice beta limit reached`.
+    #[cfg_attr(feature = "openapi", schema(example = "voice beta limit reached"))]
     pub detail: &'static str,
     /// The spent allowance: the user's UTC day, the user's UTC calendar
     /// month, or everyone's UTC calendar month (voice is off for every user
@@ -437,6 +433,10 @@ pub struct VoiceLimitBody {
     /// `Retry-After` counts down to.
     // chrono's serde form — `Z`, whole seconds (every window ends on one) —
     // the same one the relay's `limit` event carries.
+    #[cfg_attr(
+        feature = "openapi",
+        schema(value_type = String, format = DateTime, example = "2026-11-01T00:00:00Z")
+    )]
     pub resets_at: DateTime<Utc>,
 }
 
@@ -735,6 +735,54 @@ mod tests {
                 refusal.kind() == RefusalKind::LimitReached
             );
         }
+    }
+
+    /// With `openapi`, the two schemas are tapper's committed ones, byte for
+    /// byte as JSON (`tapper-rs/openapi.json` at `82be95f`): the names
+    /// (`LimitScope`, `VoiceLimitReached`), the descriptions copied from
+    /// the `///` lines, the examples, `resets_at` as a date-time string, and
+    /// the scope as a reference.
+    #[cfg(feature = "openapi")]
+    #[test]
+    fn the_openapi_schemas_are_tappers() {
+        use utoipa::{PartialSchema as _, ToSchema as _};
+        assert_eq!(LimitScope::name(), "LimitScope");
+        assert_eq!(VoiceLimitBody::name(), "VoiceLimitReached");
+        let scope = serde_json::to_value(LimitScope::schema()).expect("JSON");
+        assert_eq!(
+            scope,
+            serde_json::json!({
+                "description": "Which voice allowance is spent: the user's UTC day, the user's UTC\ncalendar month, or everyone's UTC calendar month.",
+                "enum": ["user_day", "user_month", "global_month"],
+                "type": "string"
+            })
+        );
+        let body = serde_json::to_value(VoiceLimitBody::schema()).expect("JSON");
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "description": "A voice budget is spent: which allowance, and when it comes back.",
+                "properties": {
+                    "detail": {
+                        "description": "Always `voice beta limit reached`.",
+                        "example": "voice beta limit reached",
+                        "type": "string"
+                    },
+                    "resets_at": {
+                        "description": "When that allowance resets (RFC 3339, UTC): the same instant\n`Retry-After` counts down to.",
+                        "example": "2026-11-01T00:00:00Z",
+                        "format": "date-time",
+                        "type": "string"
+                    },
+                    "scope": {
+                        "$ref": "#/components/schemas/LimitScope",
+                        "description": "The spent allowance: the user's UTC day, the user's UTC calendar\nmonth, or everyone's UTC calendar month (voice is off for every user\nuntil it resets). Of several spent at once, the one that resets last."
+                    }
+                },
+                "required": ["detail", "scope", "resets_at"],
+                "type": "object"
+            })
+        );
     }
 
     /// The app's envelope writes the status and the body (and its own

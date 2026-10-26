@@ -1,7 +1,11 @@
 #![doc = include_str!("../README.md")]
 
 pub mod budget;
+#[cfg(feature = "inworld")]
+pub mod inworld;
 pub mod lease;
+#[cfg(feature = "muse")]
+pub mod muse;
 pub mod protocol;
 pub mod refusal;
 #[cfg(feature = "axum")]
@@ -16,16 +20,17 @@ pub mod usage;
 mod voice;
 pub mod window;
 
-#[cfg(feature = "axum")]
-pub use voice::StreamContext;
 pub use voice::{RelaySettings, Voice, VoiceParts, VoiceSetupError};
+#[cfg(feature = "axum")]
+pub use voice::{StreamContext, TtsReply};
 
 /// The tracing targets an app must cap, as `(target, level)` pairs: the
 /// relay's client socket (axum's WebSocket) is tungstenite, whose `TRACE`
 /// output dumps every frame (audio, a transcript, a close reason), and so is
 /// a provider adapter's WebSocket dial (its key in the handshake). The app
 /// folds these into its own caps, as it folds any other crate's; this crate
-/// installs no subscriber.
+/// installs no subscriber. Compiled with either part that holds such a
+/// socket: the relay (`axum`) or a WebSocket adapter.
 ///
 /// ```
 /// use stridelabs_observability::TargetCaps;
@@ -35,7 +40,7 @@ pub use voice::{RelaySettings, Voice, VoiceParts, VoiceSetupError};
 ///     .fold(TargetCaps::new(), |caps, (target, level)| caps.cap(*target, *level));
 /// # let _ = caps;
 /// ```
-#[cfg(feature = "axum")]
+#[cfg(any(feature = "axum", feature = "muse"))]
 pub const LOG_CAPS: [(&str, tracing::level_filters::LevelFilter); 2] = [
     ("tungstenite", tracing::level_filters::LevelFilter::INFO),
     (
@@ -263,7 +268,7 @@ mod tests {
 
     /// Both tungstenite targets, each held at `INFO`: below it, every frame
     /// either socket carries is dumped.
-    #[cfg(feature = "axum")]
+    #[cfg(any(feature = "axum", feature = "muse"))]
     #[test]
     fn the_log_caps_hold_both_tungstenite_targets_at_info() {
         use tracing::level_filters::LevelFilter;

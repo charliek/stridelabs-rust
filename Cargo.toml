@@ -43,6 +43,8 @@ stridelabs-testing = { path = "crates/testing" }
 # stridelabs-postgres's docs fold its `LOG_CAPS` into a `TargetCaps`: a
 # dev-dependency only, so that crate depends on no logging setup.
 stridelabs-observability = { path = "crates/observability" }
+# stridelabs-voice's `inworld` adapter is built on it.
+stridelabs-inworld = { path = "crates/inworld" }
 
 # HTTP client (proxy primitives, the SSRF-guarded fetch, JWKS fetch, PAT
 # validation, GCP calls). Deliberately NO TLS feature here: whatever is listed

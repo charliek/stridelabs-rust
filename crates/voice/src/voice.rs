@@ -17,14 +17,25 @@ use std::time::Duration;
 
 use stridelabs_redis::RedisHandle;
 
+#[cfg(feature = "axum")]
+use uuid::Uuid;
+
 use crate::budget::TtsBudget;
+#[cfg(feature = "axum")]
+use crate::budget::{BudgetError, Disposition, Fingerprint};
 use crate::lease::{StreamBudget, LEASE_TTL};
 use crate::protocol::{ALLOWED_AUDIO_TYPES, TTS_MIN_TEXT_CHARS};
+#[cfg(feature = "axum")]
+use crate::refusal::VoiceRefusal;
 use crate::stt::{
     SttProvider, MAX_SAMPLE_RATE, MIN_PACING_LEAD, MIN_SAMPLE_RATE, PROTOCOL_DEFAULT_RATES,
 };
+#[cfg(feature = "axum")]
+use crate::tts::{charge_key, read_request, Audio, SynthesisRequest, TtsFailure};
 use crate::tts::{TtsProvider, VoiceCatalog};
 use crate::usage::UsageSink;
+#[cfg(feature = "axum")]
+use crate::usage::VoiceMetric;
 
 /// The relay's clocks. [`RelaySettings::default`] is both apps' production
 /// set, and [`RelaySettings::check`] holds any other to revision 1's bounds,
@@ -317,6 +328,54 @@ pub struct StreamContext<'a> {
     pub tracker: &'a tokio_util::task::TaskTracker,
 }
 
+/// What [`Voice::speak`] answered: the audio or the refusal, and the text
+/// bound every answer advertises. The app renders it with its own envelope
+/// ([`TtsReply::into_response_with`]).
+#[cfg(feature = "axum")]
+#[derive(Debug)]
+pub struct TtsReply {
+    /// The provider's text bound: the `X-Voice-Tts-Max-Chars` value.
+    pub max_text_chars: usize,
+    /// The spoken sentence, or why not.
+    pub outcome: Result<Audio, VoiceRefusal>,
+}
+
+#[cfg(feature = "axum")]
+impl TtsReply {
+    /// The response. A `200` is the audio, one body of its exact length,
+    /// `Content-Type` its media type and `Cache-Control: no-store` (the bytes
+    /// are one user's reply; no cache between client and server keeps
+    /// them). A refusal is the app's `envelope` of its status and body, then
+    /// its headers ([`VoiceRefusal::into_response_with`]). Both carry
+    /// `X-Voice-Tts-Max-Chars`.
+    pub fn into_response_with(
+        self,
+        envelope: impl FnOnce(http::StatusCode, bytes::Bytes) -> axum::response::Response,
+    ) -> axum::response::Response {
+        use http::header::{CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE};
+        use http::HeaderValue;
+
+        let mut response = match self.outcome {
+            Ok(audio) => {
+                let length = audio.bytes.len();
+                let mut response =
+                    axum::response::Response::new(axum::body::Body::from(audio.bytes));
+                let headers = response.headers_mut();
+                headers.insert(CONTENT_TYPE, HeaderValue::from_static(audio.media_type));
+                headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+                headers.insert(CONTENT_LENGTH, HeaderValue::from(length));
+                response
+            }
+            Err(refusal) => refusal.into_response_with(envelope),
+        };
+        response.headers_mut().insert(
+            crate::protocol::TTS_MAX_CHARS_HEADER,
+            HeaderValue::from(self.max_text_chars),
+        );
+        response
+    }
+}
+
 /// The parts' own redacting `Debug`s (an adapter's never prints its key or a
 /// URL credential); the usage sink by name only.
 impl<S, T> fmt::Debug for Voice<S, T>
@@ -431,6 +490,219 @@ impl<S: SttProvider, T: TtsProvider> Voice<S, T> {
     #[cfg(feature = "axum")]
     pub(crate) fn usage(&self) -> &dyn UsageSink {
         self.usage.as_ref()
+    }
+
+    /// Speak one sentence for `user`, whom the app authenticated: the
+    /// text-to-speech route's whole flow after authentication, rendered by
+    /// the app ([`TtsReply::into_response_with`]). In order:
+    ///
+    /// 1. the configuration (`503`, no `Retry-After`): the provider is not
+    ///    configured, or there is no Redis; before anything about the
+    ///    request;
+    /// 2. the request (`tts::read_request`): `415`, `413` declared, `413`
+    ///    read, then the `422`s of the shape, the voice, an empty text and a
+    ///    text over the provider's bound;
+    /// 3. the `Idempotency-Key` (`422`);
+    /// 4. the charge, BEFORE the provider and never refunded: `429` (a
+    ///    budget spent), `422` (the key names another sentence's charge) or
+    ///    `503` + `Retry-After: 5` (Redis); a fresh charge is reported to the
+    ///    usage sink, a replayed one is not;
+    /// 5. the provider, once: the audio (`200`), `503` + `Retry-After: 5`
+    ///    (unavailable) or `502` (a permanent failure, or audio of another
+    ///    media type than the provider declared, logged at ERROR). The charge
+    ///    stands either way, and a replayed admission is spoken again (the
+    ///    key protects the budget, not provider spend).
+    ///
+    /// Every request that reaches the charge logs exactly one line (target
+    /// `stridelabs_voice::voice`, message `voice tts…`): the user, the
+    /// character count, the app voice, the status class, an outcome word, the
+    /// charge's disposition and, once the provider was called, its latency.
+    /// Never the text, the key or a body.
+    #[cfg(feature = "axum")]
+    pub async fn speak(
+        &self,
+        redis: Option<&RedisHandle>,
+        user: Uuid,
+        headers: &http::HeaderMap,
+        body: axum::body::Body,
+    ) -> TtsReply {
+        TtsReply {
+            max_text_chars: self.tts.max_text_chars(),
+            outcome: self.speak_outcome(redis, user, headers, body).await,
+        }
+    }
+
+    /// [`Voice::speak`]'s flow, its answer before the header.
+    #[cfg(feature = "axum")]
+    async fn speak_outcome(
+        &self,
+        redis: Option<&RedisHandle>,
+        user: Uuid,
+        headers: &http::HeaderMap,
+        body: axum::body::Body,
+    ) -> Result<Audio, VoiceRefusal> {
+        // 503: the configuration, before anything about the request.
+        let Some(redis) = redis.filter(|_| self.tts.configured()) else {
+            return Err(VoiceRefusal::not_configured());
+        };
+        let max_text_chars = self.tts.max_text_chars();
+
+        // 415 / 413 / 422: the request, then its Idempotency-Key.
+        let request = read_request(headers, body, &self.catalog, max_text_chars).await?;
+        let Some(key) = charge_key(headers) else {
+            return Err(VoiceRefusal::bad_idempotency_key());
+        };
+        // The parse accepted the voice from this catalog, so it maps. A
+        // catalog that did not would be this service's bug, answered as the
+        // voice's 422 rather than a panic.
+        let Some(provider_voice) = self.catalog.provider_voice(&request.app_voice) else {
+            return Err(VoiceRefusal::unknown_voice(&self.catalog));
+        };
+        let chars = request.chars;
+        let voice = request.app_voice.as_str();
+
+        // 429 / 422 / 503: the budget, charged BEFORE the provider and never
+        // refunded. The charge is named by the sentence's Idempotency-Key (or
+        // a key minted for a request without one) and pinned to the sentence
+        // by its fingerprint (the APP voice and the trimmed text): a retried
+        // EVAL whose first answer was lost, and the client's retry of a
+        // sentence whose answer never reached it, both replay this charge's
+        // verdict rather than charging again.
+        let fingerprint = Fingerprint::of(voice, &request.text);
+        let disposition = match self
+            .tts_budget
+            .charge(redis, user, chars, &key, &fingerprint)
+            .await
+        {
+            // The usage the app records is what a FRESH charge admitted, at
+            // the instant it was decided, whatever the synthesis does next
+            // (the charge stands either way). A replayed verdict never
+            // counts: the run that charged it did.
+            Ok(admitted) => {
+                if admitted.disposition == Disposition::Fresh {
+                    self.usage.record(
+                        user,
+                        VoiceMetric::TtsCharacters,
+                        u64::try_from(chars).unwrap_or(u64::MAX),
+                        admitted.at,
+                    );
+                }
+                admitted.disposition
+            }
+            Err(BudgetError::KeyReused) => {
+                tracing::info!(
+                    user_id = %user,
+                    chars,
+                    voice,
+                    status_class = "4xx",
+                    outcome = "key_reused",
+                    "voice tts: the Idempotency-Key names another sentence's charge; nothing charged"
+                );
+                return Err(VoiceRefusal::key_reused());
+            }
+            Err(BudgetError::Exceeded(limit)) => {
+                tracing::info!(
+                    user_id = %user,
+                    chars,
+                    voice,
+                    status_class = "4xx",
+                    outcome = "budget",
+                    scope = limit.scope.as_str(),
+                    user_day_spent = limit.spent.user_day,
+                    user_month_spent = limit.spent.user_month,
+                    global_month_spent = limit.spent.global_month,
+                    retry_after_seconds = limit.retry_after_seconds,
+                    "voice tts: budget spent; nothing charged"
+                );
+                return Err(VoiceRefusal::limit_reached(&limit));
+            }
+            Err(failure @ BudgetError::Backend(_)) => {
+                tracing::warn!(
+                    user_id = %user,
+                    chars,
+                    voice,
+                    status_class = "5xx",
+                    outcome = "redis",
+                    error = %failure,
+                    "voice tts: the budget could not be charged"
+                );
+                return Err(VoiceRefusal::unavailable());
+            }
+        };
+        let charge = match disposition {
+            Disposition::Fresh => "fresh",
+            Disposition::Replayed => "replayed",
+        };
+
+        // The provider. ACCEPTED: a REPLAYED admission is spoken again; the
+        // first request's audio was never kept, and a client asks again only
+        // when that answer never reached it. The key protects the budget
+        // (charged once), not provider spend.
+        let started = std::time::Instant::now();
+        let outcome = self
+            .tts
+            .synthesize(&SynthesisRequest::new(&request.text, provider_voice))
+            .await;
+        let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        match outcome {
+            Ok(audio) if audio.media_type != self.tts.media_type() => {
+                // The adapter broke its contract (`TtsProvider::media_type`):
+                // a client checks the type it plays, so this is never a 200.
+                // Both types are the adapter's constants, safe to log.
+                tracing::error!(
+                    user_id = %user,
+                    chars,
+                    voice,
+                    status_class = "5xx",
+                    outcome = "provider_media_type",
+                    charge,
+                    latency_ms,
+                    declared = self.tts.media_type(),
+                    answered = audio.media_type,
+                    "voice tts: the provider answered another media type than it declares; the \
+                     charge stands"
+                );
+                Err(VoiceRefusal::provider_error())
+            }
+            Ok(audio) => {
+                tracing::info!(
+                    user_id = %user,
+                    chars,
+                    voice,
+                    status_class = "2xx",
+                    outcome = "spoken",
+                    charge,
+                    latency_ms,
+                    audio_bytes = audio.bytes.len(),
+                    "voice tts"
+                );
+                Ok(audio)
+            }
+            Err(failure) => {
+                let (outcome, class, refusal) = match failure {
+                    TtsFailure::Unavailable(class) => (
+                        "provider_unavailable",
+                        class,
+                        VoiceRefusal::provider_unavailable(),
+                    ),
+                    TtsFailure::Permanent(class) => {
+                        ("provider_error", class, VoiceRefusal::provider_error())
+                    }
+                };
+                tracing::warn!(
+                    user_id = %user,
+                    chars,
+                    voice,
+                    status_class = "5xx",
+                    outcome,
+                    charge,
+                    latency_ms,
+                    error = %class,
+                    "voice tts: the synthesis failed; the charge stands"
+                );
+                Err(refusal)
+            }
+        }
     }
 
     /// The relay sessions live on this instance, by user.

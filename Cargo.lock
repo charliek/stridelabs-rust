@@ -2992,6 +2992,7 @@ name = "stridelabs-voice"
 version = "0.11.0"
 dependencies = [
  "axum",
+ "base64 0.22.1",
  "bytes",
  "chrono",
  "futures",
@@ -2999,16 +3000,21 @@ dependencies = [
  "futures-util",
  "http",
  "hyper",
+ "rcgen",
  "redis",
+ "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "sha1 0.11.0",
  "sha2 0.11.0",
+ "stridelabs-inworld",
  "stridelabs-observability",
  "stridelabs-redis",
  "stridelabs-testing",
  "thiserror",
  "tokio",
+ "tokio-rustls",
  "tokio-tungstenite",
  "tokio-util",
  "tower",
@@ -3016,6 +3022,8 @@ dependencies = [
  "tracing-log",
  "tracing-subscriber",
  "tungstenite",
+ "url",
+ "utoipa",
  "uuid",
 ]
 
@@ -3238,7 +3246,11 @@ checksum = "8f72a05e828585856dacd553fba484c242c46e391fb0e58917c942ee9202915c"
 dependencies = [
  "futures-util",
  "log",
+ "rustls",
+ "rustls-native-certs",
+ "rustls-pki-types",
  "tokio",
+ "tokio-rustls",
  "tungstenite",
 ]
 
@@ -3416,6 +3428,8 @@ dependencies = [
  "httparse",
  "log",
  "rand 0.9.5",
+ "rustls",
+ "rustls-pki-types",
  "sha1 0.10.7",
  "thiserror",
 ]

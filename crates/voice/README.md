@@ -10,28 +10,29 @@ Extracted from tapper (`tapper-rs/src/voice/`, at `82be95f`), which had
 hardened lumen's copy; both apps run this crate's scripts and key shapes,
 byte for byte, so either adopts it with no change on the wire.
 
-**What is here today** is the core every voice route stands on — the client
+**What is here** is the core every voice route stands on — the client
 protocol, the provider traits, the app's voice catalog and refusals, the
-checked `Voice`, and the Redis budgets — and, behind `axum`, the
-speech-to-text relay and its admission:
+checked `Voice`, and the Redis budgets — and, behind `axum`, the two flows
+(the speech-to-text relay and its admission; the text-to-speech request),
+and, each behind a feature of its own, the two provider adapters (Muse for
+speech to text, Inworld for text to speech):
 
 | Module | Holds |
 |---|---|
 | `protocol` | the client contract, revision 1 ([`PROTOCOL.md`](PROTOCOL.md) is canonical): the relay's events (`RelayEvent`, `ErrorCode`, the advertising `RelayEvent::ready`), both close-code tables (`close_code`, `client_close_code`), `END_FRAME`, `TTS_MIN_TEXT_CHARS` and its header, `IDEMPOTENCY_KEY_HEADER`, `ALLOWED_AUDIO_TYPES`, the `rate`/`encoding` parameters, `tts_body_limit`, the golden fixture and its SHA-256 |
 | `stt` | the speech-to-text provider traits (`SttProvider`, `SttSession`), `SttEvent`, the fixed-class errors (`SttOpenError`, `OpenLabel`, `SttError`), `AudioFormat`, `Encoding`, and revision 1's constants (`PROTOCOL_DEFAULT_RATES`, `MIN_PACING_LEAD`, the sample-rate range, `MAX_SILENT_FRAMES_PER_POLL`); the module docs are the contract an adapter keeps |
-| `tts` | the text-to-speech provider trait (`TtsProvider`, `SynthesisRequest`, `Audio`, `TtsFailure`), the app's `VoiceCatalog` (`CatalogError`), the request's strict parse (`parse_request` → `SpeakRequest`), `charge_key`, `is_json_content_type`; the module docs are the contract |
+| `tts` | the text-to-speech provider trait (`TtsProvider`, `SynthesisRequest`, `Audio`, `TtsFailure`), the app's `VoiceCatalog` (`CatalogError`), the request's strict parse (`parse_request` → `SpeakRequest`; behind `axum`, `read_request`: the `415`, the `413`s, then the parse), `charge_key`, `is_json_content_type`; the module docs are the contract |
 | `usage` | the usage seam (`UsageSink`, `VoiceMetric`, `NoUsage`) |
 | `refusal` | every refusal the voice routes answer (`VoiceRefusal`, `RefusalKind`): status, `{"detail"}` body, headers; the budget's `429` body (`VoiceLimitBody`) |
-| the root | `Voice` (built from `VoiceParts`, checked by `Voice::new` → `VoiceSetupError`), `RelaySettings` (the relay's clocks and `RelaySettings::check`), `ErrorClass`; behind `axum`, `StreamContext` (what `Voice::open_stream` needs of the app) and `LOG_CAPS` |
+| the root | `Voice` (built from `VoiceParts`, checked by `Voice::new` → `VoiceSetupError`), `RelaySettings` (the relay's clocks and `RelaySettings::check`), `ErrorClass`; behind `axum`, `Voice::speak` and its `TtsReply`, and `StreamContext` (what `Voice::open_stream` needs of the app); behind `axum` or `muse`, `LOG_CAPS` |
 | `window` | the UTC day and month a budget counts in: when each ends (`day_end`, `month_end`), `seconds_until` (a `Retry-After` or a TTL, rounded up, never zero), the key stamps, `key_ttls`, the `Clock` |
 | `budget` | the text-to-speech character budget (`TtsBudget`, `TtsCaps`), the per-sentence idempotency key (`ChargeKey`, `Fingerprint`, `Admitted`, `Disposition`), and what both budgets share: the caps rule (`CapsError`, `CapProblem`) and the refusal (`LimitScope`, `Spent`, `LimitReached`) |
 | `lease` | the speech-to-text audio budget (`StreamBudget`, `StreamCaps`): the fenced lease (`issue_ticket`, `acquire` → `Grant`), metering (`meter` → `Metered`), `audio_ms` |
 | `relay` | (`axum`) one relay session: the client's audio to the provider, the provider's events back, the close machine, the session's two log lines; `PROVIDER_RUN_CAP`, the client socket's bounds, `budget_deadline` |
 | `stream` | (`axum`) the upgrade's admission, `Voice::open_stream` (the configuration `503`, the `426`, the `rate`/`encoding` `422`s, the ping, the ticket and the fenced acquire, the takeover on this instance, the upgrade); `parse_rate`, `parse_encoding`, `DEFAULT_ENCODING` |
+| `muse` | (`muse`) the Muse speech-to-text adapter: `MuseStt` (the app's key, URL, keywords and connector) and its `MuseSession`; `handshake_body`, `MuseEvent`, `MuseRate`, `realtime_url` (`UrlProblem`), `error_class`, `socket_config`, the endpoint constants; with `test-support` and `axum`, `mock::MockMuse` |
+| `inworld` | (`inworld`) the Inworld text-to-speech adapter: `InworldTts` over the app's `InworldClient` and `InworldSpeech` (`InworldSetupError`), `INWORLD_VOICES`, `failure`; with `test-support` and `axum`, `mock::MockInworld` |
 | `testing` | (`test-support`) the scripted adapters the core is tested against: `ScriptedStt` (its sessions play an `SttScript`, recording into an `SttLog`), `ScriptedTts`, `RecordingUsage`, `MP3_FIXTURE` |
-
-The text-to-speech flow (`Voice::speak`, behind `axum`) and the provider
-adapters build on it.
 
 ## Adding the dependency
 
@@ -50,9 +51,12 @@ provider, no client of any kind).
 
 | Feature | For | Adds |
 |---|---|---|
-| `axum` | apps | the relay (`relay`) and the stream's admission (`stream`, `Voice::open_stream`, `StreamContext`) on axum's WebSocket; `VoiceRefusal::into_response_with` (a refusal rendered through the app's envelope); `LOG_CAPS` |
-| `test-support` | tests | the `testing` module (the scripted adapters), and the test seams, none of them API without it: `TtsBudget::with_clock` / `StreamBudget::with_clock` (a fixed or moving clock, for the UTC boundaries), `TtsCaps::unchecked` / `StreamCaps::unchecked` (caps the rule refuses), `StreamBudget::acquire_under` (the real acquire under another replay policy), `Voice::with_relay_settings_unchecked` (clocks shorter than `RelaySettings::check` allows; only a zero is refused), and with `axum` `Voice::live_session_count` |
-| `live-tests` | this crate only | its real-Redis suites (`tests/budget.rs`, `tests/lease.rs`, and the relay's `tests/relay.rs` and `tests/stt_contract.rs`, which turn `axum` on); never for consumers |
+| `axum` | apps | the relay (`relay`) and the stream's admission (`stream`, `Voice::open_stream`, `StreamContext`) on axum's WebSocket; the text-to-speech flow (`Voice::speak`, `TtsReply`, `tts::read_request`); `VoiceRefusal::into_response_with` (a refusal rendered through the app's envelope); `LOG_CAPS` |
+| `muse` | apps | the Muse adapter (`muse`), dialled through the app's `tokio_tungstenite::Connector` (tokio-tungstenite with `connect` and `rustls-tls-native-roots`, its rustls without a provider: the app's connector carries the app's); `LOG_CAPS` |
+| `inworld` | apps | the Inworld adapter (`inworld`), on stridelabs-inworld (no features: the client is the app's) |
+| `openapi` | apps | `utoipa::ToSchema` on `budget::LimitScope` and `refusal::VoiceLimitBody` (as `VoiceLimitReached`), for the app's OpenAPI document |
+| `test-support` | tests | the `testing` module (the scripted adapters), and the test seams, none of them API without it: `TtsBudget::with_clock` / `StreamBudget::with_clock` (a fixed or moving clock, for the UTC boundaries), `TtsCaps::unchecked` / `StreamCaps::unchecked` (caps the rule refuses), `StreamBudget::acquire_under` (the real acquire under another replay policy), `Voice::with_relay_settings_unchecked` (clocks shorter than `RelaySettings::check` allows; only a zero is refused), and with `axum` `Voice::live_session_count` and each enabled adapter's mock provider (`muse::mock::MockMuse`, `inworld::mock::MockInworld`: loopback servers on axum, so `axum`'s `http1` comes on with it) |
+| `live-tests` | this crate only | its real-Redis suites (`tests/budget.rs`, `tests/lease.rs`, the relay's `tests/relay.rs` and `tests/stt_contract.rs`, the text-to-speech flow's `tests/tts.rs`, and with an adapter `tests/muse_relay.rs` and `tests/inworld_speak.rs`), which turn `axum` on; never for consumers |
 
 ## Using it
 
@@ -261,6 +265,136 @@ async fn voice_stream<S: SttProvider, T: TtsProvider>(
 - **Usage**: each session records its audio milliseconds once, as it ends,
   before any closing I/O (`UsageSink::record` must return at once).
 
+## The text-to-speech route
+
+The same shape as the stream's: the app's path, authentication (FIRST),
+`405`s and documentation, then one call with the user it authenticated,
+the request's headers and its body, rendered through its envelope:
+
+```rust,no_run
+# #[cfg(feature = "axum")]
+# mod example {
+use axum::body::Body;
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::{IntoResponse as _, Response};
+use stridelabs_redis::RedisHandle;
+use stridelabs_voice::stt::SttProvider;
+use stridelabs_voice::tts::TtsProvider;
+use stridelabs_voice::Voice;
+use uuid::Uuid;
+
+/// `POST /voice/tts`, once the app's extractor authenticated `user`.
+async fn voice_tts<S: SttProvider, T: TtsProvider>(
+    voice: &Voice<S, T>,
+    redis: Option<&RedisHandle>,
+    user: Uuid,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    voice
+        .speak(redis, user, &headers, body)
+        .await
+        .into_response_with(|status: StatusCode, body| {
+            (status, [(header::CONTENT_TYPE, "application/json")], body).into_response()
+        })
+}
+# }
+```
+
+- **The order** (`Voice::speak`'s docs): the configuration `503` (the
+  provider unconfigured, or no Redis), then the request (`415`, `413`
+  declared, `413` read, the `422`s: the shape, the voice, an empty text, a
+  text over the provider's bound), the `Idempotency-Key` (`422`), the
+  charge (`429`, `422` for a key that names another sentence, `503` +
+  `Retry-After: 5` for Redis), then the provider: the audio (`200`, its
+  media type, `Cache-Control: no-store`, its exact length), `503` +
+  `Retry-After: 5` or `502`. The body is read up to
+  `protocol::tts_body_limit(max_text_chars)`: 4 KiB for both apps.
+- **The charge stands**: made before the provider is asked, never
+  refunded; a sentence sent again under its key is charged once and spoken
+  again.
+- **A media type the provider did not declare** is never a `200`: the
+  `502`, logged at ERROR (`outcome = "provider_media_type"`).
+- **`X-Voice-Tts-Max-Chars`** (the provider's text bound) is on every
+  answer `TtsReply` renders; the app's own answers on the route (its
+  `401`s, its auth-outage `503`, its `405`s) need it too, so its route
+  layer sets it where it is missing (`PROTOCOL.md` §5.2).
+- **Logging**: one line per request that reached the charge (target
+  `stridelabs_voice::voice`, message `voice tts…`): the user, the character
+  count, the app voice, the status class, an outcome word (`spoken`,
+  `budget`, `key_reused`, `redis`, `provider_unavailable`,
+  `provider_error`, `provider_media_type`), the charge's disposition and,
+  once the provider was asked, its latency. Never the text, the key or a
+  body.
+- **Usage**: a FRESH charge is recorded (`VoiceMetric::TtsCharacters`, at
+  the charge's instant) before the provider is asked; a replayed one never.
+
+## The adapters
+
+Each is handed the app's keys, settings and transport; neither builds a
+client, a TLS configuration or a connector, and neither selects a crypto
+provider (the app installs aws-lc-rs).
+
+```rust,no_run
+# #[cfg(all(feature = "muse", feature = "inworld"))]
+# mod example {
+use stridelabs_inworld::InworldClient;
+use stridelabs_voice::inworld::{InworldSetupError, InworldSpeech, InworldTts};
+use stridelabs_voice::muse::MuseStt;
+
+fn adapters(
+    meta_api_key: &str,
+    meta_ws_url: &str,
+    keywords: Vec<String>,
+    ws_connector: tokio_tungstenite::Connector,
+    provider_client: reqwest::Client,
+    inworld_api_key: &str,
+    inworld_base_url: &str,
+) -> Result<(MuseStt, InworldTts), InworldSetupError> {
+    // Speech to text: the app's key, URL, keywords (none: the handshake's
+    // field is omitted) and connector (aws-lc-rs and the platform verifier).
+    let stt = MuseStt::new(meta_api_key, meta_ws_url, keywords, ws_connector);
+    if let Some(problem) = stt.url_problem() {
+        // The problem, never the URL, under the app's own setting name.
+        tracing::warn!(%problem, "voice: META_WS_URL is refused; GET /voice/stream answers 503");
+    }
+    // Text to speech: the client the app built (its reqwest client, its
+    // bounds, the MP3 check on), whether the key is set, and the speech.
+    let client = InworldClient::builder(provider_client, inworld_api_key)
+        .base_url(inworld_base_url)
+        .build();
+    let tts = InworldTts::new(
+        client,
+        !inworld_api_key.trim().is_empty(),
+        InworldSpeech {
+            model_id: "inworld-tts-2-flash",
+            audio_encoding: "MP3",
+            sample_rate_hertz: 24_000,
+            bit_rate: 64_000,
+            max_text_chars: 600,
+        },
+    )?;
+    Ok((stt, tts))
+}
+# }
+```
+
+- **Muse** (`muse`): `wss://`, or `ws://` only to a numeric loopback
+  address (`realtime_url`); the key travels in the first frame, so the app
+  folds `LOG_CAPS` into its subscriber's caps (tungstenite dumps every
+  frame below `INFO`). Revision 1's two rates and a 5 s lead. Muse bills
+  per second of audio; the relay meters its own audio time. The open
+  applies no deadline of its own; the relay's `open_timeout` is the one.
+- **Inworld** (`inworld`): `InworldTts::new` refuses an encoding other
+  than `MP3`, a client with the MP3 check off, and a client text bound
+  under the speech's. Every `InworldError` is mapped by name (`Unavailable`
+  → `503`; the rest `502`); a variant a later client crate adds is
+  answered by its own `is_retryable()` and logged at ERROR. Inworld bills
+  per character, which the budget counts first.
+- **Mocks** (`test-support` with `axum`): `muse::mock::MockMuse` and
+  `inworld::mock::MockInworld`, loopback servers an app's own route and
+  log-cap tests can dial.
+
 ## Redis
 
 ### Keys
@@ -429,6 +563,22 @@ and the ACL cases, each test under a prefix of its own
 (`stridelabs-voice-test:<uuid>:tts` / `:stream`) and each ACL user
 (`voice-test-<uuid>`) deleted when its test ends. Without a Redis they fail
 loudly; they never skip.
+
+`tests/tts.rs` (`live-tests`) drives `Voice::speak` through a minimal
+route against `ScriptedTts`: every check and its order, the body bound, the
+key, the charge and its usage record, the provider's answers, the
+max-chars header on every response, the log line.
+
+The adapters' suites: `tests/muse.rs` (`muse`, `axum`, `test-support`; no
+Redis) drives `MuseStt` against `MockMuse` (the handshake, the open's
+failures, Muse's raw frames, the close, the silent-frame bound, and the
+injected connector against a `wss://` listener with a throwaway
+certificate); `tests/inworld.rs` (`inworld`, `axum`, `test-support`; no
+Redis) drives `InworldTts` against `MockInworld` (the setup's refusals, the
+request on the wire, every failure's class, every bound);
+`tests/muse_relay.rs` and `tests/inworld_speak.rs` (`live-tests` with the
+adapter) run one relay session through Muse and `Voice::speak` through
+Inworld, the charge included.
 
 The relay's suites run whole sessions over real loopback sockets (the
 stream served by axum, a tokio-tungstenite client) against `ScriptedStt`:

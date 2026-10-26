@@ -12,10 +12,29 @@ publish = false
 [features]
 default = []
 # The parts that need axum: the relay (`relay`) and the stream's admission
-# (`stream`, `Voice::open_stream`, `StreamContext`) on axum's WebSocket,
+# (`stream`, `Voice::open_stream`, `StreamContext`) on axum's WebSocket, the
+# text-to-speech flow (`Voice::speak`, `TtsReply`, `tts::read_request`),
 # `VoiceRefusal::into_response_with` (a refusal rendered through the app's
 # own envelope) and `LOG_CAPS`.
 axum = ["dep:axum", "dep:tungstenite", "dep:futures-util"]
+# The Muse speech-to-text adapter (`muse`): `MuseStt` and its session, dialled
+# through the CONNECTOR THE APP HANDS IN (the crate builds none), and
+# `LOG_CAPS`. tokio-tungstenite's `rustls-tls-native-roots` only compiles its
+# rustls path (its rustls is `default-features = false`): no crypto provider
+# is selected here, the consumer installs one.
+muse = [
+    "dep:tokio-tungstenite",
+    "dep:rustls",
+    "dep:url",
+    "dep:futures-util",
+]
+# The Inworld text-to-speech adapter (`inworld`): `InworldTts` over the
+# `InworldClient` the app built (on its own `reqwest::Client`, with its own
+# bounds).
+inworld = ["dep:stridelabs-inworld"]
+# `utoipa::ToSchema` on `budget::LimitScope` and `refusal::VoiceLimitBody`
+# (as `VoiceLimitReached`), for an app's OpenAPI document.
+openapi = ["dep:utoipa"]
 # The test seams, none of them API without it: the `testing` module (the
 # scripted adapters `ScriptedStt` and `ScriptedTts`, `RecordingUsage`,
 # `MP3_FIXTURE`), `TtsBudget::with_clock` and `StreamBudget::with_clock` (a
@@ -24,16 +43,21 @@ axum = ["dep:axum", "dep:tungstenite", "dep:futures-util"]
 # needs them), `StreamBudget::acquire_under` (the real acquire under another
 # replay policy, for the replay-hazard test), and
 # `Voice::with_relay_settings_unchecked` (clocks shorter than revision 1
-# allows, for the relay's suites).
-test-support = []
+# allows, for the relay's suites). With `axum` and an adapter, that
+# adapter's mock provider too (`muse::mock`, `inworld::mock`): a loopback
+# server, served by axum, so `axum`'s `http1` comes on with it (no
+# dependency is added: hyper is already axum's).
+test-support = ["axum?/http1"]
 # NOT for consumers: it compiles this crate's own real-Redis suites
-# (`tests/budget.rs`, `tests/lease.rs`, and the relay's `tests/relay.rs` and
-# `tests/stt_contract.rs`), which need the compose Redis (`docker compose up
-# -d redis`) or CI's Redis service, and panic without one rather than
-# skipping. A feature, not an always-on test target, so `cargo test
-# --workspace` keeps needing no services; `--all-features` turns it on. It
-# enables a DEV-dependency's feature, as stridelabs-redis's does, the seams
-# the suites drive (`test-support`), and the relay they drive (`axum`).
+# (`tests/budget.rs`, `tests/lease.rs`, the relay's `tests/relay.rs` and
+# `tests/stt_contract.rs`, the text-to-speech flow's `tests/tts.rs`, and,
+# with an adapter, `tests/muse_relay.rs` and `tests/inworld_speak.rs`), which
+# need the compose Redis (`docker compose up -d redis`) or CI's Redis
+# service, and panic without one rather than skipping. A feature, not an
+# always-on test target, so `cargo test --workspace` keeps needing no
+# services; `--all-features` turns it on. It enables a DEV-dependency's
+# feature, as stridelabs-redis's does, the seams the suites drive
+# (`test-support`), and the flows they drive (`axum`).
 live-tests = ["test-support", "axum", "stridelabs-testing/redis"]
 
 [lints]
@@ -64,6 +88,36 @@ required-features = ["live-tests"]
 [[test]]
 name = "voice_new"
 required-features = ["test-support"]
+
+# The text-to-speech flow (`Voice::speak`) against the scripted provider:
+# the request's checks and their order, the charge, the provider's answers,
+# the max-chars header, usage.
+[[test]]
+name = "tts"
+required-features = ["live-tests"]
+
+# The Muse adapter against `muse::mock::MockMuse`, driven directly: no
+# Redis, loopback sockets only.
+[[test]]
+name = "muse"
+required-features = ["muse", "axum", "test-support"]
+
+# One relay session through `MockMuse`: the adapter as the relay drives it.
+[[test]]
+name = "muse_relay"
+required-features = ["live-tests", "muse"]
+
+# The Inworld adapter against `inworld::mock::MockInworld`, driven directly:
+# no Redis, a loopback server only.
+[[test]]
+name = "inworld"
+required-features = ["inworld", "axum", "test-support"]
+
+# `Voice::speak` through `InworldTts` and `MockInworld`: the request on the
+# wire, every failure's status, and the charge that stands.
+[[test]]
+name = "inworld_speak"
+required-features = ["live-tests", "inworld"]
 
 [dependencies]
 # Every budget call is one `EVAL` on the consumer's handle, under the replay
@@ -99,9 +153,30 @@ axum = { version = "0.8", default-features = false, features = ["ws"], optional 
 # 0.29), or the downcast silently never matches; `an_oversized_message_is_1008`
 # pins it. No default features: no handshake, no TLS, nothing to dial with.
 tungstenite = { version = "0.29", default-features = false, optional = true }
-# Feature `axum`: `SinkExt::send`/`flush` and `StreamExt::next` on the
-# client's socket.
+# Features `axum` and `muse`: `SinkExt::send`/`flush` and `StreamExt::next`
+# on the client's socket and on the Muse socket.
 futures-util = { workspace = true, features = ["sink"], optional = true }
+# Feature `muse`: the Muse dial. `connect` for `connect_async_tls_with_config`
+# (always with the app's connector), `rustls-tls-native-roots` so that
+# connector's `Rustls` variant exists. Its rustls is `default-features =
+# false` and this names no provider feature: the app's connector carries
+# the app's provider. The same tokio-tungstenite axum's `ws` is built on.
+tokio-tungstenite = { version = "0.29", default-features = false, features = [
+    "connect",
+    "rustls-tls-native-roots",
+], optional = true }
+# Feature `muse`, for one thing only: `muse::error_class` tells a TLS failure
+# (a `rustls::Error` inside an I/O error) from another I/O error. No default
+# features: no provider, no logging.
+rustls = { version = "0.23", default-features = false, optional = true }
+# Feature `muse`: `muse::realtime_url` parses the app's setting. Already in
+# every graph through reqwest and tungstenite.
+url = { workspace = true, optional = true }
+# Feature `inworld`: the client the app builds and hands in.
+stridelabs-inworld = { workspace = true, optional = true }
+# Feature `openapi`: the derive (utoipa's default `macros`). No schema
+# feature: `resets_at` is documented as a string (`value_type`).
+utoipa = { workspace = true, optional = true }
 # `Fingerprint`: SHA-256 over a sentence, cut to 16 hex characters.
 sha2 = { workspace = true }
 thiserror = { workspace = true }
@@ -154,3 +229,22 @@ tower = { workspace = true }
 stridelabs-observability = { workspace = true }
 tracing-subscriber = { workspace = true }
 tracing-log = { workspace = true }
+# The Inworld suites build the `InworldClient` an app would hand the adapter,
+# on a client with the crate's injected-client contract (no proxy, no
+# redirect, no retry, no decoder). Plain `http://` to the loopback mock: no
+# TLS feature.
+reqwest = { workspace = true }
+# The Inworld suites' mock answers and padded bodies are base64 JSON.
+base64 = { workspace = true }
+# `the_dial_uses_the_injected_connector`: a `wss://` listener with a
+# throwaway self-signed certificate, and the connectors that do and do not
+# trust it. `aws_lc_rs`, never the default `ring` (CI's "the workspace
+# compiles no ring" lists dev edges too); the tests build every rustls
+# config with that provider explicitly and install no process default. Both
+# already in Cargo.lock (stridelabs-http's and stridelabs-mcp's suites).
+rcgen = { version = "0.14", default-features = false, features = [
+    "aws_lc_rs",
+] }
+tokio-rustls = { version = "0.26", default-features = false, features = [
+    "aws_lc_rs",
+] }

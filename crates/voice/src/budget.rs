@@ -593,6 +593,7 @@ impl Fingerprint {
 /// Which voice allowance is spent: the user's UTC day, the user's UTC
 /// calendar month, or everyone's UTC calendar month.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum LimitScope {
     /// The user's allowance for the UTC day.

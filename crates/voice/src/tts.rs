@@ -43,7 +43,9 @@
 //! must then be 1 to the provider's bound in characters; `voice` is one of
 //! the catalog's APP ids, exactly, and absent or `null` is its default.
 //! [`parse_request`] is that check, and [`charge_key`] the optional
-//! `Idempotency-Key`'s.
+//! `Idempotency-Key`'s. Behind `axum`, `read_request` runs the checks before
+//! it, in order (the content type `415`, the declared and then the read
+//! length `413`), and then it; `Voice::speak` is the whole flow.
 
 use std::fmt;
 use std::future::Future;
@@ -51,6 +53,8 @@ use std::future::Future;
 use serde::Deserialize;
 
 use crate::budget::ChargeKey;
+#[cfg(feature = "axum")]
+use crate::protocol::tts_body_limit;
 use crate::protocol::IDEMPOTENCY_KEY_HEADER;
 use crate::refusal::VoiceRefusal;
 use crate::ErrorClass;
@@ -375,6 +379,47 @@ pub fn parse_request(
         app_voice,
         chars,
     })
+}
+
+/// Every request check before the charge but the key's, in order: the
+/// content type (`415`), the declared length (`413`, refused unread), the
+/// read length (`413`), then [`parse_request`]'s `422`s. The body is read
+/// up to `protocol::tts_body_limit(max_text_chars)` bytes (4 KiB at the
+/// protocol's minimum bound), never further.
+///
+/// # Errors
+///
+/// The first check that fails, as its refusal: `NotJson`, `BodyTooLarge`,
+/// then [`parse_request`]'s.
+#[cfg(feature = "axum")]
+pub async fn read_request(
+    headers: &http::HeaderMap,
+    body: axum::body::Body,
+    catalog: &VoiceCatalog,
+    max_text_chars: usize,
+) -> Result<SpeakRequest, VoiceRefusal> {
+    let content_type = headers
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok());
+    if !is_json_content_type(content_type) {
+        return Err(VoiceRefusal::not_json());
+    }
+    let limit = tts_body_limit(max_text_chars);
+    // A declared length over the limit is refused unread. One that lies, or
+    // a body with none, is bounded by the read below.
+    let declared = headers
+        .get(http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    if declared.is_some_and(|length| length > limit as u64) {
+        return Err(VoiceRefusal::body_too_large(limit));
+    }
+    // `to_bytes` fails past the limit, and also when the client goes away
+    // mid-body, which gets the same `413` that nobody is left to read.
+    let bytes = axum::body::to_bytes(body, limit)
+        .await
+        .map_err(|_| VoiceRefusal::body_too_large(limit))?;
+    parse_request(&bytes, catalog, max_text_chars)
 }
 
 /// The `Idempotency-Key` that names this request's charge: absent, a key
