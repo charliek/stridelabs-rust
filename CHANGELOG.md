@@ -219,6 +219,23 @@ for a consumer's pin.
   then refuse loudly), and preflight checks the address it names. A tapper
   ref that does not read it yet ignores it.
 
+### Fixed
+
+- `stridelabs-auth`: **an empty key set is a failed fetch** (lumen plan 003
+  S1d). A JWKS response that parses with zero entries in `keys`
+  (`{"keys": []}`) was cached as the issuer's set: on a cold cache the first
+  token got `UnknownKid` (a 401, a sign-out) and those inside the refetch
+  floor `UnseenKid`, and on a warm cache an empty refresh replaced a good set
+  and refused every token until the next fetch. Now it fails the attempt
+  with `AuthError::Jwks("response has no keys")`, through the same path as an
+  unparseable body: the previous set keeps serving until its TTL, the failure
+  counts toward the backoff, every lookup waiting on that attempt gets the
+  error, and no kid is remembered as seen from it. Consumers see a key-set
+  error (their `Jwks` mapping, a 5xx) instead of `UnknownKid`/`UnseenKid`.
+  Only zero entries counts as empty: a set whose keys are all unusable is
+  still served (and, under `report_unusable_keys`, is `UnusableKey`, as
+  before). No API change.
+
 ## [0.10.0] - 2026-10-23
 
 A joint release: tapper plan 016 C-1 (stridelabs-auth's opt-in strict screen, `Audience::IfPresent`, `Verifier::with_cache`

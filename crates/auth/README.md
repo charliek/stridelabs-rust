@@ -514,6 +514,16 @@ monotonic clock.
   carries no kid, like every `AuthError`. Off, the set is served and the
   verifier's key selection decides, as through v0.9.0: a kid with no fit key
   is `UnknownKid`, and a fit key that cannot be built is `Jwks`.
+- **An empty set is a failed fetch.** A response that parses as a JWKS with
+  zero entries in `keys` (`{"keys": []}`) can verify nothing, so it is an
+  issuer fault, not a rotation: `AuthError::Jwks` ("response has no keys"),
+  handled as an unparseable body is. The previous set, if any, keeps serving
+  until its TTL, the failure counts toward the backoff, every lookup waiting
+  on that fetch gets the error, and no kid is remembered as seen from it, so
+  a consumer sees its key-set error rather than `UnknownKid` (a sign-out) or
+  `UnseenKid`. Only zero entries counts: a set whose keys are all unusable is
+  still a set (`report_unusable_keys` above, or the verifier's key
+  selection). Through v0.10.0 an empty set was cached like any other.
 - **The body is capped.** A fetch reads at most `jwks::MAX_JWKS_BYTES`
   (1 MiB; an issuer's set is a few keys of under 2 KiB each), chunk by
   chunk and inside `FETCH_TIMEOUT`. A larger body, a valid key set

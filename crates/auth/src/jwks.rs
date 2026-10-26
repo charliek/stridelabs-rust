@@ -72,6 +72,19 @@
 //!    `UnseenKid`. The issuer published the kid, so this is no verdict on
 //!    the token: a consumer maps it where `Jwks` goes. Off, such a set is
 //!    served, and the verifier's own key selection decides.
+//! 6. **An empty set is a failed fetch.** A response that parses as a JWKS
+//!    with zero entries in `keys` (`{"keys": []}`) can verify nothing: it is
+//!    an issuer fault, not a rotation that retired every key. The attempt
+//!    fails with [`AuthError::Jwks`] ("response has no keys"), exactly as an
+//!    unparseable body does: the previous set, if any, keeps serving until
+//!    its TTL, the failure counts toward the backoff, every lookup waiting
+//!    on the attempt gets the error, and no kid is remembered as seen from
+//!    it. Without that, a cold cache would answer the first token
+//!    [`AuthError::UnknownKid`] and those inside the floor
+//!    [`AuthError::UnseenKid`], and a warm one would swap a good set for
+//!    nothing and refuse every token until the next fetch. Only zero entries
+//!    counts: a set whose keys are all unusable is still a set, and goes
+//!    through rule 5 (or, with that off, the verifier's key selection).
 //!
 //! The **refetch floor** `F` is `min(min_refetch_interval, max(ttl, 1 s))`:
 //! [`MIN_REFETCH_INTERVAL`] (30 s) at the defaults; the TTL, when that is
@@ -219,6 +232,8 @@ const TOO_SOON: &str = "key set expired inside the minimum refetch spacing; refe
 const STILL_IN_PROGRESS: &str = "JWKS refetch still in progress";
 const EXPIRED_BEFORE_USE: &str = "key set expired before the lookup could use it";
 const ABORTED: &str = "refetch aborted";
+/// A fetched set with no keys at all (module docs, rule 6).
+const NO_KEYS: &str = "response has no keys";
 
 /// A JWKS endpoint plus the last thing it said.
 ///
@@ -697,8 +712,9 @@ impl JwksCache {
     ///   kid, but no key under it can verify RS256, just refetched or within
     ///   the floor (module docs, rule 5);
     /// - [`AuthError::Jwks`]: the endpoint could not be reached, answered
-    ///   non-2xx, sent a body over [`MAX_JWKS_BYTES`] or answered with
-    ///   something that isn't a JWKS; or, with no set inside its TTL, a
+    ///   non-2xx, sent a body over [`MAX_JWKS_BYTES`], answered with
+    ///   something that isn't a JWKS or with a JWKS holding no keys (module
+    ///   docs, rule 6); or, with no set inside its TTL, a
     ///   refetch is not allowed yet, the fetch this lookup joined outlasted
     ///   its wait (2 s on a retry, [`FETCH_TIMEOUT`] plus 1 s on a first
     ///   attempt), the set it waited for aged past its TTL first, or the
@@ -1081,9 +1097,17 @@ impl Inner {
 
         // reqwest's own text for a body that does not parse, kept: serde's
         // message can quote the body.
-        serde_json::from_slice::<JwkSet>(&body).map_err(|_| {
+        let set = serde_json::from_slice::<JwkSet>(&body).map_err(|_| {
             AuthError::Jwks("response was not a valid JWKS: error decoding response body".into())
-        })
+        })?;
+        // Every attempt (a needed fetch, a refresh-ahead, and so every joiner
+        // of either) ingests its set here, so this is the one check (module
+        // docs, rule 6). A set that holds keys, however unusable, is not
+        // empty: that is rule 5's to judge.
+        if set.keys.is_empty() {
+            return Err(AuthError::Jwks(NO_KEYS.into()));
+        }
+        Ok(set)
     }
 }
 
