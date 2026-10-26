@@ -10,9 +10,10 @@ Extracted from tapper (`tapper-rs/src/voice/`, at `82be95f`), which had
 hardened lumen's copy; both apps run this crate's scripts and key shapes,
 byte for byte, so either adopts it with no change on the wire.
 
-**What is here today** is the core every voice route stands on: the client
+**What is here today** is the core every voice route stands on — the client
 protocol, the provider traits, the app's voice catalog and refusals, the
-checked `Voice`, and the Redis budgets:
+checked `Voice`, and the Redis budgets — and, behind `axum`, the
+speech-to-text relay and its admission:
 
 | Module | Holds |
 |---|---|
@@ -21,14 +22,16 @@ checked `Voice`, and the Redis budgets:
 | `tts` | the text-to-speech provider trait (`TtsProvider`, `SynthesisRequest`, `Audio`, `TtsFailure`), the app's `VoiceCatalog` (`CatalogError`), the request's strict parse (`parse_request` → `SpeakRequest`), `charge_key`, `is_json_content_type`; the module docs are the contract |
 | `usage` | the usage seam (`UsageSink`, `VoiceMetric`, `NoUsage`) |
 | `refusal` | every refusal the voice routes answer (`VoiceRefusal`, `RefusalKind`): status, `{"detail"}` body, headers; the budget's `429` body (`VoiceLimitBody`) |
-| the root | `Voice` (built from `VoiceParts`, checked by `Voice::new` → `VoiceSetupError`), `RelaySettings` (the relay's clocks and `RelaySettings::check`), `ErrorClass` |
+| the root | `Voice` (built from `VoiceParts`, checked by `Voice::new` → `VoiceSetupError`), `RelaySettings` (the relay's clocks and `RelaySettings::check`), `ErrorClass`; behind `axum`, `StreamContext` (what `Voice::open_stream` needs of the app) and `LOG_CAPS` |
 | `window` | the UTC day and month a budget counts in: when each ends (`day_end`, `month_end`), `seconds_until` (a `Retry-After` or a TTL, rounded up, never zero), the key stamps, `key_ttls`, the `Clock` |
 | `budget` | the text-to-speech character budget (`TtsBudget`, `TtsCaps`), the per-sentence idempotency key (`ChargeKey`, `Fingerprint`, `Admitted`, `Disposition`), and what both budgets share: the caps rule (`CapsError`, `CapProblem`) and the refusal (`LimitScope`, `Spent`, `LimitReached`) |
 | `lease` | the speech-to-text audio budget (`StreamBudget`, `StreamCaps`): the fenced lease (`issue_ticket`, `acquire` → `Grant`), metering (`meter` → `Metered`), `audio_ms` |
+| `relay` | (`axum`) one relay session: the client's audio to the provider, the provider's events back, the close machine, the session's two log lines; `PROVIDER_RUN_CAP`, the client socket's bounds, `budget_deadline` |
+| `stream` | (`axum`) the upgrade's admission, `Voice::open_stream` (the configuration `503`, the `426`, the `rate`/`encoding` `422`s, the ping, the ticket and the fenced acquire, the takeover on this instance, the upgrade); `parse_rate`, `parse_encoding`, `DEFAULT_ENCODING` |
 | `testing` | (`test-support`) the scripted adapters the core is tested against: `ScriptedStt` (its sessions play an `SttScript`, recording into an `SttLog`), `ScriptedTts`, `RecordingUsage`, `MP3_FIXTURE` |
 
-The relay and the text-to-speech flow (`Voice`'s methods, behind `axum`)
-and the provider adapters build on it.
+The text-to-speech flow (`Voice::speak`, behind `axum`) and the provider
+adapters build on it.
 
 ## Adding the dependency
 
@@ -47,9 +50,9 @@ provider, no client of any kind).
 
 | Feature | For | Adds |
 |---|---|---|
-| `axum` | apps | `VoiceRefusal::into_response_with` (a refusal rendered through the app's envelope) |
-| `test-support` | tests | the `testing` module (the scripted adapters), and the test seams, none of them API without it: `TtsBudget::with_clock` / `StreamBudget::with_clock` (a fixed or moving clock, for the UTC boundaries), `TtsCaps::unchecked` / `StreamCaps::unchecked` (caps the rule refuses), `StreamBudget::acquire_under` (the real acquire under another replay policy), `Voice::with_relay_settings_unchecked` (clocks shorter than `RelaySettings::check` allows; only a zero is refused) |
-| `live-tests` | this crate only | its real-Redis suites (`tests/budget.rs`, `tests/lease.rs`); never for consumers |
+| `axum` | apps | the relay (`relay`) and the stream's admission (`stream`, `Voice::open_stream`, `StreamContext`) on axum's WebSocket; `VoiceRefusal::into_response_with` (a refusal rendered through the app's envelope); `LOG_CAPS` |
+| `test-support` | tests | the `testing` module (the scripted adapters), and the test seams, none of them API without it: `TtsBudget::with_clock` / `StreamBudget::with_clock` (a fixed or moving clock, for the UTC boundaries), `TtsCaps::unchecked` / `StreamCaps::unchecked` (caps the rule refuses), `StreamBudget::acquire_under` (the real acquire under another replay policy), `Voice::with_relay_settings_unchecked` (clocks shorter than `RelaySettings::check` allows; only a zero is refused), and with `axum` `Voice::live_session_count` |
+| `live-tests` | this crate only | its real-Redis suites (`tests/budget.rs`, `tests/lease.rs`, and the relay's `tests/relay.rs` and `tests/stt_contract.rs`, which turn `axum` on); never for consumers |
 
 ## Using it
 
@@ -180,6 +183,83 @@ speech-to-text adapter's facts, then the text-to-speech adapter's against
 the catalog, against revision 1 of the protocol (the two methods' docs list
 every check, in order). An unconfigured adapter is not a startup failure: it
 is the route's `503`.
+
+## The stream's route
+
+The route is the app's: its path, its authentication (FIRST: an
+unauthenticated caller learns nothing of the configuration), its `405`s and
+its documentation. Its handler is one call — the user the app
+authenticated, the raw query, the upgrade taken as a `Result` (so the
+configuration `503` comes before the `426`), and a `StreamContext` with the
+app's Redis and shutdown — and a refusal rendered through the app's own
+`{"detail"}` envelope:
+
+```rust,no_run
+# #[cfg(feature = "axum")]
+# mod example {
+use std::sync::Arc;
+
+use axum::extract::ws::rejection::WebSocketUpgradeRejection;
+use axum::extract::ws::WebSocketUpgrade;
+use axum::http::{header, StatusCode};
+use axum::response::{IntoResponse as _, Response};
+use stridelabs_redis::RedisHandle;
+use stridelabs_voice::stt::SttProvider;
+use stridelabs_voice::tts::TtsProvider;
+use stridelabs_voice::{StreamContext, Voice};
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
+use uuid::Uuid;
+
+/// `GET /voice/stream`, once the app's extractor authenticated `user`.
+async fn voice_stream<S: SttProvider, T: TtsProvider>(
+    voice: &Arc<Voice<S, T>>,
+    redis: Option<&RedisHandle>,
+    shutdown: &CancellationToken,
+    tracker: &TaskTracker,
+    user: Uuid,
+    query: Option<&str>,
+    upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
+) -> Response {
+    let context = StreamContext { redis, shutdown, tracker };
+    match voice.open_stream(context, user, query, upgrade).await {
+        Ok(switching) => switching,
+        Err(refusal) => refusal.into_response_with(|status: StatusCode, body| {
+            (status, [(header::CONTENT_TYPE, "application/json")], body).into_response()
+        }),
+    }
+}
+# }
+```
+
+- **Shutdown**: cancelling the token closes every live session `1001`, each
+  after its release; an admitted session (and the lease release of an
+  upgrade that failed after its `101`) holds a tracker token until it is
+  done, so the app's drain (`tracker.close()`, then `tracker.wait()` under
+  its deadline) waits for them.
+- **The relay's clocks** (`RelaySettings`, checked by `Voice::new`):
+  revision 1's bounds, and the lease's margin. The lease is 30 s
+  (`LEASE_TTL`) from the acquire and the first refresh comes one
+  `refresh_interval` after `ready`, so `open_timeout + close_timeout +
+  refresh_interval` must stay under the lease (the first refresh lands in
+  it after the slowest open) and `refresh_interval` at most a third of it
+  (from the first good refresh on, one refresh that fails never costs the
+  lease). The production clocks (an 8 s open, a 2 s close bound, a 10 s
+  refresh) are the largest that pass.
+- **One session per user**: a newer upgrade supersedes the older session
+  at once on the same instance (`4001`), and at its next refresh from
+  another instance (the lease).
+- **Logging**: two lines per session (`voice stream: session start` and
+  `voice stream: session end`, the latter WARN on a provider or internal
+  failure or a failed release), a WARN per failed refresh, one line per
+  admission the ping, the ticket or the acquire refused, and one for the
+  lease release of an upgrade that failed, under the targets
+  `stridelabs_voice::relay` and `stridelabs_voice::stream`; never a key,
+  audio, a transcript, a provider's text or a close frame's reason. The
+  relay's client socket is tungstenite, so the app folds `LOG_CAPS` into its
+  subscriber's caps: below `INFO` tungstenite dumps every frame.
+- **Usage**: each session records its audio milliseconds once, as it ends,
+  before any closing I/O (`UsageSink::record` must return at once).
 
 ## Redis
 
@@ -349,3 +429,12 @@ and the ACL cases, each test under a prefix of its own
 (`stridelabs-voice-test:<uuid>:tts` / `:stream`) and each ACL user
 (`voice-test-<uuid>`) deleted when its test ends. Without a Redis they fail
 loudly; they never skip.
+
+The relay's suites run whole sessions over real loopback sockets (the
+stream served by axum, a tokio-tungstenite client) against `ScriptedStt`:
+`tests/relay.rs` (every close code, the admission's refusals, the lease and
+the budget as a session meets them, the fence at the upgrade, the failed
+upgrade's release, how the client left, usage) and `tests/stt_contract.rs`
+(the core's side of every rule in `stt`'s module docs, the provider-run cap
+on a current-thread and a multi-thread runtime, each under an external
+watchdog).

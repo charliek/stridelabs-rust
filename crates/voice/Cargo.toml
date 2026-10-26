@@ -11,9 +11,11 @@ publish = false
 
 [features]
 default = []
-# The parts that need axum: `VoiceRefusal::into_response_with` (a refusal
-# rendered through the app's own envelope).
-axum = ["dep:axum"]
+# The parts that need axum: the relay (`relay`) and the stream's admission
+# (`stream`, `Voice::open_stream`, `StreamContext`) on axum's WebSocket,
+# `VoiceRefusal::into_response_with` (a refusal rendered through the app's
+# own envelope) and `LOG_CAPS`.
+axum = ["dep:axum", "dep:tungstenite", "dep:futures-util"]
 # The test seams, none of them API without it: the `testing` module (the
 # scripted adapters `ScriptedStt` and `ScriptedTts`, `RecordingUsage`,
 # `MP3_FIXTURE`), `TtsBudget::with_clock` and `StreamBudget::with_clock` (a
@@ -25,13 +27,14 @@ axum = ["dep:axum"]
 # allows, for the relay's suites).
 test-support = []
 # NOT for consumers: it compiles this crate's own real-Redis suites
-# (`tests/budget.rs`, `tests/lease.rs`), which need the compose Redis
-# (`docker compose up -d redis`) or CI's Redis service, and panic without one
-# rather than skipping. A feature, not an always-on test target, so `cargo
-# test --workspace` keeps needing no services; `--all-features` turns it on.
-# It enables a DEV-dependency's feature, as stridelabs-redis's does, and the
-# seams the suites drive (`test-support`).
-live-tests = ["test-support", "stridelabs-testing/redis"]
+# (`tests/budget.rs`, `tests/lease.rs`, and the relay's `tests/relay.rs` and
+# `tests/stt_contract.rs`), which need the compose Redis (`docker compose up
+# -d redis`) or CI's Redis service, and panic without one rather than
+# skipping. A feature, not an always-on test target, so `cargo test
+# --workspace` keeps needing no services; `--all-features` turns it on. It
+# enables a DEV-dependency's feature, as stridelabs-redis's does, the seams
+# the suites drive (`test-support`), and the relay they drive (`axum`).
+live-tests = ["test-support", "axum", "stridelabs-testing/redis"]
 
 [lints]
 workspace = true
@@ -42,6 +45,19 @@ required-features = ["live-tests"]
 
 [[test]]
 name = "lease"
+required-features = ["live-tests"]
+
+# The relay over real sockets, against the scripted provider: the session,
+# its close codes, the admission's refusals, the lease and the budget as a
+# session meets them.
+[[test]]
+name = "relay"
+required-features = ["live-tests"]
+
+# The speech-to-text contract, the core's side of every rule an adapter
+# keeps (`stt`'s module docs), the provider-run cap among them.
+[[test]]
+name = "stt_contract"
 required-features = ["live-tests"]
 
 # `Voice::new`'s refusals, against the scripted adapters: no service.
@@ -71,16 +87,38 @@ http = { workspace = true }
 bytes = { workspace = true }
 # `SttSession` is a `Stream` of what the provider heard: the trait alone.
 futures-core = { version = "0.3", default-features = false }
-# `VoiceRefusal::into_response_with` (feature `axum`). No default features:
-# the crate needs the response and body types, not a server.
-axum = { version = "0.8", default-features = false, optional = true }
+# Feature `axum`: the relay's client socket (`ws`: axum's WebSocket, its
+# upgrade and their limits) and `VoiceRefusal::into_response_with`. No
+# default features: the crate needs the extractor, the socket and the
+# response types, not a server.
+axum = { version = "0.8", default-features = false, features = ["ws"], optional = true }
+# Feature `axum`, for one thing only: the relay reads the tungstenite error
+# behind a failed client read (`axum::Error`'s source) to tell a breach (a
+# message over the bound, a protocol error: `1008`) from a client that went
+# away. It must be the tungstenite axum's `ws` is built on (axum 0.8's is
+# 0.29), or the downcast silently never matches; `an_oversized_message_is_1008`
+# pins it. No default features: no handshake, no TLS, nothing to dial with.
+tungstenite = { version = "0.29", default-features = false, optional = true }
+# Feature `axum`: `SinkExt::send`/`flush` and `StreamExt::next` on the
+# client's socket.
+futures-util = { workspace = true, features = ["sink"], optional = true }
 # `Fingerprint`: SHA-256 over a sentence, cut to 16 hex characters.
 sha2 = { workspace = true }
 thiserror = { workspace = true }
 # `Grant::origin`, a `tokio::time::Instant`: the monotonic twin of the
 # instant a grant's windows were read at. `SttProvider::open`'s deadline is
-# one too; the scripted adapters' timers are tokio's.
+# one too; the scripted adapters' timers are tokio's; the relay's clocks and
+# the cooperative budget it spends per provider event
+# (`tokio::task::coop::consume_budget`, `rt`).
 tokio = { workspace = true }
+# The app's shutdown, as the relay sees it: the token every session selects
+# on (`CancellationToken`) and the tracker its drain waits on (`TaskTracker`,
+# `rt`). Already in the lock, with these features.
+tokio-util = { version = "0.7", default-features = false, features = ["rt"] }
+# The relay's two lines per session and the admission's refusals: fixed
+# messages and fields, never a key, a frame, a transcript or a provider's
+# text.
+tracing = { workspace = true }
 
 [dev-dependencies]
 # `require_redis`, the fail-loud probe for the live suites. Its `redis`
@@ -99,3 +137,20 @@ tokio = { workspace = true, features = ["test-util"] }
 # `the_scripts_are_the_extraction_bases`: the SHA-1 of the exact bytes each
 # script sends. Already in the lock (0.11.0), so nothing is added to it.
 sha1 = "0.11"
+# The relay suites serve the stream on a loopback port (`axum::serve`: the
+# default features' `http1` and `tokio`).
+axum = { workspace = true }
+# The relay suites' client: a plain `ws://` WebSocket to that port. No TLS.
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect"] }
+# `hyper::upgrade::on`, for an upgrade that fails after its `101`
+# (`a_failed_upgrade_is_drained_and_its_release_logged`).
+hyper = "1"
+# `ServiceExt::oneshot`: a plain request through the relay suites' router,
+# with no socket.
+tower = { workspace = true }
+# The relay suites read their own log lines as production writes them: the
+# Cloud Logging layer behind an `EnvFilter`, with the `log` bridge
+# (`tests/log_capture`).
+stridelabs-observability = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-log = { workspace = true }

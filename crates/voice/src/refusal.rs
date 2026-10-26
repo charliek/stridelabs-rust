@@ -256,16 +256,15 @@ impl VoiceRefusal {
     }
 }
 
-// The refusals the two flows answer: `Voice::speak` (the configuration,
-// the body's bound and type, the key, the charge, the provider) and
-// `Voice::open_stream` (the configuration, the upgrade, the rate and the
-// encoding, the admission). Until the flows land only the tests build them,
-// and the expectation fails the build once every one is used.
+// The refusals the stream's admission answers (`Voice::open_stream`: the
+// configuration, the upgrade, the rate and the encoding, the admission),
+// which `Voice::speak` shares the first three of. Both flows are behind
+// `axum`; without it only the tests build these.
 #[cfg_attr(
-    not(test),
+    not(any(test, feature = "axum")),
     expect(
         dead_code,
-        reason = "the voice flows answer these; until they land, only the tests build them"
+        reason = "the voice flows, which answer these, are behind `axum`"
     )
 )]
 impl VoiceRefusal {
@@ -357,7 +356,19 @@ impl VoiceRefusal {
             &format!("encoding must be {}", VoiceRefusal::one_of(&encodings)),
         )
     }
+}
 
+// The refusals only `Voice::speak` answers (the body's bound and type, the
+// key, the provider). Until it lands only the tests build them, and the
+// expectation fails the build once every one is used.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the text-to-speech flow answers these; until it lands, only the tests build them"
+    )
+)]
+impl VoiceRefusal {
     /// `request body over 4 KiB` at the default bound, else `over <n>
     /// bytes`.
     pub(crate) fn body_too_large(limit: usize) -> VoiceRefusal {

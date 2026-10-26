@@ -4,6 +4,10 @@ pub mod budget;
 pub mod lease;
 pub mod protocol;
 pub mod refusal;
+#[cfg(feature = "axum")]
+pub mod relay;
+#[cfg(feature = "axum")]
+pub mod stream;
 pub mod stt;
 #[cfg(feature = "test-support")]
 pub mod testing;
@@ -12,7 +16,33 @@ pub mod usage;
 mod voice;
 pub mod window;
 
+#[cfg(feature = "axum")]
+pub use voice::StreamContext;
 pub use voice::{RelaySettings, Voice, VoiceParts, VoiceSetupError};
+
+/// The tracing targets an app must cap, as `(target, level)` pairs: the
+/// relay's client socket (axum's WebSocket) is tungstenite, whose `TRACE`
+/// output dumps every frame (audio, a transcript, a close reason), and so is
+/// a provider adapter's WebSocket dial (its key in the handshake). The app
+/// folds these into its own caps, as it folds any other crate's; this crate
+/// installs no subscriber.
+///
+/// ```
+/// use stridelabs_observability::TargetCaps;
+///
+/// let caps = stridelabs_voice::LOG_CAPS
+///     .iter()
+///     .fold(TargetCaps::new(), |caps, (target, level)| caps.cap(*target, *level));
+/// # let _ = caps;
+/// ```
+#[cfg(feature = "axum")]
+pub const LOG_CAPS: [(&str, tracing::level_filters::LevelFilter); 2] = [
+    ("tungstenite", tracing::level_filters::LevelFilter::INFO),
+    (
+        "tokio_tungstenite",
+        tracing::level_filters::LevelFilter::INFO,
+    ),
+];
 
 /// A provider failure as a fixed class: safe to log. Never a URL, a key, a
 /// body, a transcript or a provider's own text; never a wrapped transport
@@ -230,6 +260,21 @@ mod extraction_base {
 #[cfg(test)]
 mod tests {
     use super::ErrorClass;
+
+    /// Both tungstenite targets, each held at `INFO`: below it, every frame
+    /// either socket carries is dumped.
+    #[cfg(feature = "axum")]
+    #[test]
+    fn the_log_caps_hold_both_tungstenite_targets_at_info() {
+        use tracing::level_filters::LevelFilter;
+        assert_eq!(
+            super::LOG_CAPS,
+            [
+                ("tungstenite", LevelFilter::INFO),
+                ("tokio_tungstenite", LevelFilter::INFO),
+            ]
+        );
+    }
 
     /// A class is its text, however it was made: what the log line shows.
     #[test]

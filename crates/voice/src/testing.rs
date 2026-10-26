@@ -208,8 +208,8 @@ pub enum OpenScript {
 ///   (never `None`).
 /// - **`send_audio`** counts the call, then honours the script's write
 ///   behaviour (block or fail from the scripted frame on), and only then
-///   accepts the frame: it counts towards the audio thresholds and
-///   `SttLog::frames`.
+///   accepts the frame: it counts towards the audio thresholds,
+///   `SttLog::frames` and `SttLog::frame_bytes`.
 /// - **`end_input`** returns (or hangs), and once it has RETURNED the
 ///   after-end steps are ready.
 /// - **`close(end_sent)`** records `Some(end_sent)` when called, then
@@ -375,6 +375,7 @@ impl SttSession for ScriptedSession {
             self.audio_bytes = self.audio_bytes.saturating_add(bytes);
             self.log.update(|record| {
                 record.frames.push(length);
+                record.frame_bytes.push(frame);
                 record.audio_bytes = record.audio_bytes.saturating_add(bytes);
             });
             self.wake();
@@ -557,6 +558,7 @@ struct Record {
     opened: Vec<AudioFormat>,
     opens_started: usize,
     frames: Vec<usize>,
+    frame_bytes: Vec<Bytes>,
     audio_bytes: u64,
     end_inputs: usize,
     closed: Option<bool>,
@@ -586,6 +588,13 @@ impl SttLog {
     #[must_use]
     pub fn frames(&self) -> Vec<usize> {
         lock(&self.record).frames.clone()
+    }
+
+    /// Each accepted frame's bytes, in order: what reached the provider,
+    /// byte for byte.
+    #[must_use]
+    pub fn frame_bytes(&self) -> Vec<Bytes> {
+        lock(&self.record).frame_bytes.clone()
     }
 
     /// The accepted frames' bytes, together.
@@ -881,8 +890,12 @@ mod tests {
     /// 24 kHz PCM s16le: 48 bytes a millisecond.
     const BYTES_PER_MS: usize = 48;
 
+    /// `ms` of audio whose bytes depend on `ms` (so frames of different
+    /// lengths never share a prefix by accident).
     fn audio(ms: usize) -> Bytes {
-        Bytes::from(vec![0; ms * BYTES_PER_MS])
+        (0..ms * BYTES_PER_MS)
+            .map(|index| u8::try_from((index + ms) % 251).expect("< 251"))
+            .collect()
     }
 
     /// A waker that counts its wakes.
@@ -1037,6 +1050,11 @@ mod tests {
             "exhausted: pends, never None"
         );
         assert_eq!(log.frames(), [3_840, 960, 2_880, 3_840]);
+        assert_eq!(
+            log.frame_bytes(),
+            [audio(80), audio(20), audio(60), audio(80)],
+            "each frame's bytes, as accepted"
+        );
         assert_eq!(log.audio_bytes(), 11_520);
         assert_eq!(log.cancelled(), Cancelled::default());
     }

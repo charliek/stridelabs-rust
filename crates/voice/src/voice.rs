@@ -89,17 +89,27 @@ const MIN_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 
 impl RelaySettings {
     /// Revision 1's bounds (`PROTOCOL.md` §2.4), each tied to a fixed timer
-    /// of the installed clients, checked in this order: every duration
-    /// non-zero (a zero interval panics the relay's timers);
-    /// `open_timeout + close_timeout` at most 10 s; `admit_interval` at most
-    /// 2 s; `end_timeout` at most 2 s; `idle_timeout` at least 10 s;
-    /// `pong_deadline` over `ping_interval`; `refresh_interval` under the
-    /// lease's 30 s (a lease must be refreshed before it lapses).
+    /// of the installed clients, and the lease's margin, checked in this
+    /// order: every duration non-zero (a zero interval panics the relay's
+    /// timers); `open_timeout + close_timeout` at most 10 s; `admit_interval`
+    /// at most 2 s; `end_timeout` at most 2 s; `idle_timeout` at least 10 s;
+    /// `pong_deadline` over `ping_interval`; then the lease
+    /// ([`LEASE_TTL`], 30 s from the acquire; the first refresh comes
+    /// `refresh_interval` after `ready`):
+    ///
+    /// - `open_timeout + close_timeout + refresh_interval` under the lease:
+    ///   the first refresh lands before the lease lapses even after the
+    ///   slowest open the clocks allow (the open, then the `ready` write, each
+    ///   at its bound);
+    /// - `refresh_interval` at most a third of the lease: three refreshes per
+    ///   lease, so from the first good refresh on, one refresh that fails
+    ///   never costs the lease.
     ///
     /// # Errors
     ///
     /// [`VoiceSetupError::RelaySettingOutOfRange`] naming the first setting
-    /// (or pair) out of bounds.
+    /// (or sum of settings) out of bounds: `open_timeout + close_timeout +
+    /// refresh_interval` or `refresh_interval` for the lease's two.
     pub fn check(&self) -> Result<(), VoiceSetupError> {
         self.check_non_zero()?;
         let out_of_range = |setting| Err(VoiceSetupError::RelaySettingOutOfRange { setting });
@@ -129,7 +139,18 @@ impl RelaySettings {
         if pong_deadline <= ping_interval {
             return out_of_range("pong_deadline");
         }
-        if refresh_interval >= LEASE_TTL {
+        // The lease's margin (tapper's: three refreshes per lease, and the
+        // first one inside the lease after the slowest open). Before it, a 29 s
+        // refresh passed: after a 5 s open its first refresh came at 34 s, past
+        // the lease, and a healthy session closed `4001` with no takeover.
+        if open_timeout
+            .saturating_add(close_timeout)
+            .saturating_add(refresh_interval)
+            >= LEASE_TTL
+        {
+            return out_of_range("open_timeout + close_timeout + refresh_interval");
+        }
+        if refresh_interval.saturating_mul(3) > LEASE_TTL {
             return out_of_range("refresh_interval");
         }
         Ok(())
@@ -227,11 +248,13 @@ pub enum VoiceSetupError {
         /// The adapter's lead.
         lead: Duration,
     },
-    /// A relay setting outside revision 1's bounds
+    /// A relay setting outside revision 1's bounds or the lease's margin
     /// ([`RelaySettings::check`]).
     #[error("relay setting {setting} is outside the protocol's bounds")]
     RelaySettingOutOfRange {
-        /// The setting, or the pair of settings, out of bounds.
+        /// The setting, or the sum of settings, out of bounds (the lease's
+        /// two: `open_timeout + close_timeout + refresh_interval`, and
+        /// `refresh_interval` against three per lease).
         setting: &'static str,
     },
 }
@@ -263,11 +286,35 @@ pub struct Voice<S: SttProvider, T: TtsProvider> {
     tts_budget: TtsBudget,
     stream_budget: StreamBudget,
     relay: RelaySettings,
-    #[expect(
-        dead_code,
-        reason = "the voice flows report usage; until they land, nothing reads it"
+    // The flows report usage, and both are behind `axum`.
+    #[cfg_attr(
+        not(feature = "axum"),
+        expect(
+            dead_code,
+            reason = "the voice flows, which report usage, are behind `axum`"
+        )
     )]
     usage: Arc<dyn UsageSink>,
+    /// The relay sessions live on this instance, one per user.
+    #[cfg(feature = "axum")]
+    live: crate::relay::LiveSessions,
+}
+
+/// What the stream's admission needs of the app besides the request
+/// ([`Voice::open_stream`]): its Redis, and its shutdown.
+#[cfg(feature = "axum")]
+#[derive(Debug, Clone, Copy)]
+pub struct StreamContext<'a> {
+    /// The app's Redis handle; `None` (no Redis configured) is the
+    /// configuration `503`.
+    pub redis: Option<&'a RedisHandle>,
+    /// Cancelled when the app begins to shut down: every live session then
+    /// closes `1001`, after its release.
+    pub shutdown: &'a tokio_util::sync::CancellationToken,
+    /// What the app's drain waits on: an admitted session holds one of its
+    /// tokens from before the upgrade until the session (or the release of
+    /// an upgrade that failed) is done.
+    pub tracker: &'a tokio_util::task::TaskTracker,
 }
 
 /// The parts' own redacting `Debug`s (an adapter's never prints its key or a
@@ -325,6 +372,8 @@ impl<S: SttProvider, T: TtsProvider> Voice<S, T> {
             stream_budget,
             relay,
             usage,
+            #[cfg(feature = "axum")]
+            live: crate::relay::LiveSessions::default(),
         })
     }
 
@@ -376,6 +425,27 @@ impl<S: SttProvider, T: TtsProvider> Voice<S, T> {
     #[must_use]
     pub fn stream_configured(&self, redis: Option<&RedisHandle>) -> bool {
         self.stt.configured() && redis.is_some()
+    }
+
+    /// Where usage is reported (the relay's audio, at each session's end).
+    #[cfg(feature = "axum")]
+    pub(crate) fn usage(&self) -> &dyn UsageSink {
+        self.usage.as_ref()
+    }
+
+    /// The relay sessions live on this instance, by user.
+    #[cfg(feature = "axum")]
+    pub(crate) fn live_sessions(&self) -> &crate::relay::LiveSessions {
+        &self.live
+    }
+
+    /// How many relay sessions are live on this instance: a session is
+    /// counted from its admission (before the upgrade) until its close
+    /// began.
+    #[cfg(all(feature = "test-support", feature = "axum"))]
+    #[must_use]
+    pub fn live_session_count(&self) -> usize {
+        self.live.len()
     }
 
     /// The same voice on other clocks, held only to the non-zero rule (a
@@ -458,7 +528,8 @@ mod tests {
 
     /// The production clocks are both apps': 15 min, 10 s idle, refresh and
     /// ping, 8 s to open, 25 s for a pong, 2 s per write and close, 2 s
-    /// after `end`, 2 s between upgrades; and they pass revision 1's check.
+    /// after `end`, 2 s between upgrades; and they pass revision 1's check,
+    /// the lease's margin included.
     #[test]
     fn the_production_clocks() {
         let settings = RelaySettings::default();
@@ -477,6 +548,13 @@ mod tests {
             }
         );
         assert_eq!(settings.check(), Ok(()));
+        // Three refreshes per lease lifetime: one lost refresh never costs
+        // the lease (tapper's); and the first refresh after the slowest open
+        // lands inside the lease.
+        assert!(LEASE_TTL >= settings.refresh_interval * 3);
+        assert!(
+            settings.open_timeout + settings.close_timeout + settings.refresh_interval < LEASE_TTL
+        );
     }
 
     /// Each of revision 1's bounds, at its edge and just past it, one setting
@@ -542,11 +620,36 @@ mod tests {
             (set_idle, ms(10_000), ms(9_999), "idle_timeout"),
             // ping is 10 s: the pong deadline must be longer.
             (set_pong, ms(10_001), ms(10_000), "pong_deadline"),
-            (set_refresh, ms(29_999), ms(30_000), "refresh_interval"),
+            // Three per lease: at most 10 s.
+            (set_refresh, ms(10_000), ms(10_001), "refresh_interval"),
         ] {
             assert_eq!(with(change, edge), Ok(()), "{setting} at its edge");
             assert_eq!(with(change, past), refused(setting), "{setting} past it");
         }
+        // The first refresh inside the lease after the slowest open: with an
+        // 8 s open and a 2 s close, a 20 s refresh meets the 30 s lease and
+        // is named by that rule (checked first); just under it, the
+        // three-per-lease rule names it. A 29 s refresh, once accepted, is
+        // refused.
+        let lease_sum = "open_timeout + close_timeout + refresh_interval";
+        assert_eq!(with(set_refresh, ms(20_000)), refused(lease_sum));
+        assert_eq!(with(set_refresh, ms(19_999)), refused("refresh_interval"));
+        assert_eq!(with(set_refresh, ms(29_000)), refused(lease_sum));
+        // A fast open leaves the sum room; the third of a lease still binds.
+        let fast_open = RelaySettings {
+            open_timeout: ms(1_000),
+            close_timeout: ms(1_000),
+            ..RelaySettings::default()
+        };
+        assert_eq!(fast_open.check(), Ok(()));
+        assert_eq!(
+            RelaySettings {
+                refresh_interval: ms(10_001),
+                ..fast_open
+            }
+            .check(),
+            refused("refresh_interval")
+        );
         // Two problems: the first in check's order is named.
         let both = RelaySettings {
             end_timeout: ms(5_000),

@@ -632,6 +632,13 @@ impl StreamBudget {
         &self.prefix
     }
 
+    /// The instant on this budget's clock: what a session's usage record is
+    /// stamped with, the clock its windows are read on.
+    #[cfg(feature = "axum")]
+    pub(crate) fn now(&self) -> DateTime<Utc> {
+        (self.clock)()
+    }
+
     /// The caps this budget is held to.
     #[must_use]
     pub fn caps(&self) -> StreamCaps {
