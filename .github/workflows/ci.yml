@@ -145,6 +145,9 @@ jobs:
             stridelabs-config: \
             stridelabs-config:file \
             stridelabs-postgres: \
+            stridelabs-postgres:guard \
+            stridelabs-postgres:guard,test-support \
+            stridelabs-postgres:live-tests \
             stridelabs-testing: \
             stridelabs-gcp: \
             stridelabs-gcp:service-account-key \
@@ -710,7 +713,7 @@ jobs:
           status=0
           failed=""
           checked=0
-          for crate in stridelabs-config stridelabs-observability stridelabs-http stridelabs-auth stridelabs-testing stridelabs-mcp stridelabs-redis stridelabs-gcp stridelabs-inworld stridelabs-perplexity; do
+          for crate in stridelabs-config stridelabs-observability stridelabs-http stridelabs-auth stridelabs-testing stridelabs-mcp stridelabs-redis stridelabs-gcp stridelabs-inworld stridelabs-postgres stridelabs-perplexity; do
             if ! git cat-file -e "$baseline:crates/${crate#stridelabs-}/Cargo.toml" 2>/dev/null; then
               echo "::notice::$crate is new since $baseline (no crates/${crate#stridelabs-}/Cargo.toml there), so it has no baseline API to check; it is checked from the next tag on"
               continue

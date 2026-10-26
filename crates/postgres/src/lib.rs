@@ -18,21 +18,36 @@
 //! | [`lazy_pool`] | a pool built from checked options with [`PoolSettings`], without connecting |
 //! | [`neon_pooler`] | whether options reach Neon's pooled endpoint ([`PoolerRef`]); [`neon_pooler_url`] also reads the URL's undialled hosts, for a refusal |
 //! | [`LOG_CAPS`] | the sqlx targets that log a raw error, a server notice or a URL value, to cap off |
+//! | `GuardedPool`, `GuardedConnection`, `BeginGuard`, `TxBounds` (feature `guard`) | the begin guard: a pool whose transactions begin with a bounded, cancel-safe `BEGIN` and their `SET LOCAL` bounds, and whose releases are probed, per pool, while a `BEGIN` given up on may still be answered |
 //!
 //! # Feature topology
 //!
-//! `default = []`, and nothing a consumer turns on: the only feature,
-//! `live-tests`, compiles this crate's own real-Postgres suite. sqlx is a
-//! required dependency with the Postgres driver and the Tokio runtime only;
-//! **TLS is the consumer's choice**, made on its own sqlx (see the crate
-//! README for why this crate names none).
+//! `default = []`. Feature-gated items are named in plain code spans, never
+//! intra-doc links, so `cargo doc` without `--all-features` stays clean.
+//!
+//! | Feature | Default | Adds |
+//! |---|---|---|
+//! | `guard` | off | the begin guard (`GuardedPool`, `GuardedConnection`, `BeginGuard`, `TxBounds` and their constants), with `tokio` (`rt`, `time`) and `futures-util` (`std`) as direct dependencies |
+//! | `test-support` | off | `guard`, plus its two hidden test seams (`GuardedPool::set_window_opened_at`, `TxBounds::REFUSED_BY_THE_SERVER`): for a consumer's `[dev-dependencies]` only |
+//! | `live-tests` | off | **not for consumers**: compiles this crate's own real-Postgres suites (`tests/live.rs`, `tests/guard.rs`) |
+//!
+//! sqlx is a required dependency with the Postgres driver and the Tokio
+//! runtime only; **TLS is the consumer's choice**, made on its own sqlx (see
+//! the crate README for why this crate names none).
 
 mod connect;
+#[cfg(feature = "guard")]
+mod guard;
 mod pool;
 mod pooler;
 mod summary;
 
 pub use connect::{connect_options, UrlRefusal, IGNORED_URL_PARAMETERS, SUPPORTED_URL_PARAMETERS};
+#[cfg(feature = "guard")]
+pub use guard::{
+    BeginGuard, GuardedConnection, GuardedPool, TxBounds, DEFAULT_PROBE_TIMEOUT, DEFAULT_WINDOW,
+    MAX_APPLICATION_NAME_BYTES, MAX_TIMEOUT, MAX_WINDOW,
+};
 pub use pool::{lazy_pool, PoolSettings};
 pub use pooler::{neon_pooler, neon_pooler_host, neon_pooler_url, PoolerRef};
 pub use summary::{error_summary, ErrorSummary};
@@ -48,7 +63,9 @@ use tracing::level_filters::LevelFilter;
 ///   own background work, which no consumer code sees first: the WARN when a
 ///   connection's on-release ping fails (reached when a request is cancelled
 ///   while a statement is outstanding, and the statement's error is drained
-///   by the ping), the ERROR from `after_connect`, the DEBUG when a close
+///   by the ping), the WARN when an `after_release` hook fails (a
+///   `GuardedPool`'s failed probe, next to the guard's own value-free
+///   line), the ERROR from `after_connect`, the DEBUG when a close
 ///   fails or `min_connections` upkeep fails, the INFO when an idle
 ///   connection's ping fails. Every failure a consumer acts on still reaches
 ///   it as an `Err`, which it renders through [`error_summary`].
