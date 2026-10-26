@@ -271,9 +271,39 @@ For every request that isn't skipped it:
 | how the request ended | `status` | level |
 |---|---|---|
 | a response | its status | `ERROR` ≥ 500, `WARN` ≥ 400, else `INFO` |
+| a response carrying a `RequestLogLevel` extension less severe than that | its status | the extension's |
 | the inner service returned `Err` (propagated unchanged) | 500 | `ERROR` |
 | the inner service panicked (the panic propagates unchanged) | 500 | `ERROR` |
 | the response future was dropped first (client abort, shutdown drain, or an unrelated panic unwinding through its owner) | 499 | `WARN` |
+
+A response may **lower** its entry's level, never raise it: a handler, an
+extractor's rejection or an inner layer inserts `RequestLogLevel(Level)` into
+the response's extensions, and the entry takes that level only when it is
+less severe than the status's (a raise or an equal level is ignored). No
+feature flag: nothing changes unless a response carries the extension.
+Lower-only keeps the decision with the code that made it: an app may quieten
+an expected, attacker-driven 5xx it chose to return — a `503` for a token
+naming an unknown key id, refused because the key set was refetched moments
+ago, would otherwise put one `ERROR` per forged request on the dashboards —
+but nothing can re-rank an entry upward, and a 5xx the app didn't decide on
+(a response without the extension, an `Err`, a panic) stays `ERROR`. The
+three failure rows never consult it: there is no response to carry one.
+
+```rust
+use axum::{http::StatusCode, response::IntoResponse, Extension};
+use stridelabs_observability::RequestLogLevel;
+use tracing::Level;
+
+async fn handler() -> impl IntoResponse {
+    // An expected, client-driven 503: its entry is INFO instead of ERROR.
+    (StatusCode::SERVICE_UNAVAILABLE, Extension(RequestLogLevel(Level::INFO)))
+}
+```
+
+Under `LogFormat::Cloud`, `DEBUG` and `TRACE` are both written as
+`"severity":"DEBUG"` (Cloud Logging has no `TRACE`). A filter still sees the
+real level, so a lowered entry can fall below it (`stridelabs.request=info`
+drops a `DEBUG` entry) and not be written at all.
 
 The entry is written when the response *head* is ready — the layer wraps
 the response future, never the body, and leaves the response type

@@ -26,6 +26,7 @@
 //! | how the request ended | `status` | level |
 //! |---|---|---|
 //! | the inner service returned a response | its status | `ERROR` ≥ 500, `WARN` ≥ 400, else `INFO` |
+//! | … carrying a [`RequestLogLevel`] extension less severe than that | its status | the extension's |
 //! | the inner service returned `Err` (propagated unchanged) | 500 | `ERROR` |
 //! | the inner service panicked (the panic propagates unchanged) | 500 | `ERROR` |
 //! | the response future was dropped first (client abort, shutdown drain) | 499 | `WARN` |
@@ -40,6 +41,22 @@
 //! still up, before the runtime (or anything else up the stack) catches the
 //! panic. An entry dropped any other way — including by an unrelated panic
 //! unwinding through code that owns the future — is a 499.
+//!
+//! A response may **lower** its entry's level, never raise it: a handler,
+//! an extractor's rejection or an inner layer inserts [`RequestLogLevel`]
+//! into the response's extensions, and the entry takes that level only when
+//! it is less severe than the status's. Lower-only keeps the decision with
+//! the code that made it: an app may quieten an expected, attacker-driven
+//! 5xx it chose to return — a `503` for a token naming an unknown key id,
+//! refused because the key set was refetched moments ago, would otherwise
+//! put one `ERROR` per forged request on the dashboards — but nothing can
+//! re-rank an entry upward, and a 5xx the app didn't decide on (a response
+//! without the extension, an `Err`, a panic) stays `ERROR`. A raise or an
+//! equal level is ignored, and the three failure rows never consult it:
+//! there is no response to carry one. Under [`CloudLayer`](crate::CloudLayer)
+//! `DEBUG` and `TRACE` are both written as `"severity":"DEBUG"` (Cloud
+//! Logging has no `TRACE`); a filter still sees the real level, so a
+//! lowered entry can fall below it and not be written at all.
 //!
 //! "Ends" means the inner service's response future completed — the
 //! response *head* is ready. The layer wraps that future, not the body, and
@@ -162,6 +179,35 @@ use crate::request_id::{self, RequestId};
 /// Cloud Logging query (`jsonPayload.logger="stridelabs.request"`) finds
 /// both languages' request entries.
 pub const REQUEST_LOG_TARGET: &str = "stridelabs.request";
+
+/// A response extension that **lowers** the level of the request's entry.
+///
+/// Inserted into the response's extensions by a handler, an extractor's
+/// rejection or a layer inside [`RequestLogLayer`], which reads it when the
+/// response head reaches it. Honoured only when it is less severe than the
+/// level the status gives (`ERROR` ≥ 500, `WARN` ≥ 400, else `INFO`): a raise
+/// or an equal level is ignored, and an inner `Err`, a panic or a dropped
+/// future (no response) keep their `ERROR`, `ERROR` and `WARN`. See the
+/// [module docs](self#status-and-level) for why it only lowers.
+///
+/// Only the event's level changes: the status, message and `httpRequest`
+/// fields are the same, and the extension itself is never written out.
+///
+/// ```
+/// use axum::{http::StatusCode, response::IntoResponse, Extension};
+/// use stridelabs_observability::RequestLogLevel;
+/// use tracing::Level;
+///
+/// // An expected, client-driven 503: its entry is INFO instead of ERROR.
+/// async fn handler() -> impl IntoResponse {
+///     (
+///         StatusCode::SERVICE_UNAVAILABLE,
+///         Extension(RequestLogLevel(Level::INFO)),
+///     )
+/// }
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestLogLevel(pub Level);
 
 /// Query parameters whose values are replaced by `REDACTED` in
 /// `httpRequest.requestUrl` unless [`RequestLogConfig::with_redacted_query_params`]
@@ -383,10 +429,13 @@ where
                 poll
             })
             .await;
-            entry.finish(match &result {
-                Ok(res) => res.status().as_u16(),
-                Err(_) => INTERNAL_SERVER_ERROR,
-            });
+            match &result {
+                Ok(res) => entry.finish(
+                    res.status().as_u16(),
+                    res.extensions().get::<RequestLogLevel>().copied(),
+                ),
+                Err(_) => entry.finish(INTERNAL_SERVER_ERROR, None),
+            }
             result
         })
     }
@@ -426,7 +475,8 @@ impl PendingEntry {
         }
     }
 
-    fn finish(&mut self, status: u16) {
+    /// Writes the entry at [`entry_level`]'s level.
+    fn finish(&mut self, status: u16, requested: Option<RequestLogLevel>) {
         // Marked first: if writing ever panicked, `Drop` must not try again.
         self.written = true;
         let latency = format_latency(self.start.elapsed());
@@ -454,13 +504,32 @@ impl PendingEntry {
                 )
             };
         }
-        if status >= 500 {
-            entry!(Level::ERROR);
-        } else if status >= 400 {
-            entry!(Level::WARN);
-        } else {
-            entry!(Level::INFO);
+        match entry_level(status, requested) {
+            Level::ERROR => entry!(Level::ERROR),
+            Level::WARN => entry!(Level::WARN),
+            Level::INFO => entry!(Level::INFO),
+            Level::DEBUG => entry!(Level::DEBUG),
+            Level::TRACE => entry!(Level::TRACE),
         }
+    }
+}
+
+/// The entry's level: `ERROR` ≥ 500, `WARN` ≥ 400, else `INFO`, unless the
+/// response asked for a less severe one.
+fn entry_level(status: u16, requested: Option<RequestLogLevel>) -> Level {
+    let by_status = if status >= 500 {
+        Level::ERROR
+    } else if status >= 400 {
+        Level::WARN
+    } else {
+        Level::INFO
+    };
+    match requested {
+        // `tracing` orders levels by verbosity, not severity: a LESS severe
+        // level compares GREATER (TRACE > DEBUG > INFO > WARN > ERROR). So
+        // `>` is "lowers"; a raise or an equal level keeps the status's.
+        Some(RequestLogLevel(level)) if level > by_status => level,
+        _ => by_status,
     }
 }
 
@@ -481,7 +550,8 @@ impl Drop for PendingEntry {
         } else {
             CLIENT_CLOSED_REQUEST
         };
-        self.finish(status);
+        // No response, so no `RequestLogLevel` to consult.
+        self.finish(status, None);
     }
 }
 
@@ -746,6 +816,10 @@ mod tests {
                 "/broken",
                 get(|| async { StatusCode::INTERNAL_SERVER_ERROR }),
             )
+            .route(
+                "/unavailable",
+                get(|| async { StatusCode::SERVICE_UNAVAILABLE }),
+            )
             .route("/created", get(|| async { StatusCode::CREATED }))
             .route(
                 "/moved",
@@ -920,6 +994,327 @@ mod tests {
             assert_eq!(entry["httpRequest"]["status"], status, "{path}");
             assert_eq!(entry["message"], format!("GET {path} {status}"), "{path}");
         }
+    }
+
+    /// A logged router whose `/r` answers `status` with `level` as its
+    /// [`RequestLogLevel`], the way a handler sets one.
+    fn lowered(status: StatusCode, level: Level) -> Router {
+        Router::new()
+            .route(
+                "/r",
+                get(move || async move { (status, Extension(RequestLogLevel(level))) }),
+            )
+            .layer(RequestLogLayer::new(config()))
+    }
+
+    #[test]
+    fn levels_compare_by_verbosity_and_only_a_lower_one_is_taken() {
+        // The ordering the comparison in `entry_level` relies on: a LESS
+        // severe level compares GREATER.
+        assert!(Level::TRACE > Level::DEBUG);
+        assert!(Level::DEBUG > Level::INFO);
+        assert!(Level::INFO > Level::WARN);
+        assert!(Level::WARN > Level::ERROR);
+
+        let requests = [
+            Level::ERROR,
+            Level::WARN,
+            Level::INFO,
+            Level::DEBUG,
+            Level::TRACE,
+        ];
+        for (status, expected) in [
+            (
+                503,
+                [
+                    Level::ERROR,
+                    Level::WARN,
+                    Level::INFO,
+                    Level::DEBUG,
+                    Level::TRACE,
+                ],
+            ),
+            (
+                404,
+                [
+                    Level::WARN,
+                    Level::WARN,
+                    Level::INFO,
+                    Level::DEBUG,
+                    Level::TRACE,
+                ],
+            ),
+            (
+                200,
+                [
+                    Level::INFO,
+                    Level::INFO,
+                    Level::INFO,
+                    Level::DEBUG,
+                    Level::TRACE,
+                ],
+            ),
+        ] {
+            for (requested, expected) in requests.into_iter().zip(expected) {
+                assert_eq!(
+                    entry_level(status, Some(RequestLogLevel(requested))),
+                    expected,
+                    "{status} asking for {requested}"
+                );
+            }
+        }
+        assert_eq!(entry_level(503, None), Level::ERROR);
+        assert_eq!(entry_level(404, None), Level::WARN);
+        assert_eq!(entry_level(200, None), Level::INFO);
+    }
+
+    #[test]
+    fn a_lower_level_on_the_response_is_honoured() {
+        for (status, level, severity) in [
+            (503, Level::WARN, "WARNING"),
+            (503, Level::INFO, "INFO"),
+            (503, Level::DEBUG, "DEBUG"),
+            // Cloud Logging has no TRACE: the formatter writes it as DEBUG.
+            (503, Level::TRACE, "DEBUG"),
+            (500, Level::INFO, "INFO"),
+            (404, Level::INFO, "INFO"),
+            (404, Level::DEBUG, "DEBUG"),
+            (200, Level::DEBUG, "DEBUG"),
+        ] {
+            let code = StatusCode::from_u16(status).unwrap();
+            let (capture, res) = drive(send(lowered(code, level), Request::get("/r")));
+
+            assert_eq!(res.status(), code);
+            let entry = only_entry(&capture);
+            assert_eq!(entry["severity"], severity, "{status} at {level}");
+            assert_eq!(
+                entry["httpRequest"]["status"], status,
+                "{status} at {level}"
+            );
+            assert_eq!(
+                entry["message"],
+                format!("GET /r {status}"),
+                "{status} at {level}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_raise_or_an_equal_level_is_ignored() {
+        for (status, level, severity) in [
+            (200, Level::ERROR, "INFO"),
+            (200, Level::WARN, "INFO"),
+            (404, Level::ERROR, "WARNING"),
+            // Equal: the same level either way, so nothing to see but that
+            // it is still the status's.
+            (503, Level::ERROR, "ERROR"),
+            (404, Level::WARN, "WARNING"),
+            (200, Level::INFO, "INFO"),
+        ] {
+            let code = StatusCode::from_u16(status).unwrap();
+            let (capture, _) = drive(send(lowered(code, level), Request::get("/r")));
+
+            assert_eq!(
+                only_entry(&capture)["severity"],
+                severity,
+                "{status} at {level}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_5xx_without_the_extension_stays_an_error() {
+        for (path, status) in [("/unavailable", 503), ("/broken", 500)] {
+            let (capture, _) = drive(send(logged(config()), Request::get(path)));
+
+            let entry = only_entry(&capture);
+            assert_eq!(entry["severity"], "ERROR", "{path}");
+            assert_eq!(entry["httpRequest"]["status"], status, "{path}");
+        }
+    }
+
+    #[test]
+    fn one_golden_line_for_a_lowered_entry() {
+        let (capture, _) = drive(send(
+            lowered(StatusCode::SERVICE_UNAVAILABLE, Level::INFO),
+            Request::get("/r")
+                .header(HOST, "api.example.com")
+                .header(USER_AGENT, "curl/8.4.0")
+                .header(X_FORWARDED_FOR, "203.0.113.7")
+                .header(REQUEST_ID_HEADER, "req-1"),
+        ));
+
+        assert_eq!(
+            golden_lines(&capture),
+            [format!(
+                concat!(
+                    r#"{{"severity":"INFO","message":"GET /r 503","logger":"stridelabs.request","#,
+                    r#""timestamp":"{}","httpRequest":{{"requestMethod":"GET","#,
+                    r#""requestUrl":"http://api.example.com/r","status":503,"#,
+                    r#""latency":"<latency>","protocol":"HTTP/1.1","userAgent":"curl/8.4.0","#,
+                    r#""remoteIp":"203.0.113.7"}},"requestId":"req-1"}}"#,
+                ),
+                FIXED_TIMESTAMP
+            )]
+        );
+    }
+
+    #[test]
+    fn a_filter_sees_the_lowered_level() {
+        use tracing_subscriber::{EnvFilter, Layer as _};
+
+        // TRACE and DEBUG share a severity, so only a filter tells them apart.
+        for (filter, level, kept) in [
+            ("info", Level::INFO, Some("INFO")),
+            ("info", Level::DEBUG, None),
+            ("debug", Level::DEBUG, Some("DEBUG")),
+            ("debug", Level::TRACE, None),
+            ("trace", Level::TRACE, Some("DEBUG")),
+        ] {
+            let (capture, res) = drive_under(
+                |writer| EnvFilter::new(filter).and_then(cloud_layer(writer)),
+                send(
+                    lowered(StatusCode::SERVICE_UNAVAILABLE, level),
+                    Request::get("/r"),
+                ),
+            );
+
+            assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let severities: Vec<Value> = entries(&capture)
+                .into_iter()
+                .map(|entry| entry["severity"].clone())
+                .collect();
+            let expected: Vec<Value> = kept.into_iter().map(Value::from).collect();
+            assert_eq!(severities, expected, "{filter} at {level}");
+        }
+    }
+
+    #[test]
+    fn a_streamed_response_is_logged_at_its_heads_level() {
+        use axum::response::sse::{Event, Sse};
+
+        let router = Router::new()
+            .route(
+                "/events",
+                get(|| async {
+                    // A body that never ends: the entry can only come from
+                    // the head.
+                    let events = futures_util::stream::pending::<Result<Event, Infallible>>();
+                    (Extension(RequestLogLevel(Level::DEBUG)), Sse::new(events))
+                }),
+            )
+            .layer(RequestLogLayer::new(config()));
+
+        let (capture, res) = drive(send(router, Request::get("/events")));
+
+        assert_eq!(res.headers()["content-type"], "text/event-stream");
+        let entry = only_entry(&capture);
+        assert_eq!(entry["severity"], "DEBUG");
+        assert_eq!(entry["message"], "GET /events 200");
+    }
+
+    #[test]
+    fn a_level_set_by_an_inner_layer_is_honoured() {
+        // An inner layer that quietens one expected 503, with this crate's
+        // own `RequestIdLayer` between it and the logger: the extension
+        // travels on the response through both.
+        let router = app()
+            .layer(axum::middleware::map_response(
+                |mut res: Response<Body>| async move {
+                    if res.status() == StatusCode::SERVICE_UNAVAILABLE {
+                        res.extensions_mut().insert(RequestLogLevel(Level::INFO));
+                    }
+                    res
+                },
+            ))
+            .layer(RequestIdLayer)
+            .layer(RequestLogLayer::new(config()));
+
+        for (path, severity) in [("/unavailable", "INFO"), ("/broken", "ERROR")] {
+            let (capture, res) = drive(send(router.clone(), Request::get(path)));
+
+            assert!(res.headers().contains_key(REQUEST_ID_HEADER), "{path}");
+            assert_eq!(only_entry(&capture)["severity"], severity, "{path}");
+        }
+    }
+
+    /// A request carrying a [`RequestLogLevel`] in its own extensions, where
+    /// the layer must never look.
+    fn asking_for_debug<B>(uri: &str, body: B) -> Request<B> {
+        let mut req = Request::get(uri).body(body).unwrap();
+        req.extensions_mut().insert(RequestLogLevel(Level::DEBUG));
+        req
+    }
+
+    #[test]
+    fn a_failed_or_abandoned_request_never_takes_a_level() {
+        // An inner `Err`: no response to carry a level.
+        let svc =
+            RequestLogLayer::new(config()).layer(tower::service_fn(|_req: Request<()>| async {
+                Err::<Response<()>, _>("upstream refused")
+            }));
+        let (capture, result) = drive(svc.oneshot(asking_for_debug("/boom", ())));
+        assert!(result.is_err());
+        let entry = only_entry(&capture);
+        assert_eq!(
+            (&entry["severity"], &entry["httpRequest"]["status"]),
+            (&Value::from("ERROR"), &Value::from(500))
+        );
+
+        // A panic, out of a handler whose response would have carried one.
+        let router = Router::new()
+            .route(
+                "/explode",
+                get(|| async {
+                    if true {
+                        panic!("handler exploded");
+                    }
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Extension(RequestLogLevel(Level::DEBUG)),
+                    )
+                }),
+            )
+            .layer(RequestLogLayer::new(config()));
+        let capture = Capture::run(cloud_layer, || {
+            let mut svc = router;
+            let mut fut = Box::pin(svc.call(asking_for_debug("/explode", Body::empty())));
+            let mut cx = Context::from_waker(Waker::noop());
+            panic::catch_unwind(AssertUnwindSafe(|| fut.as_mut().poll(&mut cx)))
+                .expect_err("the handler's panic propagates");
+            drop(fut);
+        });
+        let entry = only_entry(&capture);
+        assert_eq!(
+            (&entry["severity"], &entry["httpRequest"]["status"]),
+            (&Value::from("ERROR"), &Value::from(500))
+        );
+
+        // A dropped future, whose response would have carried one.
+        let router = Router::new()
+            .route(
+                "/slow",
+                get(|| async {
+                    std::future::pending::<()>().await;
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Extension(RequestLogLevel(Level::DEBUG)),
+                    )
+                }),
+            )
+            .layer(RequestLogLayer::new(config()));
+        let capture = Capture::run(cloud_layer, || {
+            let mut svc = router;
+            let mut fut = Box::pin(svc.call(asking_for_debug("/slow", Body::empty())));
+            let mut cx = Context::from_waker(Waker::noop());
+            assert!(fut.as_mut().poll(&mut cx).is_pending());
+            drop(fut);
+        });
+        let entry = only_entry(&capture);
+        assert_eq!(
+            (&entry["severity"], &entry["httpRequest"]["status"]),
+            (&Value::from("WARNING"), &Value::from(499))
+        );
     }
 
     #[test]

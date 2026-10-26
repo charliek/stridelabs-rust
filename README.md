@@ -147,7 +147,7 @@ dependency, so after adding the block:
    the crate graph" when it did not.
 
 `scripts/downstream-check.sh` is the automated form: it does both against this
-checkout for tapper, slauth, limen, imgmcp, spendwise-rs, slaudio or lumen, then proves
+checkout for tapper, slauth, limen, imgmcp, spendwise-rs, slaudio, lumen or parcel, then proves
 with `cargo metadata` that every `stridelabs-*` package is this checkout's own
 crate. It finds each consumer's checkout next to this one or under
 `~/projects` (`DOWNSTREAM_PROJECTS` and `DOWNSTREAM_<NAME>_REPO` override), and
@@ -158,7 +158,11 @@ slaudio's Rust port lives on its `rust-port` branch, so pass
 `DOWNSTREAM_SLAUDIO_REF=origin/rust-port` (an `all <ref>` run otherwise reports
 slaudio NOT RUN). lumen (informational) is not given a ref automatically: pass `origin/main`
 or set `DOWNSTREAM_LUMEN_REF`. Its tests read `LUMEN_RS_TEST_DATABASE_URL`, `LUMEN_RS_TEST_REDIS_URL` and `LUMEN_RS_TEST_GCS_URL` (default `http://localhost:54443`, lumen's own
-fake-gcs; never tapper's 4443).
+fake-gcs; never tapper's 4443). parcel (informational, likewise pass `origin/main`) runs its
+root workspace against its own compose Postgres (`localhost:5439`, a port that is also the
+example in this library's CLAUDE.md, so don't move the library's Postgres there) and fake-gcs-server
+(`localhost:4447`); `DOWNSTREAM_PARCEL_DATABASE_URL` points it elsewhere. tapper's run names its
+fake-gcs-server through `TAPPER_RS_TEST_GCS_EMULATOR_URL` (default `http://127.0.0.1:4443`).
 
 ### Feature topology (all eleven crates)
 
