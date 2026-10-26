@@ -2034,13 +2034,24 @@ fn empty_body() -> ResponseTemplate {
 /// not the `UnknownKid` that would sign its caller out; and inside the
 /// backoff that failure opened, a lookup is suppressed as after any outage,
 /// never `UnseenKid` (nothing was fetched, so nothing was seen).
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test]
 async fn an_empty_set_on_a_cold_cache_is_a_failed_fetch() {
-    // Slow, so every other task piles up behind the first one's fetch.
-    let server = issuer(empty_body().set_delay(millis(100)), 1).await;
+    let server = issuer(empty_body(), 1).await;
     let cache = Arc::new(cache(&server, BOUNDED));
 
-    for (result, _) in herd(&cache, 8).await {
+    // On this current-thread runtime the fetch runs only once the test
+    // yields, so polling each lookup once puts all eight on the one attempt
+    // (the first starts it, the rest join) before it can answer.
+    let mut lookups: Vec<_> = (0..8)
+        .map(|_| Box::pin(cache.jwks_for_kid(PRIMARY_KID)))
+        .collect();
+    for lookup in &mut lookups {
+        assert!(
+            lookup.now_or_never().is_none(),
+            "the lookup started or joined the attempt"
+        );
+    }
+    for result in futures_util::future::join_all(lookups).await {
         assert_jwks(result, NO_KEYS, "the herd on the empty fetch");
     }
     cache.assert_one_failed_attempt("the empty fetch");
