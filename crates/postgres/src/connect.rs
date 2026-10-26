@@ -63,8 +63,15 @@ const SSL_MODES: [&str; 6] = [
 ///   per-connection connect timeout; a pool's connections are bounded by its
 ///   acquire timeout ([`PoolSettings`](crate::PoolSettings)).
 /// - `keepalives` (0 or 1), `keepalives_idle`, `keepalives_interval`,
-///   `keepalives_count` (non-negative integers): TCP keepalive tuning; leaving
-///   the OS defaults changes no correctness or security property.
+///   `keepalives_count` (non-negative integers): TCP keepalive tuning, which
+///   sqlx 0.9 cannot apply. Dropping them leaves the OS defaults, and sqlx
+///   sets no keepalive itself: it opens a plain Tokio `TcpStream` and offers
+///   no hook on the socket (`sqlx-core/src/net/socket/mod.rs`,
+///   `connect_tcp`). So TCP never notices a peer that keeps the connection
+///   open and goes silent, and a statement waiting on one waits unbounded
+///   unless something above it has a timeout. (Under the `guard` feature,
+///   `GuardedPool` bounds a `BEGIN`, its `SET LOCAL` and the release probes
+///   after one; the crate README lists what stays unbounded.)
 /// - `target_session_attrs`, only `any` or `read-write`: sqlx dials one host,
 ///   which satisfies `any`, and a `read-write` demand on a replica still fails
 ///   loudly at the first write. The other values (`read-only`, `primary`,

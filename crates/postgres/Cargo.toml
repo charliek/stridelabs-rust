@@ -11,19 +11,35 @@ publish = false
 
 [features]
 default = []
-# NOT for consumers: it compiles this crate's own real-Postgres suite
-# (`tests/live.rs`), which needs the compose Postgres (`docker compose up -d`)
-# or CI's Postgres service, and panics without one rather than skipping. A
-# feature, not an always-on test target, so `cargo test --workspace` keeps
-# needing no services; `--all-features` (CI's all-features lane) turns it on.
-# It enables a DEV-dependency's feature, as stridelabs-redis's does.
-live-tests = ["stridelabs-testing/postgres"]
+# The begin guard (`GuardedPool`, `GuardedConnection`, `BeginGuard`,
+# `TxBounds`): a bounded, cancel-safe `BEGIN` in a spawned task, and a
+# per-pool quarantine window over the pool's `after_release` hook. New
+# behaviour, so opt-in; it adds Tokio (the task and the timers) and
+# futures-util (`catch_unwind`) as direct dependencies.
+guard = ["dep:tokio", "dep:futures-util"]
+# The guard's two `#[doc(hidden)]` test seams
+# (`GuardedPool::set_window_opened_at`, `TxBounds::REFUSED_BY_THE_SERVER`).
+# For a consumer's `[dev-dependencies]` only, never its `[dependencies]`:
+# resolver 2 then unifies it into test builds alone.
+test-support = ["guard"]
+# NOT for consumers: it compiles this crate's own real-Postgres suites
+# (`tests/live.rs`, and the guard's `tests/guard.rs`), which need the compose
+# Postgres (`docker compose up -d`) or CI's Postgres service, and panic
+# without one rather than skipping. A feature, not an always-on test target,
+# so `cargo test --workspace` keeps needing no services; `--all-features`
+# (CI's all-features lane) turns it on. It enables a DEV-dependency's
+# feature, as stridelabs-redis's does.
+live-tests = ["guard", "test-support", "stridelabs-testing/postgres"]
 
 [lints]
 workspace = true
 
 [[test]]
 name = "live"
+required-features = ["live-tests"]
+
+[[test]]
+name = "guard"
 required-features = ["live-tests"]
 
 [dependencies]
@@ -52,9 +68,19 @@ url = { workspace = true }
 # graph through `url`.
 percent-encoding = { workspace = true }
 thiserror = { workspace = true }
-# `LOG_CAPS`' `LevelFilter`. Already in every graph through sqlx-core, which
-# logs through it.
+# `LOG_CAPS`' `LevelFilter`, and the guard's two WARN lines. Already in
+# every graph through sqlx-core, which logs through it.
 tracing = { workspace = true }
+# The guard (feature `guard`): its `BEGIN` runs in a spawned task, under
+# `tokio::time::timeout`. Already in every consumer's graph through sqlx's
+# `runtime-tokio`. `rt` and `time` are all the guard needs; the workspace
+# entry's `full` still comes along, since inheritance can only add features,
+# so the list documents intent (as stridelabs-auth's and stridelabs-gcp's do).
+tokio = { workspace = true, optional = true, features = ["rt", "time"] }
+# The guard: `FutureExt::catch_unwind` around sqlx's `BEGIN`, so a panic in
+# it opens the window too. The workspace entry is `std` only; already in
+# every graph through sqlx-core.
+futures-util = { workspace = true, optional = true }
 
 [dev-dependencies]
 # `require_postgres`, the fail-loud probe for the live suite. Its `postgres`
@@ -62,8 +88,9 @@ tracing = { workspace = true }
 # features unify into every `cargo test --workspace`, and that lane must need
 # no Postgres.
 stridelabs-testing = { workspace = true }
-# A lazy pool needs a runtime to be built in; the live suite drives it.
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# A lazy pool needs a runtime to be built in; the live suites drive it, and
+# the guard's live suite runs its fault relay on Tokio's `net`.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-util", "sync"] }
 # Records the targets sqlx logs under, to pin `LOG_CAPS` to them.
 tracing-subscriber = { workspace = true }
 # `LOG_CAPS`' doc example folds the pairs into a `TargetCaps`.

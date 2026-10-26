@@ -213,8 +213,14 @@ construction. Then: `sub` non-empty; scopes = the union of `scope` and
   `resource.claim_checks()` starts from the resource's issuer and
   `Audience::Required(resource.url())`; checks for any other issuer or
   audience (`IfPresent` and `NotValidated` included) are a
-  `ClaimChecksError`, so the audience still cannot drift. `.screen(policy)`
-  sets the pre-lookup `ScreenPolicy` on either constructor's verifier.
+  `ClaimChecksError`, so the audience still cannot drift. The same checks
+  carry stridelabs-auth's claim type rules, off unless turned on:
+  `.with_integer_time_claims(true)` (each `exp`, `nbf` and `iat` a
+  non-negative JSON integer) and `.with_string_issuer(true)` (`iss` a JSON
+  string, never an array holding the issuer). `McpVerifier::new` applies
+  neither: an array `iss` holding the issuer and a fractional `exp` pass
+  there. `.screen(policy)` sets the pre-lookup `ScreenPolicy` on either
+  constructor's verifier.
 - **Scope precedence.** `.with_scope_source(ScopeSource::ScopeThenScp)`
   reads `scope` when the token carries it (even empty) and `scp` only when
   it does not, as fastmcp does; the default, `ScopeSource::Union`, grants
@@ -228,7 +234,11 @@ use stridelabs_mcp::{McpVerifier, ScopeSource};
 
 let verifier = McpVerifier::with_cache(
     &resource,
-    resource.claim_checks().with_leeway(Duration::ZERO),   // nbf checked
+    resource
+        .claim_checks()                     // nbf checked
+        .with_leeway(Duration::ZERO)
+        .with_integer_time_claims(true)     // exp, nbf, iat: integers
+        .with_string_issuer(true),          // iss: a string, not an array
     JwksCache::new(&config.slauth_jwks_url, http.clone()).report_unusable_keys(true),
 )?
 .screen(ScreenPolicy::Strict)
