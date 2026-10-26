@@ -1,0 +1,258 @@
+# stridelabs-voice
+
+The voice core StrideLabs apps share: what lets a client talk to an app (a
+speech-to-text relay over a WebSocket) and hear it answer (text to speech,
+one sentence per request) inside a spending ceiling, with the speech
+providers swappable behind it. The core names no provider; a provider is an
+adapter behind a feature.
+
+Extracted from tapper (`tapper-rs/src/voice/`, at `82be95f`), which had
+hardened lumen's copy; both apps run this crate's scripts and key shapes,
+byte for byte, so either adopts it with no change on the wire.
+
+**What is here today** is the Redis core every voice route stands on:
+
+| Module | Holds |
+|---|---|
+| `window` | the UTC day and month a budget counts in: when each ends (`day_end`, `month_end`), `seconds_until` (a `Retry-After` or a TTL, rounded up, never zero), the key stamps, `key_ttls`, the `Clock` |
+| `budget` | the text-to-speech character budget (`TtsBudget`, `TtsCaps`), the per-sentence idempotency key (`ChargeKey`, `Fingerprint`, `Admitted`, `Disposition`), and what both budgets share: the caps rule (`CapsError`, `CapProblem`) and the refusal (`LimitScope`, `Spent`, `LimitReached`) |
+| `lease` | the speech-to-text audio budget (`StreamBudget`, `StreamCaps`): the fenced lease (`issue_ticket`, `acquire` → `Grant`), metering (`meter` → `Metered`), `audio_ms` |
+
+The client protocol, the provider traits, the relay and the text-to-speech
+flow, and the adapters build on it.
+
+## Adding the dependency
+
+```toml
+[dependencies]
+stridelabs-voice = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.11.0" }
+```
+
+New in v0.11.0. See the workspace root README for the local `[patch]`
+co-development snippet.
+
+## Feature topology
+
+`default = []`: the Redis core above, with no feature at all.
+
+| Feature | For | Adds |
+|---|---|---|
+| `test-support` | tests | the test seams, none of them API without it: `TtsBudget::with_clock` / `StreamBudget::with_clock` (a fixed or moving clock, for the UTC boundaries), `TtsCaps::unchecked` / `StreamCaps::unchecked` (caps the rule refuses), `StreamBudget::acquire_under` (the real acquire under another replay policy) |
+| `live-tests` | this crate only | its real-Redis suites (`tests/budget.rs`, `tests/lease.rs`); never for consumers |
+
+## Using it
+
+```rust,no_run
+use std::time::Duration;
+
+use stridelabs_redis::RedisHandle;
+use stridelabs_voice::budget::{BudgetError, ChargeKey, Disposition, Fingerprint, TtsBudget, TtsCaps};
+use stridelabs_voice::lease::{MeterMode, StreamBudget, StreamCaps};
+use uuid::Uuid;
+
+# async fn example(redis: &RedisHandle, user: Uuid) -> Result<(), Box<dyn std::error::Error>> {
+// At startup: the app's prefixes and caps (its settings; the crate has no
+// defaults). A `CapsError` is a startup refusal.
+let tts = TtsBudget::new("myapp:voice:tts", TtsCaps::new(20_000, 300_000, 300_000)?);
+let stream = StreamBudget::new(
+    "myapp:voice:stream",
+    StreamCaps::from_minutes(120, 1_800, 1_800)?,
+);
+
+// Per sentence: charge the trimmed text's characters BEFORE asking the
+// provider, under the request's Idempotency-Key (or a minted one).
+let key = ChargeKey::mint();
+let fingerprint = Fingerprint::of("Jason", "Hello there.");
+match tts.charge(redis, user, 12, &key, &fingerprint).await {
+    Ok(admitted) => {
+        // Speak. Record usage only for a fresh charge: a replay was counted.
+        let _count_it = admitted.disposition == Disposition::Fresh;
+    }
+    // 429, with `scope`, `resets_at` and `Retry-After` from the limit.
+    Err(BudgetError::Exceeded(limit)) => {
+        let _ = (limit.scope, limit.resets_at, limit.retry_after_seconds);
+    }
+    // `KeyReused` is a 422; `Backend` (and anything newer) a 503.
+    Err(_) => {}
+}
+
+// Per stream session: a PING (replaces an idle-dead connection), the
+// ticket, the acquire; then a meter at each tick and a release at the end.
+redis.ping().await?;
+let ticket = stream.issue_ticket(redis, user).await?;
+let token = Uuid::new_v4();
+let grant = stream.acquire(redis, user, token, ticket, Duration::from_secs(2)).await?;
+let tick = stream.meter(redis, user, token, 1_500, MeterMode::Refresh).await?;
+if let Some(limit) = tick.limit_reached() {
+    // The session ends, reporting `limit.scope`.
+    let _ = limit;
+}
+stream.meter(redis, user, token, 3_000, MeterMode::Release).await?;
+# let _ = grant;
+# Ok(())
+# }
+```
+
+## Redis
+
+### Keys
+
+Every key is under a prefix the app passes, one per budget, with no
+default (lumen: `lumen:voice:tts`, `lumen:voice:stream`; tapper:
+`tapper:voice:tts`, `tapper:voice:stream`). `{user}` and `{token}` are
+lowercase hyphenated uuids; `{key}` is the `Idempotency-Key` as sent (or a
+minted uuid); `{day}` is `YYYY-MM-DD` and `{month}` `YYYY-MM` of the
+budget clock's UTC instant, so a window rolls over by changing keys, never by
+an expiry firing.
+
+| Budget | Key after `{prefix}:` | Holds | Expiry |
+|---|---|---|---|
+| text | `user:{user}:{day}` | characters (a canonical integer) | the day's end + 1 h |
+| text | `user-month:{user}:{month}` | characters | the month's end + 1 day |
+| text | `global:{month}` | characters | the month's end + 1 day |
+| text | `charge:{user}:{key}` | the verdict, `v1\|<mask>\|<fp>\|<reset>` | 600 s |
+| stream | `lease:{user}` | the live session's token | 30 s (`LEASE_TTL`) |
+| stream | `user:{user}:{day}` | audio ms | the day's end + 1 h |
+| stream | `user-month:{user}:{month}` | audio ms | the month's end + 1 day |
+| stream | `global:{month}` | audio ms | the month's end + 1 day |
+| stream | `session:{token}` | the ms this session has been charged | 1 h |
+| stream | `admit:{user}` | the last admitted token | the admission interval (at least 1 ms) |
+| stream | `fence:{user}` | a hash; `next` is the last ticket | 1 day, refreshed at every issue and grant |
+
+A canonical integer is `0`, or digits without a leading zero, at most 15 of
+them; anything else in a counter is a poisoned counter: the call fails
+(`Backend`) having written nothing.
+
+### Scripts
+
+Four scripts, each one `EVAL` carrying its own text. Each is byte-identical
+to the extraction base, and its SHA-1 is a public constant an app may log or
+assert; a unit test (`the_scripts_are_the_extraction_bases`) pins every one.
+
+| Script | Constant | KEYS | Bytes | SHA-1 |
+|---|---|---|---|---|
+| the charge | `budget::CHARGE_SCRIPT_SHA1` | 4 | 2398 | `6db0a4afd52968ffb65e754d4dc48c7112016757` |
+| the ticket | `lease::ISSUE_SCRIPT_SHA1` | 1 | 927 | `71b413abe08a2fe9288ecd807b0e8e8fad6cc6c0` |
+| the acquire | `lease::ACQUIRE_SCRIPT_SHA1` | 6 | 2035 | `96f220b3004096553dc0fa570d43b306aa7e52d9` |
+| the meter | `lease::METER_SCRIPT_SHA1` | 5 | 1926 | `b07b06c546464c457e44086bce1d96cbd5823ecb` |
+
+Every script opens with the same Lua helpers (649 bytes, SHA-1
+`882d901b042222ab1dfa60cad4981e1af84fd928`), so a counter and an argument
+are validated by one rule each, and validates every counter and argument
+before its first write. Each answer has one meaning: the spent-window mask
+`1`–`7` (`1` the user's day, `2` everyone's month, `4` the user's month),
+and the sentinels `-1` (a malformed counter, verdict, fence or argument;
+nothing written), `-2` (the acquire: another token admitted inside the
+admission interval), `-3` (the acquire: a stale ticket) and `-4` (the
+charge: the key's stored verdict has another fingerprint).
+
+A refusal reports ONE scope: of the spent windows, the one whose reset is
+latest; a tie goes to `user_month`, then `global_month`, then `user_day`. A
+replayed charge refusal keeps its original reset.
+
+### The replay policy, per call
+
+| Call | `Replay` | Why |
+|---|---|---|
+| `TtsBudget::charge` | `OnceOnFreshConnection` | a second run finds the stored verdict and writes nothing; residual: a first attempt delayed past 600 s charges again |
+| `StreamBudget::issue_ticket` | `Never` | an increment is not idempotent; a lost reply is a `503`, and that ticket is never used |
+| `StreamBudget::acquire` | `Never` | it IS the takeover: a second run could overwrite a session that took the lease in between, misreport `took_over`, and restart TTLs |
+| `StreamBudget::meter` | `OnceOnFreshConnection` | cumulative totals: a second run charges nothing, and the lease is touched only under its own token; residual: a first attempt delayed past an hour charges again |
+
+### Writes, ACLs and the fence's exception
+
+Redis checks ACL permissions per command inside a script and does not roll a
+script back. So every write is ONE `SET key value EX|PX ttl` (never an
+`INCRBY` then an `EXPIRE`), after every check: a denied `SET` refuses before
+anything changed. That is all the rule promises; it is not all-or-nothing
+across commands, and these partial states are allowed:
+
+- **The release's `DEL` comes last.** A denied `DEL` leaves the counters and
+  the session meter charged and the lease to expire on its own (the state a
+  failed release leaves anyway); the call is `Backend`, and a replay charges
+  nothing and fails at the `DEL` again.
+- **The fence is a hash**, which no one command both sets and expires. The
+  ticket's script does `HINCRBY` then `EXPIRE`: a denied `EXPIRE` leaves
+  `next` raised with its previous expiry (none, for a new hash) and the
+  issue failed; no lease, counter or admission key is written, and a raised
+  `next` only makes older tickets stale. The acquire's `EXPIRE` of the fence
+  comes FIRST of its writes: denied, nothing is written; allowed, followed by
+  a denied `SET`, only the fence's expiry was refreshed.
+
+An ACL user scoped to an app's voice keys needs `EVAL` and, for the
+scripts' own calls, `GET`, `SET`, `DEL`, `HGET`, `HINCRBY` and `EXPIRE` on
+the two prefixes; besides those, whatever its connection sends on its own
+(`PING`, for the stream's admission and a readiness probe).
+
+## The consumer's obligations
+
+- **The prefixes**, one per budget, with no default; two apps (or two
+  environments) sharing a Redis must not share a prefix.
+- **The caps**, from the app's settings: `TtsCaps::new` (characters) and
+  `StreamCaps::from_minutes` (minutes, counted in ms). Each refuses with a
+  `CapsError` listing every `CapProblem` (a cap not `1..=max`; a cap below
+  the one it must allow at least), which the app maps to its startup
+  refusals under its own setting names. The rule: each cap positive, and a
+  user's day <= a user's month <= everyone's month.
+- **The Redis handle**: the app's `stridelabs_redis::RedisHandle`, built
+  with the bounds the replay arguments above assume — a 1 s dial and a
+  500 ms response timeout (the handle's defaults). The crate cannot enforce
+  them. A `rediss://` dial needs the consumer's rustls crypto provider
+  (stridelabs-redis's README).
+- **The PING before the ticket**: the stream's admission sends `PING` (which
+  is retried on a fresh connection) before `issue_ticket` and `acquire`
+  (which are never replayed), so a connection that died idle costs a redial,
+  not a `503`.
+- **Charge first, never refund**: the text budget is charged before the
+  provider is asked, and a failed synthesis keeps its charge.
+- **Usage**: count a charge only when its `Disposition` is `Fresh`.
+- **Rendering**: a refusal's `scope`, `resets_at` (RFC 3339) and
+  `retry_after_seconds` are the app's to put in its `429`, beside the
+  `detail` its clients already parse; `Backend` details are fixed summaries,
+  safe to log, never a key, a user id or Redis's own text.
+
+## Named limits
+
+- **A user's month that starts mid-month under-counts it**: on the deploy
+  that first writes an app's user-month keys, every user's month starts at
+  zero; everyone's month still bounds all.
+- **Charging is per refresh**: a session can overshoot a window shared with
+  other sessions by one refresh interval of audio; a crash before the first
+  refresh leaves up to the pacing lead plus one interval uncharged; audio
+  charged at the first refresh after a UTC boundary counts in the new
+  window; a Redis outage mid-session charges late, or never if the final
+  release fails too (only admission fails closed).
+- **The fence's guarantee lasts the hash's life** (a day from the last issue
+  or grant); a missing hash refuses every ticket, and numbering restarts.
+- **One small fence hash per user may be left without an expiry** after a
+  denied `EXPIRE`, until a later issue succeeds.
+- **Formats and encodings**: a PCM-only core; a speech-to-text provider must
+  take both 24 and 16 kHz; text to speech answers `audio/mpeg` only, in one
+  body per sentence, with no context across sentences.
+- **Pacing**: a provider that must be fed below real time plus the installed
+  clients' 3 s pre-`ready` burst (Deepgram's 1.25×) is unsupported in
+  revision 1 of the protocol.
+- **Providers**: one with no endpointing needs an adapter-side voice
+  activity detector, or is unsupported; a request/response speech-to-text
+  service's failed turn ends the session; a provider's billing unit can
+  differ from the budgets' (characters sent; relay-measured audio).
+- **Client timing**: revision 1 assumes a turn's final text within 1 s of
+  the end of speech and within 2 s of the client's `end`, and a lead of at
+  least 5 s (the installed clients' fixed timers); lifting any of them is a
+  protocol revision.
+- **A server shutdown discards late final transcripts** (the client keeps
+  its last partial).
+
+## Tests
+
+`cargo test -p stridelabs-voice` runs the unit tests (the windows, the
+verdicts, the caps rule, the key shapes and the scripts' SHA-1s), which need
+nothing. `cargo test -p stridelabs-voice --features live-tests` (and the
+workspace's `--all-features` lane) adds the real-Redis suites against the
+compose Redis (`docker compose up -d redis`, `redis://localhost:6390/0`;
+`REDIS_URL` overrides): every charge, ticket, acquire and meter answer, the
+TTLs, the UTC boundaries, each call's replay policy through a fault relay,
+and the ACL cases, each test under a prefix of its own
+(`stridelabs-voice-test:<uuid>:tts` / `:stream`) and each ACL user
+(`voice-test-<uuid>`) deleted when its test ends. Without a Redis they fail
+loudly; they never skip.

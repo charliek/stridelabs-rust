@@ -161,6 +161,12 @@ base64 = "0.22"
 rand = "0.10"
 uuid = { version = "1", features = ["v4", "serde"] }
 time = { version = "0.3", features = ["serde"] }
+# stridelabs-voice's UTC windows: the day and month a budget counts in, read
+# off `Utc::now()` (`now`, which is `std`). No `clock` (the local time zone,
+# `iana-time-zone`), no `oldtime`, no `wasmbind`: nothing here reads a local
+# time. Already in the lock (0.4.45, through rmcp and schemars), so nothing
+# is added to it.
+chrono = { version = "0.4", default-features = false, features = ["now"] }
 bytes = "1"
 futures = "0.3"
 # stridelabs-auth's JWKS cache hands one fetch's outcome to every waiter

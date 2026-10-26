@@ -2974,6 +2974,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "stridelabs-voice"
+version = "0.11.0"
+dependencies = [
+ "chrono",
+ "futures",
+ "redis",
+ "serde",
+ "serde_json",
+ "sha1",
+ "sha2 0.11.0",
+ "stridelabs-redis",
+ "stridelabs-testing",
+ "thiserror",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "stringprep"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"

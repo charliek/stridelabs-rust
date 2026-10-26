@@ -1,0 +1,74 @@
+[package]
+name = "stridelabs-voice"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "A provider-neutral voice core for StrideLabs services: the UTC windows, a text-to-speech character budget and a speech-to-text audio budget with a fenced lease, on Redis scripts shared byte for byte by every app"
+publish = false
+
+[features]
+default = []
+# The test seams, none of them API without it: `TtsBudget::with_clock` and
+# `StreamBudget::with_clock` (a test's clock, for the UTC boundaries),
+# `TtsCaps::unchecked` and `StreamCaps::unchecked` (caps the startup rule
+# refuses, for a test that needs them), and `StreamBudget::acquire_under` (the
+# real acquire under another replay policy, for the replay-hazard test).
+test-support = []
+# NOT for consumers: it compiles this crate's own real-Redis suites
+# (`tests/budget.rs`, `tests/lease.rs`), which need the compose Redis
+# (`docker compose up -d redis`) or CI's Redis service, and panic without one
+# rather than skipping. A feature, not an always-on test target, so `cargo
+# test --workspace` keeps needing no services; `--all-features` turns it on.
+# It enables a DEV-dependency's feature, as stridelabs-redis's does, and the
+# seams the suites drive (`test-support`).
+live-tests = ["test-support", "stridelabs-testing/redis"]
+
+[lints]
+workspace = true
+
+[[test]]
+name = "budget"
+required-features = ["live-tests"]
+
+[[test]]
+name = "lease"
+required-features = ["live-tests"]
+
+[dependencies]
+# Every budget call is one `EVAL` on the consumer's handle, under the replay
+# policy the call needs (the crate docs, "The replay policy"). The handle,
+# its URL and its timeouts are the consumer's.
+stridelabs-redis = { workspace = true }
+# The UTC day and month a budget counts in (`window`).
+chrono = { workspace = true }
+# User ids and session tokens in the keys; `ChargeKey::mint` (`v4`).
+uuid = { workspace = true }
+# `LimitScope`'s wire names (`user_day`, `user_month`, `global_month`).
+serde = { workspace = true }
+# `Fingerprint`: SHA-256 over a sentence, cut to 16 hex characters.
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+# `Grant::origin`, a `tokio::time::Instant`: the monotonic twin of the
+# instant a grant's windows were read at.
+tokio = { workspace = true }
+
+[dev-dependencies]
+# `require_redis`, the fail-loud probe for the live suites. Its `redis`
+# feature is switched on by `live-tests` above, never here: dev-dependency
+# features unify into every `cargo test --workspace`, and that lane must need
+# no Redis.
+stridelabs-testing = { workspace = true }
+# The live suites seed, read back and delete keys, and create ACL users, on a
+# connection of their own (never the handle under test); the fault relay
+# (`tests/redis_fault`) reads the test URL with `redis::parse_redis_url`.
+redis = { workspace = true }
+# `join_all`: concurrent charges, and the fault relay's control replies.
+futures = { workspace = true }
+# `the_scopes_serialize_in_snake_case`.
+serde_json = { workspace = true }
+# `the_scripts_are_the_extraction_bases`: the SHA-1 of the exact bytes each
+# script sends. Already in the lock (0.11.0), so nothing is added to it.
+sha1 = "0.11"
