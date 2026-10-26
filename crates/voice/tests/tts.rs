@@ -529,7 +529,7 @@ async fn a_bad_request_is_refused_uncharged_and_unspoken() {
         ),
         (
             "a repeated text, spelled with an escape",
-            r#"{"text":"hi","text":"bye"}"#.into(),
+            r#"{"text":"hi","te\u0078t":"bye"}"#.into(),
             SHAPE,
         ),
     ];
