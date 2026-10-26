@@ -42,18 +42,76 @@ pub fn require_local_url(var: &str) -> String {
     require_local_url_from(var, |name| std::env::var(name).ok())
 }
 
+/// [`require_local_url`], whose refusal for an unset (or empty) variable also
+/// carries the consumer's own `hint`: how to create the thing the variable
+/// names (a make target, a script), which this crate cannot know.
+///
+/// The rule is exactly [`require_local_url`]'s, and so is every refusal but
+/// that one. For an unset or empty `var` the message reads
+/// `<var> is not set. <hint>`, with `hint` verbatim (give it its own full
+/// stop, and keep it free of secrets: it is printed), then the usual
+/// explanation of the rule.
+///
+/// # Panics
+///
+/// As [`require_local_url`].
+///
+/// ```no_run
+/// let url = stridelabs_testing::require_local_url_hinted(
+///     "MYAPP_TEST_DATABASE_URL",
+///     "Create the database with `make test-db`, then export its URL.",
+/// );
+/// # let _ = url;
+/// ```
+pub fn require_local_url_hinted(var: &str, hint: &str) -> String {
+    require_local_url_hinted_from(var, hint, |name| std::env::var(name).ok())
+}
+
 /// The env-injectable seam behind [`require_local_url`], so unit tests reach
 /// every refusal without mutating the environment.
 fn require_local_url_from(var: &str, get: impl Fn(&str) -> Option<String>) -> String {
-    checked_local_url(var, get(var).as_deref()).unwrap_or_else(|refusal| panic!("{refusal}"))
+    require_local_url_with(var, None, get)
+}
+
+/// The env-injectable seam behind [`require_local_url_hinted`].
+fn require_local_url_hinted_from(
+    var: &str,
+    hint: &str,
+    get: impl Fn(&str) -> Option<String>,
+) -> String {
+    require_local_url_with(var, Some(hint), get)
+}
+
+fn require_local_url_with(
+    var: &str,
+    hint: Option<&str>,
+    get: impl Fn(&str) -> Option<String>,
+) -> String {
+    checked_local_url_hinted(var, get(var).as_deref(), hint)
+        .unwrap_or_else(|refusal| panic!("{refusal}"))
 }
 
 /// `value` (the variable's, if set) as a local test URL, or the refusal
-/// message [`require_local_url`] panics with.
+/// message [`require_local_url`] panics with. (The un-hinted form of
+/// [`checked_local_url_hinted`], which the crate's own callers use directly;
+/// the tests read refusals through this one.)
+#[cfg(test)]
 pub(crate) fn checked_local_url(var: &str, value: Option<&str>) -> Result<String, String> {
+    checked_local_url_hinted(var, value, None)
+}
+
+/// [`checked_local_url`], with the consumer's `hint` on the unset refusal.
+pub(crate) fn checked_local_url_hinted(
+    var: &str,
+    value: Option<&str>,
+    hint: Option<&str>,
+) -> Result<String, String> {
     let refuse = |problem: &str| Err(refusal(var, problem));
     let Some(raw) = value.filter(|value| !value.is_empty()) else {
-        return refuse("is not set");
+        return Err(match hint {
+            Some(hint) => refusal_lead(&format!("{var} is not set. {hint}"), var),
+            None => refusal(var, "is not set"),
+        });
     };
     let Ok(url) = url::Url::parse(raw) else {
         return refuse("is not a URL");
@@ -79,8 +137,14 @@ pub(crate) fn checked_local_url(var: &str, value: Option<&str>) -> Result<String
 
 /// The message every refusal is: the variable, the problem, the fix.
 pub(crate) fn refusal(var: &str, problem: &str) -> String {
+    refusal_lead(&format!("{var} {problem}."), var)
+}
+
+/// [`refusal`] with its first sentence given whole, for the one refusal
+/// (unset, with a consumer's hint) that is more than "`var` `problem`.".
+fn refusal_lead(lead: &str, var: &str) -> String {
     format!(
-        "\n{var} {problem}.\n\n\
+        "\n{lead}\n\n\
          stridelabs-testing never skips a test for a missing server, and never lets a suite \
          write to a server on another machine: set {var} to a URL whose host is this machine \
          (`localhost`, `127.0.0.1` or `::1`), such as the server `docker compose up -d` starts. \
@@ -211,5 +275,103 @@ mod tests {
     #[should_panic(expected = "STRIDELABS_TESTING_LOCAL_URL names a host that is not loopback")]
     fn require_local_url_panics_with_the_refusal() {
         let _ = require_local_url_from(VAR, lookup(&[(VAR, "postgres://db.example.com/app")]));
+    }
+
+    /// The tail every refusal carries, copied here so a change to the shared
+    /// text fails these tests loudly instead of drifting.
+    const TAIL: &str =
+        "stridelabs-testing never skips a test for a missing server, and never lets a \
+        suite write to a server on another machine: set STRIDELABS_TESTING_LOCAL_URL to a URL \
+        whose host is this machine (`localhost`, `127.0.0.1` or `::1`), such as the server \
+        `docker compose up -d` starts. The value is not shown: a URL can carry a password.\n";
+
+    const HINT: &str = "Create it with `make test-db`, then export it.";
+
+    /// The existing function's refusals are byte-for-byte what they were.
+    #[test]
+    fn the_unhinted_refusals_are_byte_unchanged() {
+        assert_eq!(
+            checked_local_url(VAR, None),
+            Err(format!(
+                "\nSTRIDELABS_TESTING_LOCAL_URL is not set.\n\n{TAIL}"
+            ))
+        );
+        assert_eq!(
+            checked_local_url(VAR, Some("")),
+            Err(format!(
+                "\nSTRIDELABS_TESTING_LOCAL_URL is not set.\n\n{TAIL}"
+            ))
+        );
+        assert_eq!(
+            checked_local_url(VAR, Some("postgres://db.example.com/app")),
+            Err(format!(
+                "\nSTRIDELABS_TESTING_LOCAL_URL names a host that is not loopback.\n\n{TAIL}"
+            ))
+        );
+    }
+
+    /// An unset or empty variable is refused with `<VAR> is not set. <hint>`,
+    /// the hint verbatim, then the usual explanation.
+    #[test]
+    fn the_hinted_unset_refusal_carries_the_hint() {
+        for value in [None, Some("")] {
+            assert_eq!(
+                checked_local_url_hinted(VAR, value, Some(HINT)),
+                Err(format!(
+                    "\nSTRIDELABS_TESTING_LOCAL_URL is not set. {HINT}\n\n{TAIL}"
+                ))
+            );
+        }
+    }
+
+    /// The hint touches the unset refusal only: every other refusal, and the
+    /// URL returned, are the unhinted function's.
+    #[test]
+    fn the_hint_changes_no_other_outcome() {
+        for url in [
+            "postgres://u:hunter2@db.example.com/app",
+            "postgres://u:hunter2@localhost/app?host=db.example.com",
+            "postgres:///app?password=hunter2",
+            "not a url hunter2",
+            "postgres://dev:dev@localhost:5432/app_test",
+        ] {
+            assert_eq!(
+                checked_local_url_hinted(VAR, Some(url), Some(HINT)),
+                checked_local_url(VAR, Some(url)),
+                "{url}"
+            );
+        }
+    }
+
+    /// The public hinted entry point panics with the hinted refusal, and
+    /// returns a local URL as given.
+    #[test]
+    #[should_panic(
+        expected = "STRIDELABS_TESTING_LOCAL_URL is not set. Create it with `make test-db`"
+    )]
+    fn require_local_url_hinted_panics_with_the_hint() {
+        let _ = require_local_url_hinted_from(VAR, HINT, lookup(&[]));
+    }
+
+    #[test]
+    #[should_panic(expected = "STRIDELABS_TESTING_LOCAL_URL names a host that is not loopback")]
+    fn require_local_url_hinted_panics_with_the_ordinary_refusal_when_set() {
+        let _ = require_local_url_hinted_from(
+            VAR,
+            HINT,
+            lookup(&[(VAR, "postgres://db.example.com/app")]),
+        );
+    }
+
+    #[test]
+    fn require_local_url_hinted_returns_a_local_url() {
+        assert_eq!(
+            require_local_url_hinted_from(
+                VAR,
+                HINT,
+                lookup(&[(VAR, "postgres://dev:dev@localhost/x")])
+            ),
+            "postgres://dev:dev@localhost/x"
+        );
     }
 }

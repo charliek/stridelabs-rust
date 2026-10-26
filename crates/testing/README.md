@@ -169,6 +169,12 @@ the fix, never the value (a URL can carry a password). Pair it with
 `require_postgres_at` to probe the server, or, for Redis, use
 `require_local_redis_url` (below).
 
+`require_local_url_hinted(var, hint)` is the same rule with one difference:
+when `var` is unset (or empty) the panic reads `<VAR> is not set. <hint>`,
+with the consumer's `hint` verbatim (how to create the database, say: a make
+target this crate cannot know), before the usual explanation. Every other
+refusal is `require_local_url`'s, unchanged.
+
 ## `redis` — fail loud, never skip
 
 ```rust,no_run
@@ -251,6 +257,14 @@ that seeds state the code under test reads back by fixed key shape (a full
 rate-limit window, a spent budget), which in the dev stack's database would
 refuse a developer's real requests. It returns the URL and connects to
 nothing: build the code under test from it.
+
+`require_local_redis_url_with_example(var, policy, example_url)` is the same
+rule for a consumer whose test Redis is not on `6379`. The refusals that
+suggest a URL suggest `example_url` (say `redis://localhost:56379/1`)
+instead of the fixed `redis://localhost:6379/1`: the database-0 refusal
+under `RefuseZero`, and the unset refusal, which reads ``<VAR> is not set. Set
+it to a local Redis URL such as `<example_url>`.`` Every other refusal is
+`require_local_redis_url`'s.
 
 ## `oneshot` — driving a `Router` without a socket
 

@@ -13,6 +13,19 @@ for a consumer's pin.
 
 ### Added
 
+- `stridelabs-testing`: two message hooks for a consumer's own test setup
+  (lumen plan 003). The existing functions and their messages are unchanged
+  byte for byte; they share one validation path with the new ones.
+  - **`require_local_url_hinted(var, hint)`**: `require_local_url` whose
+    refusal for an unset or empty variable reads `<VAR> is not set. <hint>`,
+    the consumer's `hint` verbatim (how to create the test database), then
+    the usual explanation. Every other refusal is `require_local_url`'s.
+  - **`require_local_redis_url_with_example(var, policy, example_url)`**
+    (feature `redis`): `require_local_redis_url` whose refusals that suggest
+    a URL (the database-0 refusal under `RefuseZero`, and the unset one,
+    ``<VAR> is not set. Set it to a local Redis URL such as `<example_url>`.``)
+    name the consumer's `example_url` (`redis://localhost:56379/1`) instead
+    of the fixed `redis://localhost:6379/1`.
 - `stridelabs-mcp`: two opt-ins for `McpVerifier`, so an MCP endpoint can
   check JWTs as the app's REST API (and its Python MCP server) does
   (slaudio plan 027). A consumer that uses neither sees no change:

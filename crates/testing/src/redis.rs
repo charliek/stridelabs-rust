@@ -125,6 +125,45 @@ pub fn require_local_redis_url(var: &str, policy: RedisDbPolicy) -> String {
     require_local_redis_url_from(var, policy, |name| std::env::var(name).ok())
 }
 
+/// [`require_local_redis_url`], whose refusals that suggest a URL suggest the
+/// consumer's own `example_url` (`redis://localhost:56379/1`, the port and
+/// database its compose file and Makefile use) instead of a fixed
+/// `redis://localhost:6379/1`.
+///
+/// The rule is exactly [`require_local_redis_url`]'s. Two messages carry the
+/// example: for an unset or empty `var`, ``<var> is not set. Set it to a local
+/// Redis URL such as `<example_url>`.``; and, under
+/// [`RedisDbPolicy::RefuseZero`], the refusal of database 0. `example_url` is
+/// printed verbatim, so keep it free of secrets; it is not checked against
+/// the rule (a wrong example only misleads the reader).
+///
+/// # Panics
+///
+/// As [`require_local_redis_url`].
+///
+/// ```no_run
+/// use stridelabs_testing::{require_local_redis_url_with_example, RedisDbPolicy};
+///
+/// let url = require_local_redis_url_with_example(
+///     "MYAPP_TEST_REDIS_URL",
+///     RedisDbPolicy::RefuseZero,
+///     "redis://localhost:56379/1",
+/// );
+/// # let _ = url;
+/// ```
+pub fn require_local_redis_url_with_example(
+    var: &str,
+    policy: RedisDbPolicy,
+    example_url: &str,
+) -> String {
+    require_local_redis_url_with_example_from(var, policy, example_url, |name| {
+        std::env::var(name).ok()
+    })
+}
+
+/// The example [`require_local_redis_url`] has always suggested.
+const DEFAULT_EXAMPLE_URL: &str = "redis://localhost:6379/1";
+
 /// The env-injectable seam behind [`require_local_redis_url`].
 fn require_local_redis_url_from(
     var: &str,
@@ -135,12 +174,43 @@ fn require_local_redis_url_from(
         .unwrap_or_else(|refusal| panic!("{refusal}"))
 }
 
+/// The env-injectable seam behind [`require_local_redis_url_with_example`].
+fn require_local_redis_url_with_example_from(
+    var: &str,
+    policy: RedisDbPolicy,
+    example_url: &str,
+    get: impl Fn(&str) -> Option<String>,
+) -> String {
+    checked_local_redis_url_with_example(var, get(var).as_deref(), policy, example_url)
+        .unwrap_or_else(|refusal| panic!("{refusal}"))
+}
+
 fn checked_local_redis_url(
     var: &str,
     value: Option<&str>,
     policy: RedisDbPolicy,
 ) -> Result<String, String> {
-    let url = crate::local::checked_local_url(var, value)?;
+    checked_redis_url(var, value, policy, DEFAULT_EXAMPLE_URL, None)
+}
+
+fn checked_local_redis_url_with_example(
+    var: &str,
+    value: Option<&str>,
+    policy: RedisDbPolicy,
+    example_url: &str,
+) -> Result<String, String> {
+    let hint = format!("Set it to a local Redis URL such as `{example_url}`.");
+    checked_redis_url(var, value, policy, example_url, Some(&hint))
+}
+
+fn checked_redis_url(
+    var: &str,
+    value: Option<&str>,
+    policy: RedisDbPolicy,
+    example_url: &str,
+    unset_hint: Option<&str>,
+) -> Result<String, String> {
+    let url = crate::local::checked_local_url_hinted(var, value, unset_hint)?;
     let Ok(client) = ::redis::Client::open(url.as_str()) else {
         return Err(crate::local::refusal(
             var,
@@ -152,9 +222,11 @@ fn checked_local_redis_url(
     {
         return Err(crate::local::refusal(
             var,
-            "selects database 0, explicitly or by naming no database; this suite must never \
-             share the database a running dev stack counts into, so select another \
-             (`redis://localhost:6379/1`)",
+            &format!(
+                "selects database 0, explicitly or by naming no database; this suite must \
+                 never share the database a running dev stack counts into, so select another \
+                 (`{example_url}`)"
+            ),
         ));
     }
     Ok(url)
@@ -558,6 +630,145 @@ mod tests {
             VAR,
             RedisDbPolicy::RefuseZero,
             lookup(&[(VAR, "redis://localhost:6390")]),
+        );
+    }
+
+    const EXAMPLE: &str = "redis://localhost:56379/1";
+
+    /// The tail every refusal carries (see `local`'s tests), for the redis
+    /// variable.
+    const TAIL: &str =
+        "stridelabs-testing never skips a test for a missing server, and never lets a \
+        suite write to a server on another machine: set STRIDELABS_TESTING_REDIS_URL to a URL \
+        whose host is this machine (`localhost`, `127.0.0.1` or `::1`), such as the server \
+        `docker compose up -d` starts. The value is not shown: a URL can carry a password.\n";
+
+    /// The existing function's two example-bearing refusals are byte-for-byte
+    /// what they were: the unset one carries none, the database-0 one the
+    /// fixed `6379` example.
+    #[test]
+    fn the_default_example_refusals_are_byte_unchanged() {
+        assert_eq!(
+            checked_local_redis_url(VAR, None, RedisDbPolicy::RefuseZero),
+            Err(format!(
+                "\nSTRIDELABS_TESTING_REDIS_URL is not set.\n\n{TAIL}"
+            ))
+        );
+        assert_eq!(
+            checked_local_redis_url(
+                VAR,
+                Some("redis://localhost:6390/0"),
+                RedisDbPolicy::RefuseZero
+            ),
+            Err(format!(
+                "\nSTRIDELABS_TESTING_REDIS_URL selects database 0, explicitly or by naming no \
+                 database; this suite must never share the database a running dev stack counts \
+                 into, so select another (`redis://localhost:6379/1`).\n\n{TAIL}"
+            ))
+        );
+    }
+
+    /// The variant's unset refusal suggests the consumer's own example, in
+    /// place of no example at all.
+    #[test]
+    fn the_unset_refusal_suggests_the_consumers_example() {
+        for value in [None, Some("")] {
+            for policy in [RedisDbPolicy::AllowZero, RedisDbPolicy::RefuseZero] {
+                assert_eq!(
+                    checked_local_redis_url_with_example(VAR, value, policy, EXAMPLE),
+                    Err(format!(
+                        "\nSTRIDELABS_TESTING_REDIS_URL is not set. Set it to a local Redis URL \
+                         such as `redis://localhost:56379/1`.\n\n{TAIL}"
+                    ))
+                );
+            }
+        }
+    }
+
+    /// The database-0 refusal names the consumer's example, not `6379`.
+    #[test]
+    fn the_database_zero_refusal_suggests_the_consumers_example() {
+        let message = checked_local_redis_url_with_example(
+            VAR,
+            Some("redis://localhost:6390/0"),
+            RedisDbPolicy::RefuseZero,
+            EXAMPLE,
+        )
+        .expect_err("database 0");
+        assert_eq!(
+            message,
+            format!(
+                "\nSTRIDELABS_TESTING_REDIS_URL selects database 0, explicitly or by naming no \
+                 database; this suite must never share the database a running dev stack counts \
+                 into, so select another (`redis://localhost:56379/1`).\n\n{TAIL}"
+            )
+        );
+        assert!(
+            !message.contains("6379/1`") || message.contains("56379/1`"),
+            "{message}"
+        );
+        assert!(!message.contains("redis://localhost:6379"), "{message}");
+    }
+
+    /// Every refusal but the two that carry the example is the existing
+    /// function's, whatever example is given, and the default example makes
+    /// the variant the existing function outright.
+    #[test]
+    fn the_example_changes_no_other_outcome() {
+        for url in [
+            "redis://:hunter2@cache.example.com:6379/1",
+            "http://hunter2@localhost:6390/1",
+            "redis://localhost:6390/1",
+        ] {
+            for policy in [RedisDbPolicy::AllowZero, RedisDbPolicy::RefuseZero] {
+                let plain = checked_local_redis_url(VAR, Some(url), policy);
+                for example in [EXAMPLE, DEFAULT_EXAMPLE_URL] {
+                    assert_eq!(
+                        checked_local_redis_url_with_example(VAR, Some(url), policy, example),
+                        plain,
+                        "{url}"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            checked_local_redis_url_with_example(
+                VAR,
+                Some("redis://localhost:6390/0"),
+                RedisDbPolicy::RefuseZero,
+                DEFAULT_EXAMPLE_URL
+            ),
+            checked_local_redis_url(
+                VAR,
+                Some("redis://localhost:6390/0"),
+                RedisDbPolicy::RefuseZero
+            )
+        );
+    }
+
+    /// The public variant panics with the consumer's example, and returns a
+    /// good URL as given.
+    #[test]
+    #[should_panic(expected = "(`redis://localhost:56379/1`)")]
+    fn require_local_redis_url_with_example_panics_with_the_example() {
+        let _ = require_local_redis_url_with_example_from(
+            VAR,
+            RedisDbPolicy::RefuseZero,
+            EXAMPLE,
+            lookup(&[(VAR, "redis://localhost:6390")]),
+        );
+    }
+
+    #[test]
+    fn require_local_redis_url_with_example_returns_a_good_url() {
+        assert_eq!(
+            require_local_redis_url_with_example_from(
+                VAR,
+                RedisDbPolicy::RefuseZero,
+                EXAMPLE,
+                lookup(&[(VAR, "redis://localhost:6390/2")]),
+            ),
+            "redis://localhost:6390/2"
         );
     }
 
