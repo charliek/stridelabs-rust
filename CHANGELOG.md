@@ -29,8 +29,8 @@ for a consumer's pin.
   tapper (plan 017: a token naming an unseen key id, refused inside the
   JWKS refetch floor, should be one `INFO` entry, not an `ERROR`) and lumen
   (forged-kid requests produce one `ERROR` entry per request today).
-  `scripts/downstream-check.sh` checks tapper; lumen is informational there,
-  and parcel is not covered (it does not use `RequestLogLayer`).
+  `scripts/downstream-check.sh` checks tapper; lumen and parcel are
+  informational there (parcel does not use `RequestLogLayer`).
 - `stridelabs-mcp`: two opt-ins for `McpVerifier`, so an MCP endpoint can
   check JWTs as the app's REST API (and its Python MCP server) does
   (slaudio plan 027). A consumer that uses neither sees no change:
@@ -55,6 +55,38 @@ for a consumer's pin.
     only `scp` names. Under either, a malformed `scope` or `scp` stays
     `Invalid` (even the one `ScopeThenScp` does not read), and `null`
     counts as absent.
+
+### Changed
+
+- `scripts/downstream-check.sh`: **parcel** is an informational consumer
+  (`parcel`, its root workspace on parcel's `main`: pass `origin/main` or set
+  `DOWNSTREAM_PARCEL_REF`). Clippy and test run parcel's CI flags
+  (`--workspace`, clippy also `--all-targets --all-features`). It never
+  decides the exit. Preflight needs parcel's compose Postgres (`localhost:5439`,
+  or the URL in `DOWNSTREAM_PARCEL_DATABASE_URL`, passed to the run as
+  `DATABASE_URL`) and its fake-gcs-server on `localhost:4447`; the header
+  names the collision with the `STRIDELABS_PG_PORT=5439` example in this
+  library's CLAUDE.md. An override that names no database or parcel's dev
+  database `parcel` (the tests drop old schemas in the database they are
+  given), or whose query sets `host`, `hostaddr`, `port` or `dbname` (sqlx
+  applies them over the URL, so preflight would check another endpoint), is
+  refused with the rule broken and never the value. The service's own
+  settings are unset for the run: `DATABASE_URL` otherwise,
+  `STORAGE_EMULATOR_HOST`, `GOOGLE_CREDENTIALS`, `APP_ENV`, the proxy
+  variables and the like by name, and every exported variable starting
+  `AUTH_`, `SLAUTH_`, `GCS_`, `BLOB_` or `PARCEL_` by prefix (parcel builds
+  its provider settings' names, `AUTH_<PROVIDER>_*`, at run time).
+- `scripts/downstream-check.sh`: the output filter now masks a whole
+  `postgres://` or `postgresql://` URL (`postgres://<redacted>`), also one
+  with no userinfo and no secret parameter, so the override's host, port and
+  database never reach the terminal or a log in a consumer's failure
+  message; the masking of other schemes and of secret parameters is unchanged.
+- `scripts/downstream-check.sh`: tapper's run sets
+  `TAPPER_RS_TEST_GCS_EMULATOR_URL` (tapper plan 017 C-3 makes its GCS tests
+  read it, loopback only, no default) to `http://127.0.0.1:4443`, or passes the
+  caller's value through (also when set to empty, which tapper's own tests
+  then refuse loudly), and preflight checks the address it names. A tapper
+  ref that does not read it yet ignores it.
 
 ## [0.10.0] - 2026-10-23
 

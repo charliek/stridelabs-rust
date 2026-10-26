@@ -4,7 +4,7 @@
 #
 #   scripts/downstream-check.sh [--dry-run] <consumer[,consumer...]|all> <ref> [extra cargo flags]
 #
-# consumer  tapper | slauth | limen | imgmcp | spendwise | slaudio | lumen
+# consumer  tapper | slauth | limen | imgmcp | spendwise | slaudio | lumen | parcel
 #           (limen is also checked in CI, by the `downstream-limen` job; the
 #           others are private repos whose test output must not land in a public
 #           Actions log, so they are checked only here. `limen` is the public
@@ -63,16 +63,23 @@
 # passed; 1 when one failed, or when the run changed or moved the library; 2
 # when it refused to start (usage, dirty library tree, paths that overlap,
 # missing env or service).
-# spendwise, slaudio and lumen are INFORMATIONAL: their results are printed but never
-# decide the exit.
+# spendwise, slaudio, lumen and parcel are INFORMATIONAL: their results are printed but
+# never decide the exit.
 #
 # Environment (names only; this script never prints a value):
 #   tapper     TAPPER_RS_TEST_DATABASE_URL  a MIGRATED Postgres that is not the dev stack's
 #              TAPPER_RS_TEST_REDIS_URL     a Redis DB number other than 0
-#              and fake-gcs-server on localhost:4443 (`docker compose up -d fake-gcs-server`).
-#              There is no default for either variable, on purpose: tapper's
-#              own tests fail rather than skip without them, and a default
-#              would be the dev database. See "tapper-rs" in tapper's CLAUDE.md.
+#              and fake-gcs-server on 127.0.0.1:4443 (`docker compose up -d fake-gcs-server`),
+#              named to the tests by TAPPER_RS_TEST_GCS_EMULATOR_URL (loopback
+#              only; tapper's tests have no default for it). The run sets it to
+#              http://127.0.0.1:4443 unless the caller already set it, in which
+#              case the caller's value is passed through and is what preflight
+#              checks. A tapper ref from before tapper plan 017 C-3 does not read
+#              it and uses 4443 itself, so setting it is harmless there.
+#              There is no default for the database and Redis variables, on
+#              purpose: tapper's own tests fail rather than skip without them,
+#              and a default would be the dev database. See "tapper-rs" in
+#              tapper's CLAUDE.md.
 #   slauth     a Postgres superuser. Tests use their own default (the repo's
 #              docker compose, localhost:5433) unless DOWNSTREAM_SLAUTH_DATABASE_URL
 #              is set; the ambient DATABASE_URL is never inherited. The
@@ -120,6 +127,36 @@
 #              run lumen's CI flags (--workspace); its separate `--features
 #              dev-login` test run is not repeated here (clippy --all-features does
 #              compile it).
+#   parcel     its Rust workspace is the repo root (`.`) on parcel's `main`. Pass
+#              origin/main (or DOWNSTREAM_PARCEL_REF=origin/main): this script does
+#              not fetch. Clippy and test run parcel's CI flags (--workspace
+#              --all-targets --all-features, and --workspace); its production-feature
+#              clippy, cargo deny, the crypto guard, the second `DATABASE_URL`-set
+#              test pass, Spectral and the pytest functional suite are not repeated
+#              here. Its server tests need parcel's compose Postgres, which has no
+#              URL variable of its own: unset DATABASE_URL they use
+#              postgres://postgres:localdev@localhost:5439/parcel_test (the database
+#              is created on demand) and its fake-gcs-server 1.52 at
+#              http://localhost:4447 (`docker compose up -d` in parcel; the emulator
+#              address is fixed in its tests). Port 5439 is also the example
+#              alternative port in this library's CLAUDE.md (`STRIDELABS_PG_PORT=5439`):
+#              if you moved this library's Postgres there, parcel's preflight check
+#              passes on the wrong server and its tests fail on authentication or a
+#              missing role. Stop that one, move the library's to another port, or
+#              point parcel at the right server with DOWNSTREAM_PARCEL_DATABASE_URL
+#              (passed to its run as DATABASE_URL; a loopback URL naming a database
+#              that already exists, because with DATABASE_URL set parcel's harness
+#              creates schemas in it and does not create the database). Preflight
+#              refuses an override that names no database or `parcel` (parcel's DEV
+#              database: the harness drops the old schemas it finds in the one it
+#              is given), or whose query sets host, hostaddr, port or dbname (sqlx
+#              applies them over the URL, so the endpoint checked would not be the
+#              one used), saying which rule and never the value. The
+#              service's own settings (DATABASE_URL otherwise, STORAGE_EMULATOR_HOST,
+#              GOOGLE_CREDENTIALS, APP_ENV, the proxy variables, ...) are unset for
+#              the run by name, and every exported variable starting AUTH_, SLAUTH_,
+#              GCS_, BLOB_ or PARCEL_ by prefix (parcel builds its provider settings'
+#              names, AUTH_<PROVIDER>_*, at run time).
 #
 # Paths. Nothing here names a machine: every default is relative to the
 # library checkout or to $HOME, and every one can be overridden.
@@ -151,13 +188,13 @@ else
 fi
 LIB_URL='https://github.com/charliek/stridelabs-rust.git'
 CRATES='config observability http auth testing mcp redis gcp inworld postgres perplexity'
-KNOWN_CONSUMERS='tapper slauth limen imgmcp spendwise slaudio lumen'
+KNOWN_CONSUMERS='tapper slauth limen imgmcp spendwise slaudio lumen parcel'
 
 usage() {
   cat >&2 <<'EOF'
 usage: scripts/downstream-check.sh [--dry-run] <consumer[,consumer...]|all> <ref> [extra cargo flags]
-  consumer: tapper | slauth | limen | imgmcp | spendwise | slaudio | lumen
-            (spendwise, slaudio and lumen are informational)
+  consumer: tapper | slauth | limen | imgmcp | spendwise | slaudio | lumen | parcel
+            (spendwise, slaudio, lumen and parcel are informational)
   --dry-run: run every check, print the plan, build nothing
 See the header of this script for the environment each consumer needs.
 EOF
@@ -316,7 +353,9 @@ default_repo() ( # dir
 # with --all-features), slaudio's backend-rs workspace with --workspace
 # --all-features (its CI job), lumen's lumen-rs workspace clippy with
 # --workspace --all-targets --all-features and test with --workspace (its CI
-# job lumen-rs-check). The command line's extra flags are appended to
+# job lumen-rs-check), parcel's root workspace clippy with --workspace
+# --all-targets --all-features and test with --workspace (its CI job rust). The
+# command line's extra flags are appended to
 # both. The repo path is the pinned physical one once the path-safety check has
 # run.
 load_consumer() {
@@ -371,6 +410,13 @@ load_consumer() {
       C_CLIPPY_FLAGS=(--workspace --all-targets --all-features)
       C_TEST_FLAGS=(--workspace)
       ;;
+    parcel)
+      C_REPO=$(default_repo parcel)
+      C_CRATE=.
+      C_KIND=informational
+      C_CLIPPY_FLAGS=(--workspace --all-targets --all-features)
+      C_TEST_FLAGS=(--workspace)
+      ;;
   esac
   C_CLIPPY_FLAGS+=(${EXTRA[@]+"${EXTRA[@]}"})
   C_TEST_FLAGS+=(${EXTRA[@]+"${EXTRA[@]}"})
@@ -415,6 +461,10 @@ nested() {
 # failed to authenticate with, a readiness failure that prints DATABASE_URL.
 # This filter keeps them off the terminal and out of the logs:
 #   scheme://user:pass@host  ->  scheme://***@host
+#   postgres:// and postgresql:// URLs (any case), whole, up to a space or a
+#   quote  ->  postgres://<redacted>   (a URL with no userinfo and no secret
+#   parameter still names a host, a port and a database; the parcel override
+#   is the one URL this script itself passes to a consumer)
 #   name=value, for a name containing token, password, passwd, secret or key
 #   (any case), in a query string or on its own  ->  name=***
 # Deliberately blunt: an over-masked line costs a look at the raw run, a leak
@@ -422,6 +472,7 @@ nested() {
 REDACT_KEYS='[Tt][Oo][Kk][Ee][Nn]|[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]|[Pp][Aa][Ss][Ss][Ww][Dd]|[Ss][Ee][Cc][Rr][Ee][Tt]|[Kk][Ee][Yy]'
 redact() {
   sed -u -E \
+    -e "s#[Pp][Oo][Ss][Tt][Gg][Rr][Ee][Ss]([Qq][Ll])?://[^[:space:]\"'<>]*#postgres://<redacted>#g" \
     -e "s#([A-Za-z][A-Za-z0-9+.-]*://)[^[:space:]/\"']*@#\1***@#g" \
     -e "s#(^|[?&;,[:space:]\"'(])([A-Za-z0-9_.-]*($REDACT_KEYS)[A-Za-z0-9_.-]*)=[^&;,[:space:]\"')]*#\1\2=***#g" \
     -e "s#(\"?[A-Za-z0-9_.-]*($REDACT_KEYS)[A-Za-z0-9_.-]*\"?[[:space:]]*:[[:space:]]*(Some\\()?)\"([^\"\\\\]|\\\\.)*\"#\1\"***\"#g"
@@ -566,6 +617,75 @@ LUMEN_UNSET_ENV=(
   HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY http_proxy https_proxy all_proxy no_proxy
 )
 
+# parcel's DOWNSTREAM_PARCEL_DATABASE_URL (C_DB_URL), when given, is held to
+# three rules, each refusal naming the rule and never the value:
+#   - a postgres:// or postgresql:// URL (the schemes sqlx reads);
+#   - it names a database, and not `parcel`, which is parcel's DEV database
+#     (.env.example): the test harness creates schemas in the database it is given
+#     and drops the old ones it finds there, so only a throwaway database is safe
+#     (the default, parcel_test, is the one the harness creates itself);
+#   - its query sets none of host, hostaddr, port or dbname, which sqlx applies
+#     over the authority and the path, so the endpoint and database preflight
+#     checks (the authority and the path) are always the ones sqlx uses. Percent-
+#     encoding in the database name or a parameter name is refused for the same
+#     reason (it could spell what the rules above compare).
+# Returns 0 when there is no override or it passes; adds to PROBLEMS otherwise.
+check_parcel_db_url() {
+  local u=$C_DB_URL rest query='' path db param name bad=0
+  [ -n "$u" ] || return 0
+  case $u in
+    postgres://* | postgresql://*) ;;
+    *)
+      problem "DOWNSTREAM_PARCEL_DATABASE_URL breaks the scheme rule: it must be a postgres:// or postgresql:// URL"
+      return 1
+      ;;
+  esac
+  rest=${u#*://}
+  rest=${rest%%#*}
+  case $rest in
+    *\?*)
+      query=${rest#*\?}
+      rest=${rest%%\?*}
+      ;;
+  esac
+  case $rest in
+    */*) path=${rest#*/} ;;
+    *) path='' ;;
+  esac
+  db=${path%%/*}
+  if [ -z "$db" ]; then
+    problem "DOWNSTREAM_PARCEL_DATABASE_URL breaks the database rule: it must name a database (not parcel's dev database)"
+    bad=1
+  else
+    case $db in
+      *%*)
+        problem "DOWNSTREAM_PARCEL_DATABASE_URL breaks the database rule: percent-encoding in the database name is not accepted"
+        bad=1
+        ;;
+      parcel)
+        problem "DOWNSTREAM_PARCEL_DATABASE_URL breaks the database rule: 'parcel' is parcel's dev database; the tests create and drop schemas in the database they are given (name a throwaway one, e.g. parcel_test)"
+        bad=1
+        ;;
+    esac
+  fi
+  while [ -n "$query" ]; do
+    param=${query%%&*}
+    case $query in *\&*) query=${query#*&} ;; *) query='' ;; esac
+    name=${param%%=*}
+    case $name in
+      *%*)
+        problem "DOWNSTREAM_PARCEL_DATABASE_URL breaks the query rule: percent-encoding in a parameter name is not accepted"
+        bad=1
+        ;;
+      host | hostaddr | port | dbname)
+        problem "DOWNSTREAM_PARCEL_DATABASE_URL breaks the query rule: host, hostaddr, port and dbname are not accepted (sqlx applies them over the URL's own, so preflight would check another endpoint)"
+        bad=1
+        ;;
+    esac
+  done
+  [ "$bad" = 0 ]
+}
+
 # Everything a consumer needs before a build is worth starting. Fills PROBLEMS.
 preflight() {
   PROBLEMS=()
@@ -589,7 +709,15 @@ preflight() {
         esac
         need_url_tcp "TAPPER_RS_TEST_REDIS_URL's Redis" "$TAPPER_RS_TEST_REDIS_URL" 6379 "docker compose up -d redis in tapper"
       fi
-      need_tcp "fake-gcs-server" localhost 4443 "docker compose up -d fake-gcs-server in tapper"
+      if [ -n "${TAPPER_RS_TEST_GCS_EMULATOR_URL+x}" ]; then
+        # Set by the caller: theirs is what the run gets, even when empty (tapper's
+        # own tests refuse that loudly, and are the ones to say so).
+        if [ -n "$TAPPER_RS_TEST_GCS_EMULATOR_URL" ]; then
+          need_url_tcp "TAPPER_RS_TEST_GCS_EMULATOR_URL's fake-gcs-server" "$TAPPER_RS_TEST_GCS_EMULATOR_URL" "$(scheme_port "$TAPPER_RS_TEST_GCS_EMULATOR_URL" 80)" "docker compose up -d fake-gcs-server in tapper"
+        fi
+      else
+        need_tcp "fake-gcs-server" 127.0.0.1 4443 "docker compose up -d fake-gcs-server in tapper"
+      fi
       ;;
     slauth)
       need_cmd uv
@@ -608,6 +736,16 @@ preflight() {
       need_url_tcp "LUMEN_RS_TEST_REDIS_URL's Redis" "$lredis" 6379 "$lhint"
       lgcs=${LUMEN_RS_TEST_GCS_URL:-$LUMEN_DEFAULT_GCS_URL}
       need_url_tcp "LUMEN_RS_TEST_GCS_URL's fake-gcs-server" "$lgcs" "$(scheme_port "$lgcs" 80)" "docker compose up -d fake-gcs in lumen"
+      ;;
+    parcel)
+      # Neither has a variable of its own: its tests dial these addresses (the
+      # Postgres unless DOWNSTREAM_PARCEL_DATABASE_URL names another, which is
+      # passed to the run as DATABASE_URL). 5439 may be this library's own
+      # Postgres (see the header): a reachable port proves nothing about whose.
+      if check_parcel_db_url; then
+        need_default_postgres 5439 "docker compose up -d in parcel; not this library's Postgres if it was moved to 5439"
+      fi
+      need_tcp "parcel's fake-gcs-server" localhost 4447 "docker compose up -d fake-gcs in parcel"
       ;;
     slaudio)
       local hint="docker compose up -d postgres redis in slaudio"
@@ -716,7 +854,7 @@ note_tzdata() { # minimum
 # keeps its tests off databases that are not theirs. RUN_UNSET holds `-u NAME`
 # pairs for env(1). Sets RUN_ENV and RUN_UNSET.
 build_env() {
-  local v
+  local v pfx
   RUN_ENV=("CARGO_TARGET_DIR=$SCRATCH/target-$C_NAME")
   RUN_UNSET=()
   case $C_NAME in
@@ -727,6 +865,15 @@ build_env() {
       # CI sets none of these, and tests/gcs.rs requires STORAGE_EMULATOR_HOST
       # to be unset for its real-bucket gate.
       RUN_UNSET+=(-u REDIS_URL -u STORAGE_EMULATOR_HOST -u GCS_BUCKET -u GOOGLE_CREDENTIALS -u TAPPER_RS_GCS_REAL_BUCKET)
+      # The emulator tapper's GCS suites dial (tapper plan 017 C-3 reads it,
+      # loopback only, no default of its own): the caller's when set, else the
+      # compose fake-gcs-server. A ref that does not read it yet ignores it.
+      # Set-but-empty is the caller's too (`+x`, not `:-`).
+      if [ -n "${TAPPER_RS_TEST_GCS_EMULATOR_URL+x}" ]; then
+        RUN_ENV+=("TAPPER_RS_TEST_GCS_EMULATOR_URL=$TAPPER_RS_TEST_GCS_EMULATOR_URL")
+      else
+        RUN_ENV+=("TAPPER_RS_TEST_GCS_EMULATOR_URL=http://127.0.0.1:4443")
+      fi
       ;;
     slauth | spendwise)
       # Never inherit a DATABASE_URL meant for some other service (tapper's dev
@@ -755,8 +902,41 @@ build_env() {
         "LUMEN_RS_TEST_GCS_URL=${LUMEN_RS_TEST_GCS_URL:-$LUMEN_DEFAULT_GCS_URL}")
       for v in "${LUMEN_UNSET_ENV[@]}"; do RUN_UNSET+=(-u "$v"); done
       ;;
+    parcel)
+      # Its tests read only DATABASE_URL (a loopback URL, else their own compose
+      # default) and fixed local addresses: the explicit override or nothing.
+      RUN_UNSET+=(-u DATABASE_URL)
+      for v in "${PARCEL_UNSET_ENV[@]}"; do RUN_UNSET+=(-u "$v"); done
+      for v in $(compgen -e); do
+        for pfx in $PARCEL_UNSET_PREFIXES; do
+          case $v in "$pfx"*) RUN_UNSET+=(-u "$v") ;; esac
+        done
+      done
+      if [ -n "$C_DB_URL" ]; then
+        RUN_ENV+=("DATABASE_URL=$C_DB_URL")
+      fi
+      ;;
   esac
 }
+
+# The environment variables parcel's tests or the binaries they spawn can read,
+# unset for the run so nothing of the host's reaches them. Parcel builds its
+# provider settings' names at run time (AUTH_<PROVIDER-ID>_ISSUER, _CLIENT_SECRET,
+# _SCOPES, ..., config.rs), so those are unset by PREFIX: every exported name
+# starting AUTH_, SLAUTH_, GCS_, BLOB_ or PARCEL_ (build_env enumerates them with
+# `compgen -e`, which bash 3.2 has). PARCEL_UNSET_ENV is the rest, by name: the
+# server's other settings (config.rs, .env.example), the Google settings of its
+# blob store, the proxy variables and RUST_LOG/PGOPTIONS. Not listed: DATABASE_URL
+# (handled in build_env: the override or nothing), PATH, HOME, the CARGO_* and
+# SSL_CERT_* variables the toolchain needs.
+PARCEL_UNSET_PREFIXES='AUTH_ SLAUTH_ GCS_ BLOB_ PARCEL_'
+PARCEL_UNSET_ENV=(
+  STORAGE_EMULATOR_HOST GOOGLE_CREDENTIALS
+  APP_ENV BIND_ADDR PORT LOG_FORMAT RUN_MIGRATIONS
+  DEV_AUTH_EMAIL DEV_AUTH_NAME
+  RUST_LOG PGOPTIONS
+  HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY http_proxy https_proxy all_proxy no_proxy
+)
 
 # Environment assignments as printed in a plan: names only, never values.
 show_env() {
