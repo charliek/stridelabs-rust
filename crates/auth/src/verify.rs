@@ -45,6 +45,16 @@ const NOT_VALIDATED_AUDIENCE: &str = "\0audience not validated";
 /// [`ClaimChecks::with_integer_time_claims`].
 const NOT_WHOLE_SECONDS: &str = "a time claim is not a whole number of seconds";
 
+/// The [`AuthError::InvalidToken`] reason under
+/// [`ClaimChecks::with_string_issuer`].
+const NOT_A_STRING_ISSUER: &str = "the issuer claim is not a string";
+
+/// The [`AuthError::InvalidToken`] reason for a payload a type rule cannot
+/// read: one naming a claim it reads twice, or holding one serde_json
+/// cannot (`1e400`). The reason [`invalid_token`] gives claims that
+/// deserialize badly.
+const CLAIMS_MALFORMED: &str = "claims are malformed";
+
 /// Whether, and against what, a token's `aud` claim is checked.
 ///
 /// There is deliberately no `Default`, and no conversion produces
@@ -96,8 +106,9 @@ pub enum Audience {
 ///   missing"), never let through unchecked.
 /// - `iss` must equal the issuer **exactly**: a trailing-slash mismatch is a
 ///   rejected token, not a near miss. (Like every jsonwebtoken check, an
-///   `iss` *array* that contains the issuer passes too; RFC 7519 makes `iss`
-///   a single string, and only the issuer's own key can sign one.)
+///   `iss` *array* that contains the issuer passes too, unless
+///   [`ClaimChecks::with_string_issuer`] is on; RFC 7519 makes `iss` a
+///   single string, and only the issuer's own key can sign one.)
 /// - `exp` and `nbf` are whole Unix seconds, compared with the leeway: a
 ///   token is expired once `exp < now - leeway`, so with no leeway it is
 ///   accepted through the second its `exp` names and refused from the next;
@@ -107,9 +118,12 @@ pub enum Audience {
 /// - Under [`ClaimChecks::with_integer_time_claims`] (off by default), each
 ///   of `exp`, `nbf` and `iat` that is present must also be a non-negative
 ///   JSON integer ([`time_claims_are_whole_seconds`]).
+/// - Under [`ClaimChecks::with_string_issuer`] (off by default), `iss` must
+///   also be a JSON string ([`issuer_is_a_string`]).
 ///
 /// [`ClaimChecks::new`] starts from a 60 s leeway ([`DEFAULT_LEEWAY`]) with
-/// `nbf` checked and integer time claims not required. [`Verifier::new`]'s
+/// `nbf` checked, and neither integer time claims nor a string issuer
+/// required. [`Verifier::new`]'s
 /// rules, kept as they have always been, differ in one respect: `nbf` is not
 /// checked (see [`Verifier::claim_checks`]).
 ///
@@ -128,6 +142,7 @@ pub struct ClaimChecks {
     leeway: Duration,
     validate_nbf: bool,
     integer_time_claims: bool,
+    string_issuer: bool,
 }
 
 impl ClaimChecks {
@@ -140,6 +155,7 @@ impl ClaimChecks {
             leeway: DEFAULT_LEEWAY,
             validate_nbf: true,
             integer_time_claims: false,
+            string_issuer: false,
         }
     }
 
@@ -191,6 +207,36 @@ impl ClaimChecks {
         self
     }
 
+    /// Whether `iss` must be a JSON string, the single StringOrURI RFC 7519
+    /// §4.1.1 makes it ([`issuer_is_a_string`]). Off by default, and on
+    /// [`Verifier::new`], [`Verifier::claims_with_jwks`] and
+    /// [`Verifier::verify_with_jwks`], which build their own checks.
+    ///
+    /// jsonwebtoken also accepts an `iss` array that contains the issuer
+    /// (`["https://auth.example.com"]`, alone or beside other strings). On,
+    /// a token whose `iss` is not a string is refused, as
+    /// [`AuthError::InvalidToken`] ("the issuer claim is not a string").
+    /// `iss` is required and compared exactly either way, so this adds only
+    /// the type: an `iss` jsonwebtoken already refuses keeps its own reason
+    /// (a number, a boolean, `null` or an object is "a required claim is
+    /// missing", an array without the issuer "issuer is not accepted"), and
+    /// the check runs after every other one. A payload naming `iss` twice is
+    /// refused ("claims are malformed"). The type is read from the payload's
+    /// JSON text, never through a `serde_json::Value`
+    /// ([`time_claims_are_whole_seconds`] says why), in the one read
+    /// [`ClaimChecks::with_integer_time_claims`] also uses. Each option reads
+    /// only its own claims: on alone, this one never reads a time claim, so
+    /// one serde_json cannot read (`1e400`) refuses nothing here.
+    ///
+    /// With that option on too, the time claims are checked first, so a
+    /// token both refuse carries the time claims' reason: turning this on
+    /// never changes the reason for a token that option already refuses.
+    #[must_use]
+    pub fn with_string_issuer(mut self, on: bool) -> ClaimChecks {
+        self.string_issuer = on;
+        self
+    }
+
     /// The `iss` a token must carry, exactly.
     pub fn issuer(&self) -> &str {
         &self.issuer
@@ -215,6 +261,12 @@ impl ClaimChecks {
     /// ([`ClaimChecks::with_integer_time_claims`]).
     pub fn requires_integer_time_claims(&self) -> bool {
         self.integer_time_claims
+    }
+
+    /// Whether `iss` must be a JSON string
+    /// ([`ClaimChecks::with_string_issuer`]).
+    pub fn requires_string_issuer(&self) -> bool {
+        self.string_issuer
     }
 
     /// [`Verifier::new`]'s rules, unchanged since before `ClaimChecks`
@@ -260,7 +312,8 @@ impl ClaimChecks {
     /// Every check on a token whose signature `key` verifies: jsonwebtoken's
     /// [`ClaimChecks::validation`], then, under [`Audience::IfPresent`],
     /// [`audience_if_present`], then, when required,
-    /// [`time_claims_are_whole_seconds`].
+    /// [`time_claims_are_whole_seconds`], then, when required,
+    /// [`issuer_is_a_string`].
     fn claims<C: DeserializeOwned>(&self, token: &str, key: &DecodingKey) -> Result<C, AuthError> {
         let claims = decode::<C>(token, key, &self.validation())
             .map(|data| data.claims)
@@ -270,15 +323,23 @@ impl ClaimChecks {
                 return Err(invalid_token(&ErrorKind::InvalidAudience.into()));
             }
         }
-        if self.integer_time_claims {
-            // "Insecure" only in that it checks nothing: `decode` just did.
-            // Read from the payload's bytes into `TimeClaims`, never through
-            // a `serde_json::Value`, which can change a value's JSON type.
-            let time = jsonwebtoken::dangerous::insecure_decode_claims::<TimeClaims>(token)
-                .map_err(|_| AuthError::InvalidToken("claims are malformed".into()))?;
-            if !time.are_whole_seconds() {
-                return Err(AuthError::InvalidToken(NOT_WHOLE_SECONDS.into()));
-            }
+        // One read of the payload's bytes into `RegisteredClaims`, of the
+        // claims of the rules that are on only, never through a
+        // `serde_json::Value`, which can change a value's JSON type.
+        let registered = match (self.integer_time_claims, self.string_issuer) {
+            (false, false) => return Ok(claims),
+            (true, false) => RegisteredClaims::read_token::<true, false>(token),
+            (false, true) => RegisteredClaims::read_token::<false, true>(token),
+            (true, true) => RegisteredClaims::read_token::<true, true>(token),
+        };
+        let refused = |reason: &str| AuthError::InvalidToken(reason.into());
+        let registered = registered.ok_or_else(|| refused(CLAIMS_MALFORMED))?;
+        // The time claims first (`with_string_issuer` documents it).
+        if self.integer_time_claims && !registered.are_whole_seconds() {
+            return Err(refused(NOT_WHOLE_SECONDS));
+        }
+        if self.string_issuer && !registered.issuer_is_string() {
+            return Err(refused(NOT_A_STRING_ISSUER));
         }
         Ok(claims)
     }
@@ -315,34 +376,108 @@ impl ClaimChecks {
 /// assert!(!time_claims_are_whole_seconds(br#"{"exp":1,"exp":2}"#));
 /// ```
 pub fn time_claims_are_whole_seconds(payload_json: &[u8]) -> bool {
-    serde_json::from_slice::<TimeClaims>(payload_json).is_ok_and(|time| time.are_whole_seconds())
+    RegisteredClaims::read::<true, false>(payload_json)
+        .is_some_and(|claims| claims.are_whole_seconds())
 }
 
-/// A payload's registered time claims, each as its JSON type: `None` when
-/// absent. Read from a JSON object only (an array in field order, which
-/// serde's derive would take, is an error), with every other member ignored
-/// and a repeated time claim an error.
+/// Whether the `iss` in a token's payload is absent or a JSON string.
+/// `payload_json` is the payload's JSON text, its second segment
+/// base64url-decoded.
+///
+/// The rule [`ClaimChecks::with_string_issuer`] applies, public for a
+/// verifier that reads a token's claims some other way and wants the same
+/// one, as [`time_claims_are_whole_seconds`] is for the time claims. An
+/// array (one holding only the issuer included), a number, a boolean, an
+/// object and `null` fail; so does a payload that is not a JSON object, or
+/// that names `iss` twice. Only the type is checked: requiring `iss` and
+/// comparing it with the issuer is the verifier's job (an absent one passes
+/// here), and every other claim is ignored, the time claims included
+/// whatever their value (`1e400` too). An `iss` serde_json cannot read at
+/// all (`1e400`) fails. It reads the payload's JSON text, not a
+/// `serde_json::Value`, for the reason [`time_claims_are_whole_seconds`]
+/// gives.
+///
+/// ```
+/// use stridelabs_auth::issuer_is_a_string;
+///
+/// assert!(issuer_is_a_string(br#"{"iss":"https://auth.example.com","exp":1}"#));
+/// assert!(issuer_is_a_string(br#"{"exp":1800000000,"sub":"s"}"#));
+/// assert!(!issuer_is_a_string(br#"{"iss":["https://auth.example.com"]}"#));
+/// assert!(!issuer_is_a_string(br#"{"iss":null}"#));
+/// assert!(!issuer_is_a_string(br#"{"iss":"a","iss":"a"}"#));
+/// ```
+pub fn issuer_is_a_string(payload_json: &[u8]) -> bool {
+    RegisteredClaims::read::<false, true>(payload_json)
+        .is_some_and(|claims| claims.issuer_is_string())
+}
+
+/// The registered claims a type rule reads (`exp`, `nbf` and `iat` for the
+/// time rule, `iss` for the issuer rule), each as its JSON type: `None` when
+/// absent, or when no rule asked for it. One read serves every rule that is
+/// on, and reads only their claims ([`ReadFor`]). Read from a JSON object
+/// only (an array in field order, which serde's derive would take, is an
+/// error), and a claim it reads named twice is an error.
 #[derive(Default)]
-struct TimeClaims {
-    exp: Option<TimeType>,
-    nbf: Option<TimeType>,
-    iat: Option<TimeType>,
+struct RegisteredClaims {
+    exp: Option<JsonType>,
+    nbf: Option<JsonType>,
+    iat: Option<JsonType>,
+    iss: Option<JsonType>,
 }
 
-impl TimeClaims {
+impl RegisteredClaims {
+    /// `payload_json`'s registered claims for the rules asked for
+    /// ([`ReadFor`]), or `None` when it is not one JSON object, or names one
+    /// of those claims twice, or holds one serde_json cannot read.
+    fn read<const TIME: bool, const ISSUER: bool>(payload_json: &[u8]) -> Option<RegisteredClaims> {
+        serde_json::from_slice::<ReadFor<TIME, ISSUER>>(payload_json)
+            .ok()
+            .map(|read| read.0)
+    }
+
+    /// [`RegisteredClaims::read`] on `token`'s payload, decoded as
+    /// jsonwebtoken decodes it.
+    fn read_token<const TIME: bool, const ISSUER: bool>(token: &str) -> Option<RegisteredClaims> {
+        // "Insecure" only in that it checks nothing: `decode` just did.
+        jsonwebtoken::dangerous::insecure_decode_claims::<ReadFor<TIME, ISSUER>>(token)
+            .ok()
+            .map(|read| read.0)
+    }
+
+    /// [`ClaimChecks::with_integer_time_claims`]'s rule: each time claim
+    /// absent or a non-negative integer.
     fn are_whole_seconds(&self) -> bool {
         [self.exp, self.nbf, self.iat]
             .into_iter()
-            .all(|time| time.is_none_or(|time| time == TimeType::WholeSeconds))
+            .all(|time| time.is_none_or(|time| time == JsonType::UnsignedInteger))
+    }
+
+    /// [`ClaimChecks::with_string_issuer`]'s rule: `iss` absent or a string.
+    fn issuer_is_string(&self) -> bool {
+        self.iss.is_none_or(|iss| iss == JsonType::String)
     }
 }
 
-impl<'de> Deserialize<'de> for TimeClaims {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<TimeClaims, D::Error> {
-        struct Visitor;
+/// [`RegisteredClaims`] as the rules asked for read them: `TIME` reads `exp`,
+/// `nbf` and `iat`, `ISSUER` reads `iss`.
+///
+/// Every other member, a claim of a rule not asked for among them, is
+/// skipped unread, as the time rule's reader has always skipped `iss`: any
+/// JSON value passes, `1e400` included (a number serde_json cannot hold,
+/// which fails a [`JsonType`] read), and naming it twice is no error. So
+/// each rule reads a payload as it would alone: a predicate's verdict never
+/// depends on the other rule's claims, and a rule that is off never refuses
+/// a token.
+struct ReadFor<const TIME: bool, const ISSUER: bool>(RegisteredClaims);
 
-        impl<'de> serde::de::Visitor<'de> for Visitor {
-            type Value = TimeClaims;
+impl<'de, const TIME: bool, const ISSUER: bool> Deserialize<'de> for ReadFor<TIME, ISSUER> {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<ReadFor<TIME, ISSUER>, D::Error> {
+        struct Visitor<const TIME: bool, const ISSUER: bool>;
+
+        impl<'de, const TIME: bool, const ISSUER: bool> serde::de::Visitor<'de> for Visitor<TIME, ISSUER> {
+            type Value = ReadFor<TIME, ISSUER>;
 
             fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
                 formatter.write_str("a JSON object")
@@ -351,14 +486,16 @@ impl<'de> Deserialize<'de> for TimeClaims {
             fn visit_map<A: serde::de::MapAccess<'de>>(
                 self,
                 mut map: A,
-            ) -> Result<TimeClaims, A::Error> {
-                let mut time = TimeClaims::default();
+            ) -> Result<ReadFor<TIME, ISSUER>, A::Error> {
+                let mut claims = RegisteredClaims::default();
                 // An owned key: one with an escape (`"\u0065xp"`) is `exp`.
                 while let Some(key) = map.next_key::<String>()? {
                     let (name, slot) = match key.as_str() {
-                        "exp" => ("exp", &mut time.exp),
-                        "nbf" => ("nbf", &mut time.nbf),
-                        "iat" => ("iat", &mut time.iat),
+                        "exp" if TIME => ("exp", &mut claims.exp),
+                        "nbf" if TIME => ("nbf", &mut claims.nbf),
+                        "iat" if TIME => ("iat", &mut claims.iat),
+                        "iss" if ISSUER => ("iss", &mut claims.iss),
+                        // Not asked for: skipped unread.
                         _ => {
                             map.next_value::<serde::de::IgnoredAny>()?;
                             continue;
@@ -367,84 +504,93 @@ impl<'de> Deserialize<'de> for TimeClaims {
                     if slot.is_some() {
                         return Err(serde::de::Error::duplicate_field(name));
                     }
-                    // `TimeType` itself, not `Option<TimeType>`, which would
+                    // `JsonType` itself, not `Option<JsonType>`, which would
                     // read `null` as absent.
-                    *slot = Some(map.next_value::<TimeType>()?);
+                    *slot = Some(map.next_value::<JsonType>()?);
                 }
-                Ok(time)
+                Ok(ReadFor(claims))
             }
         }
 
-        deserializer.deserialize_map(Visitor)
+        deserializer.deserialize_map(Visitor::<TIME, ISSUER>)
     }
 }
 
-/// A time claim's JSON type, read from the JSON itself.
+/// A claim's JSON type, read from the JSON itself: only as much as a type
+/// rule asks. A number serde_json cannot hold (`1e400`, out of an `f64`'s
+/// range) has none: reading it fails, as it always has for a time claim
+/// under the time rule. [`ReadFor`] never reads a claim of a rule that is off.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TimeType {
+enum JsonType {
     /// A non-negative integer.
-    WholeSeconds,
-    /// Anything else: a negative integer, a float, a boolean, a string,
-    /// `null`, an array or an object. (With serde_json's
-    /// `arbitrary_precision` on, which nothing here enables, an integer that
-    /// fits a `u64` still arrives as one; a float or a larger integer arrives
-    /// as an object and is refused, so the option still fails closed.)
+    UnsignedInteger,
+    /// A string, escaped or not.
+    String,
+    /// Anything else: a negative integer, a float, a boolean, `null`, an
+    /// array or an object (the raw-value object included). (With
+    /// serde_json's `arbitrary_precision` on, which nothing here enables, an
+    /// integer that fits a `u64` still arrives as one; a float or a larger
+    /// integer arrives as an object and is refused, so the time rule still
+    /// fails closed.)
     Other,
 }
 
-impl<'de> Deserialize<'de> for TimeType {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<TimeType, D::Error> {
+impl<'de> Deserialize<'de> for JsonType {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<JsonType, D::Error> {
         struct Visitor;
 
         impl<'de> serde::de::Visitor<'de> for Visitor {
-            type Value = TimeType;
+            type Value = JsonType;
 
             fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
                 formatter.write_str("any JSON value")
             }
 
             // serde_json reports a non-negative integer here and nowhere else.
-            fn visit_u64<E>(self, _: u64) -> Result<TimeType, E> {
-                Ok(TimeType::WholeSeconds)
+            fn visit_u64<E>(self, _: u64) -> Result<JsonType, E> {
+                Ok(JsonType::UnsignedInteger)
             }
 
-            fn visit_i64<E>(self, _: i64) -> Result<TimeType, E> {
-                Ok(TimeType::Other)
+            fn visit_i64<E>(self, _: i64) -> Result<JsonType, E> {
+                Ok(JsonType::Other)
             }
 
-            fn visit_f64<E>(self, _: f64) -> Result<TimeType, E> {
-                Ok(TimeType::Other)
+            fn visit_f64<E>(self, _: f64) -> Result<JsonType, E> {
+                Ok(JsonType::Other)
             }
 
-            fn visit_bool<E>(self, _: bool) -> Result<TimeType, E> {
-                Ok(TimeType::Other)
+            fn visit_bool<E>(self, _: bool) -> Result<JsonType, E> {
+                Ok(JsonType::Other)
             }
 
-            fn visit_str<E>(self, _: &str) -> Result<TimeType, E> {
-                Ok(TimeType::Other)
+            // Every JSON string: serde_json reports one without an escape to
+            // `visit_borrowed_str` and an unescaped copy to `visit_str`, and
+            // serde forwards `visit_borrowed_str` and `visit_string` here.
+            fn visit_str<E>(self, _: &str) -> Result<JsonType, E> {
+                Ok(JsonType::String)
             }
 
-            fn visit_unit<E>(self) -> Result<TimeType, E> {
-                Ok(TimeType::Other)
+            fn visit_unit<E>(self) -> Result<JsonType, E> {
+                Ok(JsonType::Other)
             }
 
             fn visit_seq<A: serde::de::SeqAccess<'de>>(
                 self,
                 mut seq: A,
-            ) -> Result<TimeType, A::Error> {
+            ) -> Result<JsonType, A::Error> {
                 while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
-                Ok(TimeType::Other)
+                Ok(JsonType::Other)
             }
 
             fn visit_map<A: serde::de::MapAccess<'de>>(
                 self,
                 mut map: A,
-            ) -> Result<TimeType, A::Error> {
+            ) -> Result<JsonType, A::Error> {
                 while map
                     .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
                     .is_some()
                 {}
-                Ok(TimeType::Other)
+                Ok(JsonType::Other)
             }
         }
 
@@ -490,6 +636,7 @@ impl fmt::Debug for ClaimChecks {
             .field("leeway", &self.leeway)
             .field("validate_nbf", &self.validate_nbf)
             .field("integer_time_claims", &self.integer_time_claims)
+            .field("string_issuer", &self.string_issuer)
             .finish()
     }
 }
@@ -1989,7 +2136,8 @@ mod tests {
     }
 
     /// jsonwebtoken's rule, as `ClaimChecks`' docs state it: an `iss` array
-    /// passes when it holds the issuer, and only then.
+    /// passes when it holds the issuer, and only then (unless
+    /// `with_string_issuer` is on: `the_issuer_matrix_…`).
     #[test]
     fn an_iss_array_passes_only_when_it_holds_the_issuer() {
         let holding = client_claims().claim("iss", json!(["https://other.test", CLIENT_ISSUER]));
@@ -3464,5 +3612,555 @@ mod tests {
             let on = checked(&token, &integer_time_checks()).expect_err(case);
             assert_eq!(on.to_string(), off.to_string(), "{case}");
         }
+    }
+
+    // --- string issuer -----------------------------------------------------
+
+    fn string_issuer_checks() -> ClaimChecks {
+        client_checks().with_string_issuer(true)
+    }
+
+    /// A token's payload segment, decoded: the JSON text that was signed.
+    fn signed_payload(token: &str) -> String {
+        let segment = token.split('.').nth(1).expect("a payload segment");
+        String::from_utf8(URL_SAFE_NO_PAD.decode(segment).expect("base64url")).expect("UTF-8")
+    }
+
+    /// A [`client_checks`] token whose `iss` is `member` (JSON text, the key
+    /// included) and whose `exp` is `exp` (JSON text), signed exactly as
+    /// written: no serializer keeps an escaped or a repeated key. The signed
+    /// payload is checked to carry both.
+    fn registered_token(member: &str, exp: &str) -> String {
+        let token = mint_raw(&format!(r#"{{"sub":"user_01TEST","exp":{exp},{member}}}"#));
+        let payload = signed_payload(&token);
+        assert!(
+            payload.contains(member) && payload.contains(&format!(r#""exp":{exp},"#)),
+            "the signed payload carries {member} and exp {exp}: {payload}"
+        );
+        token
+    }
+
+    /// An `exp` an hour ahead, as JSON text.
+    fn valid_exp() -> String {
+        (jsonwebtoken::get_current_timestamp() + 3600).to_string()
+    }
+
+    /// The `iss` shapes the string-issuer matrix tries: a name, the member's
+    /// JSON text, and the verdicts with the option off, then on (`None`
+    /// passes). Off, jsonwebtoken 11.1.0 takes a string equal to the issuer
+    /// or an array of strings holding it, and refuses any other array as
+    /// another issuer and any other value as a missing claim; on, every
+    /// array it takes is refused by the option, and its own refusals come
+    /// first.
+    #[allow(clippy::type_complexity)]
+    fn issuer_cells() -> Vec<(
+        &'static str,
+        String,
+        Option<&'static str>,
+        Option<&'static str>,
+    )> {
+        const NOT_ACCEPTED: Option<&str> = Some("issuer is not accepted");
+        const MISSING: Option<&str> = Some("a required claim is missing");
+        const MALFORMED: Option<&str> = Some(CLAIMS_MALFORMED);
+        const NOT_A_STRING: Option<&str> = Some(NOT_A_STRING_ISSUER);
+        let iss = CLIENT_ISSUER;
+        let other = "https://other.example";
+        vec![
+            ("a string", format!(r#""iss":"{iss}""#), None, None),
+            (
+                "a string with escapes",
+                format!(r#""iss":"{}""#, iss.replace('/', r"\/")),
+                None,
+                None,
+            ),
+            (
+                "an escaped key, a string",
+                format!(r#""\u0069ss":"{iss}""#),
+                None,
+                None,
+            ),
+            (
+                "an array of the issuer",
+                format!(r#""iss":["{iss}"]"#),
+                None,
+                NOT_A_STRING,
+            ),
+            (
+                "the issuer, then another",
+                format!(r#""iss":["{iss}","{other}"]"#),
+                None,
+                NOT_A_STRING,
+            ),
+            (
+                "another, then the issuer",
+                format!(r#""iss":["{other}","{iss}"]"#),
+                None,
+                NOT_A_STRING,
+            ),
+            (
+                "an escaped key, an array",
+                format!(r#""\u0069ss":["{iss}"]"#),
+                None,
+                NOT_A_STRING,
+            ),
+            (
+                "an array without the issuer",
+                format!(r#""iss":["{other}"]"#),
+                NOT_ACCEPTED,
+                NOT_ACCEPTED,
+            ),
+            (
+                "an empty array",
+                r#""iss":[]"#.to_owned(),
+                NOT_ACCEPTED,
+                NOT_ACCEPTED,
+            ),
+            (
+                "an array holding a number",
+                format!(r#""iss":["{iss}",1]"#),
+                MISSING,
+                MISSING,
+            ),
+            ("a number", r#""iss":1"#.to_owned(), MISSING, MISSING),
+            ("a boolean", r#""iss":true"#.to_owned(), MISSING, MISSING),
+            ("null", r#""iss":null"#.to_owned(), MISSING, MISSING),
+            (
+                "an object",
+                format!(r#""iss":{{"iss":"{iss}"}}"#),
+                MISSING,
+                MISSING,
+            ),
+            (
+                "the raw-value object",
+                format!(r#""iss":{{"$serde_json::private::RawValue":"\"{iss}\""}}"#),
+                MISSING,
+                MISSING,
+            ),
+            (
+                "iss twice",
+                format!(r#""iss":"{iss}","iss":"{iss}""#),
+                MALFORMED,
+                MALFORMED,
+            ),
+            (
+                "iss twice, one key escaped",
+                format!(r#""iss":"{iss}","\u0069ss":"{iss}""#),
+                MALFORMED,
+                MALFORMED,
+            ),
+            (
+                "a string, then an array",
+                format!(r#""iss":"{iss}","iss":["{iss}"]"#),
+                MALFORMED,
+                MALFORMED,
+            ),
+        ]
+    }
+
+    #[test]
+    fn string_issuer_is_off_by_default_and_debug_prints_it() {
+        let default = ClaimChecks::new(CLIENT_ISSUER, Audience::NotValidated);
+        assert!(!default.requires_string_issuer());
+        assert!(!ClaimChecks::slauth(ISSUER, AUDIENCE).requires_string_issuer());
+        let config = SlauthConfig {
+            issuer: ISSUER.into(),
+            jwks_url: "https://jwks.test/jwks".into(),
+            audience: AUDIENCE.into(),
+            pat_validate_url: None,
+        };
+        assert!(!Verifier::new(config, reqwest::Client::new())
+            .claim_checks()
+            .requires_string_issuer());
+
+        let on = default.clone().with_string_issuer(true);
+        assert!(on.requires_string_issuer());
+        assert!(!on.requires_integer_time_claims(), "the options are apart");
+        assert_ne!(on, default);
+        assert_ne!(on, default.clone().with_integer_time_claims(true));
+        assert_eq!(on.clone().with_string_issuer(false), default);
+
+        assert!(
+            format!("{default:?}").contains("string_issuer: false"),
+            "{default:?}"
+        );
+        assert!(format!("{on:?}").contains("string_issuer: true"), "{on:?}");
+    }
+
+    /// Every `iss` shape off, then on. The four arrays jsonwebtoken takes
+    /// are what the option changes.
+    #[test]
+    fn the_issuer_matrix_without_and_with_string_issuer() {
+        let cells = issuer_cells();
+        assert_eq!(
+            cells.iter().filter(|(_, _, off, on)| off != on).count(),
+            4,
+            "the arrays holding the issuer, one under an escaped key"
+        );
+
+        for (case, member, off, on) in &cells {
+            let token = registered_token(member, &valid_exp());
+            assert_verdict(
+                checked(&token, &client_checks()),
+                *off,
+                &format!("off, {case}"),
+            );
+            assert_verdict(
+                checked(&token, &string_issuer_checks()),
+                *on,
+                &format!("on, {case}"),
+            );
+        }
+    }
+
+    /// Both verifiers built from a consumer's `ClaimChecks` apply the
+    /// option through `verify_bearer_claims`, over the whole matrix.
+    #[tokio::test]
+    async fn for_issuer_and_with_cache_verifiers_apply_string_issuer() {
+        // One fetch per verifier: each holds its own cache.
+        let server = primary_issuer(3).await;
+        let for_issuer = |checks: ClaimChecks| {
+            Verifier::for_issuer(checks, jwks_url_of(&server), None, reqwest::Client::new())
+        };
+        let off = for_issuer(client_checks());
+        let on = for_issuer(string_issuer_checks());
+        let with_cache = Verifier::with_cache(
+            string_issuer_checks(),
+            JwksCache::new(jwks_url_of(&server), reqwest::Client::new()),
+        );
+        assert!(!off.claim_checks().requires_string_issuer());
+        assert!(on.claim_checks().requires_string_issuer());
+        assert!(with_cache.claim_checks().requires_string_issuer());
+
+        for (case, member, off_verdict, on_verdict) in issuer_cells() {
+            let token = registered_token(&member, &valid_exp());
+            for (verifier, name, verdict) in [
+                (&off, "for_issuer off", off_verdict),
+                (&on, "for_issuer on", on_verdict),
+                (&with_cache, "with_cache on", on_verdict),
+            ] {
+                assert_verdict(
+                    verifier.verify_bearer_claims(&token).await,
+                    verdict,
+                    &format!("{name}, {case}"),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_array_issuer_is_refused_with_a_fixed_reason() {
+        let token = registered_token(&format!(r#""iss":["{CLIENT_ISSUER}"]"#), &valid_exp());
+
+        let err = checked(&token, &string_issuer_checks()).expect_err("on: refused");
+
+        // The reason's literal text, not the constant, and nothing of the
+        // claim's value.
+        assert_eq!(
+            err.to_string(),
+            "token rejected: the issuer claim is not a string"
+        );
+        assert!(matches!(err, AuthError::InvalidToken(_)), "{err:?}");
+        assert!(!err.to_string().contains("workos"), "{err}");
+    }
+
+    /// `claims_with_jwks` and `verify_with_jwks` build slauth's checks
+    /// themselves, so the option is never on there.
+    #[test]
+    fn claims_with_jwks_and_verify_with_jwks_never_require_a_string_issuer() {
+        let token = mint_raw(&format!(
+            r#"{{"iss":["{ISSUER}"],"aud":"{AUDIENCE}","sub":"s","email":"u@example.com","exp":{}}}"#,
+            valid_exp()
+        ));
+
+        Verifier::claims_with_jwks::<Value>(
+            &token,
+            &TestKey::primary().jwks(),
+            PRIMARY_KID,
+            ISSUER,
+            AUDIENCE,
+        )
+        .expect("claims_with_jwks: an array issuer passes");
+        verify(&token).expect("verify_with_jwks: an array issuer passes");
+        // The control: the same rules with the option on refuse this token.
+        assert_rejected(
+            checked(
+                &token,
+                &ClaimChecks::slauth(ISSUER, AUDIENCE).with_string_issuer(true),
+            ),
+            NOT_A_STRING_ISSUER,
+            "slauth's rules with the option on",
+        );
+    }
+
+    /// The two type rules, each alone and together, over tokens that break
+    /// one, the other, both, or neither. Together, the time claims are
+    /// checked first: a token both refuse carries the time claims' reason.
+    #[test]
+    fn string_issuer_and_integer_time_claims_each_alone_and_together() {
+        const TIME: Option<&str> = Some(NOT_WHOLE_SECONDS);
+        const ISS: Option<&str> = Some(NOT_A_STRING_ISSUER);
+        const MALFORMED: Option<&str> = Some(CLAIMS_MALFORMED);
+        let now = jsonwebtoken::get_current_timestamp();
+        let exp = valid_exp();
+        let fraction = format!("{}.5", now + 3600);
+        let string = format!(r#""iss":"{CLIENT_ISSUER}""#);
+        let array = format!(r#""iss":["{CLIENT_ISSUER}"]"#);
+        let iat_twice = |iss: &str| format!(r#"{iss},"iat":{now},"iat":{now}"#);
+
+        // (case, iss member and the rest, exp, verdicts: time alone, issuer
+        // alone, both); with neither, every token passes.
+        for (case, member, exp, time_alone, issuer_alone, both) in [
+            ("well-typed", string.clone(), &exp, None, None, None),
+            ("an array issuer", array.clone(), &exp, None, ISS, ISS),
+            (
+                "a fractional exp",
+                string.clone(),
+                &fraction,
+                TIME,
+                None,
+                TIME,
+            ),
+            ("both", array.clone(), &fraction, TIME, ISS, TIME),
+            (
+                "iat twice",
+                iat_twice(&string),
+                &exp,
+                MALFORMED,
+                None,
+                MALFORMED,
+            ),
+            (
+                "iat twice and an array issuer",
+                iat_twice(&array),
+                &exp,
+                MALFORMED,
+                ISS,
+                MALFORMED,
+            ),
+        ] {
+            let token = registered_token(&member, exp);
+            for (checks, name, verdict) in [
+                (client_checks(), "neither", None),
+                (
+                    client_checks().with_integer_time_claims(true),
+                    "time alone",
+                    time_alone,
+                ),
+                (string_issuer_checks(), "issuer alone", issuer_alone),
+                (
+                    string_issuer_checks().with_integer_time_claims(true),
+                    "both",
+                    both,
+                ),
+            ] {
+                assert_verdict(
+                    checked(&token, &checks),
+                    verdict,
+                    &format!("{name}, {case}"),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn issuer_is_a_string_reads_types_not_values() {
+        let read = |text: &str| issuer_is_a_string(text.as_bytes());
+        for passes in [
+            r#"{}"#,
+            r#"{"iss":"a"}"#,
+            r#"{"iss":""}"#,
+            r#"{"iss":"https:\/\/a"}"#,
+            r#"{"\u0069ss":"a"}"#,
+            r#"{"iss":"a","sub":"s","sub":"t"}"#,
+            // The time claims are another rule's.
+            r#"{"iss":"a","exp":1.5,"iat":1,"iat":2}"#,
+            r#"{"aud":["a"],"nested":{"iss":["a"]}}"#,
+        ] {
+            assert!(read(passes), "{passes}");
+        }
+        for fails in [
+            r#"{"iss":["a"]}"#,
+            r#"{"iss":["a","b"]}"#,
+            r#"{"iss":[]}"#,
+            r#"{"\u0069ss":["a"]}"#,
+            r#"{"iss":1}"#,
+            r#"{"iss":true}"#,
+            r#"{"iss":null}"#,
+            r#"{"iss":{"a":1}}"#,
+            r#"{"iss":{"$serde_json::private::RawValue":"\"a\""}}"#,
+            r#"{"iss":"a","iss":"a"}"#,
+            r#"{"iss":"a","\u0069ss":"a"}"#,
+            r#"[{"iss":"a"}]"#,
+            r#""a""#,
+            r#"null"#,
+            r#"{"iss":"a"} trailing"#,
+        ] {
+            assert!(!read(fails), "{fails}");
+        }
+    }
+
+    /// `time_claims_are_whole_seconds` never reads `iss`, whatever it holds:
+    /// S1b's predicate, unchanged.
+    #[test]
+    fn time_claims_are_whole_seconds_ignores_the_issuer() {
+        for payload in [
+            r#"{"exp":1,"iss":["a"]}"#,
+            r#"{"exp":1,"iss":null}"#,
+            r#"{"exp":1,"iss":"a","iss":"b"}"#,
+            r#"{"exp":1,"iss":"a","\u0069ss":["b"]}"#,
+        ] {
+            assert!(
+                time_claims_are_whole_seconds(payload.as_bytes()),
+                "{payload}"
+            );
+        }
+    }
+
+    /// The issuer rule as a `serde_json::Value` would have it: the control
+    /// the bytes reading must beat.
+    fn value_issuer_rule(payload: &str) -> bool {
+        let claims: serde_json::Map<String, Value> =
+            serde_json::from_str(payload).expect("a JSON object");
+        claims.get("iss").is_none_or(Value::is_string)
+    }
+
+    /// In this test build serde_json's `raw_value` is on (axum, a
+    /// dev-dependency, turns it on), so a `Value` reads the raw-value object
+    /// as the string inside it. jsonwebtoken refuses that `iss` itself, and
+    /// so does the bytes reading.
+    #[test]
+    fn a_raw_value_issuer_is_not_a_string() {
+        let member = format!(r#""iss":{{"$serde_json::private::RawValue":"\"{CLIENT_ISSUER}\""}}"#);
+        let payload = format!(r#"{{"sub":"user_01TEST","exp":{},{member}}}"#, valid_exp());
+        // Not vacuous: a `Value` normalises the object to a string.
+        assert_eq!(
+            serde_json::from_str::<Value>(&payload).expect("parses")["iss"],
+            json!(CLIENT_ISSUER),
+            "serde_json's raw_value is on in this build"
+        );
+        assert!(value_issuer_rule(&payload), "a Value map misreads it");
+        assert!(!issuer_is_a_string(payload.as_bytes()));
+
+        let token = registered_token(&member, &valid_exp());
+        for checks in [client_checks(), string_issuer_checks()] {
+            assert_rejected(
+                checked(&token, &checks),
+                "a required claim is missing",
+                "the raw-value object",
+            );
+        }
+    }
+
+    /// Each predicate reads only its own rule's claims: the other rule's are
+    /// skipped unread, whatever they hold, `1e400` (a number serde_json
+    /// cannot hold) and repeats included. The time cases are the verdicts the
+    /// time reader gave before `iss` was read at all (stridelabs-auth at
+    /// f244683, run on these payloads).
+    #[test]
+    fn each_predicate_skips_the_other_rules_claims_unread() {
+        let time = |text: &str| time_claims_are_whole_seconds(text.as_bytes());
+        for passes in [
+            r#"{"exp":1,"iss":1e400}"#,
+            r#"{"exp":1,"iss":1e400,"iss":["b"]}"#,
+            r#"{"exp":1,"other":1e400}"#,
+        ] {
+            assert!(time(passes), "{passes}");
+        }
+        for fails in [
+            r#"{"exp":1,"iat":1e400}"#,
+            r#"{"exp":1e400}"#,
+            r#"{"exp":1,"nbf":-1e400}"#,
+        ] {
+            assert!(!time(fails), "{fails}");
+        }
+
+        let issuer = |text: &str| issuer_is_a_string(text.as_bytes());
+        for passes in [
+            r#"{"iss":"a","iat":1e400}"#,
+            r#"{"iss":"a","exp":1e400,"nbf":-1e400}"#,
+            r#"{"iss":"a","exp":1e400,"exp":1e400}"#,
+            r#"{"iss":"a","iat":1,"iat":2}"#,
+        ] {
+            assert!(issuer(passes), "{passes}");
+        }
+        for fails in [r#"{"iss":1e400}"#, r#"{"iss":"a","iss":1e400}"#] {
+            assert!(!issuer(fails), "{fails}");
+        }
+    }
+
+    /// A consumer's claims type that reads `sub` alone, as `McpClaims` reads
+    /// no `iat`: serde's derive skips every other member unread, so a token
+    /// carrying `1e400` there reaches the type rules.
+    #[derive(Debug, serde::Deserialize)]
+    struct SubjectOnly {
+        sub: String,
+    }
+
+    fn checked_subject(token: &str, checks: &ClaimChecks) -> Result<Value, AuthError> {
+        Verifier::claims_with_jwks_checked::<SubjectOnly>(
+            token,
+            &TestKey::primary().jwks(),
+            PRIMARY_KID,
+            checks,
+        )
+        .map(|claims| json!({ "sub": claims.sub }))
+    }
+
+    /// A rule that is off never reads its claims, through a signed token: an
+    /// `iat` serde_json cannot hold is refused by the time rule, which reads
+    /// it (as it always has), and never by the issuer rule alone.
+    #[test]
+    fn a_rule_that_is_off_never_reads_its_claims() {
+        const MALFORMED: Option<&str> = Some(CLAIMS_MALFORMED);
+        const MISSING: Option<&str> = Some("a required claim is missing");
+        let exp = valid_exp();
+        let iat_out_of_range =
+            registered_token(&format!(r#""iss":"{CLIENT_ISSUER}","iat":1e400"#), &exp);
+        let iss_out_of_range = registered_token(r#""iss":1e400"#, &exp);
+
+        // Why a claims type of its own: a `Value` cannot read the number, so
+        // `checked` refuses the token before any rule runs.
+        assert_rejected(
+            checked(&iat_out_of_range, &client_checks()),
+            CLAIMS_MALFORMED,
+            "a Value reads 1e400",
+        );
+        let subject = checked_subject(&iat_out_of_range, &client_checks()).expect("neither rule");
+        assert_eq!(subject["sub"], "user_01TEST");
+
+        // (case, token, verdicts: time alone, issuer alone, both); with
+        // neither, `iat_out_of_range` passes (above).
+        for (case, token, time_alone, issuer_alone, both) in [
+            ("iat 1e400", &iat_out_of_range, MALFORMED, None, MALFORMED),
+            // jsonwebtoken cannot read this `iss` either and refuses it as
+            // missing before any rule, with or without them: the outcome
+            // before `iss` was read too.
+            ("iss 1e400", &iss_out_of_range, MISSING, MISSING, MISSING),
+        ] {
+            for (checks, name, verdict) in [
+                (
+                    client_checks().with_integer_time_claims(true),
+                    "time alone",
+                    time_alone,
+                ),
+                (string_issuer_checks(), "issuer alone", issuer_alone),
+                (
+                    string_issuer_checks().with_integer_time_claims(true),
+                    "both",
+                    both,
+                ),
+            ] {
+                assert_verdict(
+                    checked_subject(token, &checks),
+                    verdict,
+                    &format!("{name}, {case}"),
+                );
+            }
+        }
+        assert_rejected(
+            checked_subject(&iss_out_of_range, &client_checks()),
+            "a required claim is missing",
+            "neither, iss 1e400",
+        );
     }
 }
