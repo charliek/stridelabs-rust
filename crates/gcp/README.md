@@ -357,6 +357,7 @@ let url = public_url(bucket, "user/20261017-120000-ab12cd34.png")?;
 | `upload_with(bucket, object, Bytes, content_type, &UploadOptions)` | default options: `upload`'s request, byte for byte; otherwise `POST {base}/upload/storage/v1/b/{bucket}/o?uploadType=multipart[&ifGenerationMatch=N]` (below) | `()`; any non-2xx is an error, a failed precondition's 412 included |
 | `download(bucket, object)` | `GET {base}/storage/v1/b/{bucket}/o/{object}?alt=media` | `Some((bytes, content_type))`, or `None` on 404 |
 | `delete(bucket, object)` | `DELETE {base}/storage/v1/b/{bucket}/o/{object}` | `true` if deleted, `false` on 404 |
+| `exists(bucket, object)` | `GET {base}/storage/v1/b/{bucket}/o/{object}?fields=name` | `true` on any 2xx (body unread), `false` on 404 (one request, not retried); anything else is `Status { operation: "exists" }` |
 | `bucket_reachable(bucket)` | `GET {base}/storage/v1/b/{bucket}/o?maxResults=1` | `()` on any 2xx; anything else, a 404 included, is `Status { operation: "list" }` |
 | `public_url(bucket, object)` | (none) | `Ok("https://storage.googleapis.com/{bucket}/{object}")`, with the object's `/` kept |
 | `public_url_with(bucket, object, ObjectNamePolicy)` | (none) | `public_url` under a name policy (below) |
@@ -400,7 +401,7 @@ one attempt per operation. Each widens on its own:
   error body is read only as far as its first 16 KiB.
 - **Errors.** `StorageError::{InvalidBucketName, InvalidObjectName, Auth,
   Request, Timeout, TooLarge, Status, InvalidArgument}` names the
-  operation (`upload`, `download`, `delete` or `list`).
+  operation (`upload`, `download`, `delete`, `exists` or `list`).
   - **`Display` and `Debug` are safe for routine logs.** They carry the HTTP
     status and, from Google's JSON envelope, `error.status` when it is one
     of google.rpc.Code's 17 names (for example `GCS upload answered HTTP
@@ -514,7 +515,7 @@ let url = public_url_with(bucket, &object, ObjectNamePolicy::Literal)?; // the n
 `ObjectNamePolicy` (`#[non_exhaustive]`, `Default` = `Strict`) says which
 object names a client sends and what `public_url_with` accepts:
 
-| | `upload`, `upload_with` | `download`, `delete` | `public_url_with` |
+| | `upload`, `upload_with` | `download`, `exists`, `delete` | `public_url_with` |
 |---|---|---|---|
 | `Strict` (v0.8.0) | refuses an empty name, a leading or trailing `/`, an empty, `.` or `..` segment | the same | the same |
 | `Literal` | sends every name | refuses only `""`, `.` and `..` | refuses no name |
@@ -523,11 +524,12 @@ object names a client sends and what `public_url_with` accepts:
   objects carry names `Strict` refuses, which must stay addressable (served
   and deleted). It is a transport policy, not validation. On an upload the
   name is a query value (`name=`) or a JSON string, which nothing
-  normalizes. On a download or a delete it is a URL path segment, and the
-  whole names `""`, `.` and `..` cannot be one (`/o/.` goes out as `/o/`,
-  and `/o/..` as the bucket itself), so they are refused before a token or
-  a request. Refusing them on a download too stops `download("..")`
-  returning the bucket's metadata as an object's bytes. Everything else is
+  normalizes. On a download, an existence probe or a delete it is a URL path
+  segment, and the whole names `""`, `.` and `..` cannot be one (`/o/.` goes
+  out as `/o/`, and `/o/..` as the bucket itself), so they are refused
+  before a token or a request. Refusing them on a download too stops
+  `download("..")` returning the bucket's metadata as an object's bytes (and
+  `exists("..")` answering `true` for the bucket). Everything else is
   GCS's call: CR or LF, a `.well-known/acme-challenge/` prefix, a name past
   the length limit come back as GCS's `400`, `StorageError::Status`.
 - **Encoding is the same under both policies:** RFC 3986's unreserved
@@ -726,7 +728,8 @@ match first_inline_image(&vertex.generate_content(model, &request).await?) {
 There is no retry or backoff by default (`GcsClient`'s retry above is
 opt-in, and `VertexClient` has none), no `401` replay, no resumable
 upload, no object listing beyond `bucket_reachable`'s probe, no object metadata
-calls beyond what `upload_with` sets at creation (no read-back, no patch),
+calls beyond what `upload_with` sets at creation and `exists`'s one probe, which
+reads only the name (no read-back of size, generation or checksum, no patch),
 no service-account impersonation and no workload-identity federation (the
 `external_account` family). There is no Windows
 well-known-file lookup and no `GCE_METADATA_HOST` override.
