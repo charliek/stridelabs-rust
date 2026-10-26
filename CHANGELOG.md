@@ -61,6 +61,37 @@ for a consumer's pin.
   - `IGNORED_URL_PARAMETERS`' docs no longer say leaving the keepalives to
     the OS changes nothing: sqlx 0.9 sets no TCP keepalive and has no socket
     hook, so a silent peer is unbounded.
+- `stridelabs-observability`: **`RequestLogLevel(pub tracing::Level)`**, a
+  response extension that lowers the level of `RequestLogLayer`'s entry for
+  that request (re-exported beside `RequestLogLayer`). A handler, an
+  extractor's rejection or an inner layer inserts it into the response's
+  extensions; the entry takes it only when it is less severe than the
+  status's (`ERROR` ≥ 500, `WARN` ≥ 400, else `INFO`), and a raise or an
+  equal level is ignored, so an app can quieten an expected,
+  attacker-driven 5xx it chose to return but can never re-rank an entry
+  upward or hide a 5xx it didn't decide on. An inner `Err` (500 `ERROR`), a
+  panic (500 `ERROR`) and a dropped future (499 `WARN`) never consult it.
+  Status, message and `httpRequest` are unchanged; under `CloudLayer`,
+  `DEBUG` and `TRACE` both write `"severity":"DEBUG"`. No feature flag:
+  nothing changes unless a response carries the extension. Requested by
+  tapper (plan 017: a token naming an unseen key id, refused inside the
+  JWKS refetch floor, should be one `INFO` entry, not an `ERROR`) and lumen
+  (forged-kid requests produce one `ERROR` entry per request today).
+  `scripts/downstream-check.sh` checks tapper; lumen and parcel are
+  informational there (parcel does not use `RequestLogLayer`).
+- `stridelabs-testing`: two message hooks for a consumer's own test setup
+  (lumen plan 003). The existing functions and their messages are unchanged
+  byte for byte; they share one validation path with the new ones.
+  - **`require_local_url_hinted(var, hint)`**: `require_local_url` whose
+    refusal for an unset or empty variable reads `<VAR> is not set. <hint>`,
+    the consumer's `hint` verbatim (how to create the test database), then
+    the usual explanation. Every other refusal is `require_local_url`'s.
+  - **`require_local_redis_url_with_example(var, policy, example_url)`**
+    (feature `redis`): `require_local_redis_url` whose refusals that suggest
+    a URL (the database-0 refusal under `RefuseZero`, and the unset one,
+    ``<VAR> is not set. Set it to a local Redis URL such as `<example_url>`.``)
+    name the consumer's `example_url` (`redis://localhost:56379/1`) instead
+    of the fixed `redis://localhost:6379/1`.
 - `stridelabs-mcp`: two opt-ins for `McpVerifier`, so an MCP endpoint can
   check JWTs as the app's REST API (and its Python MCP server) does
   (slaudio plan 027). A consumer that uses neither sees no change:
@@ -85,6 +116,50 @@ for a consumer's pin.
     only `scp` names. Under either, a malformed `scope` or `scp` stays
     `Invalid` (even the one `ScopeThenScp` does not read), and `null`
     counts as absent.
+
+- `stridelabs-gcp`: **`GcsClient::exists(bucket, object) -> Result<bool,
+  StorageError>`** (parcel plan 002), the existence probe a service wants
+  before it stores bytes it may already hold. One metadata `GET
+  {base}/storage/v1/b/{bucket}/o/{object}?fields=name`: `true` on a 2xx
+  (whose body is never read), `false` on a 404 (one request, never retried,
+  as `download` and `delete` treat it), any other status
+  `StorageError::Status { operation: "exists", .. }`. Everything else is the
+  other operations': bucket validation, the client's `ObjectNamePolicy`
+  (refused names fail before a token or a request), its timeout and retry
+  policy, a bounded error body and value-free errors. Additive: no feature,
+  no dependency, no change to an existing call.
+
+### Changed
+
+- `scripts/downstream-check.sh`: **parcel** is an informational consumer
+  (`parcel`, its root workspace on parcel's `main`: pass `origin/main` or set
+  `DOWNSTREAM_PARCEL_REF`). Clippy and test run parcel's CI flags
+  (`--workspace`, clippy also `--all-targets --all-features`). It never
+  decides the exit. Preflight needs parcel's compose Postgres (`localhost:5439`,
+  or the URL in `DOWNSTREAM_PARCEL_DATABASE_URL`, passed to the run as
+  `DATABASE_URL`) and its fake-gcs-server on `localhost:4447`; the header
+  names the collision with the `STRIDELABS_PG_PORT=5439` example in this
+  library's CLAUDE.md. An override that names no database or parcel's dev
+  database `parcel` (the tests drop old schemas in the database they are
+  given), or whose query sets `host`, `hostaddr`, `port` or `dbname` (sqlx
+  applies them over the URL, so preflight would check another endpoint), is
+  refused with the rule broken and never the value. The service's own
+  settings are unset for the run: `DATABASE_URL` otherwise,
+  `STORAGE_EMULATOR_HOST`, `GOOGLE_CREDENTIALS`, `APP_ENV`, the proxy
+  variables and the like by name, and every exported variable starting
+  `AUTH_`, `SLAUTH_`, `GCS_`, `BLOB_` or `PARCEL_` by prefix (parcel builds
+  its provider settings' names, `AUTH_<PROVIDER>_*`, at run time).
+- `scripts/downstream-check.sh`: the output filter now masks a whole
+  `postgres://` or `postgresql://` URL (`postgres://<redacted>`), also one
+  with no userinfo and no secret parameter, so the override's host, port and
+  database never reach the terminal or a log in a consumer's failure
+  message; the masking of other schemes and of secret parameters is unchanged.
+- `scripts/downstream-check.sh`: tapper's run sets
+  `TAPPER_RS_TEST_GCS_EMULATOR_URL` (tapper plan 017 C-3 makes its GCS tests
+  read it, loopback only, no default) to `http://127.0.0.1:4443`, or passes the
+  caller's value through (also when set to empty, which tapper's own tests
+  then refuse loudly), and preflight checks the address it names. A tapper
+  ref that does not read it yet ignores it.
 
 ## [0.10.0] - 2026-10-23
 

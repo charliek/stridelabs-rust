@@ -18,7 +18,7 @@ use stridelabs_gcp::storage::{
     StorageError, UploadOptions, DEFAULT_MAX_DOWNLOAD_BYTES,
 };
 use stridelabs_gcp::GcpAuthError;
-use wiremock::matchers::{any, header, method, path, query_param};
+use wiremock::matchers::{any, header, method, path, path_regex, query_param};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 const BUCKET: &str = "img-bucket";
@@ -185,6 +185,163 @@ async fn delete_reports_whether_there_was_an_object() {
     server.verify().await;
 }
 
+/// `exists` is one metadata `GET` for the object's name alone: `true` on a
+/// 200 whatever its body, with the object path encoded as one segment, the
+/// bearer attached and `fields=name` the only query.
+#[tokio::test]
+async fn exists_is_true_on_a_2xx_and_asks_for_the_name_only() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/storage/v1/b/{BUCKET}/o/{ENCODED}")))
+        .and(query_param("fields", "name"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"name": OBJECT})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let gcs = authorized_client(&server).await;
+
+    assert!(gcs.exists(BUCKET, OBJECT).await.unwrap());
+
+    let request = the_request(&server, "/storage/").await;
+    assert_eq!(request.url.query(), Some("fields=name"));
+    assert_eq!(
+        request.url.path(),
+        format!("/storage/v1/b/{BUCKET}/o/{ENCODED}")
+    );
+    assert_eq!(
+        header_of(&request, "authorization").as_deref(),
+        Some("Bearer gcs-token")
+    );
+    server.verify().await;
+}
+
+/// The body of a 2xx is not read, so a huge or malformed one changes
+/// nothing, and any 2xx is `true`.
+#[tokio::test]
+async fn exists_ignores_a_2xx_body() {
+    for template in [
+        ResponseTemplate::new(204),
+        ResponseTemplate::new(200).set_body_string("not json at all"),
+        ResponseTemplate::new(200).set_body_bytes(vec![b'x'; 2 * 1024 * 1024]),
+    ] {
+        let rig = Rig::start(vec![template], bearers(&BEARERS)).await;
+        let gcs = rig.client().with_max_download_bytes(16);
+        assert!(gcs.exists(BUCKET, OBJECT).await.unwrap());
+        assert_eq!(rig.counts().await, (1, 1));
+    }
+}
+
+/// A `200` that declares a megabyte of body and never sends it: `exists`
+/// answers `true` on the status line, long before the client's timeout, so
+/// it never waits on a 2xx body (a read of it would stall until the timeout
+/// and fail with `Timeout`).
+#[tokio::test]
+async fn exists_never_reads_a_2xx_body() {
+    let server = RawServer::start(|_, _| {
+        RawReply::Stall(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 1048576\r\n\r\n"
+                .to_vec(),
+        )
+    })
+    .await;
+    let gcs = GcsClient::emulator(never_retrying(), &server.base_url, None)
+        .with_timeout(Duration::from_secs(2));
+
+    let started = Instant::now();
+    let result = tokio::time::timeout(Duration::from_secs(1), gcs.exists(BUCKET, OBJECT)).await;
+    let elapsed = started.elapsed();
+
+    assert!(
+        matches!(result, Ok(Ok(true))),
+        "answered {result:?} after {elapsed:?}"
+    );
+    assert!(elapsed < Duration::from_secs(1), "took {elapsed:?}");
+    assert_eq!(server.requests().len(), 1);
+}
+
+/// A 404 is the answer `false`, in exactly one request, under a retry
+/// policy as without one; the `200` queued behind it is never reached.
+#[tokio::test]
+async fn exists_is_false_on_a_404_in_one_request_under_a_retry_policy() {
+    let rig = Rig::start(statuses(&[404, 200]), bearers(&BEARERS)).await;
+    assert!(!rig.retrying().exists(BUCKET, OBJECT).await.unwrap());
+    assert_eq!(rig.counts().await, (1, 1));
+
+    let rig = Rig::start(statuses(&[404, 200]), bearers(&BEARERS)).await;
+    assert!(!rig.client().exists(BUCKET, OBJECT).await.unwrap());
+    assert_eq!(rig.counts().await, (1, 1));
+}
+
+/// Any other status is `Status { operation: "exists" }`, a `403` (no
+/// `storage.objects.get`) included: never `false`. Its rendering keeps the
+/// object name and Google's message out, as every operation's does.
+#[tokio::test]
+async fn exists_reports_other_statuses_as_exists_errors_without_the_name() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/storage/"))
+        .respond_with(ResponseTemplate::new(403).set_body_json(json!({
+            "error": {
+                "code": 403,
+                "status": "PERMISSION_DENIED",
+                "message": "denied on NAME-CANARY.png",
+            }
+        })))
+        .mount(&server)
+        .await;
+    let gcs = authorized_client(&server).await;
+
+    let error = gcs.exists(BUCKET, "NAME-CANARY.png").await.unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "GCS exists answered HTTP 403 (PERMISSION_DENIED)"
+    );
+    let rendered = format!("{error} | {error:?} | {error:#?}");
+    assert!(!rendered.contains("CANARY"), "{rendered}");
+    assert!(!rendered.contains(&server.uri()), "no URL: {rendered}");
+    assert_eq!(error.sensitive_message(), Some("denied on NAME-CANARY.png"));
+}
+
+/// An invalid object or bucket is refused by `exists` with neither a storage
+/// request nor a token fetch, under both name policies.
+#[tokio::test]
+async fn exists_refuses_an_invalid_name_or_bucket_before_a_request_or_a_token() {
+    let server = MockServer::start().await;
+    let gcs = authorized_client(&server).await;
+    for policy in [ObjectNamePolicy::Strict, ObjectNamePolicy::Literal] {
+        let gcs = gcs.clone().with_object_name_policy(policy);
+        for object in ["", ".", ".."] {
+            let result = gcs.exists(BUCKET, object).await;
+            assert!(
+                matches!(result, Err(StorageError::InvalidObjectName { .. })),
+                "{object:?}: {result:?}"
+            );
+        }
+        for bucket in ["..", "a/b", "UPPER", ""] {
+            let result = gcs.exists(bucket, "o").await;
+            assert!(
+                matches!(result, Err(StorageError::InvalidBucketName { .. })),
+                "{bucket:?}: {result:?}"
+            );
+        }
+    }
+    let strict = gcs
+        .clone()
+        .with_object_name_policy(ObjectNamePolicy::Strict);
+    for object in ["u/../victim.png", "./a", "a//b", "/a", "a/"] {
+        let result = strict.exists(BUCKET, object).await;
+        assert!(
+            matches!(result, Err(StorageError::InvalidObjectName { .. })),
+            "{object:?}: {result:?}"
+        );
+    }
+    assert!(
+        server.received_requests().await.unwrap().is_empty(),
+        "no storage request and no token fetch"
+    );
+}
+
 /// No operation sends anything — no token fetch, no request — for a name
 /// that would become a different path once normalized.
 #[tokio::test]
@@ -207,6 +364,7 @@ async fn invalid_names_are_refused_before_any_request() {
         refused(gcs.upload(BUCKET, object, Bytes::new(), "image/png").await);
         refused(gcs.download(BUCKET, object).await.map(drop));
         refused(gcs.delete(BUCKET, object).await.map(drop));
+        refused(gcs.exists(BUCKET, object).await.map(drop));
         refused(public_url(BUCKET, object).map(drop));
     }
     for bucket in ["..", "a/b", "UPPER", ""] {
@@ -982,6 +1140,67 @@ async fn crc32c_against_fake_gcs_server() {
     assert_eq!(stored[3].as_deref(), Some(CHECKED));
 }
 
+/// **The emulator check for `exists`** (`#[ignore]`d: it needs a running
+/// fake-gcs-server, never real GCS). Run it with
+/// `STRIDELABS_FAKE_GCS_URL=http://localhost:4443 cargo test -p
+/// stridelabs-gcp --test storage -- --ignored exists_against_fake_gcs_server`.
+/// It creates a scratch bucket, `stridelabs-exists-test-<random>`, and
+/// deletes it: an uploaded object exists, a missing name does not, and a
+/// deleted one no longer does.
+#[tokio::test]
+#[ignore = "needs a fake-gcs-server: STRIDELABS_FAKE_GCS_URL"]
+async fn exists_against_fake_gcs_server() {
+    let Ok(base) = std::env::var("STRIDELABS_FAKE_GCS_URL") else {
+        panic!(
+            "STRIDELABS_FAKE_GCS_URL is not set: point it at a fake-gcs-server \
+             (e.g. http://localhost:4443, `-scheme http`); this test never runs against real GCS"
+        );
+    };
+    let base = base.trim_end_matches('/').to_owned();
+    let http = reqwest::Client::new();
+    let bucket = format!("stridelabs-exists-test-{:08x}", rand::random::<u32>());
+    let created = http
+        .post(format!("{base}/storage/v1/b"))
+        .json(&json!({"name": bucket}))
+        .send()
+        .await
+        .expect("the emulator answers");
+    assert!(
+        created.status().is_success(),
+        "create {bucket}: {}",
+        created.status()
+    );
+
+    // A slash and a space: the name goes out as one encoded path segment.
+    let object = "dir/exists probe.txt";
+    let gcs = GcsClient::emulator(http.clone(), &base, None);
+    let uploaded = gcs
+        .upload(&bucket, object, Bytes::from_static(b"probe"), "text/plain")
+        .await;
+    let after_upload = gcs.exists(&bucket, object).await;
+    let missing = gcs.exists(&bucket, "dir/no such object.txt").await;
+    let deleted = gcs.delete(&bucket, object).await;
+    let after_delete = gcs.exists(&bucket, object).await;
+
+    // Clean up before asserting, so a failure leaves no bucket behind.
+    let removed = http
+        .delete(format!("{base}/storage/v1/b/{bucket}"))
+        .send()
+        .await
+        .expect("the emulator answers");
+    assert!(
+        removed.status().is_success(),
+        "delete {bucket}: {}",
+        removed.status()
+    );
+
+    uploaded.expect("the upload");
+    assert!(after_upload.expect("exists after an upload"), "uploaded");
+    assert!(!missing.expect("exists of a missing name"), "missing");
+    assert!(deleted.expect("the delete"), "deleted");
+    assert!(!after_delete.expect("exists after a delete"), "gone");
+}
+
 /// The name is a JSON string in the metadata part, escaped by serde_json:
 /// quotes and backslashes escaped, `/` and Unicode as they are. Not a query
 /// value, not a path.
@@ -1270,15 +1489,18 @@ enum Op {
     CreateOnly,
     Download,
     Delete,
+    /// The object existence probe.
+    Exists,
     /// `bucket_reachable`.
     List,
 }
 
-const OPS: [Op; 5] = [
+const OPS: [Op; 6] = [
     Op::Upload,
     Op::CreateOnly,
     Op::Download,
     Op::Delete,
+    Op::Exists,
     Op::List,
 ];
 
@@ -1304,6 +1526,7 @@ impl Op {
             }
             Op::Download => gcs.download(bucket, object).await.map(drop),
             Op::Delete => gcs.delete(bucket, object).await.map(drop),
+            Op::Exists => gcs.exists(bucket, object).await.map(drop),
             Op::List => gcs.bucket_reachable(bucket).await,
         }
     }
@@ -1313,6 +1536,7 @@ impl Op {
             Op::Upload | Op::CreateOnly => "upload",
             Op::Download => "download",
             Op::Delete => "delete",
+            Op::Exists => "exists",
             Op::List => "list",
         }
     }
@@ -1429,7 +1653,7 @@ const NAMES: [(&str, &str, &str); 31] = [
 const STRICT_REFUSED: usize = 14;
 
 /// The names no URL path segment can carry, which `Literal` refuses on a
-/// download and a delete.
+/// download, an existence probe and a delete.
 const UNSENDABLE: [&str; 3] = ["", ".", ".."];
 
 /// The table's rule, written out independently of the crate: every UTF-8
@@ -1524,24 +1748,25 @@ impl NameRig {
     }
 }
 
-/// The four object operations on `name`, each its own result, with the
+/// The five object operations on `name`, each its own result, with the
 /// create-only multipart upload as `upload_with`.
 async fn every_object_op(
     gcs: &GcsClient,
     bucket: &str,
     name: &str,
-) -> [Result<(), StorageError>; 4] {
+) -> [Result<(), StorageError>; 5] {
     [
         Op::Upload.run_on(gcs, bucket, name).await,
         Op::CreateOnly.run_on(gcs, bucket, name).await,
         Op::Download.run_on(gcs, bucket, name).await,
         Op::Delete.run_on(gcs, bucket, name).await,
+        Op::Exists.run_on(gcs, bucket, name).await,
     ]
 }
 
 /// The request lines [`every_object_op`] sends for a name quoted `quoted`,
 /// its delete to `delete_path`.
-fn object_op_lines(bucket: &str, quoted: &str, delete_path: &str) -> [String; 4] {
+fn object_op_lines(bucket: &str, quoted: &str, delete_path: &str) -> [String; 5] {
     [
         format!("POST /upload/storage/v1/b/{bucket}/o?uploadType=media&name={quoted} HTTP/1.1"),
         format!(
@@ -1549,6 +1774,7 @@ fn object_op_lines(bucket: &str, quoted: &str, delete_path: &str) -> [String; 4]
         ),
         format!("GET /storage/v1/b/{bucket}/o/{quoted}?alt=media HTTP/1.1"),
         format!("DELETE {delete_path} HTTP/1.1"),
+        format!("GET /storage/v1/b/{bucket}/o/{quoted}?fields=name HTTP/1.1"),
     ]
 }
 
@@ -1612,7 +1838,7 @@ async fn strict_refuses_the_same_fourteen_names_everywhere() {
                 assert_eq!(url.unwrap(), table_url(path), "{name:?}");
             }
             let requests = rig.gcs.requests();
-            let sent: Vec<String> = requests[requests.len() - 4..]
+            let sent: Vec<String> = requests[requests.len() - 5..]
                 .iter()
                 .map(|request| request_line(request))
                 .collect();
@@ -1625,7 +1851,7 @@ async fn strict_refuses_the_same_fourteen_names_everywhere() {
                 ),
                 "{name:?}"
             );
-            assert_eq!(multipart_name(&requests[requests.len() - 3]), name);
+            assert_eq!(multipart_name(&requests[requests.len() - 4]), name);
         }
     }
     assert_eq!(refused, STRICT_REFUSED, "exactly the 14");
@@ -1669,6 +1895,7 @@ async fn literal_deletes_go_to_each_names_path_and_the_unsendable_are_refused() 
             for result in [
                 gcs.delete(bucket, name).await.map(drop),
                 gcs.download(bucket, name).await.map(drop),
+                gcs.exists(bucket, name).await.map(drop),
             ] {
                 assert!(
                     matches!(result, Err(StorageError::InvalidObjectName { .. })),
@@ -1685,6 +1912,13 @@ async fn literal_deletes_go_to_each_names_path_and_the_unsendable_are_refused() 
             format!("DELETE /storage/v1/b/{bucket}/o/{segment} HTTP/1.1"),
             "{name:?}"
         );
+        assert!(gcs.exists(bucket, name).await.unwrap());
+        let requests = rig.gcs.requests();
+        assert_eq!(
+            request_line(requests.last().unwrap()),
+            format!("GET /storage/v1/b/{bucket}/o/{segment}?fields=name HTTP/1.1"),
+            "{name:?}"
+        );
     }
     rig.assert_never_the_bucket(bucket);
 }
@@ -1692,7 +1926,8 @@ async fn literal_deletes_go_to_each_names_path_and_the_unsendable_are_refused() 
 /// The hazard `Literal` must never open: `/o/..` is sent as the bucket
 /// itself, and a `DELETE` there deletes an empty bucket. `delete("..")`
 /// (and `"."` and `""`) is refused with nothing sent and no token fetched,
-/// under a retry policy too.
+/// under a retry policy too; so is `exists`, which would otherwise read the
+/// bucket's metadata as an object's.
 #[tokio::test]
 async fn a_literal_delete_of_dot_dot_never_reaches_the_bucket() {
     let rig = NameRig::start().await;
@@ -1701,6 +1936,11 @@ async fn a_literal_delete_of_dot_dot_never_reaches_the_bucket() {
         .with_retry(ms_policy());
     for name in ["..", ".", ""] {
         let result = gcs.delete(BUCKET, name).await;
+        assert!(
+            matches!(result, Err(StorageError::InvalidObjectName { .. })),
+            "{name:?}: {result:?}"
+        );
+        let result = gcs.exists(BUCKET, name).await;
         assert!(
             matches!(result, Err(StorageError::InvalidObjectName { .. })),
             "{name:?}: {result:?}"
@@ -1776,7 +2016,7 @@ async fn literal_names_go_out_exactly_in_the_path_the_query_and_the_json() {
             assert!(result.is_ok(), "{name:?}: {result:?}");
         }
         let requests = rig.gcs.requests();
-        let sent = &requests[requests.len() - 4..];
+        let sent = &requests[requests.len() - 5..];
         let quoted = unreserved_quote(name, false);
         assert_eq!(
             sent.iter().map(|r| request_line(r)).collect::<Vec<_>>(),
@@ -1818,7 +2058,7 @@ async fn literal_leaves_the_rest_to_gcs() {
             "op {i}: {result:?}"
         );
     }
-    assert_eq!(rig.gcs.requests().len(), 4, "each sent once");
+    assert_eq!(rig.gcs.requests().len(), 5, "each sent once");
 
     for name in UNSENDABLE {
         let before = rig.gcs.requests().len();
@@ -1968,14 +2208,17 @@ async fn other_statuses_are_not_retried_and_a_401_is_not() {
     }
 }
 
-/// A `404` is an answer, never retried: `None`, `false`, or the probe's
-/// `Status { 404 }`.
+/// A `404` is an answer, never retried: `None`, `false` (a delete, an
+/// existence probe), or the bucket probe's `Status { 404 }`.
 #[tokio::test]
 async fn a_404_is_one_request_under_a_policy() {
     let rig = Rig::start(statuses(&[404, 200]), bearers(&BEARERS)).await;
     assert_eq!(rig.retrying().download(BUCKET, OBJECT).await.unwrap(), None);
     let rig = Rig::start(statuses(&[404, 200]), bearers(&BEARERS)).await;
     assert!(!rig.retrying().delete(BUCKET, OBJECT).await.unwrap());
+    assert_eq!(request_count(&rig.gcs).await, 1);
+    let rig = Rig::start(statuses(&[404, 200]), bearers(&BEARERS)).await;
+    assert!(!rig.retrying().exists(BUCKET, OBJECT).await.unwrap());
     assert_eq!(request_count(&rig.gcs).await, 1);
     let rig = Rig::start(statuses(&[404, 200]), bearers(&BEARERS)).await;
     let result = Op::List.run(&rig.retrying()).await;
@@ -2686,6 +2929,16 @@ fn the_name_and_retry_api_is_pinned() {
     let _ = stridelabs_gcp::public_url_with;
     let _: stridelabs_gcp::ObjectNamePolicy = stridelabs_gcp::ObjectNamePolicy::Literal;
 
+    // `exists` is an additive `async fn` returning whether, not a body: the
+    // future's output type is its signature (never polled, nothing sent).
+    fn yields_a_bool<F>(_: F)
+    where
+        F: std::future::Future<Output = Result<bool, StorageError>>,
+    {
+    }
+    let gcs = GcsClient::emulator(reqwest::Client::new(), "localhost:4443", None);
+    yields_a_bool(gcs.exists(BUCKET, OBJECT));
+
     assert_eq!(ObjectNamePolicy::default(), ObjectNamePolicy::Strict);
     assert_eq!(RetryPolicy::default(), RetryPolicy::disabled());
     let google = RetryPolicy::google_default();
@@ -2732,6 +2985,7 @@ fn every_operation_is_send() {
     send(&gcs.upload_with(BUCKET, OBJECT, Bytes::new(), "image/png", &options));
     send(&gcs.download(BUCKET, OBJECT));
     send(&gcs.delete(BUCKET, OBJECT));
+    send(&gcs.exists(BUCKET, OBJECT));
     send(&gcs.bucket_reachable(BUCKET));
 }
 
