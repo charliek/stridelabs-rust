@@ -95,7 +95,7 @@ the bound given; the others are fixed by this revision.
 | rule | value | ends with |
 |---|---|---|
 | `ready` | the server gives the provider `open_timeout` to open and then writes `ready` within `close_timeout`: together **(server's: at most 10 s)** after the `101`. A provider that does not open in time starts the session's provider-error close at that point (the close itself takes up to a few more seconds). The reference client waits 12 s | `1011` (provider) |
-| the session cap | 15 min **(server's)**, sooner when what was left of a budget window runs out first | `4000` (`4002` for a window) |
+| the session cap | 15 min **(server's: at most 30 min)**, sooner when what was left of a budget window runs out first | `4000` (`4002` for a window) |
 | idle | no frame for 10 s, or the audio 10 s behind real time **(server's: at least 10 s; the reference client fills a capture stall over 2 s with silence)** | `1008 idle` |
 | pacing | more than `lead` ahead of real time (§3.1) | `1008 pacing` |
 | frames | odd length; over 64 KiB; audio before `ready` or after `end` | `1008` (reason names it) |

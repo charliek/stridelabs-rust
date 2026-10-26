@@ -29,7 +29,9 @@
 //! Then `101`, and the session ([`crate::relay`]) owns the socket. The lease
 //! is taken by the last check, so a session that is answered `101` already
 //! holds it — and has superseded, at once, any session this instance was
-//! running for the same user. One whose upgrade then fails releases it.
+//! running for the same user on an older ticket (one whose acquire reply
+//! arrived after a NEWER upgrade's registered is born superseded instead:
+//! `relay::LiveSessions`). One whose upgrade then fails releases it.
 //!
 //! **Admission fails closed**: a Redis error at the ping, the ticket or the
 //! acquire is a `503`, because these budgets are the spending ceiling. An
@@ -266,8 +268,11 @@ impl<S: SttProvider, T: TtsProvider> Voice<S, T> {
         };
 
         // The lease is this session's now: supersede, at once, any session
-        // this instance is running for the same user (`relay::LiveSessions`).
-        let superseded = self.live_sessions().register(user, token);
+        // this instance is running for the same user on an OLDER ticket
+        // (`relay::LiveSessions`). A session already registered on a newer
+        // ticket (this acquire's reply was slower than a newer upgrade's)
+        // keeps running, and this one is born superseded: `4001` at once.
+        let superseded = self.live_sessions().register(user, token, ticket);
         let session = Session {
             user,
             format,

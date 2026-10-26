@@ -9,11 +9,14 @@
 //! Lives at `tests/redis_fault/mod.rs`, not `tests/redis_fault.rs`: a file one
 //! level deeper is never its own test binary, only a module of whichever
 //! binary declares it — `tests/budget.rs` (the charge's lost-answer replay)
-//! and `tests/lease.rs` (the ticket's, the acquire's and the meter's).
+//! and `tests/lease.rs` (the ticket's, the acquire's and the meter's) — and
+//! `tests/relay.rs` (a late acquire reply, [`EvalFault::HoldAnswer`]).
 //!
 //! Copied from tapper (`tapper-rs/tests/redis_fault/mod.rs` at `82be95f`),
-//! which keeps its own copy for its turn limiter; only these lines and the
-//! name of the URL's variable in two messages differ.
+//! which keeps its own copy for its turn limiter; only these lines, the name
+//! of the URL's variable in two messages, and the crate's own addition (the
+//! `HoldAnswer` fault, [`RedisRelay::answers_held`] and
+//! [`RedisRelay::release_answers`]) differ.
 //!
 //! **Why a relay and not `CLIENT KILL`.** `CLIENT KILL` is server-wide — it has
 //! no database filter — so it would also kill every parallel test's
@@ -33,6 +36,9 @@
 //!   connection carries — faults apply in the order they were armed.
 //! - [`RedisRelay::gate`] holds every NEW connection (accepted, nothing
 //!   relayed) until [`RedisRelay::open_gate`] — a redial in flight.
+//! - [`RedisRelay::release_answers`] passes on the answers an
+//!   [`EvalFault::HoldAnswer`] holds: a reply that is late by exactly as long
+//!   as the test says.
 //! - It counts the connections it accepted (one per dial) and the `EVAL`s it
 //!   carried (`fixed_window_hit` is an `EVAL` too).
 //!
@@ -89,6 +95,12 @@ pub enum EvalFault {
     /// Redis sent it: a slow round trip that still succeeds (it must stay
     /// under the client's response timeout).
     DelayAnswer(Duration),
+    /// Deliver the `EVAL`, read its answer — counted by
+    /// [`RedisRelay::answers_held`] once whole, so it has RUN — and hold it
+    /// (and anything Redis sends after it on that connection) until
+    /// [`RedisRelay::release_answers`]: a reply that arrives when the test
+    /// says (the client's response timeout must outlast the hold).
+    HoldAnswer,
 }
 
 /// A relay to the test Redis. Dropping it closes every connection it holds.
@@ -107,6 +119,8 @@ struct Shared {
     accepted: AtomicUsize,
     evals: AtomicUsize,
     holding: AtomicUsize,
+    /// Answers to a `HoldAnswer` `EVAL` received whole from Redis and held.
+    answers_held: AtomicUsize,
     /// How many of the `holding` connections have been released.
     released: AtomicUsize,
     armed: Mutex<VecDeque<EvalFault>>,
@@ -128,6 +142,9 @@ enum Control {
     /// arriving is delivered once whole, and waited for too — or `false` at
     /// once if nothing was held.
     Release(oneshot::Sender<bool>),
+    /// Pass on the answers held by `HoldAnswer`, and answer `true` once they
+    /// are written to the client — `false` at once if none was held.
+    ReleaseAnswers(oneshot::Sender<bool>),
 }
 
 impl RedisRelay {
@@ -203,6 +220,23 @@ impl RedisRelay {
     /// be before the rest of it has.
     pub fn holding(&self) -> usize {
         self.shared.holding.load(Ordering::SeqCst)
+    }
+
+    /// How many `HoldAnswer` `EVAL`s have run: their answers came from Redis
+    /// whole and are held.
+    pub fn answers_held(&self) -> usize {
+        self.shared.answers_held.load(Ordering::SeqCst)
+    }
+
+    /// Pass on every answer held by [`EvalFault::HoldAnswer`] (from then on
+    /// that connection relays as usual), and return once each is written to
+    /// its client. Returns how many connections were holding an answer.
+    pub async fn release_answers(&self) -> usize {
+        join_all(self.ask(Control::ReleaseAnswers))
+            .await
+            .into_iter()
+            .filter(|released| *released == Ok(true))
+            .count()
     }
 
     /// Apply `fault` to the next `EVAL` no earlier fault is waiting for.
@@ -445,7 +479,7 @@ async fn relay_one(
                 Some(Control::Blackhole(done)) => {
                     let _ = done.send(());
                 }
-                Some(Control::Release(done)) => {
+                Some(Control::Release(done) | Control::ReleaseAnswers(done)) => {
                     let _ = done.send(false);
                 }
             },
@@ -471,6 +505,11 @@ async fn relay_one(
     let mut close_on_answer = false;
     // `DelayAnswer` fired: Redis's next answer is passed on this late.
     let mut delay_answer: Option<Duration> = None;
+    // `HoldAnswer` fired: Redis's answers wait here from that EVAL's on
+    // (`Some`, the bytes so far) until released. `answer_owed`: the held
+    // EVAL's own answer is not yet whole.
+    let mut held_answers: Option<Vec<u8>> = None;
+    let mut answer_owed = false;
     // `Hold` fired: every whole command the client sends from the EVAL on
     // waits here.
     let mut held: Option<Vec<Vec<u8>>> = None;
@@ -504,6 +543,23 @@ async fn relay_one(
                         // delivered when whole.
                         let arriving = usize::from(matches!(fate, Some(Fate::Hold)));
                         landing = Some((done, exchange.unanswered + arriving));
+                    }
+                    None => {
+                        let _ = done.send(false);
+                    }
+                },
+                Some(Control::ReleaseAnswers(done)) => match held_answers.take() {
+                    Some(bytes) => {
+                        // Release only a WHOLE held answer: before it is in
+                        // hand the caller can't know what it releases.
+                        assert!(
+                            !answer_owed,
+                            "release_answers: the held EVAL's answer has not arrived whole yet (wait for answers_held)"
+                        );
+                        if client_open && client_write.write_all(&bytes).await.is_err() {
+                            client_open = false;
+                        }
+                        let _ = done.send(true);
                     }
                     None => {
                         let _ = done.send(false);
@@ -571,6 +627,22 @@ async fn relay_one(
                                 Some(EvalFault::LoseAnswer) => silenced = true,
                                 Some(EvalFault::LoseAnswerAndClose) => close_on_answer = true,
                                 Some(EvalFault::DelayAnswer(delay)) => delay_answer = Some(delay),
+                                Some(EvalFault::HoldAnswer) => {
+                                    // Answers before this EVAL's pass on
+                                    // as usual: its own is the next owed.
+                                    assert_eq!(
+                                        exchange.unanswered, 0,
+                                        "HoldAnswer: an earlier command is still unanswered"
+                                    );
+                                    // One hold at a time: a second would
+                                    // drop the first's unreleased answer.
+                                    assert!(
+                                        held_answers.is_none(),
+                                        "HoldAnswer: an earlier held answer is not released yet"
+                                    );
+                                    held_answers = Some(Vec::new());
+                                    answer_owed = true;
+                                }
                                 Some(EvalFault::Hold) | None => {}
                             }
                             if server_write.write_all(&command).await.is_err() {
@@ -602,7 +674,16 @@ async fn relay_one(
                     // connection.
                     return;
                 }
+                if answer_owed && answers > 0 {
+                    // The held EVAL has run, and its whole answer is in hand.
+                    answer_owed = false;
+                    shared.answers_held.fetch_add(1, Ordering::SeqCst);
+                }
                 if blackholed || silenced || !client_open {
+                    continue;
+                }
+                if let Some(held) = held_answers.as_mut() {
+                    held.extend_from_slice(&from_server[..count]);
                     continue;
                 }
                 if let Some(delay) = delay_answer.take() {

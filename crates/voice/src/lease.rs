@@ -64,6 +64,11 @@
 //! longer than any plausible delay in transit, and the keys never accumulate.
 //! A missing hash refuses every ticket (`next` is then no ticket at all).
 //!
+//! The ticket also orders an instance's own sessions: the relay registers
+//! each with the ticket its acquire carried, so a granted acquire whose
+//! reply arrives after a newer upgrade's never supersedes that newer
+//! session locally (`relay::LiveSessions`).
+//!
 //! The fence is not the lease: a session's refresh and release still
 //! compare the lease's TOKEN (below), so a ticket taken by an upgrade that
 //! is then refused (throttled, a spent budget, a lost reply) never disturbs
@@ -196,7 +201,10 @@ pub const LEASE_TTL: Duration = Duration::from_secs(30);
 pub const FENCE_TTL_SECONDS: i64 = 24 * 60 * 60;
 
 /// How long a session's meter outlives its last charge — far past a
-/// session's length, so a late retried release still finds it.
+/// session's length (`RelaySettings::check` holds the session cap to half
+/// of it: a refresh that charges nothing does not extend the meter, and a
+/// session that outlived it would be charged its whole total again), so a
+/// late retried release still finds it.
 pub const METER_TTL_SECONDS: i64 = 60 * 60;
 
 /// Milliseconds in a minute: the speech-to-text caps are set in minutes and

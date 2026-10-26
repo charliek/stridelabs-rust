@@ -101,6 +101,15 @@
 //!   read side. An adapter may not complete a write on enqueue: the end
 //!   deadline starts when `end_input` returns, and a queue would be lost at
 //!   teardown. The relay bounds each write (cause `send: timed out`).
+//! - **Charged on hand-off:** the relay counts a frame (its `frames`,
+//!   `audio_ms`, the usage record and the budget's charges) when it CALLS
+//!   `send_audio`, before the write completes: a write dropped at its bound
+//!   may have left the frame in the transport's buffer (taken, its flush
+//!   pending), and `close` may then deliver it. So the charge never falls
+//!   short of what the provider can receive; a session that ends on a failed
+//!   or timed-out write may be charged that one frame without the provider
+//!   having it. An adapter need not, and may not try to, take a buffered
+//!   frame back.
 //! - **A failed write** is the provider's failure, cause `send: <class>`; the
 //!   adapter marks itself finished, so `close` only flushes.
 //! - **Keepalive:** an adapter whose provider needs one sends it from its own
@@ -126,8 +135,8 @@
 //!   provider's own text; the class is the session-end line's cause, and
 //!   nothing else of the provider's is logged.
 //! - **Billing:** speech to text is charged in relay-measured audio time
-//!   (`lease::audio_ms` over [`AudioFormat::bytes_per_second`]), never in a
-//!   provider's unit. A provider that bills otherwise is the app's cost model.
+//!   (`lease::audio_ms` over [`AudioFormat::bytes_per_second`], the bytes
+//!   handed to `send_audio`), never in a provider's unit. A provider that bills otherwise is the app's cost model.
 
 use std::future::Future;
 use std::time::Duration;
@@ -262,6 +271,11 @@ pub trait SttSession:
 {
     /// Send one frame of the client's audio, as received. Resolves once it
     /// was written and flushed; never on enqueue.
+    ///
+    /// The relay counts — charges — the frame when it calls this, not when
+    /// it resolves (module docs, "Charged on hand-off"): a call dropped at
+    /// the relay's write bound may have buffered the frame, and `close` may
+    /// still deliver it.
     fn send_audio(
         &mut self,
         frame: bytes::Bytes,

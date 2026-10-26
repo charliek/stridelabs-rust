@@ -281,25 +281,30 @@ impl Harness {
         }
     }
 
+    /// A second door into this harness's app, on a port of its own: the
+    /// same `Voice` (its live sessions included), shutdown, tracker and
+    /// user, with its own Redis handle `redis` — two admissions of ONE
+    /// instance whose Redis round trips a test can time apart (one through a
+    /// fault relay, one not).
+    pub async fn second_door(&self, redis: RedisHandle) -> SocketAddr {
+        let app = Arc::new(App {
+            voice: Arc::clone(&self.voice),
+            redis: Some(redis),
+            shutdown: self.shutdown.clone(),
+            tracker: self.tracker.clone(),
+            user: self.user,
+        });
+        serve(
+            Router::new()
+                .route("/voice/stream", get(voice_stream))
+                .with_state(app),
+        )
+        .await
+    }
+
     /// An upgrade to `/voice/stream{query}`.
     pub async fn try_open(&self, query: &str) -> Result<Client, Answer> {
-        let url = format!("ws://{}/voice/stream{query}", self.addr);
-        match timeout(WAIT, tokio_tungstenite::connect_async(url))
-            .await
-            .expect("the upgrade hung")
-        {
-            Ok((ws, response)) => {
-                assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
-                Ok(Client { ws, wait: WAIT })
-            }
-            Err(tungstenite::Error::Http(response)) => Err(Answer {
-                status: response.status(),
-                headers: response.headers().clone(),
-                body: String::from_utf8_lossy(response.body().as_deref().unwrap_or_default())
-                    .into_owned(),
-            }),
-            Err(error) => panic!("the upgrade failed below HTTP: {error}"),
-        }
+        try_open_at(self.addr, query).await
     }
 
     pub async fn open(&self, query: &str) -> Client {
@@ -420,6 +425,27 @@ impl Harness {
 
     pub async fn clean_up(&self) {
         drop_keys_under(self.budget.prefix()).await;
+    }
+}
+
+/// An upgrade to `/voice/stream{query}` at `addr` (a harness's door).
+pub async fn try_open_at(addr: SocketAddr, query: &str) -> Result<Client, Answer> {
+    let url = format!("ws://{addr}/voice/stream{query}");
+    match timeout(WAIT, tokio_tungstenite::connect_async(url))
+        .await
+        .expect("the upgrade hung")
+    {
+        Ok((ws, response)) => {
+            assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+            Ok(Client { ws, wait: WAIT })
+        }
+        Err(tungstenite::Error::Http(response)) => Err(Answer {
+            status: response.status(),
+            headers: response.headers().clone(),
+            body: String::from_utf8_lossy(response.body().as_deref().unwrap_or_default())
+                .into_owned(),
+        }),
+        Err(error) => panic!("the upgrade failed below HTTP: {error}"),
     }
 }
 

@@ -101,6 +101,17 @@
 //! wins), a write at its bound, `close` at its bound, and the stream's
 //! `next()` whenever another arm wins.
 //!
+//! **Audio is counted when it is handed over, not when the write
+//! completes.** A frame counts — the session-end line's `frames` and
+//! `audio_ms`, the usage record, every charge — from the moment the relay
+//! calls [`crate::stt::SttSession::send_audio`] with it. A transport can take
+//! a frame into its buffer and then stall on the flush; the write is dropped
+//! at its bound, and the provider's close (which flushes) can still deliver
+//! that frame. Counting it is what keeps the charge from ever falling short of
+//! what the provider may receive; the price is at most one frame (64 KiB)
+//! charged but never delivered, once per session, since a failed write ends
+//! it.
+//!
 //! # The provider-run cap
 //!
 //! The provider's arm comes before the client's: a transcript is what the
@@ -161,7 +172,9 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::budget::{LimitReached, LimitScope, Spent};
-use crate::lease::{audio_ms, millis, Grant, MeterMode, Metered, StreamBudgetError, LEASE_TTL};
+use crate::lease::{
+    audio_ms, millis, Grant, MeterMode, Metered, StreamBudgetError, FENCE_TTL_SECONDS, LEASE_TTL,
+};
 use crate::protocol::{close_code, ErrorCode, RelayEvent, END_FRAME, MAX_FRAME_BYTES};
 use crate::stt::{AudioFormat, SttError, SttEvent, SttProvider, SttSession};
 use crate::tts::TtsProvider;
@@ -201,24 +214,76 @@ const OPEN_TIMEOUT_CAUSE: &str = "open_timeout: not open before the deadline";
 /// refresh), instead of leaving two sessions open at the provider for up to
 /// a refresh interval. A takeover from another instance is still found by
 /// the refresh, through the lease ([`crate::lease`]).
+///
+/// **Newest ticket wins, here as in Redis.** Each session is registered with
+/// the fence ticket its acquire carried ([`crate::lease`], "Fenced"): the
+/// user's tickets rise with every upgrade, and Redis granted the lease to
+/// whichever acquire carried the newest. Two admissions on one instance can
+/// reach this registry in the other order — an acquire whose reply was slow
+/// (a separate connection, a slow round trip) registers after a newer
+/// upgrade took a ticket, the lease and its place here — so registration
+/// order is not acquisition order. A registration therefore supersedes only
+/// a session holding an OLDER ticket; one that arrives with an older ticket
+/// than the session registered is itself born superseded (`4001` before it
+/// dials the provider: Redis holds the newer session's token, so its
+/// release deletes nothing) and leaves the newer one running.
 #[derive(Debug, Default)]
-pub(crate) struct LiveSessions(Mutex<HashMap<Uuid, (Uuid, CancellationToken)>>);
+pub(crate) struct LiveSessions(Mutex<HashMap<Uuid, Registered>>);
+
+/// One user's registered session.
+#[derive(Debug)]
+struct Registered {
+    token: Uuid,
+    /// The fence ticket its acquire carried.
+    ticket: u64,
+    /// When it registered: a ticket is comparable only within the life of
+    /// the fence that numbered it ([`FENCE_TTL`]).
+    at: Instant,
+    superseded: CancellationToken,
+}
+
+/// How long a user's fence hash lives after its last issue or grant
+/// ([`crate::lease::FENCE_TTL_SECONDS`]): a registration at least this old
+/// may hold a ticket of an expired numbering (the fence restarts at `1`),
+/// so a newer registration supersedes it whatever its ticket.
+const FENCE_TTL: Duration = Duration::from_secs(FENCE_TTL_SECONDS.unsigned_abs());
 
 impl LiveSessions {
-    /// Register session `token` as `user`'s, cancelling the session that was
-    /// registered before it. The returned token is this session's: cancelled
-    /// by the NEXT registration for the same user.
-    /// Registering the same token again returns its existing handle.
-    pub(crate) fn register(&self, user: Uuid, token: Uuid) -> CancellationToken {
+    /// Register session `token`, whose acquire carried `ticket`, as
+    /// `user`'s, cancelling the session registered before it — unless that
+    /// one holds a NEWER ticket (type docs): then the returned handle is
+    /// already cancelled, and the registered session is untouched. The
+    /// returned handle is this session's: cancelled by the next newer
+    /// registration for the same user. Registering the same token again
+    /// returns its existing handle.
+    pub(crate) fn register(&self, user: Uuid, token: Uuid, ticket: u64) -> CancellationToken {
+        self.register_at(user, token, ticket, Instant::now())
+    }
+
+    /// [`LiveSessions::register`] at `now`.
+    fn register_at(&self, user: Uuid, token: Uuid, ticket: u64, now: Instant) -> CancellationToken {
         let mut live = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some((registered, superseded)) = live.get(&user) {
-            if *registered == token {
-                return superseded.clone();
+        if let Some(registered) = live.get(&user) {
+            if registered.token == token {
+                return registered.superseded.clone();
+            }
+            if registered.ticket > ticket
+                && now.saturating_duration_since(registered.at) < FENCE_TTL
+            {
+                let late = CancellationToken::new();
+                late.cancel();
+                return late;
             }
         }
         let superseded = CancellationToken::new();
-        if let Some((_, previous)) = live.insert(user, (token, superseded.clone())) {
-            previous.cancel();
+        let registered = Registered {
+            token,
+            ticket,
+            at: now,
+            superseded: superseded.clone(),
+        };
+        if let Some(previous) = live.insert(user, registered) {
+            previous.superseded.cancel();
         }
         superseded
     }
@@ -229,7 +294,7 @@ impl LiveSessions {
         let mut live = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         if live
             .get(&user)
-            .is_some_and(|(registered, _)| *registered == token)
+            .is_some_and(|registered| registered.token == token)
         {
             live.remove(&user);
         }
@@ -671,9 +736,14 @@ impl<S: SttProvider, T: TtsProvider> Relay<S, T> {
                 if self.audio_bytes.saturating_add(length) > self.allowed_bytes() {
                     return Err(Ending::Policy("pacing"));
                 }
-                self.send_audio(audio).await?;
+                // Counted — and so charged — once handed to the provider,
+                // BEFORE the write is awaited (`SttSession::send_audio`'s
+                // contract): a write cut off at its bound may have left the
+                // frame in the transport's buffer, which the provider's close
+                // can still flush to it.
                 self.audio_bytes = self.audio_bytes.saturating_add(length);
                 self.frames += 1;
+                self.send_audio(audio).await?;
                 self.last_audio = Instant::now();
                 Ok(false)
             }
@@ -1292,18 +1362,18 @@ mod tests {
         let live = LiveSessions::default();
         let (user, other_user) = (Uuid::new_v4(), Uuid::new_v4());
         let (first, second) = (Uuid::new_v4(), Uuid::new_v4());
-        let first_cancel = live.register(user, first);
-        let again = live.register(user, first);
+        let first_cancel = live.register(user, first, 1);
+        let again = live.register(user, first, 1);
         assert!(
             !first_cancel.is_cancelled(),
             "the same token is not a takeover"
         );
-        let other = live.register(other_user, Uuid::new_v4());
+        let other = live.register(other_user, Uuid::new_v4(), 7);
         assert!(
             !first_cancel.is_cancelled(),
             "another user's session is not a takeover"
         );
-        let second_cancel = live.register(user, second);
+        let second_cancel = live.register(user, second, 2);
         assert!(first_cancel.is_cancelled() && again.is_cancelled());
         assert!(!second_cancel.is_cancelled() && !other.is_cancelled());
         live.deregister(user, first);
@@ -1314,6 +1384,53 @@ mod tests {
         );
         live.deregister(user, second);
         assert_eq!(live.len(), 1);
+    }
+
+    /// Registration follows the fence's order, not arrival order: the
+    /// session that acquired on ticket 2 registers first, and the late
+    /// registration of ticket 1 (its acquire's reply was slower) is born
+    /// superseded and leaves ticket 2's session running and registered;
+    /// ticket 3 then supersedes ticket 2 as usual.
+    #[test]
+    fn a_late_registration_on_an_older_ticket_is_born_superseded() {
+        let live = LiveSessions::default();
+        let user = Uuid::new_v4();
+        let (older, newer, newest) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let newer_cancel = live.register(user, newer, 2);
+        let older_cancel = live.register(user, older, 1);
+        assert!(
+            !newer_cancel.is_cancelled(),
+            "the late registration of an older ticket superseded the newer session"
+        );
+        assert!(
+            older_cancel.is_cancelled(),
+            "the late session is superseded"
+        );
+        live.deregister(user, older);
+        assert_eq!(live.len(), 1, "the newer session is still registered");
+        let newest_cancel = live.register(user, newest, 3);
+        assert!(newer_cancel.is_cancelled() && !newest_cancel.is_cancelled());
+    }
+
+    /// A ticket is comparable only within its fence's life: a registration
+    /// a fence lifetime old (the user's numbering may have restarted at `1`
+    /// since) is superseded by any newer one, a lower ticket included.
+    #[test]
+    fn a_registration_older_than_the_fence_is_superseded_by_any_ticket() {
+        let live = LiveSessions::default();
+        let user = Uuid::new_v4();
+        let start = Instant::now();
+        let stale = live.register_at(user, Uuid::new_v4(), 40, start);
+        let just_inside = live.register_at(
+            user,
+            Uuid::new_v4(),
+            1,
+            start + FENCE_TTL - Duration::from_millis(1),
+        );
+        assert!(just_inside.is_cancelled() && !stale.is_cancelled());
+        let restarted = live.register_at(user, Uuid::new_v4(), 1, start + FENCE_TTL);
+        assert!(stale.is_cancelled() && !restarted.is_cancelled());
+        assert_eq!(FENCE_TTL, Duration::from_secs(86_400));
     }
 
     /// A client close frame is recorded by its code alone — any code, the

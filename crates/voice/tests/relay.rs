@@ -44,7 +44,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use futures::{SinkExt as _, StreamExt as _};
 use redis::AsyncCommands as _;
-use stridelabs_redis::RedisHandle;
+use stridelabs_redis::{RedisHandle, RedisOptions};
 use stridelabs_voice::budget::LimitScope;
 use stridelabs_voice::lease::StreamBudget;
 use stridelabs_voice::protocol::{RelayEvent, MAX_FRAME_BYTES};
@@ -59,8 +59,8 @@ use uuid::Uuid;
 
 #[allow(
     dead_code,
-    reason = "shared with the other live suites; this one uses the lost-answer, hold, delay and \
-              sever faults"
+    reason = "shared with the other live suites; this one uses the lost-answer, hold, delay, \
+              hold-answer and sever faults"
 )]
 mod redis_fault;
 use redis_fault::{within_deadline, EvalFault, RedisRelay};
@@ -80,9 +80,9 @@ use log_capture::{capture_logs, Capture};
 mod relay_harness;
 use relay_harness::{
     counter_keys, counter_values, how_the_client_left, limit_event, pcm, provider_error, quick,
-    rfc3339, session_end_for, settle_admission, small_budget, Harness, Setup, TestClock,
-    CAPPED_TRACE, GLOBAL_MONTHLY_MS, SECOND_24K, SMALL_DAY_MS, SMALL_USER_MONTH_MS, USER_DAILY_MS,
-    WAIT,
+    rfc3339, session_end_for, settle_admission, small_budget, try_open_at, Harness, Received,
+    Setup, TestClock, CAPPED_TRACE, GLOBAL_MONTHLY_MS, SECOND_24K, SMALL_DAY_MS,
+    SMALL_USER_MONTH_MS, USER_DAILY_MS, WAIT,
 };
 
 /// A provider that finishes as soon as the end of input returned: a session
@@ -636,6 +636,95 @@ async fn a_takeover_on_the_same_instance_is_4001_at_once() {
     );
     assert!(!lease.is_empty());
     harness.clean_up().await;
+}
+
+/// **Registration follows the fence, not arrival** (the S2 branch review's
+/// finding 1). Two admissions for one user on ONE instance: A's acquire
+/// runs (ticket 1, the lease A's) but its reply is held back at the fault
+/// relay; meanwhile B takes ticket 2 and the lease, registers and reaches
+/// `ready`; only then is A's reply passed on. A must not supersede B —
+/// Redis holds B's token — so A is born superseded (`4001` before it dials
+/// the provider, its release deleting nothing) and B runs on to `1000`,
+/// releasing its own lease. Every step waits on an event, never a guess at a
+/// delay: A's acquire is known to have RUN once its answer is held.
+#[tokio::test]
+async fn a_late_acquire_reply_does_not_supersede_the_newer_session() {
+    within_deadline("a late acquire reply", async {
+        let harness = Harness::scripted(finishes()).await;
+        let relay = RedisRelay::start(&test_redis_url().await).await;
+        // A's door: its own handle through the fault relay, patient enough
+        // (20 s, inside the test's deadline) to wait out the held reply
+        // rather than answer 503.
+        let slow = RedisHandle::open_with(
+            &relay.url,
+            RedisOptions::default().with_response_timeout(Duration::from_secs(20)),
+        )
+        .expect("the relay's URL parses");
+        let slow_door = harness.second_door(slow).await;
+        // The issue (the first EVAL) passes at once; the acquire (the
+        // second) runs, and its answer is held until released.
+        relay.arm(EvalFault::DelayAnswer(Duration::ZERO));
+        relay.arm(EvalFault::HoldAnswer);
+        let late = tokio::spawn(try_open_at(slow_door, ""));
+        relay
+            .await_count("held acquire answers", RedisRelay::answers_held, 1)
+            .await;
+        let late_lease = harness
+            .lease()
+            .await
+            .expect("premise: A's acquire ran and took the lease");
+        // Past the admission interval A's acquire opened, which it opened
+        // before its answer came back.
+        settle_admission().await;
+        let mut newer = harness.ready().await;
+        let newer_lease = harness.lease().await.expect("B holds the lease");
+        assert_ne!(newer_lease, late_lease, "premise: B took the lease over");
+        assert!(
+            !late.is_finished(),
+            "premise: B registered before A's acquire reply arrived"
+        );
+        assert_eq!(relay.release_answers().await, 1, "A's reply, released");
+        let mut late = late
+            .await
+            .expect("A's upgrade task")
+            .expect("A's acquire succeeded: its upgrade is a 101");
+        // A's first message, read whole before B is touched: its close comes
+        // after its release, so A's session is over once it is read.
+        let late_first = late.next().await;
+        assert_eq!(
+            harness.lease().await.as_deref(),
+            Some(newer_lease.as_str()),
+            "B's lease is intact: nothing released it"
+        );
+        newer.audio(pcm(SECOND_24K / 10, 1)).await;
+        newer.end().await;
+        assert_eq!(
+            newer.closed().await,
+            (1000, "done".to_string()),
+            "B, the lease's rightful holder, was not superseded by A's late reply"
+        );
+        assert_eq!(
+            late_first,
+            Received::Closed(4001, "superseded".to_string()),
+            "the late registration is born superseded"
+        );
+        assert_eq!(harness.lease().await, None, "B released its own lease");
+        assert_eq!(
+            harness.log.opened().len(),
+            1,
+            "B's session alone opened: A never dialled the provider"
+        );
+        assert_eq!(
+            harness.log.cancelled(),
+            Cancelled {
+                open: 1,
+                ..Cancelled::default()
+            },
+            "A's open future was dropped unpolled"
+        );
+        harness.clean_up().await;
+    })
+    .await;
 }
 
 /// A second upgrade by the same user inside the admission interval (the

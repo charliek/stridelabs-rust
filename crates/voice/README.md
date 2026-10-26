@@ -251,7 +251,12 @@ async fn voice_stream<S: SttProvider, T: TtsProvider>(
   done, so the app's drain (`tracker.close()`, then `tracker.wait()` under
   its deadline) waits for them.
 - **The relay's clocks** (`RelaySettings`, checked by `Voice::new`):
-  revision 1's bounds, and the lease's margin. The lease is 30 s
+  revision 1's bounds, the meter's life and the lease's margin.
+  `session_cap` is at most 30 min, half the speech-to-text meter's hour
+  (`METER_TTL_SECONDS`): the meter makes the cumulative charges
+  idempotent and expires an hour after the last charge that raised it, so
+  a session that outlived it (a long silence near its end) would be charged
+  its audio again. The lease is 30 s
   (`LEASE_TTL`) from the acquire and the first refresh comes one
   `refresh_interval` after `ready`, so `open_timeout + close_timeout +
   refresh_interval` must stay under the lease (the first refresh lands in
@@ -261,7 +266,9 @@ async fn voice_stream<S: SttProvider, T: TtsProvider>(
   refresh) are the largest that pass.
 - **One session per user**: a newer upgrade supersedes the older session
   at once on the same instance (`4001`), and at its next refresh from
-  another instance (the lease).
+  another instance (the lease). "Newer" is the fence ticket's order, not
+  arrival: an admission whose acquire reply lands after a newer upgrade's
+  registered is itself `4001` at once, before it dials the provider.
 - **Logging**: two lines per session (`voice stream: session start` and
   `voice stream: session end`, the latter WARN on a provider or internal
   failure or a failed release), a WARN per failed refresh, one line per

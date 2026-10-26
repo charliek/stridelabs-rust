@@ -793,8 +793,8 @@ async fn a_send_audio_dropped_at_its_write_bound_leaves_the_session_closable() {
     let line = session_end_for(&capture, harness.user).await;
     assert_eq!(line["cause"], "send: timed out", "{line}");
     assert_eq!(
-        line["frames"], 1,
-        "the blocked frame is not counted: {line}"
+        line["frames"], 2,
+        "the blocked frame was handed over, so it counts: {line}"
     );
     assert_eq!(
         harness.log.cancelled(),
@@ -876,7 +876,9 @@ async fn a_shutdown_during_a_blocked_write_ends_at_the_write_bound() {
 
 /// A `send_audio` the provider never completes is cut off by the write
 /// bound (`close_timeout`, 500 ms here): `error{provider}` and `1011` about
-/// then, the audio never counted as sent.
+/// then. The frame was handed over, so it is charged (charged on hand-off:
+/// `a_frame_taken_before_a_stalled_flush_is_charged`), though this provider
+/// never took it.
 #[tokio::test]
 async fn a_blocked_send_audio_is_cut_off_by_the_close_bound() {
     let harness = Harness::scripted(SttScript::default().block_writes_after(0)).await;
@@ -893,9 +895,62 @@ async fn a_blocked_send_audio_is_cut_off_by_the_close_bound() {
     assert!(harness.log.frames().is_empty());
     assert_eq!(
         harness.counters().await,
-        (None, None),
-        "nothing was charged"
+        (Some(80), Some(80)),
+        "the handed-over frame was charged"
     );
+    harness.clean_up().await;
+}
+
+/// **Charged on hand-off** (the S2 branch review's finding 5). A provider
+/// that TAKES a frame and then stalls its flush past the write bound — the
+/// Muse socket's frame accepted into tungstenite's buffer, `Pending` on the
+/// flush — may still receive that frame when its close flushes. The session
+/// ends `send: timed out`, `1011`, and the frame the provider holds is in
+/// the session-end line, the usage record and the release's final charge:
+/// never less than what the provider may receive.
+#[tokio::test]
+async fn a_frame_taken_before_a_stalled_flush_is_charged() {
+    let (capture, _guard) = capture_logs(CAPPED_TRACE);
+    let harness = Harness::scripted(SttScript::default().stall_flush_after(1)).await;
+    let mut client = harness.ready().await;
+    client.audio(pcm(FRAME_80MS, 1)).await;
+    client.audio(pcm(FRAME_80MS, 2)).await;
+    let (events, code, _) = client.events_then_close().await;
+    assert_eq!((events, code), (vec![provider_error()], 1011));
+    assert_eq!(
+        harness.log.frames(),
+        [FRAME_80MS, FRAME_80MS],
+        "premise: the provider took both frames"
+    );
+    assert_eq!(
+        harness.log.cancelled().send_audio,
+        1,
+        "premise: the second write was cut off"
+    );
+    let line = session_end_for(&capture, harness.user).await;
+    assert_eq!(line["cause"], "send: timed out", "{line}");
+    assert_eq!(
+        (line["frames"].as_u64(), line["audio_ms"].as_u64()),
+        (Some(2), Some(160)),
+        "the session-end line counts the frame the provider took: {line}"
+    );
+    let usage: Vec<u64> = harness
+        .usage
+        .records()
+        .into_iter()
+        .map(|(_, _, amount, _)| amount)
+        .collect();
+    assert_eq!(
+        usage,
+        [160],
+        "the usage record holds the frame the provider took"
+    );
+    assert_eq!(
+        harness.counters().await,
+        (Some(160), Some(160)),
+        "the final charge holds the frame the provider took"
+    );
+    assert_eq!(harness.lease().await, None);
     harness.clean_up().await;
 }
 

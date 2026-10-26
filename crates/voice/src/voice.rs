@@ -23,7 +23,7 @@ use uuid::Uuid;
 use crate::budget::TtsBudget;
 #[cfg(feature = "axum")]
 use crate::budget::{BudgetError, Disposition, Fingerprint};
-use crate::lease::{StreamBudget, LEASE_TTL};
+use crate::lease::{StreamBudget, LEASE_TTL, METER_TTL_SECONDS};
 use crate::protocol::{ALLOWED_AUDIO_TYPES, TTS_MIN_TEXT_CHARS};
 #[cfg(feature = "axum")]
 use crate::refusal::VoiceRefusal;
@@ -82,6 +82,15 @@ impl Default for RelaySettings {
     }
 }
 
+/// The longest `session_cap` may be: half the speech-to-text meter's life
+/// ([`METER_TTL_SECONDS`], an hour). The meter is what makes a session's
+/// cumulative charges idempotent, and it expires that long after the last
+/// charge that raised it — a refresh that charges nothing (silence) does not
+/// extend it — so a session that outlived it would have its whole total
+/// charged again by the next refresh. Half leaves the closing bounds, a
+/// replayed release and any refresh failures a wide margin.
+const MAX_SESSION_CAP: Duration = Duration::from_secs(METER_TTL_SECONDS.unsigned_abs() / 2);
+
 /// The longest `open_timeout + close_timeout` may be: `ready` is written
 /// within it, and the reference client waits 12 s.
 const MAX_READY_DELAY: Duration = Duration::from_secs(10);
@@ -100,9 +109,12 @@ const MIN_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 
 impl RelaySettings {
     /// Revision 1's bounds (`PROTOCOL.md` §2.4), each tied to a fixed timer
-    /// of the installed clients, and the lease's margin, checked in this
-    /// order: every duration non-zero (a zero interval panics the relay's
-    /// timers); `open_timeout + close_timeout` at most 10 s; `admit_interval`
+    /// of the installed clients, the meter's life and the lease's margin,
+    /// checked in this order: every duration non-zero (a zero interval panics
+    /// the relay's timers); `session_cap` at most 30 min (half the speech-to-
+    /// text meter's life, [`METER_TTL_SECONDS`]: a session that outlived the
+    /// meter would be charged its audio again); `open_timeout +
+    /// close_timeout` at most 10 s; `admit_interval`
     /// at most 2 s; `end_timeout` at most 2 s; `idle_timeout` at least 10 s;
     /// `pong_deadline` over `ping_interval`; then the lease
     /// ([`LEASE_TTL`], 30 s from the acquire; the first refresh comes
@@ -125,6 +137,7 @@ impl RelaySettings {
         self.check_non_zero()?;
         let out_of_range = |setting| Err(VoiceSetupError::RelaySettingOutOfRange { setting });
         let RelaySettings {
+            session_cap,
             idle_timeout,
             refresh_interval,
             open_timeout,
@@ -133,8 +146,10 @@ impl RelaySettings {
             close_timeout,
             end_timeout,
             admit_interval,
-            ..
         } = *self;
+        if session_cap > MAX_SESSION_CAP {
+            return out_of_range("session_cap");
+        }
         if open_timeout.saturating_add(close_timeout) > MAX_READY_DELAY {
             return out_of_range("open_timeout + close_timeout");
         }
@@ -873,7 +888,10 @@ mod tests {
         let set_idle: Change = |s, v| s.idle_timeout = v;
         let set_pong: Change = |s, v| s.pong_deadline = v;
         let set_refresh: Change = |s, v| s.refresh_interval = v;
+        let set_cap: Change = |s, v| s.session_cap = v;
         for (change, edge, past, setting) in [
+            // Half the meter's hour.
+            (set_cap, ms(1_800_000), ms(1_800_001), "session_cap"),
             // open 8 s + close 2 s is the 10 s edge.
             (
                 set_open,
@@ -907,6 +925,17 @@ mod tests {
         assert_eq!(with(set_refresh, ms(20_000)), refused(lease_sum));
         assert_eq!(with(set_refresh, ms(19_999)), refused("refresh_interval"));
         assert_eq!(with(set_refresh, ms(29_000)), refused(lease_sum));
+        // The session cap stays inside the meter's life with half of it to
+        // spare: two hours (which outlived the meter, so a silent stretch
+        // let the next refresh charge the whole total again) is refused.
+        assert_eq!(
+            with(set_cap, Duration::from_secs(2 * 60 * 60)),
+            refused("session_cap")
+        );
+        assert_eq!(
+            MAX_SESSION_CAP * 2,
+            Duration::from_secs(METER_TTL_SECONDS.unsigned_abs())
+        );
         // A fast open leaves the sum room; the third of a lease still binds.
         let fast_open = RelaySettings {
             open_timeout: ms(1_000),

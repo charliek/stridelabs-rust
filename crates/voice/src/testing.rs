@@ -378,6 +378,11 @@ impl SttSession for ScriptedSession {
                 record.frame_bytes.push(frame);
                 record.audio_bytes = record.audio_bytes.saturating_add(bytes);
             });
+            // Taken: the frame is the provider's (the log's) whatever happens
+            // to this call now; the flush is what stalls.
+            if matches!(self.script.writes, Writes::StallFlushAfter(frames) if number > frames) {
+                std::future::pending::<()>().await;
+            }
             self.wake();
             unfinished.complete();
             Ok(())
@@ -441,6 +446,7 @@ enum Writes {
     #[default]
     Accept,
     BlockAfter(usize),
+    StallFlushAfter(usize),
     FailAfter(usize, SttError),
 }
 
@@ -513,6 +519,19 @@ impl SttScript {
     pub fn block_writes_after(self, frames: usize) -> SttScript {
         SttScript {
             writes: Writes::BlockAfter(frames),
+            ..self
+        }
+    }
+
+    /// `send_audio` of frame `frames + 1` and every later one TAKES the
+    /// frame — it is logged as received (`SttLog::frames`), as a
+    /// transport's buffered frame still reaches the provider once it reads
+    /// again (at the close, say) — and then pends forever: a write whose
+    /// flush stalled.
+    #[must_use]
+    pub fn stall_flush_after(self, frames: usize) -> SttScript {
+        SttScript {
+            writes: Writes::StallFlushAfter(frames),
             ..self
         }
     }
