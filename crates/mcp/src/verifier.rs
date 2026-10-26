@@ -209,6 +209,16 @@ impl McpVerifier {
     ///
     /// The claim rules are [`Verifier::new`]'s: a 60 s leeway on `exp`, and
     /// `nbf` not checked. [`McpVerifier::with_cache`] takes the consumer's.
+    ///
+    /// Neither of stridelabs-auth's claim type rules is on here: an `iss`
+    /// array that holds the issuer passes, and so does a fractional `exp`
+    /// (jsonwebtoken rounds it). Both are opt-in through
+    /// [`McpVerifier::with_cache`], with
+    /// `resource.claim_checks().with_integer_time_claims(true).with_string_issuer(true)`
+    /// as its checks and `JwksCache::new(jwks_url, http)` in place of this
+    /// function's last two arguments. Those checks have
+    /// [`ProtectedResource::claim_checks`]'s defaults, `nbf` checked among
+    /// them; `.with_nbf_validation(false)` keeps this function's `nbf` rule.
     pub fn new(
         resource: &ProtectedResource,
         jwks_url: impl Into<String>,
@@ -241,6 +251,13 @@ impl McpVerifier {
     /// with the issuer is the caller's job, as for [`Verifier::with_cache`]:
     /// build it from the same configuration.
     ///
+    /// The claim type rules are opt-in here, through `checks`, and off by
+    /// default: [`ClaimChecks::with_integer_time_claims`] (each `exp`, `nbf`
+    /// and `iat` a non-negative JSON integer) and
+    /// [`ClaimChecks::with_string_issuer`] (`iss` a JSON string, never an
+    /// array holding the issuer). An MCP endpoint whose REST API, or whose
+    /// Python twin, refuses those tokens turns them on to match:
+    ///
     /// ```no_run
     /// # fn example(http: reqwest::Client) -> Result<(), Box<dyn std::error::Error>> {
     /// use std::time::Duration;
@@ -257,7 +274,11 @@ impl McpVerifier {
     ///     .report_unusable_keys(true);
     /// let verifier = McpVerifier::with_cache(
     ///     &resource,
-    ///     resource.claim_checks().with_leeway(Duration::ZERO),
+    ///     resource
+    ///         .claim_checks()
+    ///         .with_leeway(Duration::ZERO)
+    ///         .with_integer_time_claims(true)
+    ///         .with_string_issuer(true),
     ///     cache,
     /// )?
     /// .screen(ScreenPolicy::Strict)
@@ -455,8 +476,9 @@ impl McpClaims {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+    use base64::Engine as _;
     use serde_json::{json, Value};
     use stridelabs_auth::test_support::{TestClaims, TestKey};
     use wiremock::matchers::{method, path};
@@ -855,6 +877,110 @@ mod tests {
             matches!(default, Err(VerifyError::Invalid(_))),
             "{default:?}"
         );
+    }
+
+    /// `with_cache` with both of stridelabs-auth's claim type rules on.
+    fn typed_claims_verifier(server: &MockServer) -> McpVerifier {
+        let resource = resource();
+        McpVerifier::with_cache(
+            &resource,
+            resource
+                .claim_checks()
+                .with_integer_time_claims(true)
+                .with_string_issuer(true),
+            JwksCache::new(format!("{}/jwks", server.uri()), reqwest::Client::new()),
+        )
+        .expect("the resource's own checks")
+    }
+
+    /// The JSON text a token signed: its payload segment, decoded.
+    fn signed_payload(token: &str) -> String {
+        let segment = token.split('.').nth(1).expect("a payload segment");
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(segment)
+            .expect("base64url");
+        String::from_utf8(payload).expect("UTF-8")
+    }
+
+    /// Two tokens for the resource, each otherwise valid: one whose `iss` is
+    /// an array holding the issuer, one whose `exp` is an hour ahead plus
+    /// half a second. Each signed payload is checked to carry its claim.
+    fn mistyped_tokens() -> (String, String) {
+        let key = TestKey::primary();
+        let array_issuer = key.mint(&mcp_claims().claim("iss", json!([ISSUER])).build());
+        let member = format!(r#""iss":["{ISSUER}"]"#);
+        assert!(signed_payload(&array_issuer).contains(&member), "{member}");
+
+        let exp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("after 1970")
+            .as_secs()
+            + 3600;
+        let fractional_exp = key.mint(&mcp_claims().claim("exp", json!(exp as f64 + 0.5)).build());
+        let member = format!(r#""exp":{exp}.5"#);
+        assert!(
+            signed_payload(&fractional_exp).contains(&member),
+            "{member}"
+        );
+        (array_issuer, fractional_exp)
+    }
+
+    #[tokio::test]
+    async fn with_cache_can_refuse_an_array_issuer_and_a_fractional_exp() {
+        let server = jwks_issuer().await;
+        let (array_issuer, fractional_exp) = mistyped_tokens();
+        let typed = typed_claims_verifier(&server);
+        assert!(typed.claim_checks().requires_string_issuer());
+        assert!(typed.claim_checks().requires_integer_time_claims());
+
+        assert_eq!(
+            typed.verify(&array_issuer).await,
+            Err(VerifyError::invalid(
+                "token rejected: the issuer claim is not a string"
+            ))
+        );
+        assert_eq!(
+            typed.verify(&fractional_exp).await,
+            Err(VerifyError::invalid(
+                "token rejected: a time claim is not a whole number of seconds"
+            ))
+        );
+        let principal = typed
+            .verify(&TestKey::primary().mint(&mcp_claims().build()))
+            .await
+            .expect("a well-typed token");
+        assert_eq!(principal.auth_method, AuthMethod::Jwt);
+    }
+
+    /// Today's default, pinned so that changing it is a conscious act:
+    /// `new`, and `with_cache` over the resource's plain checks, accept an
+    /// array issuer and a fractional `exp`.
+    #[tokio::test]
+    async fn by_default_an_array_issuer_and_a_fractional_exp_pass() {
+        let server = jwks_issuer().await;
+        let (array_issuer, fractional_exp) = mistyped_tokens();
+        let resource = resource();
+        let plain = McpVerifier::with_cache(
+            &resource,
+            resource.claim_checks(),
+            JwksCache::new(format!("{}/jwks", server.uri()), reqwest::Client::new()),
+        )
+        .expect("the resource's own checks");
+
+        for (name, verifier) in [("new", verifier(&server)), ("with_cache", plain)] {
+            assert!(!verifier.claim_checks().requires_string_issuer(), "{name}");
+            assert!(
+                !verifier.claim_checks().requires_integer_time_claims(),
+                "{name}"
+            );
+            for token in [&array_issuer, &fractional_exp] {
+                let principal = verifier
+                    .verify(token)
+                    .await
+                    .unwrap_or_else(|err| panic!("{name}: {err}"));
+                assert_eq!(principal.subject, "test-subject", "{name}");
+            }
+        }
     }
 
     #[tokio::test]

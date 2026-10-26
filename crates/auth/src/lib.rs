@@ -54,8 +54,10 @@
 //! [`ClaimChecks`] instead: the issuer (compared exactly), an [`Audience`]
 //! (`Required`, or `NotValidated` for an issuer whose tokens carry none), the
 //! leeway on `exp` and `nbf`, whether `nbf` is checked (by default it is),
-//! and whether each present `exp`, `nbf` and `iat` must be a whole number of
-//! seconds (by default not: [`ClaimChecks::with_integer_time_claims`]).
+//! whether each present `exp`, `nbf` and `iat` must be a whole number of
+//! seconds (by default not: [`ClaimChecks::with_integer_time_claims`]), and
+//! whether `iss` must be a string, not an array holding the issuer (by
+//! default not: [`ClaimChecks::with_string_issuer`]).
 //! Everything else is [`Verifier::new`]'s, from the same code: RS256
 //! only, a `kid` required, the key-fitness rules, and a [`JwksCache`] the
 //! verifier builds itself from the URL it is given, with an optional TTL, so
@@ -220,8 +222,8 @@ pub use slauth_pat::{
     is_slauth_pat, PatValidationError, PatValidator, PAT_VALIDATION_TIMEOUT, SLAUTH_PAT_PREFIX,
 };
 pub use verify::{
-    time_claims_are_whole_seconds, Audience, ClaimChecks, Claims, VerifiedIdentity, Verifier,
-    DEFAULT_LEEWAY,
+    issuer_is_a_string, time_claims_are_whole_seconds, Audience, ClaimChecks, Claims,
+    VerifiedIdentity, Verifier, DEFAULT_LEEWAY,
 };
 
 #[cfg(feature = "axum")]

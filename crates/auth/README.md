@@ -205,13 +205,15 @@ the signature:
 | Leeway on `exp` and `nbf` | 60 s (`DEFAULT_LEEWAY`) | `.with_leeway(Duration)` — whole seconds (a fraction is dropped), at most a day |
 | `nbf`, when present | checked; never required | `.with_nbf_validation(false)` |
 | `exp`, `nbf` and `iat`, when present, are whole seconds (a non-negative JSON integer) | not required | `.with_integer_time_claims(true)` |
+| `iss` is a JSON string (not an array holding the issuer) | not required | `.with_string_issuer(true)` |
 
 Times are whole Unix seconds: with no leeway a token is accepted through the
 second its `exp` names and refused from the next, and refused while its
 `nbf` is later than now. A present `nbf` that is not a number is "token is
 malformed" while `nbf` is checked. As everywhere in jsonwebtoken, an `iss`
-*array* that contains the issuer passes too; RFC 7519 makes `iss` one string,
-and only the issuer's own key can sign one.
+*array* that contains the issuer passes too, unless `.with_string_issuer(true)`
+is on (below); RFC 7519 makes `iss` one string, and only the issuer's own key
+can sign one.
 
 **Integer time claims (opt-in).** jsonwebtoken reads `exp` and `nbf` as any
 finite non-negative number, rounding a fraction to the nearest second, and
@@ -238,6 +240,28 @@ The rule is also a function, `time_claims_are_whole_seconds(payload_json:
 base64url-decoded), for a verifier that reads the claims itself and wants the
 same rule. It takes the bytes, not a parsed `Value` or map, for the reason
 above; a payload that is not a JSON object fails it.
+
+**A string issuer (opt-in).** jsonwebtoken takes an `iss` that is an array
+holding the issuer (`["https://auth.example.com"]`, alone or beside other
+strings), where RFC 7519 §4.1.1 makes `iss` a single StringOrURI.
+`.with_string_issuer(true)` refuses a token whose `iss` is not a JSON string,
+as `AuthError::InvalidToken` ("the issuer claim is not a string"). `iss` stays
+required and compared exactly, so the option adds only the type: an `iss`
+jsonwebtoken refuses on its own keeps jsonwebtoken's reason (a number, a
+boolean, `null` or an object is "a required claim is missing", an array
+without the issuer "issuer is not accepted"), and a payload naming `iss` twice
+is "claims are malformed". The type is read from the payload's JSON text, in
+the same single read the integer-time option uses, and each option reads only
+its own claims: alone, this one never reads (or refuses a token over) a time
+claim, even one serde_json cannot read (`1e400`), and
+`time_claims_are_whole_seconds` still ignores `iss`. With both on, the time
+claims are checked first, so a token both refuse carries the time claims'
+reason: adding this option never changes the reason for a token the other
+already refuses. Like the integer-time option, it is off on `Verifier::new`,
+`claims_with_jwks` and `verify_with_jwks`, and applies wherever your
+`ClaimChecks` do. The rule is also a function, `issuer_is_a_string(payload_json:
+&[u8]) -> bool`, over the same payload text; an absent `iss` passes it
+(requiring one is the verifier's check).
 
 **`Audience::NotValidated` skips the `aud` check, and is safe only when the
 issuer binds the audience some other way**: when the exact `iss` you require
