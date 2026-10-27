@@ -11,6 +11,38 @@ for a consumer's pin.
 
 ## [Unreleased]
 
+### Fixed
+
+- `stridelabs-auth`: **a PAT validation states `Content-Length: 0`**.
+  `PatValidator` sent its body-less `POST /api/v1/pat/validate` with no
+  `Content-Length` (hyper writes none for an empty body). Over HTTP/1.1,
+  Google's front end, in front of slauth on Cloud Run, answers such a
+  `POST` with a **411 Length Required**. The validator maps that to
+  `Unavailable("Authentication service error")`, so **every slauth PAT got
+  a 503**, on REST and MCP alike (slaudio staging, 2026-10-27, logged
+  `unexpected slauth PAT validation status status="411 Length Required"`).
+  The same day, against production slauth, an HTTP/1.1 request without a
+  body got a 411, one with `Content-Length: 0` got a 200, and HTTP/2
+  succeeded either way.
+  - **Who is affected:** every consumer since v0.7.0 that validates slauth
+    PATs over HTTP/1.1 behind Google's front end, or behind any proxy that
+    requires a length on a `POST`. That includes every consumer whose
+    reqwest lacks the `http2` feature, which speaks nothing but HTTP/1.1.
+    Local slauth has no such front end, which is why no local test caught
+    it.
+  - **The fix:** the request now carries exactly one `Content-Length: 0` and
+    an empty body, as Python's httpx client sends it. The header is set by
+    hand because an empty `.body(..)` puts nothing on the wire (hyper keeps
+    a length the caller sets and adds none of its own). No API change.
+- `stridelabs-gcp`: **an empty media upload states its length**.
+  `GcsClient::upload` (and `upload_with` with only a CRC32C) sent a
+  zero-byte object's `POST` with no `Content-Length`, the same hyper
+  behaviour as above. Over HTTP/1.1, Google's front end refuses that with a
+  411, so a zero-byte object could not be written. A media upload now
+  always states its length (exactly one header, whatever the size). The
+  multipart upload and every other request already carried a non-empty
+  body or none that needs a length. No API change.
+
 ## [0.11.0] - 2026-10-27
 
 A joint release, mostly lumen plan 003 (S1a: `stridelabs-postgres`'s begin guard, behind a new feature `guard`; S1b:

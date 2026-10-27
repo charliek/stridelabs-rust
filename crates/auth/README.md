@@ -685,7 +685,10 @@ if let Some(pats) = &pats {
 ```
 
 slauth issues `slp_live_…` PATs and resolves them at
-`POST /api/v1/pat/validate` (`Authorization: Bearer <pat>`, no body). The
+`POST /api/v1/pat/validate` (`Authorization: Bearer <pat>`,
+`Content-Length: 0`, an empty body: the length is stated, as httpx states
+it, because over HTTP/1.1 a front end such as Google's answers a `POST`
+without one with a 411). The
 validator is that call and nothing more — the Rust twin of
 stridelabs-python's `PATValidator`, with its outcomes and its messages:
 

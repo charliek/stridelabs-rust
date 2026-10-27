@@ -1,8 +1,11 @@
 //! slauth personal access tokens, validated by asking slauth.
 //!
 //! slauth issues `slp_live_…` PATs and resolves them at its validate endpoint:
-//! `POST /api/v1/pat/validate` with `Authorization: Bearer <pat>` and no
-//! body, answered — once the header is acceptable — with a 200 carrying
+//! `POST /api/v1/pat/validate` with `Authorization: Bearer <pat>`,
+//! `Content-Length: 0` and an empty body (the length stated, as httpx states
+//! it, because an HTTP/1.1 front end such as Google's answers a `POST`
+//! without one with a 411), answered — once the header is acceptable — with
+//! a 200 carrying
 //! `{"valid": bool, "identity_id": uuid | null, "reason": string | null}`
 //! (slauth `backend-rs/src/http/pat.rs`). [`PatValidator`] is that call and
 //! nothing more: the Rust twin of stridelabs-python's `PATValidator`
@@ -91,7 +94,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
-use reqwest::header::{HeaderValue, AUTHORIZATION};
+use reqwest::header::{HeaderValue, AUTHORIZATION, CONTENT_LENGTH};
 use reqwest::StatusCode;
 use serde_json::Value;
 use uuid::Uuid;
@@ -271,10 +274,18 @@ impl PatValidator {
         // not set one, so every request carries its own. Built first so the
         // URL compared below is the one reqwest actually requested (it moves
         // any userinfo out into a header).
+        //
+        // The length is stated by hand, as httpx states it: hyper writes no
+        // `Content-Length` for an empty body (an empty `.body(..)` makes no
+        // difference), and over HTTP/1.1 a front end that requires one —
+        // Google's, in front of slauth on Cloud Run — answers a `POST`
+        // without it with a 411, which made every PAT a 503. hyper keeps
+        // a length set here and adds none of its own, so exactly one is sent.
         let request = self
             .http
             .post(&*self.validate_url)
             .header(AUTHORIZATION, authorization)
+            .header(CONTENT_LENGTH, HeaderValue::from_static("0"))
             .timeout(self.timeout)
             .build()
             .map_err(transport_failure)?;
@@ -894,6 +905,129 @@ mod tests {
                 "{len} bytes"
             );
         }
+    }
+
+    // --- the request on the wire ----------------------------------------------
+
+    /// The most [`raw_slauth`] waits for its whole exchange: the connection,
+    /// the request, its answer and the client hanging up. One on loopback
+    /// takes milliseconds.
+    const EXCHANGE_BOUND: Duration = Duration::from_secs(5);
+
+    /// A slauth on a raw socket, for what wiremock cannot show: the request
+    /// as sent rather than as parsed. It reads one HTTP/1.1 request's head,
+    /// answers it valid for [`IDENTITY`] with `connection: close`, then keeps
+    /// reading until the client hangs up, so anything sent after the head —
+    /// a body, whatever the head declared — is caught too. Resolves to every
+    /// byte the client sent, and only to a complete exchange: one that is
+    /// not done within [`EXCHANGE_BOUND`] (no connection at all included) or
+    /// breaks off fails the task, and so the test joining it.
+    async fn raw_slauth() -> (String, tokio::task::JoinHandle<Vec<u8>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a local port");
+        let url = format!(
+            "http://{}{VALIDATE_PATH}",
+            listener.local_addr().expect("a bound address")
+        );
+        let sent = tokio::spawn(async move {
+            let mut sent = Vec::new();
+            let exchange = async {
+                let (mut socket, _) = listener.accept().await.expect("one connection");
+                let mut chunk = [0u8; 4096];
+                while !sent.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let read = socket.read(&mut chunk).await.expect("the request");
+                    assert!(
+                        read > 0,
+                        "the client hung up mid-head: {:?}",
+                        String::from_utf8_lossy(&sent)
+                    );
+                    sent.extend_from_slice(&chunk[..read]);
+                }
+                let body = json!({ "valid": true, "identity_id": IDENTITY }).to_string();
+                let answer = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket
+                    .write_all(answer.as_bytes())
+                    .await
+                    .expect("the answer");
+                loop {
+                    let read = socket
+                        .read(&mut chunk)
+                        .await
+                        .expect("the rest of the request");
+                    if read == 0 {
+                        break;
+                    }
+                    sent.extend_from_slice(&chunk[..read]);
+                }
+            };
+            if tokio::time::timeout(EXCHANGE_BOUND, exchange)
+                .await
+                .is_err()
+            {
+                panic!(
+                    "no complete exchange within {EXCHANGE_BOUND:?}: the validation \
+                     never connected, or never hung up; received {:?}",
+                    String::from_utf8_lossy(&sent)
+                );
+            }
+            sent
+        });
+        (url, sent)
+    }
+
+    /// The validation states its empty body's length, `Content-Length: 0`,
+    /// as httpx does. hyper writes no length at all for an empty body (an
+    /// empty `.body(..)` included), and Google's front end, in front of
+    /// slauth on Cloud Run, answers an HTTP/1.1 `POST` without one with a
+    /// 411 — read here as slauth being unavailable, so every PAT was a 503.
+    /// Over HTTP/1.1 explicitly: a reqwest built without `http2` speaks
+    /// nothing else, and HTTP/2 frames its end of stream without a length.
+    #[tokio::test]
+    async fn the_validation_states_a_zero_content_length() {
+        let (url, sent) = raw_slauth().await;
+        let http1 = reqwest::Client::builder()
+            .http1_only()
+            .build()
+            .expect("a plain client builds");
+
+        let identity_id = PatValidator::new(url, http1).validate(PAT).await;
+
+        let sent = sent.await.expect("the raw slauth");
+        let head_end = sent
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("a whole head")
+            + 4;
+        let head = std::str::from_utf8(&sent[..head_end]).expect("an ASCII head");
+        let mut lines = head.split("\r\n");
+        assert_eq!(
+            lines.next(),
+            Some("POST /api/v1/pat/validate HTTP/1.1"),
+            "{head:?}"
+        );
+        let values = |name: &str| -> Vec<&str> {
+            head.split("\r\n")
+                .skip(1)
+                .filter_map(|line| line.split_once(':'))
+                .filter(|(field, _)| field.eq_ignore_ascii_case(name))
+                .map(|(_, value)| value.trim())
+                .collect()
+        };
+        assert_eq!(values("content-length"), ["0"], "exactly one: {head:?}");
+        assert!(values("transfer-encoding").is_empty(), "{head:?}");
+        assert!(
+            sent[head_end..].is_empty(),
+            "no body: {:?}",
+            String::from_utf8_lossy(&sent[head_end..])
+        );
+        assert_eq!(identity_id, Ok(identity()));
     }
 
     // --- the token and URL canary --------------------------------------------

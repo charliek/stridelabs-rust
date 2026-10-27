@@ -3,7 +3,8 @@
 //! headers that carry meaning (the bearer, the quota project, the content
 //! type) and the body. What reqwest adds on its own (`accept`, `host`,
 //! `content-length`) and the header order are the transport's, so they are
-//! not asserted.
+//! not asserted — except a media upload's `content-length`, which the client
+//! sets by hand (an empty body would otherwise carry none).
 
 mod common;
 
@@ -174,6 +175,55 @@ async fn a_default_gcs_client_sends_each_operations_request() {
     list.assert_call("GET /storage/v1/b/img-bucket/o?maxResults=1 HTTP/1.1", None);
     for request in [download, delete, exists, list] {
         assert!(request.body.is_empty(), "{}", request.line);
+    }
+}
+
+/// A media upload states its length, an empty one included, and states it
+/// once. hyper writes no `Content-Length` for an empty body, and over
+/// HTTP/1.1 Google's front end answers a `POST` without one with a 411, so
+/// the length is set by hand; hyper keeps it and adds none of its own. The
+/// checksum-only `upload_with` is the same media upload.
+#[tokio::test]
+async fn a_media_upload_states_its_length_once_an_empty_one_included() {
+    let token_server = MockServer::start().await;
+    let raw = RawServer::start(|_, _| RawReply::Full(ANSWER.to_vec())).await;
+    let gcs = GcsClient::new(never_retrying(), tokens(&token_server).await)
+        .with_base_url(&raw.base_url)
+        .with_timeout(Duration::from_secs(20));
+    let uploads = [Bytes::new(), Bytes::from_static(b"\x89PNG")];
+
+    for media in &uploads {
+        gcs.upload("img-bucket", "a.png", media.clone(), "image/png")
+            .await
+            .unwrap();
+        gcs.upload_with(
+            "img-bucket",
+            "a.png",
+            media.clone(),
+            "image/png",
+            &UploadOptions::default().with_crc32c(0),
+        )
+        .await
+        .unwrap();
+    }
+
+    let sent = received(&raw);
+    assert_eq!(sent.len(), 2 * uploads.len());
+    for (request, media) in sent.iter().zip(uploads.iter().flat_map(|m| [m, m])) {
+        request.assert_call(
+            "POST /upload/storage/v1/b/img-bucket/o?uploadType=media&name=a.png HTTP/1.1",
+            Some("image/png"),
+        );
+        // `header` fails on a field sent twice.
+        let length = media.len().to_string();
+        assert_eq!(
+            request.header("content-length"),
+            Some(length.as_str()),
+            "{} bytes",
+            media.len()
+        );
+        assert_eq!(request.header("transfer-encoding"), None);
+        assert_eq!(request.body, *media);
     }
 }
 
