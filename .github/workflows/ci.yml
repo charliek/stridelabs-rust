@@ -112,6 +112,21 @@ jobs:
       - name: Test (stridelabs-http, release profile)
         run: cargo test -p stridelabs-http --release --all-features --locked
 
+      # stridelabs-voice's suites per feature set, `-p` alone so each is
+      # resolved on its own (the two lanes above unify every crate's
+      # features): the core's suites with no adapter compiled (these run the
+      # relay, the admission and the text-to-speech flow against the
+      # scripted adapters, with Redis), then each adapter's suites with
+      # neither the other adapter nor `live-tests` (loopback only, no Redis).
+      - name: stridelabs-voice, test lanes per feature set
+        run: |
+          set -euo pipefail
+          for features in axum,test-support,live-tests muse,axum,test-support inworld,axum,test-support; do
+            echo "::group::stridelabs-voice test [$features]"
+            cargo test --locked -p stridelabs-voice --no-default-features --features "$features"
+            echo "::endgroup::"
+          done
+
       - name: Build (no default features)
         run: cargo build --workspace --no-default-features --locked
 
@@ -137,7 +152,12 @@ jobs:
 
       # The same per-feature lanes for the other crates with optional
       # surfaces (stridelabs-mcp's is above). Each line is `crate:features`;
-      # an empty feature list is the core.
+      # an empty feature list is the core, and a list is comma-separated.
+      # stridelabs-voice has each of its features alone, then the
+      # combinations its test targets are gated on (`required-features` in
+      # crates/voice/Cargo.toml: `axum,test-support`, each adapter with
+      # `axum,test-support`, `live-tests` with each adapter) and every
+      # production feature together.
       - name: Other crates, feature by feature (build + clippy)
         run: |
           set -euo pipefail
@@ -161,7 +181,20 @@ jobs:
             stridelabs-http:ssrf-decompress \
             stridelabs-http:ssrf-test-support \
             stridelabs-redis: \
-            stridelabs-testing:redis; do
+            stridelabs-testing:redis \
+            stridelabs-voice: \
+            stridelabs-voice:axum \
+            stridelabs-voice:muse \
+            stridelabs-voice:inworld \
+            stridelabs-voice:openapi \
+            stridelabs-voice:test-support \
+            stridelabs-voice:live-tests \
+            stridelabs-voice:axum,test-support \
+            stridelabs-voice:muse,axum,test-support \
+            stridelabs-voice:inworld,axum,test-support \
+            stridelabs-voice:live-tests,muse \
+            stridelabs-voice:live-tests,inworld \
+            stridelabs-voice:axum,muse,inworld,openapi; do
             crate="${entry%%:*}"
             features="${entry#*:}"
             echo "::group::$crate [${features:-core}]"
@@ -574,6 +607,124 @@ jobs:
             echo "ok: [$features] rustls present, ring absent, provider features: $(echo ${providers:-none, the consumer installs aws-lc-rs})"
           done
 
+      # stridelabs-voice's core names no provider and carries none: a
+      # consumer that wants a second speech provider writes an adapter behind
+      # a feature of its own, and the core build must not need any of the
+      # existing two. Built with `axum,test-support` (the core and both flows,
+      # with the scripted adapters), the compiler-artifact messages say what
+      # was compiled: the crate with exactly those two features (so neither
+      # adapter module, each behind a feature of its own), and no
+      # `stridelabs-inworld` or `reqwest` (the Inworld adapter's client and
+      # its transport). `cargo tree` says the same of the graph. Positive
+      # controls: the build did compile the crate with `axum`, and
+      # `stridelabs-redis` is in its graph (a listing for another crate, or
+      # an empty one, would pass for the wrong reason). The source half of
+      # the boundary, no provider name in the core and no client of its own,
+      # is crates/voice/tests/guards.rs, run by every test lane.
+      - name: "Guard: stridelabs-voice's core build compiles no provider adapter"
+        run: |
+          set -euo pipefail
+          messages="$(mktemp)"
+          pkgs="$(mktemp)"
+          trap 'rm -f "$messages" "$pkgs"' EXIT
+          cargo build --locked -p stridelabs-voice --no-default-features --features axum,test-support \
+            --message-format=json > "$messages"
+          features="$(jq -c 'select(.reason == "compiler-artifact" and .target.name == "stridelabs_voice") | .features' "$messages" | sort -u)"
+          echo "stridelabs-voice compiled with features: $features"
+          if [ "$features" != '["axum","test-support"]' ]; then
+            echo "::error::stridelabs-voice[axum,test-support] was compiled with features $features, not exactly [\"axum\",\"test-support\"]; a feature of this build pulled in an adapter (or the guard is not looking at the crate)"
+            exit 1
+          fi
+          jq -r 'select(.reason == "compiler-artifact") | .package_id' "$messages" | sed 's/.*[#\/]//; s/@.*//' | sort -u > "$pkgs"
+          echo "$(wc -l < "$pkgs") packages compiled for stridelabs-voice[axum,test-support]"
+          for control in stridelabs-redis axum; do
+            if ! grep -qx "$control" "$pkgs"; then
+              echo "::error::positive control failed: $control was not compiled for stridelabs-voice[axum,test-support], so this listing is not the one the guard means to inspect"
+              exit 1
+            fi
+          done
+          for forbidden in stridelabs-inworld reqwest; do
+            if grep -qx "$forbidden" "$pkgs"; then
+              echo "::error::$forbidden is compiled for stridelabs-voice[axum,test-support]; the core build must carry no provider adapter's dependency"
+              exit 1
+            fi
+          done
+          cargo tree --locked --target all -e normal -p stridelabs-voice --no-default-features --features axum,test-support \
+            --prefix none --format '{p}' | awk '{print $1}' | sort -u > "$pkgs"
+          echo "$(wc -l < "$pkgs") packages in stridelabs-voice[axum,test-support]'s normal graph"
+          if [ ! -s "$pkgs" ]; then
+            echo "::error::the stridelabs-voice package listing is empty; the guard proved nothing"
+            exit 1
+          fi
+          for control in stridelabs-redis axum; do
+            if ! grep -qx "$control" "$pkgs"; then
+              echo "::error::positive control failed: $control is not in stridelabs-voice[axum,test-support]'s graph, so this listing is not the one the guard means to inspect"
+              exit 1
+            fi
+          done
+          for forbidden in stridelabs-inworld reqwest; do
+            if grep -qx "$forbidden" "$pkgs"; then
+              echo "::error::$forbidden is in stridelabs-voice[axum,test-support]'s normal graph"
+              cargo tree --locked --target all -e normal -p stridelabs-voice --no-default-features --features axum,test-support -i "$forbidden" || true
+              exit 1
+            fi
+          done
+          echo "ok: no adapter feature, no stridelabs-inworld or reqwest; stridelabs-redis and axum present"
+
+      # stridelabs-voice selects no crypto provider, whatever its features:
+      # `muse` dials through the app's connector (its tokio-tungstenite and
+      # rustls are `default-features = false`, so rustls has no provider
+      # feature) and `inworld` takes the app's client, so the app's own
+      # provider (aws-lc-rs) is the only one in its process. rustls reaches
+      # the crate through stridelabs-redis (`rediss://`) in every
+      # combination, so `-i rustls` always has something to say: its listing,
+      # features included, must name no `aws_lc_rs`, `aws-lc-rs` or `ring`
+      # feature, and the graph no `ring`, `aws-lc-rs` or `aws-lc-sys` package.
+      # `no-dev`, because the crate's own dev-dependencies (rcgen and
+      # tokio-rustls, for a `wss://` fixture) enable aws-lc-rs for the tests
+      # and must not count. Positive control: the same query WITH dev edges
+      # does list `aws_lc_rs`, proving the query sees provider features.
+      - name: "Guard: stridelabs-voice selects no crypto provider"
+        run: |
+          set -euo pipefail
+          listing="$(mktemp)"
+          trap 'rm -f "$listing"' EXIT
+          for features in "" axum muse inworld axum,muse,inworld,openapi; do
+            label="${features:-core}"
+            cargo tree --locked --target all -e features,no-dev -p stridelabs-voice --no-default-features \
+              ${features:+--features "$features"} -i rustls --prefix none > "$listing"
+            echo "$(wc -l < "$listing") lines in stridelabs-voice[$label]'s rustls listing"
+            if ! grep -q '^rustls v' "$listing"; then
+              echo "::error::positive control failed: rustls is not in stridelabs-voice[$label]'s graph, so this listing is not the one the guard means to inspect"
+              exit 1
+            fi
+            if grep -E 'feature "(aws_lc_rs|aws-lc-rs|ring)"' "$listing"; then
+              echo "::error::stridelabs-voice[$label] enables a crypto provider feature on rustls (or a crate that selects one); the app installs its provider, the crate selects none"
+              exit 1
+            fi
+            cargo tree --locked --target all -e normal,build -p stridelabs-voice --no-default-features \
+              ${features:+--features "$features"} --prefix none --format '{p}' | awk '{print $1}' | sort -u > "$listing"
+            if [ ! -s "$listing" ]; then
+              echo "::error::the stridelabs-voice[$label] package listing is empty; the guard proved nothing"
+              exit 1
+            fi
+            for forbidden in ring aws-lc-rs aws-lc-sys; do
+              if grep -qx "$forbidden" "$listing"; then
+                echo "::error::$forbidden is in stridelabs-voice[$label]'s graph; the crate selects no crypto provider"
+                cargo tree --locked --target all -e normal,build -p stridelabs-voice --no-default-features ${features:+--features "$features"} -i "$forbidden" || true
+                exit 1
+              fi
+            done
+            echo "ok: [$label] rustls present, no provider feature, no ring or aws-lc package"
+          done
+          cargo tree --locked --target all -e features -p stridelabs-voice --no-default-features \
+            --features muse -i rustls --prefix none > "$listing"
+          if ! grep -q 'feature "aws_lc_rs"' "$listing"; then
+            echo "::error::positive control failed: the dev edges of stridelabs-voice[muse] do not list aws_lc_rs, so the query cannot see provider features"
+            exit 1
+          fi
+          echo "ok: the query with dev edges lists aws_lc_rs (the test fixtures'), so the guard above sees provider features"
+
       # rsa (RUSTSEC-2023-0071, no upstream fix) has to stay out of the lock
       # entirely: cargo-audit reads Cargo.lock, so even a crate that is never
       # compiled would put the advisory back, and `cargo tree` cannot see
@@ -713,7 +864,7 @@ jobs:
           status=0
           failed=""
           checked=0
-          for crate in stridelabs-config stridelabs-observability stridelabs-http stridelabs-auth stridelabs-testing stridelabs-mcp stridelabs-redis stridelabs-gcp stridelabs-inworld stridelabs-postgres stridelabs-perplexity; do
+          for crate in stridelabs-config stridelabs-observability stridelabs-http stridelabs-auth stridelabs-testing stridelabs-mcp stridelabs-redis stridelabs-gcp stridelabs-inworld stridelabs-postgres stridelabs-perplexity stridelabs-voice; do
             if ! git cat-file -e "$baseline:crates/${crate#stridelabs-}/Cargo.toml" 2>/dev/null; then
               echo "::notice::$crate is new since $baseline (no crates/${crate#stridelabs-}/Cargo.toml there), so it has no baseline API to check; it is checked from the next tag on"
               continue
@@ -851,7 +1002,7 @@ jobs:
           set -euo pipefail
           patch="$RUNNER_TEMP/stridelabs-patch.toml"
           echo '[patch."https://github.com/charliek/stridelabs-rust.git"]' > "$patch"
-          for c in config observability http auth testing mcp redis gcp inworld postgres perplexity; do
+          for c in config observability http auth testing mcp redis gcp inworld postgres perplexity voice; do
             echo "stridelabs-$c = { path = \"$GITHUB_WORKSPACE/stridelabs-rust/crates/$c\" }" >> "$patch"
           done
           cat "$patch"

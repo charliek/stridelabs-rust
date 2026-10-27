@@ -4,12 +4,12 @@ Shared Rust crates for StrideLabs services — the Rust twin of
 [stridelabs-python](https://github.com/charliek/stridelabs-python). Common
 patterns and practices live here once, so services stay consistent.
 
-**Status: all eleven crates implemented.** The workspace scaffold (Cargo
+**Status: all twelve crates implemented.** The workspace scaffold (Cargo
 workspace, CI, toolchain pins) and `stridelabs-config`,
 `stridelabs-observability`, `stridelabs-http`, `stridelabs-auth`,
 `stridelabs-testing`, `stridelabs-mcp`, `stridelabs-redis`,
-`stridelabs-gcp`, `stridelabs-inworld`, `stridelabs-postgres` and
-`stridelabs-perplexity` are all in place. See each crate's own README for its full
+`stridelabs-gcp`, `stridelabs-inworld`, `stridelabs-postgres`,
+`stridelabs-perplexity` and `stridelabs-voice` are all in place. See each crate's own README for its full
 API and feature topology.
 
 ## Crates
@@ -27,8 +27,9 @@ API and feature topology.
 | `stridelabs-inworld` | Implemented | A policy-free Inworld text-to-speech client on the consumer's `reqwest::Client`: one bounded, classified, log-safe synthesis (whole-exchange timeout, streamed response cap, pre-decode base64 guard, decoded-audio and text bounds, an optional MP3 shape check) | tapper's and lumen's `voice/inworld.rs`; slaudio's Python Inworld adapter |
 | `stridelabs-postgres` | Implemented | Postgres connection hygiene on sqlx: a `DATABASE_URL` allow-list whose refusals never print a value (no `search_path`, no NUL byte, no password file), value-free `sqlx::Error` summaries, a lazy pool, Neon pooler detection, the sqlx log targets to cap; a begin guard (feature `guard`: a bounded, cancel-safe `BEGIN` with `SET LOCAL` bounds, and a per-pool release probe); no TLS stack of its own | tapper's `db.rs` (hardened from lumen-rs's), checked against slaudio's `parse_connect_options`; the guard from lumen-rs's `db.rs` (plan 003) |
 | `stridelabs-perplexity` | Implemented | A policy-free Perplexity Agent API web-search client on the consumer's `reqwest::Client`: one bounded, classified, log-safe search (whole-exchange timeout, streamed response cap, input bound), a faithful answer (text, every search result with its citation id, status, usage) and an optional display helper (`sources`) | lumen's Sonar `web_search` (Sonar's chat completions were retired 2026-09-27), to lumen plan 002 W4b-1 |
+| `stridelabs-voice` | Implemented | The voice core apps share, provider-neutral: the client protocol (revision 1, `PROTOCOL.md`, with its golden fixture), the speech-to-text and text-to-speech provider traits, the UTC windows, a text-to-speech character budget and a speech-to-text audio budget with a fenced lease on Redis scripts shared byte for byte, the checked `Voice` and its refusals; behind `axum` the speech-to-text relay with its admission and the text-to-speech flow; the Muse and Inworld adapters behind features of their own (the app's connector and client; no crypto provider, no client built here) | tapper's and lumen's `voice/` (`tapper-rs/src/voice/` at `82be95f`), lumen plan 003 |
 
-See [§ Feature topology](#feature-topology-all-eleven-crates) below for what
+See [§ Feature topology](#feature-topology-all-twelve-crates) below for what
 each crate turns on by default versus behind a feature flag.
 
 ## Conventions
@@ -80,7 +81,7 @@ stridelabs-config = { git = "https://github.com/charliek/stridelabs-rust.git", r
 released and tagged, bump the consumer back to `tag = "vX.Y.Z"` so its
 manifest reads the same way for everyone, forever. Every crate is versioned
 in lockstep (one `[workspace.package].version` for the whole workspace), so a
-consumer pins **one** tag/rev for however many of the eleven crates it uses.
+consumer pins **one** tag/rev for however many of the twelve crates it uses.
 
 ### MSRV policy
 
@@ -122,6 +123,7 @@ stridelabs-gcp = { path = "../stridelabs-rust/crates/gcp" }
 stridelabs-inworld = { path = "../stridelabs-rust/crates/inworld" }
 stridelabs-postgres = { path = "../stridelabs-rust/crates/postgres" }
 stridelabs-perplexity = { path = "../stridelabs-rust/crates/perplexity" }
+stridelabs-voice = { path = "../stridelabs-rust/crates/voice" }
 ```
 
 `[patch]` keys the whole *source* (the git URL), not one crate — list every
@@ -130,7 +132,7 @@ or transitively (e.g. `stridelabs-auth`'s `http` feature depends on
 `stridelabs-http`, so the consumer's `[patch]` block needs both if it uses
 that feature). A patch entry for a crate the consumer doesn't depend on is
 harmless — Cargo only applies the ones that match a real dependency — so
-listing all eleven up front, as above, is the simplest thing that stays correct
+listing all twelve up front, as above, is the simplest thing that stays correct
 as a consumer's dependency set grows. The `[patch]` key must match the
 `https://…` source URL the consumer's `[dependencies]` actually used.
 
@@ -164,7 +166,7 @@ example in this library's CLAUDE.md, so don't move the library's Postgres there)
 (`localhost:4447`); `DOWNSTREAM_PARCEL_DATABASE_URL` points it elsewhere. tapper's run names its
 fake-gcs-server through `TAPPER_RS_TEST_GCS_EMULATOR_URL` (default `http://127.0.0.1:4443`).
 
-### Feature topology (all eleven crates)
+### Feature topology (all twelve crates)
 
 Every crate that defines optional features defaults to `default = []` — a
 consumer opts into the heavier parts of its dependency graph (a TLS stack, a
@@ -209,6 +211,12 @@ on what.
 | `stridelabs-postgres` | `test-support` | off | `guard`, plus its two hidden test seams (`GuardedPool::set_window_opened_at`, `TxBounds::REFUSED_BY_THE_SERVER`) — `[dev-dependencies]` only |
 | `stridelabs-postgres` | `live-tests` | off | **not for consumers**: compiles the crate's real-Postgres suites (everything else is unconditional; sqlx is required, with `postgres` and `runtime-tokio` only) |
 | `stridelabs-perplexity` | *(none — everything is unconditional; its `reqwest` has no features, so no TLS)* | — | — |
+| `stridelabs-voice` | `axum` | off | the speech-to-text relay (`relay`), the stream's admission (`stream`, `Voice::open_stream`) and the text-to-speech flow (`Voice::speak`), on axum's WebSocket (`ws`, no server), plus `LOG_CAPS`; via `axum`, `tungstenite` and `futures-util`, and tokio's `rt` and `macros` |
+| `stridelabs-voice` | `muse` | off | the Muse speech-to-text adapter, dialled through the app's `tokio_tungstenite::Connector` (tokio-tungstenite with `connect` and `rustls-tls-native-roots`, its rustls with no provider feature), plus `LOG_CAPS` |
+| `stridelabs-voice` | `inworld` | off | the Inworld text-to-speech adapter over the app's `InworldClient`, via `stridelabs-inworld` (no features) |
+| `stridelabs-voice` | `openapi` | off | `utoipa::ToSchema` on `LimitScope` and `VoiceLimitBody`, via `utoipa` |
+| `stridelabs-voice` | `test-support` | off | the scripted adapters (`testing`), the test seams, and with `axum` and an adapter that adapter's mock provider server — `[dev-dependencies]` only |
+| `stridelabs-voice` | `live-tests` | off | **not for consumers**: compiles the crate's real-Redis suites (with `test-support` and `axum`) |
 
 `stridelabs-testing`'s `oneshot`, `wiremock` and `local` modules have no
 feature gate of their own — all are cheap and every consumer of the crate
@@ -226,7 +234,12 @@ provider of its own (see below). `stridelabs-auth`, `stridelabs-gcp`,
 the process's rustls provider stay the consumer's choice (and
 `stridelabs-mcp` builds rmcp with no HTTP-client feature) — and
 `stridelabs-testing`'s Postgres pool and Redis probe talk to their servers in
-the clear. `stridelabs-postgres` names no sqlx TLS feature either: the
+the clear. `stridelabs-voice` is not TLS-free (rustls is in its graph in
+every combination, through `stridelabs-redis`'s `rediss://` support, and
+`muse` adds tokio-tungstenite's rustls transport) but selects no crypto
+provider, and builds no client: the `muse` dial takes the app's
+`tokio_tungstenite::Connector` and the `inworld` adapter the app's client,
+so the provider is the app's (CI-guarded, below). `stridelabs-postgres` names no sqlx TLS feature either: the
 consumer's own sqlx dependency picks it (`tls-rustls-aws-lc-rs`, below), and
 Cargo unifies it into the crate's sqlx.
 

@@ -1,0 +1,275 @@
+[package]
+name = "stridelabs-voice"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "A provider-neutral voice core for StrideLabs services: the client protocol, the speech-to-text and text-to-speech provider traits, the UTC windows, a text-to-speech character budget and a speech-to-text audio budget with a fenced lease, on Redis scripts shared byte for byte by every app"
+publish = false
+
+[features]
+default = []
+# The parts that need axum: the relay (`relay`) and the stream's admission
+# (`stream`, `Voice::open_stream`, `StreamContext`) on axum's WebSocket, the
+# text-to-speech flow (`Voice::speak`, `TtsReply`, `tts::read_request`),
+# `VoiceRefusal::into_response_with` (a refusal rendered through the app's
+# own envelope) and `LOG_CAPS`.
+axum = [
+    "dep:axum",
+    "dep:tungstenite",
+    "dep:futures-util",
+    "tokio/rt",
+    "tokio/macros",
+]
+# The Muse speech-to-text adapter (`muse`): `MuseStt` and its session, dialled
+# through the CONNECTOR THE APP HANDS IN (the crate builds none), and
+# `LOG_CAPS`. tokio-tungstenite's `rustls-tls-native-roots` only compiles its
+# rustls path (its rustls is `default-features = false`): no crypto provider
+# is selected here, the consumer installs one.
+muse = [
+    "dep:tokio-tungstenite",
+    "dep:rustls",
+    "dep:url",
+    "dep:futures-util",
+    "tokio/net",
+]
+# The Inworld text-to-speech adapter (`inworld`): `InworldTts` over the
+# `InworldClient` the app built (on its own `reqwest::Client`, with its own
+# bounds).
+inworld = ["dep:stridelabs-inworld"]
+# `utoipa::ToSchema` on `budget::LimitScope` and `refusal::VoiceLimitBody`
+# (as `VoiceLimitReached`), for an app's OpenAPI document.
+openapi = ["dep:utoipa"]
+# The test seams, none of them API without it: the `testing` module (the
+# scripted adapters `ScriptedStt` and `ScriptedTts`, `RecordingUsage`,
+# `MP3_FIXTURE`), `TtsBudget::with_clock` and `StreamBudget::with_clock` (a
+# test's clock, for the UTC boundaries), `TtsCaps::unchecked` and
+# `StreamCaps::unchecked` (caps the startup rule refuses, for a test that
+# needs them), `StreamBudget::acquire_under` (the real acquire under another
+# replay policy, for the replay-hazard test), and
+# `Voice::with_relay_settings_unchecked` (clocks shorter than revision 1
+# allows, for the relay's suites). With `axum` and an adapter, that
+# adapter's mock provider too (`muse::mock`, `inworld::mock`): a loopback
+# server, served by axum, so `axum`'s `http1` comes on with it (no
+# dependency is added: hyper is already axum's).
+test-support = ["axum?/http1"]
+# NOT for consumers: it compiles this crate's own real-Redis suites
+# (`tests/budget.rs`, `tests/lease.rs`, the relay's `tests/relay.rs` and
+# `tests/stt_contract.rs`, the text-to-speech flow's `tests/tts.rs`, and,
+# with an adapter, `tests/muse_relay.rs` and `tests/inworld_speak.rs`), which
+# need the compose Redis (`docker compose up -d redis`) or CI's Redis
+# service, and panic without one rather than skipping. A feature, not an
+# always-on test target, so `cargo test --workspace` keeps needing no
+# services; `--all-features` turns it on. It enables a DEV-dependency's
+# feature, as stridelabs-redis's does, the seams the suites drive
+# (`test-support`), and the flows they drive (`axum`).
+live-tests = ["test-support", "axum", "stridelabs-testing/redis"]
+
+[lints]
+workspace = true
+
+[[test]]
+name = "budget"
+required-features = ["live-tests"]
+
+[[test]]
+name = "lease"
+required-features = ["live-tests"]
+
+# The relay over real sockets, against the scripted provider: the session,
+# its close codes, the admission's refusals, the lease and the budget as a
+# session meets them.
+[[test]]
+name = "relay"
+required-features = ["live-tests"]
+
+# The speech-to-text contract, the core's side of every rule an adapter
+# keeps (`stt`'s module docs), the provider-run cap among them.
+[[test]]
+name = "stt_contract"
+required-features = ["live-tests"]
+
+# `Voice::new`'s refusals, against the scripted adapters: no service.
+[[test]]
+name = "voice_new"
+required-features = ["test-support"]
+
+# The text-to-speech flow (`Voice::speak`) against the scripted provider:
+# the request's checks and their order, the charge, the provider's answers,
+# the max-chars header, usage.
+[[test]]
+name = "tts"
+required-features = ["live-tests"]
+
+# The Muse adapter against `muse::mock::MockMuse`, driven directly: no
+# Redis, loopback sockets only.
+[[test]]
+name = "muse"
+required-features = ["muse", "axum", "test-support"]
+
+# One relay session through `MockMuse`: the adapter as the relay drives it.
+[[test]]
+name = "muse_relay"
+required-features = ["live-tests", "muse"]
+
+# The Inworld adapter against `inworld::mock::MockInworld`, driven directly:
+# no Redis, a loopback server only.
+[[test]]
+name = "inworld"
+required-features = ["inworld", "axum", "test-support"]
+
+# `Voice::speak` through `InworldTts` and `MockInworld`: the request on the
+# wire, every failure's status, and the charge that stands.
+[[test]]
+name = "inworld_speak"
+required-features = ["live-tests", "inworld"]
+
+[dependencies]
+# Every budget call is one `EVAL` on the consumer's handle, under the replay
+# policy the call needs (the crate docs, "The replay policy"). The handle,
+# its URL and its timeouts are the consumer's.
+stridelabs-redis = { workspace = true }
+# The UTC day and month a budget counts in (`window`); `serde` for the
+# instant a limit resets at, in the relay's `limit` event and the `429` body
+# (RFC 3339, `Z`).
+chrono = { workspace = true, features = ["serde"] }
+# User ids and session tokens in the keys; `ChargeKey::mint` (`v4`).
+uuid = { workspace = true }
+# The wire names: `LimitScope`'s, the relay's events, the encoding.
+serde = { workspace = true }
+# The relay's events as text frames, the refusal bodies, the text-to-speech
+# request's strict parse.
+serde_json = { workspace = true }
+# The refusals' status and headers, and the `Idempotency-Key` header read.
+http = { workspace = true }
+# An audio frame and a spoken sentence, without a copy.
+bytes = { workspace = true }
+# `SttSession` is a `Stream` of what the provider heard: the trait alone.
+futures-core = { version = "0.3", default-features = false }
+# Feature `axum`: the relay's client socket (`ws`: axum's WebSocket, its
+# upgrade and their limits) and `VoiceRefusal::into_response_with`. No
+# default features: the crate needs the extractor, the socket and the
+# response types, not a server.
+axum = { version = "0.8", default-features = false, features = ["ws"], optional = true }
+# Feature `axum`, for one thing only: the relay reads the tungstenite error
+# behind a failed client read (`axum::Error`'s source) to tell a breach (a
+# message over the bound, a protocol error: `1008`) from a client that went
+# away. It must be the tungstenite axum's `ws` is built on (axum 0.8's is
+# 0.29), or the downcast silently never matches; `an_oversized_message_is_1008`
+# pins it. No default features: no handshake, no TLS, nothing to dial with.
+tungstenite = { version = "0.29", default-features = false, optional = true }
+# Features `axum` and `muse`: `SinkExt::send`/`flush` and `StreamExt::next`
+# on the client's socket and on the Muse socket.
+futures-util = { workspace = true, features = ["sink"], optional = true }
+# Feature `muse`: the Muse dial. `connect` for `connect_async_tls_with_config`
+# (always with the app's connector), `rustls-tls-native-roots` so that
+# connector's `Rustls` variant exists. Its rustls is `default-features =
+# false` and this names no provider feature: the app's connector carries
+# the app's provider. The same tokio-tungstenite axum's `ws` is built on.
+tokio-tungstenite = { version = "0.29", default-features = false, features = [
+    "connect",
+    "rustls-tls-native-roots",
+], optional = true }
+# Feature `muse`, for one thing only: `muse::error_class` tells a TLS failure
+# (a `rustls::Error` inside an I/O error) from another I/O error. No default
+# features: no provider, no logging.
+rustls = { version = "0.23", default-features = false, optional = true }
+# Feature `muse`: `muse::realtime_url` parses the app's setting. Already in
+# every graph through reqwest and tungstenite.
+url = { workspace = true, optional = true }
+# Feature `inworld`: the client the app builds and hands in.
+stridelabs-inworld = { workspace = true, optional = true }
+# Feature `openapi`: the derive (utoipa's default `macros`). No schema
+# feature: `resets_at` is documented as a string (`value_type`).
+utoipa = { workspace = true, optional = true }
+# `Fingerprint`: SHA-256 over a sentence, cut to 16 hex characters.
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+# `Grant::origin`, a `tokio::time::Instant`: the monotonic twin of the
+# instant a grant's windows were read at. `SttProvider::open`'s deadline is
+# one too; the scripted adapters' timers are tokio's; the relay's clocks and
+# the cooperative budget it spends per provider event
+# (`tokio::task::coop::consume_budget`, `rt`).
+#
+# Not the workspace's `full`: only `time` is the core's own. `axum` adds `rt`
+# (`spawn`, `coop`) and `macros` (`select!`, `join!`), `muse` adds `net` (its
+# `TcpStream`); `sync` and `rt` come in any case with tokio-util's `rt`
+# below, and are named here for what the crate uses of them. The adapters'
+# mock servers and the suites' runtimes are the dev-dependency's.
+tokio = { version = "1", default-features = false, features = ["time", "sync", "rt"] }
+# The app's shutdown, as the relay sees it: the token every session selects
+# on (`CancellationToken`) and the tracker its drain waits on (`TaskTracker`,
+# `rt`). Already in the lock, with these features.
+tokio-util = { version = "0.7", default-features = false, features = ["rt"] }
+# The relay's two lines per session and the admission's refusals: fixed
+# messages and fields, never a key, a frame, a transcript or a provider's
+# text.
+tracing = { workspace = true }
+
+[dev-dependencies]
+# `require_redis`, the fail-loud probe for the live suites. Its `redis`
+# feature is switched on by `live-tests` above, never here: dev-dependency
+# features unify into every `cargo test --workspace`, and that lane must need
+# no Redis.
+stridelabs-testing = { workspace = true }
+# The live suites seed, read back and delete keys, and create ACL users, on a
+# connection of their own (never the handle under test); the fault relay
+# (`tests/redis_fault`) reads the test URL with `redis::parse_redis_url`.
+redis = { workspace = true }
+# `join_all`: concurrent charges, and the fault relay's control replies.
+futures = { workspace = true }
+# The scripted adapters' timing tests run on tokio's paused clock
+# (`test-util`); the suites use `#[tokio::test]` (`macros`), a multi-thread
+# runtime for the run cap's second case (`rt-multi-thread`), and loopback
+# sockets (`net`, `io-util`).
+tokio = { version = "1", default-features = false, features = [
+    "test-util",
+    "macros",
+    "rt-multi-thread",
+    "net",
+    "io-util",
+    "time",
+    "sync",
+    "rt",
+] }
+# `the_scripts_are_the_extraction_bases`: the SHA-1 of the exact bytes each
+# script sends. Already in the lock (0.11.0), so nothing is added to it.
+sha1 = "0.11"
+# The relay suites serve the stream on a loopback port (`axum::serve`: the
+# default features' `http1` and `tokio`).
+axum = { workspace = true }
+# The relay suites' client: a plain `ws://` WebSocket to that port. No TLS.
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect"] }
+# `hyper::upgrade::on`, for an upgrade that fails after its `101`
+# (`a_failed_upgrade_is_drained_and_its_release_logged`).
+hyper = "1"
+# `ServiceExt::oneshot`: a plain request through the relay suites' router,
+# with no socket.
+tower = { workspace = true }
+# The relay suites read their own log lines as production writes them: the
+# Cloud Logging layer behind an `EnvFilter`, with the `log` bridge
+# (`tests/log_capture`).
+stridelabs-observability = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-log = { workspace = true }
+# The Inworld suites build the `InworldClient` an app would hand the adapter,
+# on a client with the crate's injected-client contract (no proxy, no
+# redirect, no retry, no decoder). Plain `http://` to the loopback mock: no
+# TLS feature.
+reqwest = { workspace = true }
+# The Inworld suites' mock answers and padded bodies are base64 JSON.
+base64 = { workspace = true }
+# `the_dial_uses_the_injected_connector`: a `wss://` listener with a
+# throwaway self-signed certificate, and the connectors that do and do not
+# trust it. `aws_lc_rs`, never the default `ring` (CI's "the workspace
+# compiles no ring" lists dev edges too); the tests build every rustls
+# config with that provider explicitly and install no process default. Both
+# already in Cargo.lock (stridelabs-http's and stridelabs-mcp's suites).
+rcgen = { version = "0.14", default-features = false, features = [
+    "aws_lc_rs",
+] }
+tokio-rustls = { version = "0.26", default-features = false, features = [
+    "aws_lc_rs",
+] }

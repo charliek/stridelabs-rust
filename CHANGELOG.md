@@ -3,7 +3,7 @@
 All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
-Versioning is lockstep across all eleven crates in this workspace (one
+Versioning is lockstep across all twelve crates in this workspace (one
 `[workspace.package].version`, bumped together regardless of which crate(s)
 changed) rather than independent per-crate versioning —
 see the root README's "Consuming these crates" section for what that means
@@ -186,6 +186,73 @@ for a consumer's pin.
   (refused names fail before a token or a request), its timeout and retry
   policy, a bounded error body and value-free errors. Additive: no feature,
   no dependency, no change to an existing call.
+- **`stridelabs-voice`, a new crate: the provider-neutral voice core** two
+  apps share (lumen plan 003; extracted from tapper's `tapper-rs/src/voice/`
+  at `82be95f`, which had hardened lumen's copy). What lets a client talk to
+  an app (a speech-to-text relay over a WebSocket) and hear it answer (text
+  to speech, one sentence per request) inside a spending ceiling, with the
+  speech providers swappable behind it. The core names no provider; a
+  provider is an adapter behind a feature. Both apps run this crate's Redis
+  scripts and key shapes byte for byte (the scripts' SHA-1s are pinned by a
+  test), so either adopts it with no change on the wire.
+  - **The core (no feature at all):** the client protocol, revision 1
+    (`PROTOCOL.md` is canonical; `protocol`: the relay's events, both
+    close-code tables, `END_FRAME`, the `rate`/`encoding` parameters, the
+    allowed audio types, and a golden fixture whose SHA-256 a test pins);
+    the speech-to-text provider traits (`SttProvider`, `SttSession`,
+    `SttEvent`, fixed-class errors: `stt`) and the text-to-speech trait
+    (`TtsProvider`, `VoiceCatalog`, the request's strict parse: `tts`), each
+    with its contract in the module docs; the UTC day and month windows
+    (`window`); the text-to-speech character budget with its per-sentence
+    idempotency key (`budget`) and the speech-to-text audio budget with a
+    fenced lease and a session meter (`lease`), on `stridelabs-redis` under
+    the replay policy each call needs; every refusal a voice route answers
+    (`refusal`: status, `{"detail"}` body, headers, the `429` body); the
+    usage seam (`usage`); and `Voice`, built from `VoiceParts` and checked by
+    `Voice::new` (`VoiceSetupError`), with `RelaySettings::check`.
+  - **Feature `axum`:** the relay (`relay`: one session, its close machine
+    and two log lines, the provider-run cap), the stream's admission
+    (`stream`, `Voice::open_stream`, `StreamContext`: the configuration `503`,
+    the `426`, the `422`s, the ping, the ticket and the fenced acquire, the
+    takeover, the upgrade), the text-to-speech flow (`Voice::speak`,
+    `TtsReply`, `tts::read_request`), `VoiceRefusal::into_response_with`
+    (a refusal rendered through the app's own envelope) and `LOG_CAPS`
+    (tungstenite's targets, to fold into the app's caps). axum is
+    `default-features = false` with `ws`: the socket and the extractors, not
+    a server.
+  - **Features `muse` and `inworld`:** the Muse speech-to-text adapter
+    (`MuseStt`, dialled through the `tokio_tungstenite::Connector` the app
+    hands in) and the Inworld text-to-speech adapter (`InworldTts` over the
+    `InworldClient` the app built). **The crate builds no HTTP client, no
+    rustls `ClientConfig`, no connector, and selects no crypto provider**: the
+    app injects each, and installs aws-lc-rs.
+  - **Features `openapi`** (`utoipa::ToSchema` on `LimitScope` and
+    `VoiceLimitBody`), **`test-support`** (the scripted adapters
+    `ScriptedStt`/`ScriptedTts`/`RecordingUsage` in `testing`, the test seams,
+    and, with `axum` and an adapter, that adapter's mock provider
+    `muse::mock::MockMuse` / `inworld::mock::MockInworld`) and
+    **`live-tests`** (not for consumers: the crate's real-Redis suites).
+  - **Guards in CI:** `crates/voice/tests/guards.rs` fails if a core module
+    names `muse`, `inworld`, `meta.ai` or `tungstenite::Message` (the
+    adapters and `lib.rs`'s gating lines, listed exactly, excepted) or if any
+    source builds a `reqwest` client, a `ClientBuilder`, a rustls client
+    config, a connector or a `connect_async`; "Guard: stridelabs-voice's core
+    build compiles no provider adapter" builds `axum,test-support` and checks
+    the compiled features and graph (no `stridelabs-inworld`, no `reqwest`);
+    "Guard: stridelabs-voice selects no crypto provider" checks that no
+    feature set names `aws_lc_rs`, `aws-lc-rs` or `ring` on rustls and that no
+    `ring`, `aws-lc-rs` or `aws-lc-sys` package is in the graph (dev edges
+    excluded, with a positive control that they do list aws_lc_rs). CI also
+    gains the crate's per-feature build and clippy lanes, three test lanes
+    per feature set, and its place in the cargo-semver-checks list (checked
+    from the first tag that contains it) and in the downstream checks'
+    `[patch]` list.
+  - The crate's README carries the feature topology, the Redis keys and
+    scripts, the consumer's obligations, the named limits and an appendix:
+    the walkthrough of two further providers (Deepgram and OpenAI file
+    transcription for speech to text, ElevenLabs for text to speech) mapped
+    onto the traits and the protocol's constants, from public documentation,
+    and what it changed and recorded.
 
 ### Changed
 
