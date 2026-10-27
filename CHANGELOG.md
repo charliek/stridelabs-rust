@@ -11,6 +11,23 @@ for a consumer's pin.
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-10-27
+
+A joint release, mostly lumen plan 003 (S1a: `stridelabs-postgres`'s begin guard, behind a new feature `guard`; S1b:
+`stridelabs-auth`'s opt-in integer time claims, with the opt-in string issuer that builds on it; S1d: an empty key set is
+a failed fetch; S2: a new crate, `stridelabs-voice`, the provider-neutral voice core extracted from tapper's, with `muse`
+and `inworld` adapters; `stridelabs-testing`'s two message hooks), slaudio plan 027's `stridelabs-mcp` claim checks
+(`McpVerifier::with_cache`, `with_scope_source`, `screen`, `claim_checks`), `stridelabs-observability`'s
+`RequestLogLevel` (requested by tapper plan 017 and lumen), `stridelabs-gcp`'s `GcsClient::exists` (parcel plan 002) and
+`scripts/downstream-check.sh` learning parcel and tapper's GCS emulator variable. **Changed:** `stridelabs-auth` on an
+empty JWKS response (`{"keys": []}`), listed under Fixed: it was cached as the issuer's set, so a token got
+`UnknownKid`/`UnseenKid` (a 401); it now fails the fetch as `AuthError::Jwks("response has no keys")`, so a consumer sees
+its key-set error (its `Jwks` mapping, a 5xx), the previous set keeps serving and the failure counts toward the backoff;
+a test that asserts the old kid error for an empty set fails. No API change. Everything else is additive or opt-in
+(every new option is off by default, and the new crate and features add nothing to a consumer that does not name them),
+and the dev-profile debug-info change in the workspace `Cargo.toml` never reaches a consumer. Downstream-checked against
+each merge: downstream-limen passed on every one; no other downstream result is claimed here. Details below.
+
 ### Added
 
 - `stridelabs-postgres`: **the begin guard**, behind a new feature `guard`

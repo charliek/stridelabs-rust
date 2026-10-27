@@ -53,29 +53,29 @@ build.
 
 ```toml
 [dependencies]
-stridelabs-http = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.10.0" }
+stridelabs-http = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.11.0" }
 
 # with the CORS layer builder:
-stridelabs-http = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.10.0", features = ["cors"] }
+stridelabs-http = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.11.0", features = ["cors"] }
 
 # for a service that proxies to an upstream:
-stridelabs-http = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.10.0", features = ["proxy"] }
+stridelabs-http = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.11.0", features = ["proxy"] }
 
 # for a service that publishes an OpenAPI document:
-stridelabs-http = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.10.0", features = ["openapi"] }
+stridelabs-http = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.11.0", features = ["openapi"] }
 
 # for a service that fetches user-supplied URLs, and installs the rustls provider at startup:
-stridelabs-http = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.10.0", features = ["ssrf", "tls"] }
+stridelabs-http = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.11.0", features = ["ssrf", "tls"] }
 
 # to name configured URLs in logs without their credentials:
-stridelabs-http = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.10.0", features = ["redact-url"] }
+stridelabs-http = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.11.0", features = ["redact-url"] }
 
 # for a feed fetcher that decodes gzip and deflate:
-stridelabs-http = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.10.0", features = ["ssrf-decompress", "tls"] }
+stridelabs-http = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.11.0", features = ["ssrf-decompress", "tls"] }
 
 [dev-dependencies]
 # its tests, to fetch from a local TLS server (never in [dependencies]):
-stridelabs-http = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.10.0", features = ["ssrf-test-support"] }
+stridelabs-http = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.11.0", features = ["ssrf-test-support"] }
 ```
 
 (During development against an unreleased commit, pin `rev = "<sha>"`

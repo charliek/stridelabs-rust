@@ -12,7 +12,7 @@ write a fourth copy.
 
 ```toml
 [dependencies]
-stridelabs-redis = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.10.0" }
+stridelabs-redis = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.11.0" }
 ```
 
 (`v0.7.0` is the first release with this crate. During development against

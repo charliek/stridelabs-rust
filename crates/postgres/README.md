@@ -20,7 +20,7 @@ refused.
 
 ```toml
 [dependencies]
-stridelabs-postgres = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.10.0" }
+stridelabs-postgres = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.11.0" }
 # Your own sqlx picks the TLS stack (see "Feature topology"):
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "postgres", "tls-rustls-aws-lc-rs"] }
 ```
@@ -29,7 +29,7 @@ New in v0.10.0. During development against an unreleased commit, pin
 `rev = "<sha>"` instead of `tag`; see the workspace root README for the local
 `[patch]` co-development snippet.
 
-For the begin guard, name `features = ["guard"]` in `[dependencies]`, and
+For the begin guard (new in v0.11.0), name `features = ["guard"]` in `[dependencies]`, and
 `features = ["guard", "test-support"]` in `[dev-dependencies]` if your tests
 use its two seams (never `test-support` in `[dependencies]`).
 
