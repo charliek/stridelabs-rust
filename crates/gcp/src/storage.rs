@@ -705,11 +705,17 @@ impl GcsClient {
             encode_component(object)
         );
         let hash = crc32c.map(|crc32c| format!("crc32c={}", crc32c_base64(crc32c)));
+        // The length is stated by hand: hyper writes no `Content-Length` for
+        // an empty body, and over HTTP/1.1 Google's front end answers a
+        // `POST` without one with a 411, so a zero-byte object could not be
+        // written. hyper keeps a length set here and adds none of its own.
+        let length = bytes.len();
         let build = || {
             let request = self
                 .http
                 .post(&url)
                 .header(reqwest::header::CONTENT_TYPE, content_type)
+                .header(reqwest::header::CONTENT_LENGTH, length)
                 .body(bytes.clone());
             match &hash {
                 Some(hash) => request.header("x-goog-hash", hash),
