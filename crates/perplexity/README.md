@@ -34,7 +34,7 @@ provider in your graph (the root README, "One crypto provider").
 
 ```toml
 [dependencies]
-stridelabs-perplexity = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.11.0" }
+stridelabs-perplexity = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.11.1" }
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 ```
 

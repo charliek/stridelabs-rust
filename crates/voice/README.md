@@ -38,7 +38,7 @@ speech to text, Inworld for text to speech):
 
 ```toml
 [dependencies]
-stridelabs-voice = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.11.0" }
+stridelabs-voice = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.11.1" }
 ```
 
 New in v0.11.0. See the workspace root README for the local `[patch]`
