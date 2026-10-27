@@ -35,7 +35,7 @@ README, "One crypto provider").
 
 ```toml
 [dependencies]
-stridelabs-inworld = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.11.0", features = ["client-builder"] }
+stridelabs-inworld = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.11.1", features = ["client-builder"] }
 ```
 
 New in v0.9.0. See the workspace root README for the local `[patch]`

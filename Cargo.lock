@@ -2779,7 +2779,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "stridelabs-auth"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -2803,7 +2803,7 @@ dependencies = [
 
 [[package]]
 name = "stridelabs-config"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -2815,7 +2815,7 @@ dependencies = [
 
 [[package]]
 name = "stridelabs-gcp"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -2837,7 +2837,7 @@ dependencies = [
 
 [[package]]
 name = "stridelabs-http"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -2864,7 +2864,7 @@ dependencies = [
 
 [[package]]
 name = "stridelabs-inworld"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -2879,7 +2879,7 @@ dependencies = [
 
 [[package]]
 name = "stridelabs-mcp"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -2910,7 +2910,7 @@ dependencies = [
 
 [[package]]
 name = "stridelabs-observability"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "axum",
  "futures-util",
@@ -2931,7 +2931,7 @@ dependencies = [
 
 [[package]]
 name = "stridelabs-perplexity"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "reqwest",
  "serde",
@@ -2944,7 +2944,7 @@ dependencies = [
 
 [[package]]
 name = "stridelabs-postgres"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "futures-util",
  "percent-encoding",
@@ -2960,7 +2960,7 @@ dependencies = [
 
 [[package]]
 name = "stridelabs-redis"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "futures",
  "redis",
@@ -2973,7 +2973,7 @@ dependencies = [
 
 [[package]]
 name = "stridelabs-testing"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "axum",
  "http",
@@ -2990,7 +2990,7 @@ dependencies = [
 
 [[package]]
 name = "stridelabs-voice"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "axum",
  "base64 0.22.1",

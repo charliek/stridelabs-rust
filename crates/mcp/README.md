@@ -50,11 +50,11 @@ The app writes its tools as an rmcp `ServerHandler`. This crate supplies:
 
 ```toml
 [dependencies]
-stridelabs-mcp = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.11.0" }
+stridelabs-mcp = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.11.1" }
 rmcp = { version = "3.5", default-features = false, features = ["server", "macros"] }
 
 [dev-dependencies]
-stridelabs-mcp = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.11.0", features = ["test-support"] }
+stridelabs-mcp = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.11.1", features = ["test-support"] }
 ```
 
 Rate limiting, `SlauthPatCredential`, `canonical_tools_json` and the
@@ -63,10 +63,10 @@ window (`Window`, `RateLimit`, `from_limits`) in v0.8.0:
 
 ```toml
 [dependencies]
-stridelabs-mcp = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.11.0", features = ["cors", "redis", "image-fetch"] }
+stridelabs-mcp = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.11.1", features = ["cors", "redis", "image-fetch"] }
 
 [dev-dependencies]
-stridelabs-mcp = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.11.0", features = ["cors", "redis", "image-fetch", "test-support"] }
+stridelabs-mcp = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.11.1", features = ["cors", "redis", "image-fetch", "test-support"] }
 ```
 
 rmcp's types are this crate's API (`ServerHandler`, `RequestContext`,

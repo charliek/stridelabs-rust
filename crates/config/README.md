@@ -15,7 +15,7 @@ turns it off and gets the env helpers and the validation accumulator with no
 YAML parser in its graph:
 
 ```toml
-stridelabs-config = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.11.0", default-features = false }
+stridelabs-config = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.11.1", default-features = false }
 ```
 
 (The `file` feature is new in v0.10.0.)
@@ -27,7 +27,7 @@ stridelabs-config = { git = "https://github.com/charliek/stridelabs-rust.git", t
 
 ```toml
 [dependencies]
-stridelabs-config = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.11.0" }
+stridelabs-config = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.11.1" }
 ```
 
 (During development against an unreleased commit, pin `rev = "<sha>"`

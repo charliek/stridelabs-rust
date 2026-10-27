@@ -20,7 +20,7 @@ refused.
 
 ```toml
 [dependencies]
-stridelabs-postgres = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.11.0" }
+stridelabs-postgres = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.11.1" }
 # Your own sqlx picks the TLS stack (see "Feature topology"):
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "postgres", "tls-rustls-aws-lc-rs"] }
 ```

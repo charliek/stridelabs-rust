@@ -11,6 +11,8 @@ for a consumer's pin.
 
 ## [Unreleased]
 
+## [0.11.1] - 2026-10-27
+
 ### Fixed
 
 - `stridelabs-auth`: **a PAT validation states `Content-Length: 0`**.
