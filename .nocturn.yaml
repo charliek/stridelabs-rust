@@ -1,0 +1,9 @@
+version: 1
+targets:
+  crates:
+    kind: library
+    # Lockstep-versioned workspace (Cargo.toml [workspace.package]): consumers
+    # pin one git tag for every crate (README). Nothing goes to crates.io.
+    # Consumers resolve their own lockfile; this one is what CI tests with.
+    released: { tag_pattern: '^v\d+\.\d+\.\d+$' }
+    ships: [Cargo.lock]
