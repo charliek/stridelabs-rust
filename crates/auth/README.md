@@ -824,6 +824,24 @@ workspace rather than copied from any service. See
 [`testdata/README.md`](testdata/README.md); the repository `.gitignore` has a
 global `*.pem` rule with an explicit exception for that directory.
 
+### Against a live issuer
+
+`tests/live_issuer.rs` checks the crate against a real issuer: seven
+`#[ignore]`d tests, which **panic** without their variables instead of
+skipping. Run them with
+
+```sh
+cargo test -p stridelabs-auth --features test-support --test live_issuer -- --ignored
+```
+
+with `STRIDELABS_TEST_ISSUER` (the issuer's base URL), `STRIDELABS_TEST_AUDIENCE`,
+`STRIDELABS_TEST_ACCESS_TOKEN`, `STRIDELABS_TEST_SUBJECT` and
+`STRIDELABS_TEST_EMAIL` set, plus `STRIDELABS_TEST_ID_TOKEN` for the ID-token
+test. The tests obtain no token: the issuer's side hands one over. The issuer
+must be reachable over **plain HTTP**: this workspace's reqwest has no TLS, so an
+HTTPS issuer is not supported. slauth's reference server provides such an
+issuer.
+
 ## Not included
 
 Issuer-side signing (minting real tokens), OAuth2 authorization-code/PKCE flow
