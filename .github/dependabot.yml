@@ -1,25 +1,36 @@
-# Dependabot keeps dependencies current and surfaces security advisories as PRs.
-# Updates are weekly; each ecosystem gets its own PR stream.
+# Dependabot, written by Nocturn's onboarding: every package ecosystem and
+# directory in the repository in one pull request, on the 1st and 15th of
+# each month. Majors are left out except for GitHub Actions (Nocturn's major
+# work items take them), and a cooldown holds new releases back. Security
+# updates arrive when they're published, grouped per ecosystem.
 version: 2
-updates:
-  # CI workflow actions (actions/checkout, setup-rust-toolchain, …). Bumps the
-  # pinned ref whether it's a version tag or a commit SHA. Grouped into one PR
-  # per week: some actions (taiki-e/install-action) release near-daily, so
-  # separate PRs kept being auto-closed as superseded before anyone merged them.
-  - package-ecosystem: github-actions
-    directory: /
+multi-ecosystem-groups:
+  dependencies:
     schedule:
-      interval: weekly
-    groups:
-      actions:
-        patterns: ["*"]
-
-  # The Cargo workspace at the repo root.
+      interval: cron
+      cronjob: "0 11 1,15 * *"
+    open-pull-requests-limit: 5
+updates:
   - package-ecosystem: cargo
     directory: /
-    schedule:
-      interval: weekly
-    open-pull-requests-limit: 10
+    multi-ecosystem-group: dependencies
+    patterns: ["*"]
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+    cooldown:
+      default-days: 7
     groups:
-      cargo-minor-patch:
-        update-types: ["minor", "patch"]
+      security:
+        applies-to: security-updates
+        patterns: ["*"]
+  - package-ecosystem: github-actions
+    directory: /
+    multi-ecosystem-group: dependencies
+    patterns: ["*"]
+    cooldown:
+      default-days: 7
+    groups:
+      security:
+        applies-to: security-updates
+        patterns: ["*"]
