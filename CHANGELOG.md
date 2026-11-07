@@ -11,6 +11,16 @@ for a consumer's pin.
 
 ## [Unreleased]
 
+### Added
+
+- `stridelabs-auth`: **a live-issuer test**, `tests/live_issuer.rs` (feature
+  `test-support`), seven `#[ignore]`d tests that verify a token from a real
+  issuer over plain HTTP: the profile and `Verifier::for_issuer` accept it,
+  and a wrong audience, a wrong issuer, a tampered signature, an unknown `kid`
+  and an ID token are each refused with the specific error. They panic without
+  `STRIDELABS_TEST_ISSUER` and its companions rather than skip. See the crate
+  README's "Test support".
+
 ## [0.11.1] - 2026-10-27
 
 ### Fixed

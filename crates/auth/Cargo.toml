@@ -87,3 +87,9 @@ jsonwebtoken = { workspace = true, features = ["use_pem"] }
 # tracing-subscriber.
 axum = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+# Against a live issuer over plain HTTP (see the file's header); ignored by
+# default, and failing without STRIDELABS_TEST_ISSUER rather than skipping.
+[[test]]
+name = "live_issuer"
+required-features = ["test-support"]
