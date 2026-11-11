@@ -102,7 +102,7 @@
 //!
 //! rmcp's types are this crate's API (`ServerHandler`, `RequestContext`,
 //! `CallToolResult`, `StreamableHttpServerConfig`), so a consumer depends on
-//! the same major, `rmcp = { version = "3.5", default-features = false,
+//! the same major, `rmcp = { version = "3.6", default-features = false,
 //! features = ["server", "macros"] }`; [`rmcp`] is re-exported for naming
 //! types without that dependency. **Never enable rmcp's `local` feature**: it
 //! compiles the Streamable HTTP service out.

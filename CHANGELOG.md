@@ -21,6 +21,44 @@ for a consumer's pin.
   `STRIDELABS_TEST_ISSUER` and its companions rather than skip. See the crate
   README's "Test support".
 
+### Security
+
+- `stridelabs-mcp`: **rmcp's floor is 3.6** (was 3.5), and `Cargo.lock`
+  moves rmcp and rmcp-macros 3.5.1 → 3.6.0, for RUSTSEC-2026-0461
+  (GHSA-4432-vg92-fqh6). Before 3.6.0, rmcp's `StreamableHttpService`, which
+  `stridelabs-mcp`'s router builds, cached each `ServerHandler::get_tool`
+  result in a process-wide map keyed by the `tools/call` tool name, with no
+  bound and no eviction. Unknown names were cached too, even for a request
+  answered 400, so a client sending made-up tool names grew the server's
+  memory without limit. 3.6.0 removed the cache, and `get_tool` now runs per
+  request. No source change here. The raised floor reaches a consumer at the
+  next tag. Until then a consumer moves its own lock with `cargo update -p
+  rmcp --precise 3.6.0`, the smallest fix, and names `"3.6"` on its own rmcp
+  dependency, as the crate README's snippet does. A plain `cargo update -p
+  rmcp` takes the lock to 3.9.0, which changes `tools/list` (see
+  Dependencies).
+
+### Dependencies
+
+- `Cargo.lock` refreshed within every requirement (`cargo update`, about 120
+  packages; lock only, no manifest or source change). Among them rmcp and
+  rmcp-macros 3.6.0 → 3.9.0, which also clears RUSTSEC-2026-0457 (OAuth
+  client SSRF filter, fixed in 3.7.0) and RUSTSEC-2026-0462 (unbounded
+  response buffering in Streamable HTTP clients, fixed in 3.9.0). Both are
+  rmcp client code, which `stridelabs-mcp` does not compile, but `cargo
+  audit` reads the lock. rmcp 3.9.0 also builds a tool's `outputSchema` for
+  the serialize contract (rmcp #1378): an `Option` field without
+  `skip_serializing_if`, or a `#[serde(default)]` field, is now required.
+  A consumer that moves to 3.9 may see its committed `mcp-tools.json`
+  change, and `assert_committed_tools_are_fresh` fail until the file is
+  regenerated with the consumer's own regenerate command. This workspace
+  commits no tool list, so nothing here changes. tokio 1.53.1 → 1.54.1 clears the RUSTSEC-2026-0386
+  unsound warning (`AsyncFd`). One advisory is left: RUSTSEC-2026-0459,
+  libsqlite3-sys, now at 0.37.0 against a fix in 0.39.0. It is a lock-only
+  entry (sqlx's optional SQLite driver, which no crate here enables), and
+  sqlx 0.9's requirement does not reach 0.39. A consumer's own `Cargo.lock`
+  decides what it builds.
+
 ## [0.11.1] - 2026-10-27
 
 ### Fixed
