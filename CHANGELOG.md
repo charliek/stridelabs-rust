@@ -37,6 +37,18 @@ for a consumer's pin.
   dependency, as the crate README's snippet does. A plain `cargo update -p
   rmcp` takes the lock to 3.9.0, which changes `tools/list` (see
   Dependencies).
+- CI: **`cargo audit` ignores RUSTSEC-2026-0459** (libsqlite3-sys 0.37.0, C
+  SQLite CVE-2026-119375, fixed in libsqlite3-sys 0.39.0), on the audit step
+  and in `deny.toml`'s `[advisories].ignore`, each with the written
+  assessment. It is lock-only: libsqlite3-sys is locked only as the
+  dependency of sqlx's optional SQLite driver, sqlx-sqlite, no crate enables
+  sqlx's `sqlite` feature, and nothing compiles or links SQLite (`cargo tree
+  --workspace --all-features --target all -i libsqlite3-sys` prints nothing).
+  No update clears it: sqlx-sqlite 0.9.0, the newest, caps libsqlite3-sys
+  below 0.38. The ignore comes out once sqlx allows libsqlite3-sys 0.39 or
+  later, or at once if anything enables sqlx's `sqlite` feature. This turns
+  main's audit (and so `ci-success`) green again. No crate or lock change.
+  Tracked in #65.
 
 ### Dependencies
 

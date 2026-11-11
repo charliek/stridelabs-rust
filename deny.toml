@@ -41,10 +41,40 @@ db-urls = ["https://github.com/rustsec/advisory-db"]
 # `cargo deny check` locally, so it doesn't disagree with the audit job's
 # published assessment.
 #
-# No `ignore` entries, and none on CI's `cargo audit` step either (keep the two
-# in sync if one is ever added). The last one, RUSTSEC-2023-0071 (rsa, Marvin
-# timing side-channel, no upstream fix), was dropped once sqlx 0.9 took `rsa`
-# out of Cargo.lock; CI's "Guard: no rsa in Cargo.lock" step keeps it out.
+# `ignore` mirrors the `--ignore` flags on CI's `cargo audit` step exactly
+# (keep the two in sync); each entry carries its assessment and when it comes
+# out. The previous one, RUSTSEC-2023-0071 (rsa, Marvin timing side-channel,
+# no upstream fix), was dropped once sqlx 0.9 took `rsa` out of Cargo.lock;
+# CI's "Guard: no rsa in Cargo.lock" step keeps it out.
+ignore = [
+    # libsqlite3-sys 0.37.0, C SQLite CVE-2026-119375: SQLite before 3.54.0
+    # can return uninitialized page-cache memory when a process opens a
+    # database together with a crafted sibling `-wal` file. Fixed in
+    # libsqlite3-sys >= 0.39.0.
+    #   https://rustsec.org/advisories/RUSTSEC-2026-0459
+    #
+    # Lock-only, so unreachable: libsqlite3-sys is in Cargo.lock only as the
+    # dependency of sqlx's optional SQLite driver, sqlx-sqlite, and no crate
+    # here enables sqlx's `sqlite` feature (the workspace's sqlx is
+    # Postgres-only). Nothing compiles or links SQLite: `cargo tree --locked
+    # --workspace --all-features --target all -i libsqlite3-sys` (and
+    # `-i sqlx-sqlite`) prints nothing, and `-e features -i sqlx` lists no
+    # `sqlite` feature. The same holds here: cargo-deny builds its graph from
+    # resolved features, not from the lock, so a local `cargo deny check`
+    # warns that this entry matched no crate. That warning is expected; the
+    # entry is for `cargo audit`, which reads the lock, and keeps the two
+    # lists in sync.
+    #
+    # No update fixes it: sqlx-sqlite 0.9.0, the newest, requires
+    # libsqlite3-sys >=0.30.1, <0.38.0, so `cargo update -p libsqlite3-sys
+    # --precise 0.39.0` fails.
+    #
+    # Remove once sqlx allows libsqlite3-sys >= 0.39 (then `cargo update -p
+    # libsqlite3-sys`, and confirm with `cargo audit` on the committed lock),
+    # or at once if any crate enables sqlx's `sqlite` feature. Tracked in
+    # charliek/stridelabs-rust#65.
+    "RUSTSEC-2026-0459",
+]
 
 [licenses]
 # Licenses allowed for any crate in the dependency graph. Base set is the

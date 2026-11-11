@@ -919,16 +919,31 @@ jobs:
         with:
           tool: cargo-audit
 
-      # No `--ignore` entries, so every advisory is live and a genuinely NEW one
-      # stands out. If one is ever added it must be mirrored in deny.toml's
-      # [advisories].ignore, assessed in writing, and removed the moment it is
-      # fixed upstream or the reachability assessment changes — and only after
-      # `cargo audit` on the committed lock shows it gone (`cargo tree` cannot
-      # prove that: lock-only entries are invisible to it). The last one,
-      # RUSTSEC-2023-0071 (rsa), was removed that way when sqlx 0.9 dropped
-      # rsa from the lock; the "no rsa" guard in build-test keeps it out.
+      # Every `--ignore` here is mirrored in deny.toml's [advisories].ignore
+      # (keep the two in sync), assessed in writing, and removed the moment it
+      # is fixed upstream or the reachability assessment changes — and only
+      # after `cargo audit` on the committed lock shows it gone (`cargo tree`
+      # cannot prove that: lock-only entries are invisible to it). Anything
+      # not listed stays live, so a genuinely NEW advisory stands out. The
+      # previous one, RUSTSEC-2023-0071 (rsa), was removed that way when sqlx
+      # 0.9 dropped rsa from the lock; the "no rsa" guard in build-test keeps
+      # it out.
+      #
+      # RUSTSEC-2026-0459 (libsqlite3-sys 0.37.0, C SQLite CVE-2026-119375,
+      # fixed in libsqlite3-sys >= 0.39.0). Lock-only, so unreachable:
+      # libsqlite3-sys is in Cargo.lock only as the dependency of sqlx's
+      # optional SQLite driver, sqlx-sqlite, and no crate here enables sqlx's
+      # `sqlite` feature (the workspace's sqlx is Postgres-only). Nothing
+      # compiles or links SQLite: `cargo tree --locked --workspace
+      # --all-features --target all -i libsqlite3-sys` (and `-i sqlx-sqlite`)
+      # prints nothing, and `-e features -i sqlx` lists no `sqlite` feature.
+      # No update fixes it: sqlx-sqlite 0.9.0, the newest, requires
+      # libsqlite3-sys >=0.30.1, <0.38.0, so `cargo update -p libsqlite3-sys
+      # --precise 0.39.0` fails. Remove it once sqlx allows libsqlite3-sys
+      # >= 0.39 (then `cargo update -p libsqlite3-sys`), or at once if any
+      # crate enables sqlx's `sqlite` feature. Tracked in #65.
       - name: cargo audit
-        run: cargo audit
+        run: cargo audit --ignore RUSTSEC-2026-0459
 
   # Does the candidate still build and pass for a real consumer? limen is the
   # one consumer checked here: it is public, so this log is public too, and it
