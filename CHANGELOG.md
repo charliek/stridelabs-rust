@@ -58,6 +58,22 @@ for a consumer's pin.
   entry (sqlx's optional SQLite driver, which no crate here enables), and
   sqlx 0.9's requirement does not reach 0.39. A consumer's own `Cargo.lock`
   decides what it builds.
+- **Reviewed for the next patch release; no requirement changes.** Every
+  requirement already admits the newest compatible release, and the lock
+  above is current: a further `cargo update` would only take crypto-common
+  back from 0.1.7 to 0.1.6 (and generic-array to 0.14.9). Left as they are:
+  - base64 stays on 0.22. jsonwebtoken, axum, sqlx and wiremock lock 0.22,
+    so 0.23 would remove no copy from a graph, and its default
+    `simd-unsafe` engines would reach the token and audio decoders.
+  - tungstenite and tokio-tungstenite stay on 0.29. `stridelabs-voice` must
+    use the version axum 0.8's `ws` is built on, and `muse::error_class`
+    takes a `tungstenite::Error`, so 0.30 waits for axum and a minor release.
+  - redis 2 and rustls 0.24 are pre-releases.
+  - The toolchain stays at 1.97.1, the pin every consumer shares.
+- CI: `actions-rust-lang/setup-rust-toolchain` v2.0.0 → v2.0.1 (rust-cache
+  2.9.3) and `taiki-e/install-action` v2.87.26 → v2.90.1, which installs
+  cargo-semver-checks (still pinned at 0.51.0) and cargo-audit. Nothing a
+  consumer builds changes.
 
 ## [0.11.1] - 2026-10-27
 
