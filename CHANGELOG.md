@@ -11,6 +11,8 @@ for a consumer's pin.
 
 ## [Unreleased]
 
+## [0.11.2] - 2026-11-11
+
 ### Added
 
 - `stridelabs-auth`: **a live-issuer test**, `tests/live_issuer.rs` (feature
