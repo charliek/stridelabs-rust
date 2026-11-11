@@ -61,7 +61,7 @@ for a consumer's pin.
 - **Reviewed for the next patch release; no requirement changes.** Every
   requirement already admits the newest compatible release, and the lock
   above is current: a further `cargo update` would only take crypto-common
-  back from 0.1.7 to 0.1.6. Left as they are:
+  back from 0.1.7 to 0.1.6 (and generic-array to 0.14.9). Left as they are:
   - base64 stays on 0.22. jsonwebtoken, axum, sqlx and wiremock lock 0.22,
     so 0.23 would remove no copy from a graph, and its default
     `simd-unsafe` engines would reach the token and audio decoders.
