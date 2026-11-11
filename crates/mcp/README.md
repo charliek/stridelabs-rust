@@ -3,7 +3,7 @@
 The hardened middle of a StrideLabs MCP server: everything between an HTTP
 request at `/mcp` and an app's tool code. The Rust twin of
 stridelabs-python's `stridelabs-mcp`, built on
-[rmcp](https://docs.rs/rmcp) 3.5 (the official Rust MCP SDK).
+[rmcp](https://docs.rs/rmcp) 3.6 (the official Rust MCP SDK).
 
 The app writes its tools as an rmcp `ServerHandler`. This crate supplies:
 
@@ -51,7 +51,7 @@ The app writes its tools as an rmcp `ServerHandler`. This crate supplies:
 ```toml
 [dependencies]
 stridelabs-mcp = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.11.1" }
-rmcp = { version = "3.5", default-features = false, features = ["server", "macros"] }
+rmcp = { version = "3.6", default-features = false, features = ["server", "macros"] }
 
 [dev-dependencies]
 stridelabs-mcp = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.11.1", features = ["test-support"] }

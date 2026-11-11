@@ -21,6 +21,21 @@ for a consumer's pin.
   `STRIDELABS_TEST_ISSUER` and its companions rather than skip. See the crate
   README's "Test support".
 
+### Security
+
+- `stridelabs-mcp`: **rmcp's floor is 3.6** (was 3.5), and `Cargo.lock`
+  moves rmcp and rmcp-macros 3.5.1 → 3.6.0, for RUSTSEC-2026-0461
+  (GHSA-4432-vg92-fqh6). Before 3.6.0, rmcp's `StreamableHttpService`, which
+  `stridelabs-mcp`'s router builds, cached each `ServerHandler::get_tool`
+  result in a process-wide map keyed by the `tools/call` tool name, with no
+  bound and no eviction. Unknown names were cached too, even for a request
+  answered 400, so a client sending made-up tool names grew the server's
+  memory without limit. 3.6.0 removed the cache, and `get_tool` now runs per
+  request. No source change here. The raised floor reaches a consumer at the
+  next tag; until then a consumer moves its own lock with `cargo update -p
+  rmcp` (and names `"3.6"` on its own rmcp dependency, the crate README's
+  snippet).
+
 ## [0.11.1] - 2026-10-27
 
 ### Fixed
