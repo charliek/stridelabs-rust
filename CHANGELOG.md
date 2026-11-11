@@ -32,9 +32,11 @@ for a consumer's pin.
   answered 400, so a client sending made-up tool names grew the server's
   memory without limit. 3.6.0 removed the cache, and `get_tool` now runs per
   request. No source change here. The raised floor reaches a consumer at the
-  next tag; until then a consumer moves its own lock with `cargo update -p
-  rmcp` (and names `"3.6"` on its own rmcp dependency, the crate README's
-  snippet).
+  next tag. Until then a consumer moves its own lock with `cargo update -p
+  rmcp --precise 3.6.0`, the smallest fix, and names `"3.6"` on its own rmcp
+  dependency, as the crate README's snippet does. A plain `cargo update -p
+  rmcp` takes the lock to 3.9.0, which changes `tools/list` (see
+  Dependencies).
 
 ### Dependencies
 
@@ -44,7 +46,13 @@ for a consumer's pin.
   client SSRF filter, fixed in 3.7.0) and RUSTSEC-2026-0462 (unbounded
   response buffering in Streamable HTTP clients, fixed in 3.9.0). Both are
   rmcp client code, which `stridelabs-mcp` does not compile, but `cargo
-  audit` reads the lock. tokio 1.53.1 → 1.54.1 clears the RUSTSEC-2026-0386
+  audit` reads the lock. rmcp 3.9.0 also builds a tool's `outputSchema` for
+  the serialize contract (rmcp #1378): an `Option` field without
+  `skip_serializing_if`, or a `#[serde(default)]` field, is now required.
+  A consumer that moves to 3.9 may see its committed `mcp-tools.json`
+  change, and `assert_committed_tools_are_fresh` fail until the file is
+  regenerated with the consumer's own regenerate command. This workspace
+  commits no tool list, so nothing here changes. tokio 1.53.1 → 1.54.1 clears the RUSTSEC-2026-0386
   unsound warning (`AsyncFd`). One advisory is left: RUSTSEC-2026-0459,
   libsqlite3-sys, now at 0.37.0 against a fix in 0.39.0. It is a lock-only
   entry (sqlx's optional SQLite driver, which no crate here enables), and
