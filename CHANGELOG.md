@@ -36,6 +36,21 @@ for a consumer's pin.
   rmcp` (and names `"3.6"` on its own rmcp dependency, the crate README's
   snippet).
 
+### Dependencies
+
+- `Cargo.lock` refreshed within every requirement (`cargo update`, about 120
+  packages; lock only, no manifest or source change). Among them rmcp and
+  rmcp-macros 3.6.0 → 3.9.0, which also clears RUSTSEC-2026-0457 (OAuth
+  client SSRF filter, fixed in 3.7.0) and RUSTSEC-2026-0462 (unbounded
+  response buffering in Streamable HTTP clients, fixed in 3.9.0). Both are
+  rmcp client code, which `stridelabs-mcp` does not compile, but `cargo
+  audit` reads the lock. tokio 1.53.1 → 1.54.1 clears the RUSTSEC-2026-0386
+  unsound warning (`AsyncFd`). One advisory is left: RUSTSEC-2026-0459,
+  libsqlite3-sys, now at 0.37.0 against a fix in 0.39.0. It is a lock-only
+  entry (sqlx's optional SQLite driver, which no crate here enables), and
+  sqlx 0.9's requirement does not reach 0.39. A consumer's own `Cargo.lock`
+  decides what it builds.
+
 ## [0.11.1] - 2026-10-27
 
 ### Fixed
